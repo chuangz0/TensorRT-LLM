@@ -153,3 +153,6 @@ public:
 
 } // namespace batch_manager
 }; // namespace tensorrt_llm
+
+// 一个原则 所有 generation 要获得的信息， blockIds ,cacheFormat , MR Desp 的等等 。 都应该通过context_params 或者etcd
+// 发送 被动方 只能去检查request 是否完成 。 如果context 也去send Blockid ，那么为什么做出双边的呢？
