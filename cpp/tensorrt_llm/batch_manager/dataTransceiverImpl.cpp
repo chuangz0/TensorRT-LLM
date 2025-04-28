@@ -19,6 +19,8 @@
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 namespace tensorrt_llm::batch_manager
@@ -147,11 +149,34 @@ void DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
         requestInfo = RequestInfo(requestId, blockRange.getBlockHashes(), mSelfState);
     }
 
+    auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
+    std::optional<size_t> cacheBufferId = std::nullopt;
+    if (agentConnectionManager != nullptr)
+    {
+        cacheBufferId = agentConnectionManager->getCacheTransBufferManager()->assignBufferIndexForRecv();
+        TLLM_CHECK(cacheBufferId.has_value());
+        // memory Desp , validSegmentIdx send
+    }
+
     for (auto index : mFormatter->getCounterparts(
              mSelfState.getCacheState().value(), mSelfState.getCommState().value().getSelfIdx(), destCacheState))
     {
         auto const* connection = mManager->getConnections(commState).at(index);
-        sendRequestInfo(connection, requestInfo);
+        // if Manager is agentConnectionManager, then send request info to agent
+        auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
+        if (agentConnectionManager != nullptr)
+        {
+            // TODO: index -> validConnectionIdx conversion
+            auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
+            TLLM_CHECK(agentConnection != nullptr);
+            TLLM_CHECK(cacheBufferId.has_value());
+            const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
+                ->sendRequestAndBufferInfo(requestInfo, cacheBufferId, index);
+        }
+        else
+        {
+            sendRequestInfo(connection, requestInfo);
+        }
     }
 }
 
