@@ -32,8 +32,6 @@ struct NixlHelper
     [[nodiscard]] static nixl_xfer_dlist_t convertXferDist(TransferDescs const& descs);
 };
 
-class NixlTransferAgent;
-
 class NixlTransferStatus final : public TransferStatus
 {
 public:
