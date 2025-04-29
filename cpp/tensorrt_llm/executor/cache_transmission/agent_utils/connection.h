@@ -61,7 +61,7 @@ private:
 class AgentConnectionManager : public ConnectionManager
 {
 public:
-    AgentConnectionManager(batch_manager::kv_cache_manager::CacheTransBufferManager const* cacheTransBufferManager);
+    AgentConnectionManager(batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager);
     AgentConnection* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     [[nodiscard]] std::vector<Connection const*> getConnections(CommState const& state) override;
     [[nodiscard]] CommState const& getCommState() const override;

@@ -202,7 +202,7 @@ void AgentConnection::sendRequestAndBufferInfo(
     TLLM_CHECK(!common::getEnvTryZCopyForKVCacheTransfer());
 
     TLLM_CHECK(cacheBufferId.has_value());
-    auto preAllocateBuffer = mCacheTransBufferManager->getSendBuffer(cacheBufferId.value());
+    auto preAllocateBuffer = mCacheTransBufferManager->getRecvBuffer(cacheBufferId.value());
     // memory Desp , validSegmentIdx send
     mCacheBufferId = cacheBufferId;
     // TODO: deviceID;
@@ -223,8 +223,10 @@ void AgentConnection::setSenderState(MemoryDesc mReceiverBufferDesc, int valideS
 }
 
 AgentConnectionManager::AgentConnectionManager(
-    batch_manager::kv_cache_manager::CacheTransBufferManager const* cacheTransBufferManager)
+    batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager)
 {
+    // TODO: register memory
+    mCacheTransBufferManager = cacheTransBufferManager;
 }
 
 AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batch_manager::RequestInfo& requestInfo)
