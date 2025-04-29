@@ -17,6 +17,7 @@ set(TARGET_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 set(SRCS
     cache_transmission/mpi_utils/connection.cpp
     cache_transmission/agent_utils/connection.cpp
+    cache_transmission/transferAgent.cpp
     cache_transmission/cacheConcatenate.cu
     contextPhaseParams.cpp
     debugConfig.cpp
@@ -84,3 +85,4 @@ target_compile_definitions(${EXECUTOR_STATIC_TARGET}
                            PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
 
 add_subdirectory(cache_transmission/ucx_utils)
+add_subdirectory(cache_transmission/nixl_utils)
