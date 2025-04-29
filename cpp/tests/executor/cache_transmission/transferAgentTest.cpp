@@ -108,5 +108,4 @@ TEST_F(TransferAgentTest, Basic)
     TLLM_CHECK(memory0 == memory1);
 
     nixlAgent0->invalidateRemoteAgent(agent1);
-    nixlAgent1->invalidateRemoteAgent(agent0);
 }

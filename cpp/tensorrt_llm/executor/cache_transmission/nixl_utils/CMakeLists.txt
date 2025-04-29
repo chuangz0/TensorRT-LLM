@@ -1,48 +1,25 @@
-if(NIXL_ROOT)
-  # Add NIXL configuration
-  set(NIXL_ROOT "/opt/nvidia/nvda_nixl")
+# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# AFFILIATES. All rights reserved. SPDX-License-Identifier: NVIDIA TensorRT
+# Source Code License Agreement
+#
+# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
+# property and proprietary rights in and to this material, related documentation
+# and any modifications thereto. Any use, reproduction, disclosure or
+# distribution of this material and related documentation without an express
+# license agreement from NVIDIA CORPORATION or its affiliates is strictly
+# prohibited.
 
-  message(STATUS "Found NIXL in NIXL_ROOT:${NIXL_ROOT}.")
-
-  # Ensure TARGET_ARCH is defined
-  if(NOT DEFINED TARGET_ARCH)
-    message(FATAL_ERROR "TARGET_ARCH is not defined")
+if(ENABLE_NIXL)
+  if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+    message(STATUS "NIXL currently only supports aarch64.")
+    return()
   endif()
 
-  message(STATUS "Target architecture: ${TARGET_ARCH}")
-
-  # Find NIXL include directory
-  find_path(NIXL_INCLUDE_DIR nixl.h HINTS ${NIXL_ROOT}/include)
-
-  # Find all required NIXL libraries
-  find_library(NIXL_LIBRARY nixl HINTS ${NIXL_ROOT}/lib/${TARGET_ARCH})
-  find_library(NIXL_BUILD_LIBRARY nixl_build
-               HINTS ${NIXL_ROOT}/lib/${TARGET_ARCH})
-  find_library(SERDES_LIBRARY serdes HINTS ${NIXL_ROOT}/lib/${TARGET_ARCH})
-  find_library(UCX_BACKEND_LIBRARY plugin_UCX
-               HINTS ${NIXL_ROOT}/lib/${TARGET_ARCH}/plugins)
-  find_library(UCX_UTILS_LIBRARY ucx_utils
-               HINTS ${NIXL_ROOT}/lib/${TARGET_ARCH})
-  find_library(GDS_BACKEND_LIBRARY plugin_GDS
-               HINTS ${NIXL_ROOT}/lib/${TARGET_ARCH}/plugins)
-
-  # Display found libraries
-  message(STATUS "Found NIXL libraries:")
-  message(STATUS "  NIXL: ${NIXL_LIBRARY}")
-  message(STATUS "  NIXL Build: ${NIXL_BUILD_LIBRARY}")
-  message(STATUS "  SERDES: ${SERDES_LIBRARY}")
-  message(STATUS "  UCX Backend: ${UCX_BACKEND_LIBRARY}")
-  message(STATUS "  UCX Utils: ${UCX_UTILS_LIBRARY}")
-  message(STATUS "  GDS Backend: ${GDS_BACKEND_LIBRARY}")
-
-  # Check if all required libraries were found
-  if(NOT NIXL_LIBRARY
-     OR NOT NIXL_BUILD_LIBRARY
-     OR NOT SERDES_LIBRARY
-     OR NOT UCX_BACKEND_LIBRARY
-     OR NOT UCX_UTILS_LIBRARY
-     OR NOT GDS_BACKEND_LIBRARY)
-    message(FATAL_ERROR "One or more NIXL libraries not found")
+  find_package(NIXL REQUIRED)
+  # Check if all required packages were found
+  if(NOT NIXL_FOUND)
+    message(
+      FATAL_ERROR "NIXL not found. Please install NIXL or set `NIXL_ROOT`.")
   endif()
 
   # Define the NIXL wrapper target
@@ -52,11 +29,8 @@ if(NIXL_ROOT)
   add_library(${NIXL_WRAPPER_TARGET} SHARED transferAgent.cpp)
 
   # Add include directories
-  target_include_directories(${NIXL_WRAPPER_TARGET} PRIVATE ${NIXL_INCLUDE_DIR})
+  target_include_directories(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
 
   # Link against all NIXL libraries
-  target_link_libraries(
-    ${NIXL_WRAPPER_TARGET}
-    PRIVATE ${NIXL_LIBRARY} ${NIXL_BUILD_LIBRARY} ${SERDES_LIBRARY}
-            ${UCX_BACKEND_LIBRARY} ${UCX_UTILS_LIBRARY} ${GDS_BACKEND_LIBRARY})
+  target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
 endif()
