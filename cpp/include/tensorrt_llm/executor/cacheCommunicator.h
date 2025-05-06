@@ -190,11 +190,13 @@ enum class TransferOp : uint8_t
 class TransferRequest
 {
 public:
-    TransferRequest(TransferOp op, TransferDescs srcDescs, TransferDescs dstDescs, AgentDesc const& remoteAgent)
+    TransferRequest(TransferOp op, TransferDescs srcDescs, TransferDescs dstDescs, AgentDesc const& remoteAgent,
+        std::optional<SyncMessage> syncMessage)
         : mOp{op}
         , mSrcDescs{std::move(srcDescs)}
         , mDstDescs{std::move(dstDescs)}
         , mRemoteAgent{std::addressof(remoteAgent)}
+        , mSyncMessage{std::move(syncMessage)}
     {
     }
 
@@ -223,6 +225,7 @@ private:
     TransferDescs mSrcDescs;
     TransferDescs mDstDescs;
     AgentDesc const* mRemoteAgent;
+    std::optional<SyncMessage> mSyncMessage;
 };
 
 class TransferStatus

@@ -28,6 +28,7 @@
 namespace tensorrt_llm::executor::kv_cache
 {
 class AgentConnectionManager;
+class NotificationSyncInfo;
 
 class AgentConnection : public Connection
 {
@@ -61,7 +62,8 @@ private:
 class AgentConnectionManager : public ConnectionManager
 {
 public:
-    AgentConnectionManager(batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager);
+    AgentConnectionManager(
+        batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager, BaseTransferAgent* agent);
     AgentConnection* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     [[nodiscard]] std::vector<Connection const*> getConnections(CommState const& state) override;
     [[nodiscard]] CommState const& getCommState() const override;
@@ -69,16 +71,19 @@ public:
     [[nodiscard]] batch_manager::kv_cache_manager::CacheTransBufferManager* getCacheTransBufferManager();
     void updateUnhandledNotifications();
     [[nodiscard]] BaseTransferAgent* getAgent() const;
-    AgentConnection* connect(std::string const& agentName, std::string const& address);
+    AgentConnection* connect(std::string const& remoteAgentName, std::string const& address);
+    int getDeviceId() const;
+    void waitForSyncInfo(AgentDesc const& remoteAgentDesc, NotificationSyncInfo const& syncInfo);
 
 private:
-    std::map<AgentDesc, Connection*> mConnections;
+    std::map<AgentDesc, std::shared_ptr<AgentConnection>> mConnections;
     std::mutex mConnectionsMutex;
     CommState mCommState;
     batch_manager::kv_cache_manager::CacheTransBufferManager* mCacheTransBufferManager;
-    std::mutex mMutex;
+    std::mutex mNotificationMutex;
     std::unordered_map<AgentDesc, std::list<std::string>> mUnhandledNotifications;
     BaseTransferAgent* m_Agent;
+    int mDeviceId;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache

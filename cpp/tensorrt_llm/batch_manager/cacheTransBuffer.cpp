@@ -269,4 +269,14 @@ void CacheTransBufferManager::freeBufferIndex(
     }
 }
 
+size_t CacheTransBufferManager::getRecvBufferCount()
+{
+    return mRecvBufferCount;
+}
+
+size_t CacheTransBufferManager::getSendBufferCount()
+{
+    return mSendBufferCount;
+}
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager
