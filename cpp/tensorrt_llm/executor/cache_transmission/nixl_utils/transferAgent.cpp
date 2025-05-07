@@ -16,9 +16,107 @@
  */
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.h"
+#include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
+
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <unistd.h>
 
 namespace tensorrt_llm::executor::kv_cache
 {
+
+static std::string getAvailableIP()
+{
+    struct ifaddrs *ifaddr, *ifa;
+    void* addr_ptr;
+    std::string ip("UNKNOWN IP");
+
+    // Get the list of network interfaces
+    if (getifaddrs(&ifaddr) == -1)
+    {
+        perror("getifaddrs");
+        return ip;
+    }
+
+    // Loop through the linked list of interfaces
+    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
+    {
+        // Check if the interface is an IP interface
+        if (ifa->ifa_addr == nullptr)
+            continue;
+
+        std::string ucxInterface = common::getEnvUCXInterface();
+        if (!ucxInterface.empty() && strcmp(ifa->ifa_name, ucxInterface.c_str()) != 0)
+        {
+            continue;
+        }
+
+        // Skip the loopback interface
+        if (ucxInterface.empty() && (strncmp(ifa->ifa_name, "docker", 6) == 0 || strcmp(ifa->ifa_name, "lo") == 0))
+        {
+            continue;
+        }
+
+        // Check if the address family is AF_INET (IPv4)
+        // TODO: USER CAN SPECIFY THE IP ADDRESS
+        if (ifa->ifa_addr->sa_family == AF_INET)
+        {
+            addr_ptr = &((struct sockaddr_in*) ifa->ifa_addr)->sin_addr;
+            char address_buffer[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, addr_ptr, address_buffer, sizeof(address_buffer));
+
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " ***** UCX    Interface: %s IP Address: %s", ifa->ifa_name,
+                address_buffer);
+            ip = address_buffer;
+            break;
+        }
+    }
+    if (ifa == nullptr)
+    {
+        TLLM_LOG_ERROR(mpi::MpiComm::world().getRank(),
+            "UCX   No valid IP address found please set correct UCX interface with env variable TRTLLM_UCX_INTERFACE");
+    }
+
+    freeifaddrs(ifaddr);
+    return ip;
+}
+
+uint16_t getAvailablePort(std::string const& ip = "0.0.0.0")
+{
+    struct addrinfo hints
+    {
+    };
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+
+    struct addrinfo* res;
+    int ret = getaddrinfo(ip.c_str(), "0", &hints, &res);
+    TLLM_CHECK(ret == 0);
+
+    int sockfd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    TLLM_CHECK(sockfd != -1);
+
+    ret = bind(sockfd, res->ai_addr, res->ai_addrlen);
+    TLLM_CHECK(ret == 0);
+
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    ret = getsockname(sockfd, (struct sockaddr*) &addr, &addrlen);
+    TLLM_CHECK(ret == 0);
+
+    uint16_t port = ntohs(addr.sin_port);
+    close(sockfd);
+    freeaddrinfo(res);
+
+    return port;
+}
 
 [[nodiscard]] nixl_mem_t NixlHelper::convert(MemoryType type)
 {
@@ -87,13 +185,13 @@ void NixlTransferStatus::wait() const
     return mRawAgent->getXferStatus(mHandle) == NIXL_SUCCESS;
 }
 
-NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config, AgentRegistrar* registrar)
-    : mRegistrar{registrar}
-    , mName{config.mName}
+NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
+    : mName{config.mName}
 {
     nixl_status_t status;
-    TLLM_CHECK(mRegistrar);
-    nixlAgentConfig nixlConfig{config.useProgThread};
+    uint16_t port = getAvailablePort();
+    nixlAgentConfig nixlConfig{config.useProgThread, true, port};
+    mAddress = getAvailableIP() + ":" + std::to_string(port);
     mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
 
     nixl_b_params_t init1;
@@ -107,6 +205,7 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config, AgentRegistr
         TLLM_THROW("Failed to create NIXL backend");
     }
     mExtraParams.backends.push_back(mRawBackend);
+    TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent mAddress: %s", mAddress.c_str());
 }
 
 void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
@@ -118,7 +217,6 @@ void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
     std::string localMD;
     status = mRawAgent->getLocalMD(localMD);
     TLLM_CHECK(status == NIXL_SUCCESS);
-    mRegistrar->addAgentDesc(mName, std::move(localMD));
 }
 
 void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
@@ -128,13 +226,11 @@ void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
     TLLM_CHECK(status == NIXL_SUCCESS);
 }
 
-void NixlTransferAgent::loadRemoteAgent(std::string const& name)
+void NixlTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc const& agentDesc)
 {
     nixl_status_t status;
-    auto const* desc = mRegistrar->getAgentDesc(name);
-    TLLM_CHECK(desc);
     std::string remoteName;
-    status = mRawAgent->loadRemoteMD(desc->getBackendAgentDesc(), remoteName);
+    status = mRawAgent->loadRemoteMD(agentDesc.getBackendAgentDesc(), remoteName);
     TLLM_CHECK(status == NIXL_SUCCESS);
     TLLM_CHECK_WITH_INFO(
         name == remoteName, "loadRemoteAgent gets error agent name: %s != %s", name.c_str(), remoteName.c_str());
@@ -152,10 +248,74 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()),
         NixlHelper::convertXferDist(request.getSrcDescs()), NixlHelper::convertXferDist(request.getDstDescs()),
         request.getRemoteName(), handle, &mExtraParams);
-    TLLM_CHECK(status == NIXL_SUCCESS);
+    TLLM_CHECK_WITH_INFO(
+        status == NIXL_SUCCESS, "createXferReq failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+
+    if (request.getSyncMessage().has_value())
+    {
+        mExtraParams.hasNotif = true;
+
+        mExtraParams.notifMsg = request.getSyncMessage().value();
+    }
+    else
+    {
+        mExtraParams.hasNotif = false;
+    }
 
     status = mRawAgent->postXferReq(handle, &mExtraParams);
     return std::make_unique<NixlTransferStatus>(mRawAgent.get(), handle);
+}
+
+void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage const& syncMessage)
+{
+    auto status = mRawAgent->genNotif(name, syncMessage);
+    TLLM_CHECK_WITH_INFO(
+        status == NIXL_SUCCESS, "genNotif failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+}
+
+[[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> NixlTransferAgent::getNotifiedSyncMessages()
+{
+
+    nixl_notifs_t notifs;
+    auto status = mRawAgent->getNotifs(notifs);
+    TLLM_CHECK_WITH_INFO(
+        status == NIXL_SUCCESS, "getNotifs failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+
+    return notifs;
+}
+
+ConnectionInfoType NixlTransferAgent::getConnectionInfo()
+{
+    return mAddress;
+}
+
+void NixlTransferAgent::connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo)
+{
+    std::string ip = connectionInfo.substr(0, connectionInfo.find(":"));
+    std::string port = connectionInfo.substr(connectionInfo.find(":") + 1);
+    TLLM_CHECK_WITH_INFO(!ip.empty() && !port.empty(), "connectRemoteAgent get empty ip or port, connectionInfo: %s",
+        connectionInfo.c_str());
+    nixl_opt_args_t md_extra_params;
+    md_extra_params.ipAddr = ip;
+    md_extra_params.port = std::stoi(port);
+    auto status = mRawAgent->fetchRemoteMD(name, &md_extra_params);
+    TLLM_CHECK_WITH_INFO(
+        status == NIXL_SUCCESS, "fetchRemoteMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+    status = NIXL_ERR_NOT_FOUND;
+    nixl_xfer_dlist_t descs{DRAM_SEG};
+    while (status == NIXL_ERR_NOT_FOUND)
+    {
+        status = mRawAgent->checkRemoteMD(name, descs);
+        TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS || status == NIXL_ERR_NOT_FOUND,
+            "checkRemoteMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    TLLM_LOG_DEBUG("NixlTransferAgent::connectRemoteAgent connectRemoteAgent to %s success", connectionInfo.c_str());
+}
+
+NixlTransferAgent::~NixlTransferAgent()
+{
+    TLLM_LOG_DEBUG("NixlTransferAgent::~NixlTransferAgent");
 }
 
 #if defined(__clang__)
@@ -165,10 +325,10 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 
 extern "C"
 {
-    std::unique_ptr<BaseTransferAgent> createNixlTransferAgent(BaseAgentConfig const* config, AgentRegistrar* registrar)
+    std::unique_ptr<BaseTransferAgent> createNixlTransferAgent(BaseAgentConfig const* config)
     {
         TLLM_CHECK(config);
-        return std::make_unique<NixlTransferAgent>(*config, registrar);
+        return std::make_unique<NixlTransferAgent>(*config);
     }
 }
 
