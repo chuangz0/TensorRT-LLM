@@ -75,6 +75,10 @@ public:
         return mDeviceId;
     }
 
+    static void serialize(MemoryDesc const& memoryDesc, std::ostream& os);
+    [[nodiscard]] static MemoryDesc deserialize(std::istream& is);
+    [[nodiscard]] static size_t serializedSize(MemoryDesc const& memoryDesc);
+
 private:
     uintptr_t mAddr;
     size_t mLen;

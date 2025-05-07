@@ -225,6 +225,8 @@ struct AgentState
     {
     }
 
+    AgentState() = default;
+
     [[nodiscard]] bool operator==(AgentState const& other) const noexcept
     {
         return mAgentName == other.mAgentName && mConnectionInfo == other.mConnectionInfo;

@@ -17,6 +17,7 @@
 
 #include "connection.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include <string>
 #include <unistd.h>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -33,13 +34,15 @@ std::string genUniqueAgentName()
     return std::string(hostname) + "_" + std::to_string(pid) + "_" + std::to_string(counter++);
 }
 
-AgentConnection::AgentConnection(AgentDesc mAgentDesc, AgentDesc mRemoteAgentDesc,
-    batch_manager::kv_cache_manager::CacheTransBufferManager* mCacheTransBufferManager)
-    : mAgentDesc(mAgentDesc)
-    , mRemoteAgentDesc(mRemoteAgentDesc)
-    , mCacheTransBufferManager(mCacheTransBufferManager)
-    , mSenderState()
+AgentConnection::AgentConnection(
+    std::string mAgentName, std::string mRemoteAgentName, AgentConnectionManager* mAgentConnectionManager)
+    : mAgentName(mAgentName)
+    , mRemoteAgentName(mRemoteAgentName)
+    , mAgentConnectionManager(mAgentConnectionManager)
+    , mCacheTransBufferManager(mAgentConnectionManager->getCacheTransBufferManager())
 {
+    TLLM_CHECK(mAgentConnectionManager != nullptr);
+    TLLM_CHECK(mCacheTransBufferManager != nullptr);
 }
 
 std::optional<size_t> AgentConnection::getCacheBufferId() const
@@ -72,139 +75,6 @@ size_t MemoryDesc::serializedSize(MemoryDesc const& memoryDesc)
         + su::serializedSize(memoryDesc.mDeviceId);
 }
 
-struct RequestAndBufferInfo
-{
-    AgentDesc mAgentDesc;
-    std::string mAddress;
-    batch_manager::RequestInfo mRequestInfo;
-    MemoryDesc mBufferDesc;
-    int mValidConnectionIdx;
-
-    static void serialize(RequestAndBufferInfo const& requestAndBufferInfo, std::ostream& os)
-    {
-        namespace su = executor::serialize_utils;
-        su::serialize(requestAndBufferInfo.mAgentDesc, os);
-        su::serialize(requestAndBufferInfo.mAddress, os);
-        batch_manager::RequestInfo::serialize(requestAndBufferInfo.mRequestInfo, os);
-        MemoryDesc::serialize(requestAndBufferInfo.mBufferDesc, os);
-        su::serialize(requestAndBufferInfo.mValidConnectionIdx, os);
-    }
-
-    static RequestAndBufferInfo deserialize(std::istream& is)
-    {
-        namespace su = executor::serialize_utils;
-        auto agentDesc = su::deserialize<decltype(mAgentDesc)>(is);
-        auto address = su::deserialize<decltype(mAddress)>(is);
-        auto requestInfo = batch_manager::RequestInfo::deserialize(is);
-        auto bufferDesc = MemoryDesc::deserialize(is);
-        auto validConnectionIdx = su::deserialize<decltype(mValidConnectionIdx)>(is);
-        return RequestAndBufferInfo{agentDesc, address, requestInfo, bufferDesc, validConnectionIdx};
-    }
-
-    static size_t serializedSize(RequestAndBufferInfo const& requestAndBufferInfo)
-    {
-        namespace su = executor::serialize_utils;
-        return su::serializedSize(requestAndBufferInfo.mAgentDesc) + su::serializedSize(requestAndBufferInfo.mAddress)
-            + batch_manager::RequestInfo::serializedSize(requestAndBufferInfo.mRequestInfo)
-            + MemoryDesc::serializedSize(requestAndBufferInfo.mBufferDesc)
-            + su::serializedSize(requestAndBufferInfo.mValidConnectionIdx);
-    }
-};
-
-struct NotificationSyncInfo
-{
-
-    AgentDesc mAgentDesc;
-    DataContext mContext;
-
-    static void serialize(NotificationSyncInfo const& notificationSyncInfo, std::ostream& os)
-    {
-        namespace su = executor::serialize_utils;
-        su::serialize(notificationSyncInfo.mAgentDesc, os);
-        su::serialize(notificationSyncInfo.mContext.getTag(), os);
-    }
-
-    static NotificationSyncInfo deserialize(std::istream& is)
-    {
-        namespace su = executor::serialize_utils;
-        auto agentDesc = su::deserialize<decltype(mAgentDesc)>(is);
-        auto contextTag = su::deserialize<decltype(mContext.getTag())>(is);
-        DataContext context{contextTag};
-        return NotificationSyncInfo{agentDesc, context};
-    }
-
-    static size_t serializedSize(NotificationSyncInfo const& notificationSyncInfo)
-    {
-        namespace su = executor::serialize_utils;
-        return su::serializedSize(notificationSyncInfo.mAgentDesc)
-            + su::serializedSize(notificationSyncInfo.mContext.getTag());
-    }
-};
-
-struct NotificationInfo
-{
-
-    std::variant<RequestAndBufferInfo, NotificationSyncInfo> mInfo;
-
-    static void serialize(NotificationInfo const& notificationInfo, std::ostream& os)
-    {
-        namespace su = executor::serialize_utils;
-        su::serialize(notificationInfo.mInfo.index(), os);
-        if (std::holds_alternative<RequestAndBufferInfo>(notificationInfo.mInfo))
-        {
-            RequestAndBufferInfo::serialize(std::get<RequestAndBufferInfo>(notificationInfo.mInfo), os);
-        }
-        else if (std::holds_alternative<NotificationSyncInfo>(notificationInfo.mInfo))
-        {
-            NotificationSyncInfo::serialize(std::get<NotificationSyncInfo>(notificationInfo.mInfo), os);
-        }
-        else
-        {
-            TLLM_THROW("Unknown variant type");
-        }
-    }
-
-    static NotificationInfo deserialize(std::istream& is)
-    {
-        namespace su = executor::serialize_utils;
-        auto variantIdx = su::deserialize<std::size_t>(is);
-        constexpr std::size_t requestAndBufferInfoIdx{0};
-        constexpr std::size_t notificationSyncInfoIdx{1};
-        if (variantIdx == requestAndBufferInfoIdx)
-        {
-            return NotificationInfo{RequestAndBufferInfo::deserialize(is)};
-        }
-        else if (variantIdx == notificationSyncInfoIdx)
-        {
-            return NotificationInfo{NotificationSyncInfo::deserialize(is)};
-        }
-        else
-        {
-            TLLM_THROW("Unknown variant type");
-        }
-    }
-
-    static size_t serializedSize(NotificationInfo const& notificationInfo)
-    {
-        namespace su = executor::serialize_utils;
-        size_t totalSize = 0;
-        totalSize += su::serializedSize(notificationInfo.mInfo.index());
-        if (std::holds_alternative<RequestAndBufferInfo>(notificationInfo.mInfo))
-        {
-            totalSize += RequestAndBufferInfo::serializedSize(std::get<RequestAndBufferInfo>(notificationInfo.mInfo));
-        }
-        else if (std::holds_alternative<NotificationSyncInfo>(notificationInfo.mInfo))
-        {
-            totalSize += NotificationSyncInfo::serializedSize(std::get<NotificationSyncInfo>(notificationInfo.mInfo));
-        }
-        else
-        {
-            TLLM_THROW("Unknown variant type");
-        }
-        return totalSize;
-    }
-};
-
 void AgentConnection::send(DataContext const& ctx, void const* data, size_t size) const
 {
 
@@ -213,12 +83,14 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     MemoryDescs srcDescs{MemoryType::kVRAM, {srcDesc}};
     auto dstBaseDesc = mSenderState.mReceiverBufferDesc;
     MemoryDesc dstDesc{dstBaseDesc.getAddr() + (mSenderState.valideSegmentIdx * size), size, dstBaseDesc.getDeviceId()};
+    TLLM_LOG_DEBUG(
+        "send dstDesc: %p, size: %ld ,validSegmentIdx: %ld", dstDesc.getAddr(), size, mSenderState.valideSegmentIdx);
     MemoryDescs dstDescs{MemoryType::kVRAM, {dstDesc}};
     std::stringstream ss;
-    NotificationSyncInfo syncInfo{mRemoteAgentDesc, ctx};
+    NotificationSyncInfo syncInfo{mRemoteAgentName, ctx};
     NotificationInfo notificationInfo{syncInfo};
     NotificationInfo::serialize(notificationInfo, ss);
-    TransferRequest request{TransferOp::kWRITE, srcDescs, dstDescs, mRemoteAgentDesc, ss.str()};
+    TransferRequest request{TransferOp::kWRITE, srcDescs, dstDescs, mRemoteAgentName, ss.str()};
     auto status = mAgentConnectionManager->getAgent()->submitTransferRequests(request);
     status->wait();
 }
@@ -226,8 +98,8 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
 void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) const
 {
 
-    NotificationSyncInfo syncInfo{mAgentDesc, ctx};
-    mAgentConnectionManager->waitForSyncInfo(mRemoteAgentDesc, syncInfo);
+    NotificationSyncInfo syncInfo{mAgentName, ctx};
+    mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo);
 }
 
 void AgentConnection::sendRequestAndBufferInfo(
@@ -243,30 +115,34 @@ void AgentConnection::sendRequestAndBufferInfo(
     int deviceId = -1;
     TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
     TLLM_CHECK(deviceId != -1);
+    TLLM_CHECK(deviceId == mAgentConnectionManager->getDeviceId());
     MemoryDesc bufferDesc(
         reinterpret_cast<uintptr_t>(preAllocateBuffer->data()), preAllocateBuffer->getSize(), deviceId);
-    std::string address;
-    RequestAndBufferInfo requestAndBufferInfo{mAgentDesc, address, requestInfo, bufferDesc, validConnectionIdx};
+    std::string address = mAgentConnectionManager->getAgent()->getConnectionInfo();
+    RequestAndBufferInfo requestAndBufferInfo{mAgentName, address, requestInfo, bufferDesc, validConnectionIdx};
     std::stringstream ss;
-    RequestAndBufferInfo::serialize(requestAndBufferInfo, ss);
-    mAgentConnectionManager->getAgent()->notifySyncInfo(mRemoteAgentDesc, ss.str());
+    NotificationInfo notificationInfo{requestAndBufferInfo};
+    NotificationInfo::serialize(notificationInfo, ss);
+    mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
 
 void AgentConnection::setSenderState(MemoryDesc mReceiverBufferDesc, int valideSegmentIdx)
 {
-    mSenderState = SenderState{mReceiverBufferDesc, valideSegmentIdx};
+    mSenderState.mReceiverBufferDesc = mReceiverBufferDesc;
+    mSenderState.valideSegmentIdx = valideSegmentIdx;
 }
 
 AgentConnectionManager::AgentConnectionManager(
-    batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager, BaseTransferAgent* agent)
+    batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager)
 {
     // TODO: register memory
     TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     TLLM_CHECK(mDeviceId != -1);
 
-    // TODO:
+    mAgentName = genUniqueAgentName();
     // Create Agent
-    m_Agent = agent;
+    BaseAgentConfig config{mAgentName, true};
+    m_Agent = makeTransferAgent("nixl", &config);
     mCacheTransBufferManager = cacheTransBufferManager;
     auto recvBufferCount = mCacheTransBufferManager->getRecvBufferCount();
     auto sendBufferCount = mCacheTransBufferManager->getSendBufferCount();
@@ -284,7 +160,7 @@ AgentConnectionManager::AgentConnectionManager(
     MemoryDescs descs{MemoryType::kVRAM, MemDescs};
     m_Agent->registerMemory(descs);
 
-    AgentState localAgentState{m_Agent->getAgentDesc(), m_Agent->getMetaData().getBackendMetaData()};
+    AgentState localAgentState{mAgentName, m_Agent->getConnectionInfo()};
     std::vector<AgentState> agentStates(mpi::MpiComm::session().getSize());
     if (mpi::MpiComm::session().getSize() > 1)
     {
@@ -359,8 +235,9 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
                     auto address = requestAndBufferInfo.mAddress;
                     auto bufferDesc = requestAndBufferInfo.mBufferDesc;
                     auto validConnectionIdx = requestAndBufferInfo.mValidConnectionIdx;
-                    auto remoteAgentDesc = requestAndBufferInfo.mAgentDesc;
-                    auto connection = connect(remoteAgentDesc, address);
+                    auto remoteAgentName = requestAndBufferInfo.mAgentName;
+                    TLLM_LOG_DEBUG(" recv Address:%s", address.c_str());
+                    auto connection = connect(remoteAgentName, address);
                     connection->setSenderState(bufferDesc, validConnectionIdx);
                     it2 = notifs.erase(it2);
                     // TODO: if notifs.empty(), erase it
@@ -392,14 +269,14 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
 void AgentConnectionManager::updateUnhandledNotifications()
 {
 
-    auto notif_map = m_Agent->getSyncInfo();
+    auto notif_map = m_Agent->getNotifiedSyncMessages();
     std::lock_guard<std::mutex> lock(mNotificationMutex);
 
     // Merge new notifications with existing ones
     for (auto const& [agent, notifs] : notif_map)
     {
         auto& existing_notifs = mUnhandledNotifications[agent];
-        existing_notifs.insert(existing_notifs.end(), notifs);
+        existing_notifs.insert(existing_notifs.end(), notifs.begin(), notifs.end());
     }
 }
 
@@ -421,7 +298,7 @@ void AgentConnectionManager::updateUnhandledNotifications()
 
 BaseTransferAgent* AgentConnectionManager::getAgent() const
 {
-    return m_Agent;
+    return m_Agent.get();
 }
 
 batch_manager::kv_cache_manager::CacheTransBufferManager* AgentConnectionManager::getCacheTransBufferManager()
@@ -440,8 +317,7 @@ AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentN
     }
 
     m_Agent->connectRemoteAgent(remoteAgentName, connecitonInfo);
-    auto connection
-        = std::make_shared<AgentConnection>(m_Agent->getAgentDesc(), remoteAgentName, mCacheTransBufferManager);
+    auto connection = std::make_shared<AgentConnection>(mAgentName, remoteAgentName, this);
     mConnections[remoteAgentName] = connection;
     return connection.get();
 }
@@ -464,7 +340,7 @@ int AgentConnectionManager::getDeviceId() const
     return mDeviceId;
 }
 
-void AgentConnectionManager::waitForSyncInfo(AgentDesc const& remoteAgentDesc, NotificationSyncInfo const& syncInfo)
+void AgentConnectionManager::waitForSyncInfo(std::string const& remoteAgentName, NotificationSyncInfo const& syncInfo)
 {
     while (true)
     {
@@ -475,7 +351,7 @@ void AgentConnectionManager::waitForSyncInfo(AgentDesc const& remoteAgentDesc, N
         while (it != mUnhandledNotifications.end())
         {
             auto& [agent, notifs] = *it;
-            if (agent != remoteAgentDesc)
+            if (agent != remoteAgentName)
             {
                 it++;
                 continue;
@@ -490,7 +366,7 @@ void AgentConnectionManager::waitForSyncInfo(AgentDesc const& remoteAgentDesc, N
                 {
                     auto notificationSyncInfo = std::get<NotificationSyncInfo>(notificationInfo.mInfo);
                     if (notificationSyncInfo.mContext.getTag() == syncInfo.mContext.getTag()
-                        && notificationSyncInfo.mAgentDesc == syncInfo.mAgentDesc)
+                        && notificationSyncInfo.mAgentName == syncInfo.mAgentName)
                     {
                         erase = true;
                         it2 = notifs.erase(it2);
@@ -518,4 +394,18 @@ void AgentConnectionManager::waitForSyncInfo(AgentDesc const& remoteAgentDesc, N
     }
 }
 
+std::string const& AgentConnectionManager::getAgentName() const
+{
+    return mAgentName;
+}
+
+AgentConnectionManager::~AgentConnectionManager()
+{
+    // TLLM_LOG_INFO("AgentConnectionManager::~AgentConnectionManager: agentName: %s", mAgentName.c_str());
+    // for (auto& [agent, connection] : mConnections)
+    // {
+    //     TLLM_LOG_INFO("AgentConnectionManager::~AgentConnectionManager: invalidateremoteAgentName: %s",
+    //     agent.c_str()); m_Agent->invalidateRemoteAgent(agent);
+    // }
+}
 } // namespace tensorrt_llm::executor::kv_cache
