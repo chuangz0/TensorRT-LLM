@@ -30,7 +30,5 @@ if(ENABLE_NIXL)
 
   # Add include directories
   target_include_directories(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
-
-  # Link against all NIXL libraries
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
 endif()

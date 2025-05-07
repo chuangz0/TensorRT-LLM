@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -107,6 +108,7 @@ private:
 using TransferDescs = MemoryDescs;
 using RegisterDescs = MemoryDescs;
 using SyncMessage = std::string;
+using ConnectionInfoType = std::string;
 
 class AgentDesc final
 {
@@ -134,11 +136,13 @@ enum class TransferOp : uint8_t
 class TransferRequest
 {
 public:
-    TransferRequest(TransferOp op, TransferDescs srcDescs, TransferDescs dstDescs, std::string const& remoteName)
+    TransferRequest(TransferOp op, TransferDescs srcDescs, TransferDescs dstDescs, std::string const& remoteName,
+        std::optional<SyncMessage> syncMessage = std::nullopt)
         : mOp{op}
         , mSrcDescs{std::move(srcDescs)}
         , mDstDescs{std::move(dstDescs)}
         , mRemoteName{remoteName}
+        , mSyncMessage{std::move(syncMessage)}
     {
     }
 
@@ -162,11 +166,17 @@ public:
         return mRemoteName;
     }
 
+    [[nodiscard]] std::optional<SyncMessage> getSyncMessage() const noexcept
+    {
+        return mSyncMessage;
+    }
+
 private:
     TransferOp mOp;
     TransferDescs mSrcDescs;
     TransferDescs mDstDescs;
     std::string mRemoteName;
+    std::optional<SyncMessage> mSyncMessage;
 };
 
 class TransferStatus
@@ -175,18 +185,6 @@ public:
     virtual ~TransferStatus() = default;
     [[nodiscard]] virtual bool isCompleted() const = 0;
     virtual void wait() const = 0;
-};
-
-class AgentRegistrar
-{
-public:
-    ~AgentRegistrar() = default;
-
-    [[nodiscard]] virtual AgentDesc const* getAgentDesc(std::string const& agentName) const = 0;
-
-    virtual void addAgentDesc(std::string agentName, AgentDesc desc) = 0;
-
-    virtual void removeAgentDesc(std::string const& agentName) = 0;
 };
 
 struct BaseAgentConfig
@@ -204,13 +202,17 @@ public:
 
     virtual void deregisterMemory(RegisterDescs const& descs) = 0;
 
-    virtual void loadRemoteAgent(std::string const& name) = 0;
+    virtual void loadRemoteAgent(std::string const& name, AgentDesc const& agentDesc) = 0;
 
     virtual void invalidateRemoteAgent(std::string const& name) = 0;
 
     [[nodiscard]] virtual std::unique_ptr<TransferStatus> submitTransferRequests(TransferRequest const& request) = 0;
+    virtual void notifySyncMessage(std::string const& name, SyncMessage const& syncMessage) = 0;
 
-    // TODO: Add `notifySyncInfo` and `getMatchedSyncInfo` interfaces.
+    virtual std::unordered_map<std::string, std::vector<SyncMessage>> getNotifiedSyncMessages() = 0;
+
+    virtual ConnectionInfoType getConnectionInfo() = 0;
+    virtual void connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) = 0;
 };
 
 class DynLibLoader final
@@ -248,7 +250,7 @@ template <typename... Args>
     if (backend == "nixl")
     {
         auto& loader = DynLibLoader::getInstance();
-        using CreateNixlFuncType = std::unique_ptr<BaseTransferAgent> (*)(BaseAgentConfig const*, AgentRegistrar*);
+        using CreateNixlFuncType = std::unique_ptr<BaseTransferAgent> (*)(BaseAgentConfig const*);
         auto* func = loader.getFunctionPointer<CreateNixlFuncType>(
             "libtensorrt_llm_nixl_wrapper.so", "createNixlTransferAgent");
         return func(std::forward<Args>(args)...);

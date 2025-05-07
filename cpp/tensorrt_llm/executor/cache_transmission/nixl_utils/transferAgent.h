@@ -19,6 +19,8 @@
 
 #include "nixl.h"
 #include "tensorrt_llm/executor/transferAgent.h"
+#include <atomic>
+#include <thread>
 
 namespace tensorrt_llm::executor::kv_cache
 {
@@ -49,13 +51,14 @@ private:
 class NixlTransferAgent final : public BaseTransferAgent
 {
 public:
-    NixlTransferAgent(BaseAgentConfig const& config, AgentRegistrar* registrar);
+    NixlTransferAgent(BaseAgentConfig const& config);
+    ~NixlTransferAgent();
 
     void registerMemory(RegisterDescs const& descs) override;
 
     void deregisterMemory(RegisterDescs const& descs) override;
 
-    void loadRemoteAgent(std::string const& name) override;
+    void loadRemoteAgent(std::string const& name, AgentDesc const& agentDesc) override;
 
     void invalidateRemoteAgent(std::string const& name) override;
 
@@ -71,12 +74,20 @@ public:
         return &mExtraParams;
     }
 
+    void notifySyncMessage(std::string const& name, SyncMessage const& syncMessage) override;
+
+    [[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> getNotifiedSyncMessages() override;
+
+    ConnectionInfoType getConnectionInfo() override;
+
+    void connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo) override;
+
 private:
     std::unique_ptr<nixlAgent> mRawAgent;
     nixlBackendH* mRawBackend{};
-    AgentRegistrar* mRegistrar{};
     nixl_opt_args_t mExtraParams;
     std::string mName;
+    std::string mAddress;
 };
 
 #if defined(__clang__)
@@ -86,8 +97,7 @@ private:
 
 extern "C"
 {
-    [[nodiscard]] std::unique_ptr<BaseTransferAgent> createNixlTransferAgent(
-        BaseAgentConfig const* config, AgentRegistrar* registrar);
+    [[nodiscard]] std::unique_ptr<BaseTransferAgent> createNixlTransferAgent(BaseAgentConfig const* config);
 }
 
 #if defined(__clang__)
