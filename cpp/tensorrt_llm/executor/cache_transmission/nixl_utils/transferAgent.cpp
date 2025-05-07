@@ -308,7 +308,10 @@ void NixlTransferAgent::connectRemoteAgent(std::string const& name, ConnectionIn
         status = mRawAgent->checkRemoteMD(name, descs);
         TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS || status == NIXL_ERR_NOT_FOUND,
             "checkRemoteMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (status == NIXL_ERR_NOT_FOUND)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     }
     TLLM_LOG_DEBUG("NixlTransferAgent::connectRemoteAgent connectRemoteAgent to %s success", connectionInfo.c_str());
 }
