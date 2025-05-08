@@ -69,16 +69,17 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
         commType = CacheTransceiver::CommType::UCX;
         TLLM_LOG_INFO("Enable UCX KV cache transport.");
     }
-    else if (common::getEnvUseMPIKvCache())
-    {
-        commType = CacheTransceiver::CommType::MPI;
-        TLLM_LOG_INFO("Enable MPI KV cache transport.");
-    }
     else if (common::getEnvUseNixlKvCache())
     {
         commType = CacheTransceiver::CommType::NIXL;
         TLLM_LOG_INFO("Enable NIXL KV cache transport.");
     }
+    else if (common::getEnvUseMPIKvCache())
+    {
+        commType = CacheTransceiver::CommType::MPI;
+        TLLM_LOG_INFO("Enable MPI KV cache transport.");
+    }
+
     if (commType)
     {
         executor::kv_cache::CacheState::ModelConfig cacheStateCfg{
