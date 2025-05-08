@@ -219,6 +219,7 @@ private:
     std::unique_ptr<BaseTransferAgent> m_Agent;
     int mDeviceId;
     std::string mAgentName;
+    MemoryDescs mRegMemDescs;
 };
 
 } // namespace tensorrt_llm::executor::kv_cache

@@ -148,6 +148,13 @@ void CacheFormatter::formatOutput(LlmRequest const& llmRequest,
             cacheBufferId, targetNum, targetBufferSize, bufferManager);
         auto& outputSplitCaches = std::get<0>(result);
         auto& bufferCoverTargetNum = std::get<1>(result);
+        auto& onlyUseDynamicBuffer = std::get<2>(result);
+        auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+        if (agentConnnecion != nullptr)
+        {
+            TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == targetNum, "Agent need all buffer pre-allocated");
+            TLLM_CHECK(onlyUseDynamicBuffer == false);
+        }
 
         tensorrt_llm::executor::kv_cache::splitKVCacheDispatch(
             inputKvCacheBlocks, outputSplitCaches, destConfig, selfConfig, selfIdx, bufferManager);
@@ -425,6 +432,7 @@ void CacheFormatter::formatInput(LlmRequest const& llmRequest,
                     if (agentConnnecion != nullptr)
                     {
                         cacheBufferId = agentConnnecion->getCacheBufferId();
+                        TLLM_CHECK(cacheBufferId.has_value());
                     }
                     else
                     {

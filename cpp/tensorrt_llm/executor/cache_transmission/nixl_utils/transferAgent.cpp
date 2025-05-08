@@ -118,6 +118,12 @@ uint16_t getAvailablePort(std::string const& ip = "0.0.0.0")
     return port;
 }
 
+uint16_t getIncrmentPort(uint16_t basePort)
+{
+    static uint16_t times = 0;
+    return basePort + (times++) * mpi::MpiComm::world().getSize();
+}
+
 [[nodiscard]] nixl_mem_t NixlHelper::convert(MemoryType type)
 {
     switch (type)
@@ -189,7 +195,8 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     : mName{config.mName}
 {
     nixl_status_t status;
-    uint16_t port = getAvailablePort();
+    auto envPort = common::getEnvNixlPort();
+    uint16_t port = envPort > 0 ? getIncrmentPort(envPort) : getAvailablePort();
     nixlAgentConfig nixlConfig{config.useProgThread, true, port};
     mAddress = getAvailableIP() + ":" + std::to_string(port);
     mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
@@ -245,11 +252,6 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 {
     nixl_status_t status;
     nixlXferReqH* handle;
-    status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()),
-        NixlHelper::convertXferDist(request.getSrcDescs()), NixlHelper::convertXferDist(request.getDstDescs()),
-        request.getRemoteName(), handle, &mExtraParams);
-    TLLM_CHECK_WITH_INFO(
-        status == NIXL_SUCCESS, "createXferReq failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
 
     if (request.getSyncMessage().has_value())
     {
@@ -261,6 +263,19 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     {
         mExtraParams.hasNotif = false;
     }
+    // Need to do this in a loop with NIXL_ERR_NOT_FOUND
+    // UCX AM with desc list is faster than listener thread can recv/load MD with sockets
+    // Will be deprecated with ETCD or callbacks
+
+    do
+    {
+        status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()),
+            NixlHelper::convertXferDist(request.getSrcDescs()), NixlHelper::convertXferDist(request.getDstDescs()),
+            request.getRemoteName(), handle, &mExtraParams);
+    } while (status == NIXL_ERR_NOT_FOUND);
+
+    TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS, " rank: %d createXferReq failed with status: %s remoteAgent name: %s",
+        mpi::MpiComm::world().getRank(), nixlEnumStrings::statusStr(status).c_str(), request.getRemoteName().c_str());
 
     status = mRawAgent->postXferReq(handle, &mExtraParams);
     return std::make_unique<NixlTransferStatus>(mRawAgent.get(), handle);
@@ -301,6 +316,10 @@ void NixlTransferAgent::connectRemoteAgent(std::string const& name, ConnectionIn
     auto status = mRawAgent->fetchRemoteMD(name, &md_extra_params);
     TLLM_CHECK_WITH_INFO(
         status == NIXL_SUCCESS, "fetchRemoteMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+    status = mRawAgent->sendLocalMD(&md_extra_params);
+    TLLM_CHECK_WITH_INFO(
+        status == NIXL_SUCCESS, "sendLocalMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+
     status = NIXL_ERR_NOT_FOUND;
     nixl_xfer_dlist_t descs{DRAM_SEG};
     while (status == NIXL_ERR_NOT_FOUND)
@@ -313,7 +332,9 @@ void NixlTransferAgent::connectRemoteAgent(std::string const& name, ConnectionIn
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
-    TLLM_LOG_DEBUG("NixlTransferAgent::connectRemoteAgent connectRemoteAgent to %s success", connectionInfo.c_str());
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "NixlTransferAgent::connectRemoteAgent connectRemoteAgent to %s remoteagent name: %s success status: %s",
+        connectionInfo.c_str(), name.c_str(), nixlEnumStrings::statusStr(status).c_str());
 }
 
 NixlTransferAgent::~NixlTransferAgent()

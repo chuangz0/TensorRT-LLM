@@ -403,4 +403,10 @@ size_t getEnvMemSizeForKVCacheTransferBuffer()
     return memSizeForKVCacheTransferBuffer;
 }
 
+uint16_t getEnvNixlPort()
+{
+    static uint16_t const nixlPort = getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
+    return nixlPort;
+}
+
 } // namespace tensorrt_llm::common

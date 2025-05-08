@@ -160,6 +160,13 @@ void MLACacheFormatter::formatOutput(LlmRequest const& llmRequest,
         cacheBufferId, pPDomainSize, targetBufferSize, bufferManager);
     auto& outputSplitCaches = std::get<0>(result);
     auto& bufferCoverTargetNum = std::get<1>(result);
+    auto& onlyUseDynamicBuffer = std::get<2>(result);
+    auto* agentConnnecion = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[0]);
+    if (agentConnnecion != nullptr)
+    {
+        TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == pPDomainSize, "Agent need all buffer pre-allocated");
+        TLLM_CHECK(onlyUseDynamicBuffer == false);
+    }
     // diff end
 
     // The size of outputSplitCaches should be equal to pPDomainSize
@@ -323,6 +330,7 @@ void MLACacheFormatter::formatInput(LlmRequest const& llmRequest,
         if (agentConnnecion != nullptr)
         {
             cacheBufferId = agentConnnecion->getCacheBufferId();
+            TLLM_CHECK(cacheBufferId.has_value());
         }
         else
         {

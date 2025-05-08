@@ -134,8 +134,8 @@ void AgentConnection::setSenderState(MemoryDesc mReceiverBufferDesc, int valideS
 
 AgentConnectionManager::AgentConnectionManager(
     batch_manager::kv_cache_manager::CacheTransBufferManager* cacheTransBufferManager)
+    : mRegMemDescs(MemoryType::kVRAM, {})
 {
-    // TODO: register memory
     TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     TLLM_CHECK(mDeviceId != -1);
 
@@ -157,8 +157,8 @@ AgentConnectionManager::AgentConnectionManager(
         auto sendBuffer = mCacheTransBufferManager->getSendBuffer(i);
         MemDescs.emplace_back(sendBuffer->data(), sendBuffer->getSizeInBytes(), mDeviceId);
     }
-    MemoryDescs descs{MemoryType::kVRAM, MemDescs};
-    m_Agent->registerMemory(descs);
+    mRegMemDescs = MemoryDescs{MemoryType::kVRAM, MemDescs};
+    m_Agent->registerMemory(mRegMemDescs);
 
     AgentState localAgentState{mAgentName, m_Agent->getConnectionInfo()};
     std::vector<AgentState> agentStates(mpi::MpiComm::session().getSize());
@@ -230,7 +230,6 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
                     auto requestAndBufferInfo = std::get<RequestAndBufferInfo>(notificationInfo.mInfo);
 
                     erase = true;
-                    // TODO: recv buffer and requestInfo
                     requestInfo = requestAndBufferInfo.mRequestInfo;
                     auto address = requestAndBufferInfo.mAddress;
                     auto bufferDesc = requestAndBufferInfo.mBufferDesc;
@@ -240,7 +239,6 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
                     auto connection = connect(remoteAgentName, address);
                     connection->setSenderState(bufferDesc, validConnectionIdx);
                     it2 = notifs.erase(it2);
-                    // TODO: if notifs.empty(), erase it
                     if (notifs.empty())
                     {
                         it = mUnhandledNotifications.erase(it);
@@ -407,5 +405,6 @@ AgentConnectionManager::~AgentConnectionManager()
     //     TLLM_LOG_INFO("AgentConnectionManager::~AgentConnectionManager: invalidateremoteAgentName: %s",
     //     agent.c_str()); m_Agent->invalidateRemoteAgent(agent);
     // }
+    m_Agent->deregisterMemory(mRegMemDescs);
 }
 } // namespace tensorrt_llm::executor::kv_cache
