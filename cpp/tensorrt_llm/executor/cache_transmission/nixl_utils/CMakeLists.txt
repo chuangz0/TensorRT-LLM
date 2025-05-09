@@ -24,11 +24,17 @@ if(ENABLE_NIXL)
 
   # Define the NIXL wrapper target
   set(NIXL_WRAPPER_TARGET "tensorrt_llm_nixl_wrapper")
+  include_directories(${3RDPARTY_DIR}/cppzmq)
 
+  # Find and link ZMQ
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(ZMQ REQUIRED libzmq)
   # Add the NIXL wrapper target
   add_library(${NIXL_WRAPPER_TARGET} SHARED transferAgent.cpp)
 
   # Add include directories
-  target_include_directories(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
-  target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
+  target_include_directories(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl
+                                                            ${ZMQ_INCLUDE_DIRS})
+  target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl
+                                                       ${ZMQ_LIBRARIES})
 endif()

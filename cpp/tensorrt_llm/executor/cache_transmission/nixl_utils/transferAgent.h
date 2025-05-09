@@ -21,6 +21,7 @@
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <atomic>
 #include <thread>
+#include <zmq.hpp>
 
 namespace tensorrt_llm::executor::kv_cache
 {
@@ -87,7 +88,10 @@ private:
     nixlBackendH* mRawBackend{};
     nixl_opt_args_t mExtraParams;
     std::string mName;
-    std::string mAddress;
+    zmq::context_t mZmqContext;
+    zmq::socket_t mZmqRepSocket;
+    std::string mZmqRepEndpoint;
+    std::thread mZmqRepThread;
 };
 
 #if defined(__clang__)

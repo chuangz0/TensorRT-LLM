@@ -96,6 +96,4 @@ size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();
 
-uint16_t getEnvNixlPort();
-
 } // namespace tensorrt_llm::common

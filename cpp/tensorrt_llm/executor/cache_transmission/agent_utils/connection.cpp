@@ -311,8 +311,15 @@ AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentN
     auto it = mConnections.find(remoteAgentName);
     if (it != mConnections.end())
     {
+
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+            "has connected AgentConnectionManager::connect: remoteAgentName: %s, connectionInfo: %s",
+            remoteAgentName.c_str(), connecitonInfo.c_str());
         return it->second.get();
     }
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "going to connect AgentConnectionManager::connect: remoteAgentName: %s, connectionInfo: %s",
+        remoteAgentName.c_str(), connecitonInfo.c_str());
 
     m_Agent->connectRemoteAgent(remoteAgentName, connecitonInfo);
     auto connection = std::make_shared<AgentConnection>(mAgentName, remoteAgentName, this);

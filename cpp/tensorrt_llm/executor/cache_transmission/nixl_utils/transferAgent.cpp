@@ -195,10 +195,7 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     : mName{config.mName}
 {
     nixl_status_t status;
-    auto envPort = common::getEnvNixlPort();
-    uint16_t port = envPort > 0 ? getIncrmentPort(envPort) : getAvailablePort();
-    nixlAgentConfig nixlConfig{config.useProgThread, true, port};
-    mAddress = getAvailableIP() + ":" + std::to_string(port);
+    nixlAgentConfig nixlConfig{config.useProgThread};
     mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
 
     nixl_b_params_t init1;
@@ -212,7 +209,42 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         TLLM_THROW("Failed to create NIXL backend");
     }
     mExtraParams.backends.push_back(mRawBackend);
-    TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent mAddress: %s", mAddress.c_str());
+
+    mZmqRepSocket = zmq::socket_t(mZmqContext, zmq::socket_type::rep);
+    mZmqRepSocket.set(zmq::sockopt::sndhwm, 2);
+    std::string ip = getAvailableIP();
+    mZmqRepSocket.bind("tcp://" + ip + ":*");
+    mZmqRepEndpoint = mZmqRepSocket.get(zmq::sockopt::last_endpoint);
+    TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent mZmqRepEndpoint: %s", mZmqRepEndpoint.c_str());
+    mZmqRepThread = std::thread(
+        [this]()
+        {
+            while (true)
+            {
+                zmq::message_t message;
+                auto ret = mZmqRepSocket.recv(message);
+                TLLM_CHECK_WITH_INFO(ret, "mZmqRepSocket.recv failed");
+                std::string recvMessage(static_cast<char*>(message.data()), message.size());
+                if (recvMessage == std::string("get_md"))
+                {
+                    std::string localMD;
+                    auto status = mRawAgent->getLocalMD(localMD);
+                    TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS, "getLocalMD failed with status: %s",
+                        nixlEnumStrings::statusStr(status).c_str());
+                    mZmqRepSocket.send(zmq::buffer(localMD), zmq::send_flags::none);
+                }
+                else if (recvMessage == std::string("stop"))
+                {
+                    std::string stopMessage = "stop";
+                    mZmqRepSocket.send(zmq::buffer(stopMessage), zmq::send_flags::none);
+                    break;
+                }
+                else
+                {
+                    TLLM_THROW("Unknown message: %s", recvMessage.c_str());
+                }
+            }
+        });
 }
 
 void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
@@ -263,16 +295,10 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     {
         mExtraParams.hasNotif = false;
     }
-    // Need to do this in a loop with NIXL_ERR_NOT_FOUND
-    // UCX AM with desc list is faster than listener thread can recv/load MD with sockets
-    // Will be deprecated with ETCD or callbacks
 
-    do
-    {
-        status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()),
-            NixlHelper::convertXferDist(request.getSrcDescs()), NixlHelper::convertXferDist(request.getDstDescs()),
-            request.getRemoteName(), handle, &mExtraParams);
-    } while (status == NIXL_ERR_NOT_FOUND);
+    status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()),
+        NixlHelper::convertXferDist(request.getSrcDescs()), NixlHelper::convertXferDist(request.getDstDescs()),
+        request.getRemoteName(), handle, &mExtraParams);
 
     TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS, " rank: %d createXferReq failed with status: %s remoteAgent name: %s",
         mpi::MpiComm::world().getRank(), nixlEnumStrings::statusStr(status).c_str(), request.getRemoteName().c_str());
@@ -301,45 +327,63 @@ void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage c
 
 ConnectionInfoType NixlTransferAgent::getConnectionInfo()
 {
-    return mAddress;
+    return mZmqRepEndpoint;
 }
 
 void NixlTransferAgent::connectRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo)
 {
-    std::string ip = connectionInfo.substr(0, connectionInfo.find(":"));
-    std::string port = connectionInfo.substr(connectionInfo.find(":") + 1);
-    TLLM_CHECK_WITH_INFO(!ip.empty() && !port.empty(), "connectRemoteAgent get empty ip or port, connectionInfo: %s",
-        connectionInfo.c_str());
-    nixl_opt_args_t md_extra_params;
-    md_extra_params.ipAddr = ip;
-    md_extra_params.port = std::stoi(port);
-    auto status = mRawAgent->fetchRemoteMD(name, &md_extra_params);
-    TLLM_CHECK_WITH_INFO(
-        status == NIXL_SUCCESS, "fetchRemoteMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
-    status = mRawAgent->sendLocalMD(&md_extra_params);
-    TLLM_CHECK_WITH_INFO(
-        status == NIXL_SUCCESS, "sendLocalMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+    auto reqSocket = zmq::socket_t(mZmqContext, zmq::socket_type::req);
+    TLLM_LOG_DEBUG("NixlTransferAgent::connectRemoteAgent connectionInfo: %s", connectionInfo.c_str());
 
-    status = NIXL_ERR_NOT_FOUND;
-    nixl_xfer_dlist_t descs{DRAM_SEG};
-    while (status == NIXL_ERR_NOT_FOUND)
+    try
     {
-        status = mRawAgent->checkRemoteMD(name, descs);
-        TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS || status == NIXL_ERR_NOT_FOUND,
-            "checkRemoteMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
-        if (status == NIXL_ERR_NOT_FOUND)
+        reqSocket.connect(connectionInfo);
+        TLLM_LOG_DEBUG("NixlTransferAgent::connectRemoteAgent reqSocket.connect");
+        std::string getMDMessage = "get_md";
+        reqSocket.send(zmq::buffer(getMDMessage), zmq::send_flags::none);
+        zmq::message_t message;
+        if (!reqSocket.recv(message))
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            TLLM_THROW("Failed to receive message from remote agent");
         }
+        std::string remoteMD(static_cast<char*>(message.data()), message.size());
+        std::string remoteName;
+        auto status = mRawAgent->loadRemoteMD(remoteMD, remoteName);
+
+        TLLM_CHECK_WITH_INFO(
+            status == NIXL_SUCCESS, "loadRemoteMD failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+        TLLM_CHECK_WITH_INFO(
+            name == remoteName, "connectRemoteAgent gets error agent name: %s != %s", name.c_str(), remoteName.c_str());
     }
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "NixlTransferAgent::connectRemoteAgent connectRemoteAgent to %s remoteagent name: %s success status: %s",
-        connectionInfo.c_str(), name.c_str(), nixlEnumStrings::statusStr(status).c_str());
+    catch (zmq::error_t const& e)
+    {
+        TLLM_THROW("ZMQ error during connection: %s", e.what());
+    }
+    TLLM_LOG_DEBUG("NixlTransferAgent::connectRemoteAgent connectRemoteAgent success");
 }
 
 NixlTransferAgent::~NixlTransferAgent()
 {
     TLLM_LOG_DEBUG("NixlTransferAgent::~NixlTransferAgent");
+
+    if (mZmqRepThread.joinable())
+    {
+        zmq::socket_t socket(mZmqContext, zmq::socket_type::req);
+        socket.connect(mZmqRepEndpoint);
+        std::string stopMessage = "stop";
+        socket.send(zmq::buffer(stopMessage), zmq::send_flags::none);
+        zmq::message_t message;
+        auto ret = socket.recv(message);
+        TLLM_CHECK_WITH_INFO(ret, "socket.recv failed");
+        std::string recvMessage(static_cast<char*>(message.data()), message.size());
+        TLLM_CHECK_WITH_INFO(recvMessage == stopMessage, "recvMessage != stop , %s", recvMessage.c_str());
+        socket.close();
+        mZmqRepThread.join();
+    }
+
+    mZmqRepSocket.close();
+
+    mZmqContext.close();
 }
 
 #if defined(__clang__)

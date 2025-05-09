@@ -24,3 +24,6 @@
 	path = 3rdparty/nixl
 	url = https://github.com/ai-dynamo/nixl.git
 	branch = 0.2.0
+[submodule "3rdparty/cppzmq"]
+	path = 3rdparty/cppzmq
+	url = https://github.com/zeromq/cppzmq.git

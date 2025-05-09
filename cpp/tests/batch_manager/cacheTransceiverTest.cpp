@@ -714,10 +714,6 @@ protected:
             }
             else if (isNixl)
             {
-                auto port = tensorrt_llm::mpi::MpiComm::world().getRank() + 22345;
-
-                setenv("TRTLLM_NIXL_PORT", std::to_string(port).c_str(), 1);
-
                 mConnectionManager
                     = std::make_unique<texec::kv_cache::AgentConnectionManager>(mCacheTransBufferManager.get());
             }
