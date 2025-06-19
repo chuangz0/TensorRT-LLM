@@ -1424,7 +1424,6 @@ class CacheTransceiverConfig
 public:
     enum class CommType : std::uint8_t
     {
-        UNKNOWN = 0,
         MPI = 1,
         UCX = 2,
         NIXL = 3
@@ -1433,12 +1432,9 @@ public:
         std::optional<CommType> commType = std::nullopt, std::optional<size_t> maxNumTokens = std::nullopt);
 
     bool operator==(CacheTransceiverConfig const& other) const;
+    void setCommType(std::optional<CommType> commType);
 
     [[nodiscard]] std::optional<size_t> getMaxNumTokens() const;
-    void setMaxNumTokens(size_t maxNumTokens);
-
-    void setEnableCacheTransceiver(bool enableCacheTransceiver);
-    void setCommType(std::optional<CommType> commType);
     [[nodiscard]] bool getEnableCacheTransceiver() const;
     [[nodiscard]] std::optional<CommType> getCommType() const;
 
