@@ -24,19 +24,13 @@
 #define dllGetSym(handle, name) dlsym(handle, name)
 #endif // defined(_WIN32)
 
-#include "tensorrt_llm/batch_manager/cacheFormatter.h"
-#include "tensorrt_llm/batch_manager/cacheTransceiver.h"
+#include "cxxopts.hpp"
 #include "tensorrt_llm/batch_manager/dataTransceiverImpl.h"
-#include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
-#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
-#include "gtest/gtest.h"
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -44,18 +38,12 @@
 #include <cstdlib>
 #include <gmock/gmock.h>
 #include <memory>
-#include <random>
-#include <tensorrt_llm/batch_manager/dataTransceiverImpl.h>
-#include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
-#include <tensorrt_llm/executor/cache_transmission/cacheConcatenate.h>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using LlmRequest = tensorrt_llm::batch_manager::LlmRequest;
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 using namespace tensorrt_llm::batch_manager;
 namespace texec = tensorrt_llm::executor;
-
-#include "cxxopts.hpp"
 
 namespace
 {
@@ -91,6 +79,8 @@ int main(int argc, char* argv[])
     options.add_options()("is_server", "Whether to run as server", cxxopts::value<bool>()->default_value("false"));
     options.add_options()("server_ip", "Server IP", cxxopts::value<std::string>()->default_value("127.0.0.1"));
     options.add_options()("server_port", "Server port", cxxopts::value<int>()->default_value("12345"));
+    options.add_options()("device_id", "Device ID", cxxopts::value<int>()->default_value("0"));
+    options.add_options()("iters", "Number of iterations", cxxopts::value<int>()->default_value("10"));
 
     auto result = options.parse(argc, argv);
     if (result.count("help"))
@@ -98,14 +88,20 @@ int main(int argc, char* argv[])
         std::cout << options.help() << std::endl;
         return 0;
     }
+    int deviceId = result["device_id"].as<int>();
+    TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
+    TLLM_LOG_INFO("Using device %d", deviceId);
 
+    tensorrt_llm::runtime::BufferManager bufferManager{std::make_shared<tensorrt_llm::runtime::CudaStream>()};
+    constexpr size_t bufferSize = 1024L * 1024L * 100L;
     auto connectionManager = makeOneUcxConnectionManager();
 
     bool const isServer = result["is_server"].as<bool>();
 
-    tensorrt_llm::runtime::BufferManager bufferManager{std::make_shared<tensorrt_llm::runtime::CudaStream>()};
-    constexpr size_t bufferSize = 1024;
     tensorrt_llm::executor::kv_cache::DataContext dataContext{0x75};
+
+    int iters = result["iters"].as<int>();
+
     if (isServer)
     {
         auto CommState = connectionManager->getCommState();
@@ -116,8 +112,11 @@ int main(int argc, char* argv[])
             tensorrt_llm::executor::kv_cache::DataContext{TransceiverTag::kID_TAG}, &id1Peer, sizeof(id1Peer));
 
         auto srcBuffer1 = bufferManager.gpuSync(bufferSize, nvinfer1::DataType::kINT8);
-        connection1Peer->send(dataContext, srcBuffer1->data(), srcBuffer1->getSizeInBytes());
-        TLLM_LOG_INFO("Sent data to client");
+        for (int i = 0; i < iters; i++)
+        {
+            connection1Peer->send(dataContext, srcBuffer1->data(), srcBuffer1->getSizeInBytes());
+            TLLM_LOG_INFO("Sent data to client iter: %d/%d", i, iters);
+        }
     }
     else
     {
@@ -132,9 +131,13 @@ int main(int argc, char* argv[])
         connection->send(tensorrt_llm::executor::kv_cache::DataContext{TransceiverTag::kID_TAG}, &id1, sizeof(id1));
 
         auto dstBuffer1 = bufferManager.gpuSync(bufferSize, nvinfer1::DataType::kINT8);
-        connection->recv(dataContext, dstBuffer1->data(), dstBuffer1->getSizeInBytes());
+        for (int i = 0; i < iters; i++)
+        {
+            connection->recv(dataContext, dstBuffer1->data(), dstBuffer1->getSizeInBytes());
+            TLLM_LOG_INFO("Received data from server iter: %d/%d", i, iters);
+        }
         // bufferManager.getStream().synchronize();
-        TLLM_LOG_INFO("Received data from server");
+        // TLLM_LOG_INFO("Received data from server");
 
         // TLLM_LOG_INFO("Client is connecting to server on port %d", CommState.getSocketState()[0].getPort());
     }
