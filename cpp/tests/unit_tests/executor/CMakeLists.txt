@@ -37,3 +37,11 @@ if(NIXL_ROOT)
   add_gtest(agentCommTest agentCommTest.cpp)
   target_link_libraries(transferAgentTest PRIVATE tensorrt_llm_nixl_wrapper)
 endif()
+
+if(NOT TARGET cxxopts::cxxopts)
+  set(CXXOPTS_SRC_DIR ${PROJECT_SOURCE_DIR}/../3rdparty/cxxopts)
+  add_subdirectory(${CXXOPTS_SRC_DIR} ${CMAKE_CURRENT_BINARY_DIR}/cxxopts)
+endif()
+
+add_gtest(ucxCommConnectionTest ucxCommConnectionTest.cpp)
+target_link_libraries(ucxCommConnectionTest PRIVATE cxxopts::cxxopts)
