@@ -196,6 +196,8 @@ class OpenAIDisaggServer:
             else:
                 assert isinstance(ctx_req, CompletionRequest)
                 ctx_response = await self.send_completion_request(ctx_server, ctx_req)
+            logger.info(f"ctx_response: response from ctx_server: {ctx_server}")
+
         finally:
             await self.ctx_router.finish_request(ctx_req)
 
@@ -247,6 +249,8 @@ class OpenAIDisaggServer:
                 # Append disaggregates parameters to generation request
                 req.disaggregated_params = ctx_response.choices[0].disaggregated_params
                 req.disaggregated_params.request_type = "generation_only"
+
+                logger.info(f" server get disagg_context_req_id: {req.disaggregated_params.ctx_request_id}")
 
                 # Replace the string prompt with prompt_tokens_ids
                 if isinstance(req, CompletionRequest):
@@ -301,6 +305,8 @@ class OpenAIDisaggServer:
         await uvicorn.Server(config).serve()
 
     async def create_generator(self, url: str, request: Union[CompletionRequest, ChatCompletionRequest], end_point: str):
+        logger.info(f"server post sending request with disagg_context_req_id: {request.disaggregated_params.ctx_request_id}")
+
         async with self.session.post(url + end_point, json=request.model_dump(exclude_unset=True)) as response:
             content_type = response.headers.get("Content-Type", "")
             if "text/event-stream" in content_type:

@@ -337,6 +337,8 @@ class OpenAIServer:
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
+                logger.info(f" **** openai_completion request id after completion_response pp_result disagg context id: {response.outputs[0].disaggregated_params.ctx_request_id} ****")
+
             return pp_result
 
         def merge_completion_responses(responses: List[CompletionResponse]) -> CompletionResponse:
