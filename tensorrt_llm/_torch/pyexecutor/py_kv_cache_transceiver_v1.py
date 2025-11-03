@@ -10,6 +10,7 @@ from typing import Optional
 import zmq
 
 import tensorrt_llm.bindings
+from tensorrt_llm import Mapping
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
@@ -207,7 +208,7 @@ class InstanceInfo:
 
 
 @dataclass
-class peerDomainRanks:
+class peerDomainTargets:
     domain_pp_size: int
     domain_tp_size: int
     domain_cp_size: int
@@ -217,14 +218,14 @@ class peerDomainRanks:
     ranks: list[int]
 
 
-class ResourceRegister:
+class ResourceRegistrar:
 
     def __init__(self, instance_rank_info: InstanceRankInfo,
                  instance_info: InstanceInfo):
         self.instance_rank_info = instance_rank_info
         self.instance_info = instance_info
         self.peer_instance_rank_info_cache = {}
-        self.peer_domain_ranks_cache = {}
+        self.peer_domain_targets_cache = {}
 
     def register_peer_info(self, peer_instance_name: str, peer_rank: int,
                            peer_instance_rank_info: InstanceRankInfo):
@@ -246,15 +247,15 @@ class ResourceRegister:
     def get_instance_rank_info(self):
         return self.instance_rank_info
 
-    def get_peer_domain_ranks(self, peer_instance_info: InstanceInfo,
-                              peer_dp_rank: int):
+    def get_peer_domain_targets(self, peer_instance_info: InstanceInfo,
+                                peer_dp_rank: int):
 
         # return the mapping rank relationship between self and peer in asymmetric parallelism case
 
         if peer_instance_info.instance_name + str(
-                peer_dp_rank) in self.peer_domain_ranks_cache:
-            return self.peer_domain_ranks_cache[peer_instance_info.instance_name
-                                                + str(peer_dp_rank)]
+                peer_dp_rank) in self.peer_domain_targets_cache:
+            return self.peer_domain_targets_cache[
+                peer_instance_info.instance_name + str(peer_dp_rank)]
         peer_pp_rank_start = 0
         peer_pp_rank_end = 0
         self_start_layer_id = sum(
@@ -328,7 +329,7 @@ class ResourceRegister:
             (self.instance_rank_info.kv_head_num_per_rank *
              self_tp_size_per_dp_group))
 
-        peer_domain_ranks = peerDomainRanks(
+        peer_domain_ranks = peerDomainTargets(
             domain_pp_size=domain_pp_size,
             domain_tp_size=domain_tp_size,
             domain_cp_size=domain_cp_size,
@@ -337,23 +338,33 @@ class ResourceRegister:
             target_peer_pp_layer_num=target_peer_pp_layer_num,
             ranks=ranks,
         )
-        self.peer_domain_ranks_cache[peer_instance_info.instance_name +
-                                     str(peer_dp_rank)] = peer_domain_ranks
+        self.peer_domain_targets_cache[peer_instance_info.instance_name +
+                                       str(peer_dp_rank)] = peer_domain_ranks
         return peer_domain_ranks
 
     def get_kv_block_ptrs_extractor(self,
                                     peer_instance_rank_info: InstanceRankInfo):
 
         # return the kv block ptrs extractor for the peer. the extractor will be used to extract the kv block ptrs and submit to transfer agent.
-        pass
+        # the returned will be a callable object that will be called to extract the kv block ptrs.
+        def extractor(
+            src_kv_block_ptrs: list[int],
+            src_kv_block_size: int,
+            dst_kv_block_ptrs: list[int],
+            dst_kv_block_size: int,
+        ) -> tuple[list[int], int, list[int], int]:
+            # return the kv block ptrs and size for the peer.
+            return src_kv_block_ptrs, src_kv_block_size, dst_kv_block_ptrs, dst_kv_block_size
 
-        return
+        # TODO: implement the extractor
+
+        return extractor
 
 
 class TransferSession:
 
     def __init__(self, kv_cache_manager: KVCacheManager, request_id: int,
-                 resource_register: ResourceRegister):
+                 resource_register: ResourceRegistrar):
         self.kv_cache_manager = kv_cache_manager
         self.request_id = request_id
         self.resource_register = resource_register
@@ -366,7 +377,7 @@ class TransferSession:
     def get_future_for_session(self):
         return self.future
 
-    def extra_trams_meta(self):
+    def extra_trans_meta(self):
         pass
 
 
@@ -375,12 +386,13 @@ class TransferGenSideReqInfo:
     instance_name: str
     instance_rank: int
     block_ids: list[int]
+    start_token_id: int
     gen_req_id: int
     session_id: str
 
 
 @dataclass
-class TransSendMeta:
+class AgentSendArgs:
     session_id: str
     future_for_session: concurrent.futures.Future
     src_kv_ptrs: list[int]
@@ -396,7 +408,7 @@ class TransSendMeta:
 
 
 @dataclass
-class TransRecvMeta:
+class AgentRecvArgs:
     session_id: str
     future_for_session: concurrent.futures.Future
     expect_count: int
@@ -422,14 +434,14 @@ class MessageType:
     REGISTER_RANK_INFO = "REQUEST_RANK_INFO"
 
 
-class SendSession(TransferSession):
+class SenderSession(TransferSession):
 
     def __init__(self, kv_cache_manager: KVCacheManager, request_id: int,
-                 resource_register: ResourceRegister):
+                 resource_register: ResourceRegistrar):
         super().__init__(kv_cache_manager, request_id, resource_register)
 
     def extract_trans_meta(self,
-                           dst_info: TransferGenSideReqInfo) -> TransSendMeta:
+                           dst_info: TransferGenSideReqInfo) -> AgentSendArgs:
         pass
 
     def get_state(self) -> SessionState:
@@ -440,26 +452,34 @@ class SendSession(TransferSession):
         pass
 
 
-class ReceiveSession(TransferSession):
+class ReceiverSession(TransferSession):
 
     def __init__(self, kv_cache_manager: KVCacheManager, request_id: int,
-                 resource_register: ResourceRegister):
+                 disagg_params: DisaggregatedParams,
+                 resource_register: ResourceRegistrar):
+        self.disagg_params = disagg_params
         super().__init__(kv_cache_manager, request_id, resource_register)
 
     def extract_trans_meta(
             self, peer_instance_info: InstanceInfo,
-            peer_dp_rank: int) -> tuple[TransRecvMeta, list[int]]:
-        peer_domain_ranks = self.resource_register.get_peer_domain_ranks(
+            peer_dp_rank: int) -> tuple[AgentRecvArgs, list[int]]:
+        peer_domain_ranks = self.resource_register.get_peer_domain_targets(
             peer_instance_info, peer_dp_rank)
         expect_count = len(peer_domain_ranks.ranks)
         if not self.first_extracted:
             self.first_extracted = True
             self.expect_count = len(peer_domain_ranks.ranks)
         self.encountered_count = self.encountered_count + 1
-        return TransRecvMeta(session_id=self.session_id,
+        return AgentRecvArgs(session_id=self.session_id,
                              future_for_session=self.future,
                              expect_count=expect_count,
                              remote_name=None), peer_domain_ranks.ranks
+
+    def create_gen_side_transfer_req_info(self) -> TransferGenSideReqInfo:
+
+        # TODO:
+
+        return TransferGenSideReqInfo()
 
     def get_state(self) -> SessionState:
         pass
@@ -468,7 +488,7 @@ class ReceiveSession(TransferSession):
 class Sender:
 
     def __init__(self, kv_cache_manager: KVCacheManager,
-                 resource_register: ResourceRegister, device_id: int,
+                 resource_register: ResourceRegistrar, device_id: int,
                  transfer_agent: BaseTransferAgent):
         self.kv_cache_manager = kv_cache_manager
         self.resource_register = resource_register
@@ -491,13 +511,13 @@ class Sender:
     #  return a session for a request.
     #  upper layer can check the state of the session to know the progress of the request.
     #
-    def async_send(self, request: LlmRequest) -> SendSession:
+    def async_send(self, request: LlmRequest) -> SenderSession:
         request_id = request.py_request_id
 
         if request_id in self.send_session_cache:
             return self.send_session_cache[request_id]
-        send_session = SendSession(self.kv_cache_manager, request_id,
-                                   self.resource_register)
+        send_session = SenderSession(self.kv_cache_manager, request_id,
+                                     self.resource_register)
         self.send_session_cache[request_id] = send_session
 
         self._handel_send_session(send_session)
@@ -505,7 +525,7 @@ class Sender:
         return
 
     #  for upper layer to create a send session for a request ,only used for pre-allocate flow
-    def create_send_session(self, request: LlmRequest) -> SendSession:
+    def create_send_session(self, request: LlmRequest) -> SenderSession:
 
         #  for upper layer to create a send session for a request ,only used for pre-allocate flow. the kvcache will not send until session.trigger_send_chunk() is called.
 
@@ -514,10 +534,10 @@ class Sender:
     def cancel_request(self, request: LlmRequest):
         pass
 
-    def submit_send_task(self, trans_send_meta: TransSendMeta):
+    def submit_send_task(self, trans_send_meta: AgentSendArgs):
         pass
 
-    def _handel_send_session(self, send_session: SendSession):
+    def _handel_send_session(self, send_session: SenderSession):
         pass
 
     def _handle_sender_loop(self):
@@ -621,7 +641,7 @@ class Sender:
 class Receiver:
 
     def __init__(self, kv_cache_manager: KVCacheManager,
-                 resource_register: ResourceRegister, device_id: int,
+                 resource_register: ResourceRegistrar, device_id: int,
                  transfer_agent: BaseTransferAgent):
         self.kv_cache_manager = kv_cache_manager
         self.resource_register = resource_register
@@ -631,37 +651,155 @@ class Receiver:
         self.receive_session_cache_lock = threading.Lock()
 
         self._zmq_context = zmq.Context()
-
+        self.socket_cache = {}
         self.context_endpoint_to_instance_info_cache = {}
+        self.request_id_to_receiver_session_cache = {}
+        self.request_id_to_receiver_session_cache_lock = threading.Lock()
 
-    def async_receive(self, request: LlmRequest) -> ReceiveSession:
+        self.receiver_server_socket = self._zmq_context.socket(zmq.ROUTER)
+        self.receiver_server_socket.bind(f"tcp://*:5556")
+        self.receiver_server_endpoint = self.receiver_server_socket.getsockopt(
+            zmq.LAST_ENDPOINT).decode()
+        self._receiver_background_thread = threading.Thread(
+            target=self._handle_receiver_loop, daemon=True)
+        self._receiver_background_thread.start()
+
+        self.session_id_to_future = {}
+        self.session_id_to_count = {}
+        self.session_id_to_count_lock = threading.Lock()
+        self.session_id_to_future_lock = threading.Lock()
+
+    def async_receive(self,
+                      request: LlmRequest,
+                      start_token_id: Optional[int] = None) -> ReceiverSession:
         # for upper layer to create a receive session for a request, and the receiver will async wait the receive finished.
 
         pass
 
     def _async_request_data_transfer(self, request: LlmRequest):
-        pass
+        disagg_params: DisaggregatedParams = request.py_disaggregated_params
+        context_peer_infos: InstanceInfo = self._get_context_info(disagg_params)
+
+        receiver_session = ReceiverSession(self.kv_cache_manager,
+                                           request.py_request_id, disagg_params,
+                                           self.resource_register)
+        with self.request_id_to_receiver_session_cache_lock:
+            self.request_id_to_receiver_session_cache[
+                request.py_request_id] = receiver_session
+
+        transfer_gen_side_req_info = receiver_session.create_gen_side_transfer_req_info(
+        )
+        agent_recv_args, target_ranks = receiver_session.extract_trans_meta(
+            context_peer_infos, disagg_params.ctx_dp_rank)
+
+        for rank in target_ranks:
+            self._send_data_request(
+                context_peer_infos.ctx_server_endpoints[rank],
+                transfer_gen_side_req_info)
+        self.submit_receive_task(agent_recv_args)
 
     def _need_register_peer_in_first_request(
             self, disagg_params: DisaggregatedParams) -> bool:
-        pass
+        return disagg_params.ctx_leader_endpoint not in self.context_endpoint_to_instance_info_cache
 
     def _get_socket(self, endpoint: str):
-
-        pass
+        if endpoint not in self.socket_cache:
+            self.socket_cache[endpoint] = self._zmq_context.socket(zmq.DEALER)
+            self.socket_cache[endpoint].connect(endpoint)
+        return self.socket_cache[endpoint]
 
     def _get_context_info(self,
                           disagg_params: DisaggregatedParams) -> InstanceInfo:
-        pass
+        if self._need_register_peer_in_first_request(disagg_params):
+            socket = self._zmq_context.socket(zmq.DEALER)
+            socket.connect(disagg_params.ctx_leader_endpoint)
+            message = [str(MessageType.REQUEST_INSTANCE_INFO).encode("ascii")]
+            socket.send_multipart(message)
+            message = socket.recv_multipart()
+            instance_info = pickle.loads(message[0])
+            socket.close()
 
-    def submit_receive_task(self, trans_recv_meta: TransRecvMeta):
+            for endpoint in instance_info.ctx_server_endpoints:
+                socket = self._get_socket(endpoint)
+                send_message = []
+                send_message.append(
+                    str(MessageType.REGISTER_RANK_INFO).encode("ascii"))
+                send_message.append(
+                    pickle.dumps(self.resource_register.get_instance_rank_info))
+                socket.send_multipart(send_message)
 
+            self.context_endpoint_to_instance_info_cache[
+                disagg_params.ctx_leader_endpoint] = instance_info
+            return instance_info
+
+        else:
+            return self.context_endpoint_to_instance_info_cache[
+                disagg_params.ctx_leader_endpoint]
+
+    def submit_receive_task(self, trans_recv_meta: AgentRecvArgs):
+        if trans_recv_meta.session_id not in self.session_id_to_count:
+            self.session_id_to_count[
+                trans_recv_meta.session_id] = trans_recv_meta.expect_count
+            self.session_id_to_future[
+                trans_recv_meta.session_id] = trans_recv_meta.future_for_session
         # async wait the write finished signal from sender
-        pass
+        else:
+            assert self.session_id_to_future[
+                trans_recv_meta.
+                session_id] == trans_recv_meta.future_for_session
 
     def _handle_receiver_loop(self):
 
-        pass
+        while True:
+            message = self.receiver_server_socket.recv_multipart()
+            send_id = message[0]
+            recv_message = message[1:]
+            if self._message_is_termination(recv_message):
+                break
+            elif self._message_is_task_state(recv_message):
+                self._handle_request_data(send_id, recv_message)
+            else:
+                raise ValueError(
+                    f"transceiver receiver loop received unknown message type: {recv_message[0]}"
+                )
+
+    def _message_is_termination(self, message: list[bytes]):
+        return message[0] == str(MessageType.TERMINATION).encode("ascii")
+
+    def _message_is_task_state(self, message: list[bytes]):
+        return message[0] == str(MessageType.TASK_STATE).encode("ascii")
+
+    def _handle_task_state(self, send_id: bytes, message: list[bytes]):
+        assert len(message) == 3
+        assert message[0].decode("ascii") == str(MessageType.TASK_STATE)
+        session_id = message[1].decode("ascii")
+        task_state = message[2].decode("ascii")
+        if task_state == "SUCCESS":
+            self.session_id_to_count[session_id] -= 1
+            if self.session_id_to_count[session_id] == 0:
+                self.session_id_to_future[session_id].set_result("SUCCESS")
+                self.session_id_to_future.pop(session_id)
+                del self.session_id_to_count[session_id]
+        elif task_state == "FAILED":
+            self.session_id_to_future[session_id].set_exception(
+                RuntimeError(f"Task state: {task_state}"))
+        else:
+            raise ValueError(
+                f" session {session_id} received unknown task state: {task_state}"
+            )
+
+    def _send_data_request(self, endpoint: str,
+                           transfer_gen_side_req_info: TransferGenSideReqInfo):
+
+        socket = self._get_socket(endpoint)
+        send_message = []
+        send_message.append(str(MessageType.REQUEST_DATA).encode("ascii"))
+        send_message.append(pickle.dumps(transfer_gen_side_req_info))
+        socket.send_multipart(send_message)
+
+
+class TransferAgentConfig:
+    pass
 
 
 class TransferWorker:
@@ -669,30 +807,36 @@ class TransferWorker:
     def __init__(
         self,
         kv_cache_manager: KVCacheManager,
-        instance_info: InstanceInfo,
-        instance_rank_info: InstanceRankInfo,
+        mapping: Mapping,
         device_id: int,
+        transfer_agent_config: TransferAgentConfig,
     ):
 
+        self.mapping = mapping
+        self.instance_info = InstanceInfo(
+        )  # TODO , inferred by mapping and kvcache_manager
+        self.instance_rank_info = InstanceRankInfo(
+        )  # TODO , inferred by mapping and kvcache_manager
+
         self.kv_cache_manager = kv_cache_manager
-        self.resource_register = ResourceRegister(instance_info,
-                                                  instance_rank_info)
+        self.resource_register = ResourceRegistrar(self.instance_info,
+                                                   self.instance_rank_info)
         self.device_id = device_id
         self.transfer_agent = NixlTransferAgent(
-            instance_rank_info.instance_name +
-            str(instance_rank_info.instance_rank), True)
+            self.instance_rank_info.instance_name +
+            str(self.instance_rank_info.instance_rank), True)
         self.sender = Sender(kv_cache_manager, self.resource_register,
                              device_id, self.transfer_agent)
         self.receiver = Receiver(kv_cache_manager, self.resource_register,
                                  device_id, self.transfer_agent)
 
-    def create_send_session(self, request: LlmRequest) -> SendSession:
+    def create_send_session(self, request: LlmRequest) -> SenderSession:
         return self.sender.create_send_session(request)
 
-    def async_send(self, request: LlmRequest) -> SendSession:
+    def async_send(self, request: LlmRequest) -> SenderSession:
         return self.sender.async_send(request)
 
-    def async_receive(self, request: LlmRequest) -> ReceiveSession:
+    def async_receive(self, request: LlmRequest) -> ReceiverSession:
         return self.receiver.async_receive(request)
 
     def cancel_request(self, request: LlmRequest):
