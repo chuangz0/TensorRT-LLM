@@ -780,8 +780,8 @@ class TransferSession:
             src_kv_block_ptr = src_kv_block_ptrs[block_id]
             dst_kv_block_ptr = dst_kv_block_ptrs[block_id]
             for layer_id in range(transfer_layer_num):
-                src_layer_id = start_layer_id + layer_id
-                dst_layer_id = start_layer_id + layer_id
+                src_layer_id = start_layer_id + layer_id - src_start_layer_offset
+                dst_layer_id = start_layer_id + layer_id - peer_start_layer_offset
                 for kv in range(kv_factor):
                     src_kv_block_transfer_ptr = src_kv_block_ptr + src_layer_ele_size * src_layer_id + src_layer_kv_ele_size * kv + src_head_offset
                     dst_kv_block_transfer_ptr = dst_kv_block_ptr + dst_layer_ele_size * dst_layer_id + dst_layer_kv_ele_size * kv + dst_head_offset

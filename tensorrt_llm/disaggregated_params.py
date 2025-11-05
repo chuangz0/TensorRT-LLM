@@ -32,6 +32,8 @@ class DisaggregatedParams:
     ctx_request_id: Optional[int] = None
     opaque_state: Optional[bytes] = None
     draft_tokens: Optional[List[int]] = None
+    ctx_dp_rank: Optional[int] = None
+    ctx_leader_endpoint: Optional[str] = None
 
     # E-P Disaggregated Params
     multimodal_embedding_handles: Optional[List[Dict[str, Any]]] = (
@@ -45,6 +47,8 @@ class DisaggregatedParams:
         return tllme.ContextPhaseParams(
             self.first_gen_tokens, self.ctx_request_id, self.opaque_state, self.draft_tokens
         )
+
+    # def get_py_context_phase_params(self):
 
     def get_request_type(self) -> tllme.RequestType:
         if self.request_type == "context_only":
