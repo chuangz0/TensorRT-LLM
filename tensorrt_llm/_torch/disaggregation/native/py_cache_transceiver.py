@@ -294,8 +294,5 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             raise ValueError("PyNativeCacheTransceiver: _check_compatible: VSWA is not supported")
         return
 
-    def prepare_context_request(self, requests: List[LlmRequest]):
-        raise NotImplementedError
-
     def get_context_state(self):
-        raise NotImplementedError
+        raise NotImplementedError("get_context_state is not implemented")
