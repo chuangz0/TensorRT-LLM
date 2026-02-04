@@ -86,6 +86,9 @@ class AuxBuffer(AuxBufferBase):
 
         self._free_slots = deque(list(range(self._max_slot_num)))
         self._occupied_slots: set[int] = set()
+        self._slot_token_counts: dict[
+            int, tuple[int, int]
+        ] = {}  # slot -> (first_tokens_len, draft_tokens_len)
 
         data_type = torch.int32
         self._first_tokens_buffer = torch.empty(
@@ -143,6 +146,11 @@ class AuxBuffer(AuxBufferBase):
         return self._meta
 
     def fill_slot(self, slot: int, request: LlmRequest) -> None:
+        if slot not in self._occupied_slots:
+            raise ValueError(
+                f"Cannot fill slot {slot}: slot is not currently allocated. "
+                "Call `alloc_slot` first."
+            )
         first_gen_tokens = request.get_last_tokens()
         draft_tokens = request.py_draft_tokens
 
@@ -163,9 +171,13 @@ class AuxBuffer(AuxBufferBase):
         self._draft_tokens_buffer[slot][: len(draft_tokens)].copy_(
             torch.tensor(draft_tokens, dtype=torch.int32, device=self._device)
         )
+        self._slot_token_counts[slot] = (len(first_gen_tokens), len(draft_tokens))
 
     def get_slot_tokens(self, slot: int) -> tuple[list[int], list[int]]:
-        first_gen_tokens = self._first_tokens_buffer[slot].tolist()
-        draft_tokens = self._draft_tokens_buffer[slot].tolist()
+        first_len, draft_len = self._slot_token_counts.get(
+            slot, (self._beam_width, self._max_draft_len)
+        )
+        first_gen_tokens = self._first_tokens_buffer[slot][:first_len].tolist()
+        draft_tokens = self._draft_tokens_buffer[slot][:draft_len].tolist()
 
         return first_gen_tokens, draft_tokens
