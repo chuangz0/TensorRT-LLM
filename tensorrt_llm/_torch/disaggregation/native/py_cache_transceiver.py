@@ -277,9 +277,11 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         raise NotImplementedError("cancel_request is not implemented")
         # self.transfer_worker.cancel_request(req)
 
-    def get_disaggregated_params(self) -> Dict[str, Any]: ...
+    def get_disaggregated_params(self) -> Dict[str, Any]:
+        raise NotImplementedError("get_disaggregated_params is not implemented")
 
-    def prepare_context_requests(self, requests: List[LlmRequest]): ...
+    def prepare_context_requests(self, requests: List[LlmRequest]):
+        raise NotImplementedError("prepare_context_requests is not implemented")
 
     def _check_compatible(self):
         if self.mapping.cp_size != 1:
