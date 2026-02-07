@@ -576,6 +576,18 @@ bool getEnvPrintSkipSoftmaxStat()
     return getBoolEnv("TRTLLM_PRINT_SKIP_SOFTMAX_STAT");
 }
 
+bool getEnvDisableFabricTransfer()
+{
+    static bool const disabled = getBoolEnv("TRTLLM_DISABLE_FABRIC_TRANSFER");
+    return disabled;
+}
+
+size_t getEnvFabricBatchThresholdKB()
+{
+    static size_t const threshold = getUInt64Env("TRTLLM_FABRIC_BATCH_THRESHOLD_KB").value_or(16);
+    return threshold;
+}
+
 } // namespace common
 
 TRTLLM_NAMESPACE_END

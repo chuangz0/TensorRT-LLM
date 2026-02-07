@@ -49,9 +49,10 @@ if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
   add_gtest(transferAgentTest transferAgentTest.cpp)
 
   if(NIXL_ROOT)
-    target_link_libraries(transferAgentTest PRIVATE tensorrt_llm_nixl_wrapper)
+    target_link_libraries(transferAgentTest PRIVATE tensorrt_llm_nixl_wrapper
+                                                    NIXL::nixl)
     target_link_libraries(agentCommTest PRIVATE tensorrt_llm_nixl_wrapper
-                                                ${Python3_LIBRARIES})
+                                                NIXL::nixl ${Python3_LIBRARIES})
     target_compile_definitions(transferAgentTest PRIVATE TEST_NIXL_BACKEND=1)
     target_compile_definitions(agentCommTest PRIVATE TEST_NIXL_BACKEND=1)
   endif()
@@ -65,4 +66,17 @@ if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
                                PRIVATE TEST_MOONCAKE_BACKEND=1)
     target_compile_definitions(agentCommTest PRIVATE TEST_MOONCAKE_BACKEND=1)
   endif()
+endif()
+
+# POSIX FD Transfer Test (MPI-based, run with: mpirun -n 2
+# ./posixFdTransferTest)
+if(NIXL_ROOT)
+  add_executable(posixFdTransferTest posixFdTransferTest.cu)
+  target_compile_options(posixFdTransferTest PRIVATE -Wno-error)
+  target_include_directories(posixFdTransferTest
+                             PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  target_link_libraries(
+    posixFdTransferTest
+    PRIVATE tensorrt_llm_nixl_wrapper NIXL::nixl ${SHARED_TARGET} CUDA::cudart
+            CUDA::cuda_driver MPI::MPI_CXX)
 endif()

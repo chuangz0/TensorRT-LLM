@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/transferAgent.h"
@@ -27,11 +28,13 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
+#include <iterator>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <nixl_types.h>
 #include <numeric>
 #include <set>
+#include <sstream>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <thread>
@@ -590,6 +593,12 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     mDRamDstBuffer.resize(16);
     MemoryDescs descs{MemoryType::kDRAM, {MemoryDesc{mDRamSrcBuffer}, MemoryDesc{mDRamDstBuffer}}};
     registerMemory(descs);
+
+    // Initialize fabric transfer helper if not disabled
+    if (!common::getEnvDisableFabricTransfer())
+    {
+        mFabricHelper = std::make_unique<FabricTransferHelper>();
+    }
 }
 
 void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
@@ -605,6 +614,12 @@ void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
     std::string localMD;
     status = mRawAgent->getLocalMD(localMD);
     TLLM_CHECK(status == NIXL_SUCCESS);
+
+    // Detect and export fabric handles for VRAM (new optimization)
+    if (descs.getType() == MemoryType::kVRAM && mFabricHelper)
+    {
+        mFabricHelper->detectAndExportFabricHandles(descs);
+    }
 }
 
 void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
@@ -616,32 +631,99 @@ void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
     nixl_status_t status;
     status = mRawAgent->deregisterMem(NixlHelper::convertRegDlist(coalescedDescs), &mExtraParams);
     TLLM_CHECK(status == NIXL_SUCCESS);
+
+    // Clean up fabric handles for deregistered VRAM memory
+    if (descs.getType() == MemoryType::kVRAM && mFabricHelper)
+    {
+        mFabricHelper->removeFabricHandles(descs);
+    }
 }
 
 void NixlTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc const& agentDesc)
 {
+    auto const& blob = agentDesc.getBackendAgentDesc();
+    std::string nixlBlob;
+    std::optional<FabricMemInfo> fabricInfo;
+
+    // Try to parse extended format (NIXL blob + FabricMemInfo)
+    if (blob.size() >= sizeof(uint32_t))
+    {
+        std::istringstream iss(blob);
+        uint32_t nixlSize;
+        iss.read(reinterpret_cast<char*>(&nixlSize), sizeof(nixlSize));
+
+        if (nixlSize <= blob.size() - sizeof(uint32_t))
+        {
+            nixlBlob.resize(nixlSize);
+            iss.read(nixlBlob.data(), nixlSize);
+
+            // Try to parse remaining data as FabricMemInfo
+            std::string remaining(std::istreambuf_iterator<char>(iss), {});
+            fabricInfo = FabricMemInfo::deserialize(remaining);
+        }
+    }
+
+    // If parsing failed, treat as old format (plain NIXL blob)
+    if (nixlBlob.empty())
+    {
+        nixlBlob = blob;
+    }
+
+    // Normal NIXL remote loading
     nixl_status_t status;
     std::string remoteName;
-    status = mRawAgent->loadRemoteMD(agentDesc.getBackendAgentDesc(), remoteName);
+    status = mRawAgent->loadRemoteMD(nixlBlob, remoteName);
     TLLM_CHECK(status == NIXL_SUCCESS);
     TLLM_CHECK_WITH_INFO(
         name == remoteName, "loadRemoteAgent gets error agent name: %s != %s", name.c_str(), remoteName.c_str());
+
+    // If fabric info is available, import and map remote memory
+    if (fabricInfo.has_value() && fabricInfo->supported && mFabricHelper)
+    {
+        mFabricHelper->importAndMapRemoteFabric(name, *fabricInfo);
+    }
 }
 
 AgentDesc NixlTransferAgent::getLocalAgentDesc()
 {
-    nixl_blob_t desc;
-    nixl_status_t status = mRawAgent->getLocalMD(desc);
+    nixl_blob_t nixlBlob;
+    nixl_status_t status = mRawAgent->getLocalMD(nixlBlob);
     TLLM_CHECK(status == NIXL_SUCCESS);
-    return AgentDesc{desc};
+
+    // If we have fabric info, serialize it along with NIXL blob
+    if (mFabricHelper && mFabricHelper->isSupported())
+    {
+        std::ostringstream oss;
+        // Write NIXL blob size and content
+        uint32_t nixlSize = static_cast<uint32_t>(nixlBlob.size());
+        oss.write(reinterpret_cast<char*>(&nixlSize), sizeof(nixlSize));
+        oss.write(nixlBlob.data(), nixlBlob.size());
+        // Write fabric info
+        std::string fabricData = mFabricHelper->getLocalFabricInfo().serialize();
+        oss.write(fabricData.data(), fabricData.size());
+
+        TLLM_LOG_DEBUG("NixlTransferAgent::getLocalAgentDesc: serialized %zu pools with fabric handles",
+            mFabricHelper->getLocalFabricInfo().pools.size());
+
+        return AgentDesc{oss.str()};
+    }
+
+    // Backward compatible: return plain NIXL blob if no fabric info
+    return AgentDesc{nixlBlob};
 }
 
 void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 {
     mRawAgent->invalidateRemoteMD(name);
+
+    // Clean up remote fabric mapping (release cuMemMap/cuMemImport resources)
+    if (mFabricHelper)
+    {
+        mFabricHelper->cleanupRemoteFabricMapping(name);
+    }
 }
 
-[[nodiscard]] std::unique_ptr<TransferStatus> NixlTransferAgent::submitTransferRequests(TransferRequest const& request)
+[[nodiscard]] std::unique_ptr<TransferStatus> NixlTransferAgent::submitWithNixl(TransferRequest const& request)
 {
     nixl_status_t status;
     nixlXferReqH* handle;
@@ -649,39 +731,29 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     if (request.getSyncMessage().has_value())
     {
         mExtraParams.hasNotif = true;
-
         mExtraParams.notifMsg = request.getSyncMessage().value();
     }
     else
     {
         mExtraParams.hasNotif = false;
     }
-    // Need to do this in a loop with NIXL_ERR_NOT_FOUND
-    // UCX AM with desc list is faster than listener thread can recv/load MD with sockets
-    // Will be deprecated with ETCD or callbacks
 
     // Coalesce contiguous memory regions to reduce transfer count (enabled by default)
     // This matches the coalescing done during registerMemory()
     // Set TRTLLM_NIXL_DISABLE_COALESCE=1 to disable this optimization
     if (common::getEnvNixlDisableCoalesce())
     {
-        // do
-        // {
         status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()),
             NixlHelper::convertXferDist(request.getSrcDescs()), NixlHelper::convertXferDist(request.getDstDescs()),
             request.getRemoteName(), handle, &mExtraParams);
-        // } while (status == NIXL_ERR_NOT_FOUND);
     }
     else
     {
         auto [coalescedSrc, coalescedDst]
             = NixlHelper::coalesceTransferDescs(request.getSrcDescs(), request.getDstDescs());
-        // do
-        // {
         status
             = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(coalescedSrc),
                 NixlHelper::convertXferDist(coalescedDst), request.getRemoteName(), handle, &mExtraParams);
-        // } while (status == NIXL_ERR_NOT_FOUND);
     }
 
     TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS,
@@ -691,6 +763,101 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 
     status = mRawAgent->postXferReq(handle, &mExtraParams);
     return std::make_unique<NixlTransferStatus>(mRawAgent.get(), handle);
+}
+
+[[nodiscard]] std::unique_ptr<TransferStatus> NixlTransferAgent::submitTransferRequests(TransferRequest const& request)
+{
+    // ========== Try fabric-based transfer first ==========
+    if (mFabricHelper && mFabricHelper->hasRemoteMapping(request.getRemoteName()))
+    {
+        auto const& srcDescs = request.getSrcDescs().getDescs();
+        auto const& dstDescs = request.getDstDescs().getDescs();
+        std::string const& remoteName = request.getRemoteName();
+
+        TLLM_CHECK_WITH_INFO(srcDescs.size() == dstDescs.size(),
+            "Fabric transfer: srcDescs.size(%zu) != dstDescs.size(%zu)", srcDescs.size(), dstDescs.size());
+
+        // NIXL convention: srcDescs = LOCAL addresses, dstDescs = REMOTE addresses
+        // Translate the REMOTE (dstDescs) addresses to locally mapped pointers
+        std::vector<void*> srcPtrs;
+        std::vector<void*> dstPtrs;
+        std::vector<size_t> sizes;
+        srcPtrs.reserve(srcDescs.size());
+        dstPtrs.reserve(srcDescs.size());
+        sizes.reserve(srcDescs.size());
+
+        bool allMapped = true;
+        for (size_t i = 0; i < srcDescs.size(); ++i)
+        {
+            // dstDescs are REMOTE addresses in NIXL convention
+            auto mappedRemotePtr = mFabricHelper->translateToLocalMapping(remoteName, dstDescs[i].getAddr());
+            if (mappedRemotePtr == nullptr)
+            {
+                allMapped = false;
+                break;
+            }
+
+            if (request.getOp() == TransferOp::kWRITE)
+            {
+                // WRITE: copy from local(srcDescs) to mapped remote(dstDescs)
+                srcPtrs.push_back(reinterpret_cast<void*>(srcDescs[i].getAddr()));
+                dstPtrs.push_back(mappedRemotePtr);
+            }
+            else
+            {
+                // READ: copy from mapped remote(dstDescs) to local(srcDescs)
+                srcPtrs.push_back(mappedRemotePtr);
+                dstPtrs.push_back(reinterpret_cast<void*>(srcDescs[i].getAddr()));
+            }
+            sizes.push_back(srcDescs[i].getLen());
+        }
+
+        if (allMapped)
+        {
+            // Calculate average segment size to choose transfer method
+            size_t totalBytes = 0;
+            for (auto s : sizes)
+            {
+                totalBytes += s;
+            }
+            size_t avgSegmentSize = sizes.empty() ? 0 : totalBytes / sizes.size();
+
+            // Threshold: 16KB. Small segments benefit from cub kernel-based copy;
+            // larger segments benefit from cudaMemcpyBatchAsync with DMA engines.
+            static constexpr size_t kCubThreshold = 16 * 1024; // 16 KB
+
+            if (avgSegmentSize < kCubThreshold)
+            {
+                TLLM_LOG_DEBUG(
+                    "NixlTransferAgent::submitTransferRequests: fabric+cub path for %zu segments "
+                    "(avgSize=%zuB) to %s (op=%s)",
+                    sizes.size(), avgSegmentSize, remoteName.c_str(),
+                    request.getOp() == TransferOp::kWRITE ? "WRITE" : "READ");
+
+                return mFabricHelper->submitWithCubBatched(srcPtrs, dstPtrs, sizes);
+            }
+            else
+            {
+                TLLM_LOG_DEBUG(
+                    "NixlTransferAgent::submitTransferRequests: fabric+cudaMemcpyBatch path for %zu segments "
+                    "(avgSize=%zuB) to %s (op=%s)",
+                    sizes.size(), avgSegmentSize, remoteName.c_str(),
+                    request.getOp() == TransferOp::kWRITE ? "WRITE" : "READ");
+
+                return mFabricHelper->submitWithCudaMemcpyBatch(srcPtrs, dstPtrs, sizes);
+            }
+        }
+        else
+        {
+            TLLM_LOG_WARNING(
+                "NixlTransferAgent::submitTransferRequests: fabric mapping incomplete for %s, "
+                "falling back to NIXL",
+                remoteName.c_str());
+        }
+    }
+
+    // ========== Fallback to NIXL ==========
+    return submitWithNixl(request);
 }
 
 void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage const& syncMessage)
@@ -764,6 +931,8 @@ bool NixlTransferAgent::checkRemoteDescs(std::string const& name, MemoryDescs co
 NixlTransferAgent::~NixlTransferAgent()
 {
     TLLM_LOG_DEBUG("NixlTransferAgent::~NixlTransferAgent");
+    // mFabricHelper destructor handles unmapping, UDS cleanup, and handle release
+    mFabricHelper.reset();
 }
 
 NixlLoopbackAgent::NixlLoopbackAgent(BaseAgentConfig const& config)

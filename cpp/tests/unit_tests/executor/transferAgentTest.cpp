@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/executor/transferAgent.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/transferAgent.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serialization.h"
 #include <gmock/gmock.h>
@@ -496,5 +497,198 @@ TEST_P(LoopbackAgentTest, GpuToFile)
 }
 
 INSTANTIATE_TEST_SUITE_P(, LoopbackAgentTest, ::testing::Values(true, false));
+
+// ============================================================================
+// FabricMemInfo Serialization Tests
+// ============================================================================
+
+TEST(FabricMemInfoTest, SerializeDeserializeEmpty)
+{
+    FabricMemInfo info;
+    info.supported = false;
+
+    std::string serialized = info.serialize();
+    auto deserialized = FabricMemInfo::deserialize(serialized);
+
+    ASSERT_TRUE(deserialized.has_value());
+    EXPECT_FALSE(deserialized->supported);
+    EXPECT_TRUE(deserialized->pools.empty());
+}
+
+TEST(FabricMemInfoTest, SerializeDeserializeSinglePool)
+{
+    FabricMemInfo info;
+    info.supported = true;
+
+    FabricMemPool pool;
+    pool.deviceId = 0;
+    pool.poolBaseAddr = 0x7f0000000000ULL;
+    pool.poolTotalSize = 1024 * 1024 * 1024; // 1GB
+
+    FabricMemChunk chunk1;
+    chunk1.virtAddrOffset = 0;
+    chunk1.size = 512 * 1024 * 1024;
+    std::memset(chunk1.fabricHandle, 0xAB, sizeof(chunk1.fabricHandle));
+
+    FabricMemChunk chunk2;
+    chunk2.virtAddrOffset = 512 * 1024 * 1024;
+    chunk2.size = 512 * 1024 * 1024;
+    std::memset(chunk2.fabricHandle, 0xCD, sizeof(chunk2.fabricHandle));
+
+    pool.chunks.push_back(chunk1);
+    pool.chunks.push_back(chunk2);
+    info.pools.push_back(pool);
+
+    std::string serialized = info.serialize();
+    auto deserialized = FabricMemInfo::deserialize(serialized);
+
+    ASSERT_TRUE(deserialized.has_value());
+    EXPECT_TRUE(deserialized->supported);
+    ASSERT_EQ(deserialized->pools.size(), 1);
+    EXPECT_EQ(deserialized->pools[0].deviceId, 0);
+    EXPECT_EQ(deserialized->pools[0].poolBaseAddr, 0x7f0000000000ULL);
+    EXPECT_EQ(deserialized->pools[0].poolTotalSize, 1024 * 1024 * 1024);
+    ASSERT_EQ(deserialized->pools[0].chunks.size(), 2);
+    EXPECT_EQ(deserialized->pools[0].chunks[0].virtAddrOffset, 0);
+    EXPECT_EQ(deserialized->pools[0].chunks[0].size, 512 * 1024 * 1024);
+    EXPECT_EQ(deserialized->pools[0].chunks[1].virtAddrOffset, 512 * 1024 * 1024);
+    EXPECT_EQ(deserialized->pools[0].chunks[1].size, 512 * 1024 * 1024);
+}
+
+TEST(FabricMemInfoTest, SerializeDeserializeMultiplePools)
+{
+    FabricMemInfo info;
+    info.supported = true;
+
+    // Pool 1
+    FabricMemPool pool1;
+    pool1.deviceId = 0;
+    pool1.poolBaseAddr = 0x7f0000000000ULL;
+    pool1.poolTotalSize = 1024 * 1024 * 1024;
+    FabricMemChunk chunk1;
+    chunk1.virtAddrOffset = 0;
+    chunk1.size = 1024 * 1024 * 1024;
+    std::memset(chunk1.fabricHandle, 0x11, sizeof(chunk1.fabricHandle));
+    pool1.chunks.push_back(chunk1);
+
+    // Pool 2
+    FabricMemPool pool2;
+    pool2.deviceId = 1;
+    pool2.poolBaseAddr = 0x8f0000000000ULL;
+    pool2.poolTotalSize = 2 * 1024 * 1024 * 1024ULL;
+    FabricMemChunk chunk2;
+    chunk2.virtAddrOffset = 0;
+    chunk2.size = 2 * 1024 * 1024 * 1024ULL;
+    std::memset(chunk2.fabricHandle, 0x22, sizeof(chunk2.fabricHandle));
+    pool2.chunks.push_back(chunk2);
+
+    info.pools.push_back(pool1);
+    info.pools.push_back(pool2);
+
+    std::string serialized = info.serialize();
+    auto deserialized = FabricMemInfo::deserialize(serialized);
+
+    ASSERT_TRUE(deserialized.has_value());
+    EXPECT_TRUE(deserialized->supported);
+    ASSERT_EQ(deserialized->pools.size(), 2);
+
+    EXPECT_EQ(deserialized->pools[0].deviceId, 0);
+    EXPECT_EQ(deserialized->pools[1].deviceId, 1);
+}
+
+TEST(FabricMemInfoTest, DeserializeInvalidData)
+{
+    // Empty data
+    auto result1 = FabricMemInfo::deserialize("");
+    EXPECT_FALSE(result1.has_value());
+
+    // Wrong magic
+    std::string wrongMagic(20, '\0');
+    auto result2 = FabricMemInfo::deserialize(wrongMagic);
+    EXPECT_FALSE(result2.has_value());
+
+    // Too short
+    std::string tooShort(4, '\0');
+    auto result3 = FabricMemInfo::deserialize(tooShort);
+    EXPECT_FALSE(result3.has_value());
+}
+
+TEST(FabricMemChunkTest, SerializedSize)
+{
+    // FabricMemChunk should be 64 bytes for handle + 8 bytes for offset + 8 bytes for size = 80 bytes
+    EXPECT_EQ(FabricMemChunk::serializedSize(), 80);
+}
+
+// ============================================================================
+// POSIX FD Serialization Tests (Version 4)
+// ============================================================================
+
+TEST(FabricMemInfoTest, SerializeDeserializePosixFd)
+{
+    FabricMemInfo info;
+    info.supported = true;
+    info.handleType = VmmHandleType::kPosixFd;
+    info.udsPath = "/tmp/test_posix_fd_12345.sock";
+
+    FabricMemPool pool;
+    pool.deviceId = 0;
+    pool.poolBaseAddr = 0x7f0000000000ULL;
+    pool.poolTotalSize = 64 * 1024 * 1024;
+    pool.registeredAddr = 0x7f0000000000ULL;
+    pool.registeredSize = 4 * 1024 * 1024;
+    pool.mappedOffset = 0;
+    pool.mappedSize = 4 * 1024 * 1024;
+
+    FabricMemChunk chunk;
+    chunk.virtAddrOffset = 0;
+    chunk.size = 4 * 1024 * 1024;
+    std::memset(chunk.fabricHandle, 0, sizeof(chunk.fabricHandle)); // Zeroed for POSIX FD
+    pool.chunks.push_back(chunk);
+    info.pools.push_back(pool);
+
+    std::string serialized = info.serialize();
+    auto deserialized = FabricMemInfo::deserialize(serialized);
+
+    ASSERT_TRUE(deserialized.has_value());
+    EXPECT_TRUE(deserialized->supported);
+    EXPECT_EQ(deserialized->handleType, VmmHandleType::kPosixFd);
+    EXPECT_EQ(deserialized->udsPath, "/tmp/test_posix_fd_12345.sock");
+    ASSERT_EQ(deserialized->pools.size(), 1);
+    EXPECT_EQ(deserialized->pools[0].deviceId, 0);
+    ASSERT_EQ(deserialized->pools[0].chunks.size(), 1);
+    EXPECT_EQ(deserialized->pools[0].chunks[0].size, 4 * 1024 * 1024);
+}
+
+TEST(FabricMemInfoTest, SerializeDeserializeFabricHandleType)
+{
+    FabricMemInfo info;
+    info.supported = true;
+    info.handleType = VmmHandleType::kFabric;
+    // udsPath empty for fabric mode
+
+    FabricMemPool pool;
+    pool.deviceId = 0;
+    pool.poolBaseAddr = 0x7f0000000000ULL;
+    pool.poolTotalSize = 1024 * 1024 * 1024;
+    pool.registeredAddr = 0x7f0000000000ULL;
+    pool.registeredSize = 512 * 1024 * 1024;
+    pool.mappedOffset = 0;
+    pool.mappedSize = 512 * 1024 * 1024;
+
+    FabricMemChunk chunk;
+    chunk.virtAddrOffset = 0;
+    chunk.size = 512 * 1024 * 1024;
+    std::memset(chunk.fabricHandle, 0xAA, sizeof(chunk.fabricHandle));
+    pool.chunks.push_back(chunk);
+    info.pools.push_back(pool);
+
+    std::string serialized = info.serialize();
+    auto deserialized = FabricMemInfo::deserialize(serialized);
+
+    ASSERT_TRUE(deserialized.has_value());
+    EXPECT_TRUE(deserialized->supported);
+    EXPECT_EQ(deserialized->handleType, VmmHandleType::kFabric);
+    EXPECT_TRUE(deserialized->udsPath.empty());
+}
 
 #endif // TEST_NIXL_BACKEND

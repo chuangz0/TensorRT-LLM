@@ -524,6 +524,7 @@ class Sender:
         logger.info(f" Sender init end with endpoint: {self._messenger.endpoint}")
         self._closed = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
+        self._loaded_remote_agents: set[str] = set()
 
         # Multi-threaded task queue support
         self._num_threads = KV_TRANSFER_NUM_THREADS
@@ -806,6 +807,7 @@ class Sender:
             ri.instance_name + str(ri.instance_rank),
             ri.transfer_engine_info,
         )
+        self._loaded_remote_agents.add(agent_name)
         logger.debug(
             f"Completed handling REGISTER_RANK_INFO for instance='{ri.instance_name}', rank={ri.instance_rank}"
         )
@@ -884,6 +886,17 @@ class Sender:
             if hasattr(self, "_worker_threads"):
                 for t in self._worker_threads:
                     t.join(timeout=5)
+
+        # Invalidate all loaded remote agents to release fabric/POSIX FD resources
+        if hasattr(self, "_loaded_remote_agents"):
+            for agent_name in self._loaded_remote_agents:
+                try:
+                    self._agent.invalidate_remote_agent(agent_name)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to invalidate remote agent '{agent_name}' during shutdown: {e}"
+                    )
+            self._loaded_remote_agents.clear()
 
         self._messenger.stop()
 
