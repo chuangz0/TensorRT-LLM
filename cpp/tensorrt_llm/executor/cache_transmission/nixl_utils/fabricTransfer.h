@@ -146,7 +146,7 @@ private:
 class FabricTransferHelper
 {
 public:
-    FabricTransferHelper() = default;
+    FabricTransferHelper();
     ~FabricTransferHelper();
 
     // Non-copyable
@@ -259,6 +259,9 @@ private:
 
     // Detected handle type for this helper instance
     VmmHandleType mDetectedHandleType{VmmHandleType::kNone};
+
+    // Local CUDA device ID (queried once at construction)
+    CUdevice mLocalDevice{0};
 
     // Remote fabric memory mappings
     std::unordered_map<std::string, RemoteFabricMapping> mRemoteFabricMappings;

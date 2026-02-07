@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
@@ -767,8 +768,16 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 
 [[nodiscard]] std::unique_ptr<TransferStatus> NixlTransferAgent::submitTransferRequests(TransferRequest const& request)
 {
+
+    NVTX3_SCOPED_RANGE(NixlTransferAgent_submitTransferRequests);
     // ========== Try fabric-based transfer first ==========
-    if (mFabricHelper && mFabricHelper->hasRemoteMapping(request.getRemoteName()))
+    // Skip fabric path if:
+    // 1. Request carries a sync message (needs NIXL notification mechanism)
+    // 2. Source or destination is not VRAM (fabric mapping is VRAM-only)
+    bool canUseFabric = mFabricHelper && mFabricHelper->hasRemoteMapping(request.getRemoteName())
+        && !request.getSyncMessage().has_value() && request.getSrcDescs().getType() == MemoryType::kVRAM
+        && request.getDstDescs().getType() == MemoryType::kVRAM;
+    if (canUseFabric)
     {
         auto const& srcDescs = request.getSrcDescs().getDescs();
         auto const& dstDescs = request.getDstDescs().getDescs();
