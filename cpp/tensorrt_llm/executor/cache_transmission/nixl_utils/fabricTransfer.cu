@@ -414,6 +414,15 @@ TransferState FabricTransferStatus::wait(int64_t timeout_ms) const
 // FabricTransferHelper Implementation
 // ============================================================================
 
+FabricTransferHelper::FabricTransferHelper()
+{
+    auto err = cuCtxGetDevice(&mLocalDevice);
+    if (err != CUDA_SUCCESS)
+    {
+        TLLM_LOG_WARNING("FabricTransfer: failed to get current CUDA device, error=%d", err);
+    }
+}
+
 FabricTransferHelper::~FabricTransferHelper()
 {
     // Stop UDS server if running (must be done first, before closing FDs)
@@ -1461,7 +1470,7 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
             // Set access permissions using localOffset
             CUmemAccessDesc accessDesc = {};
             accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-            accessDesc.location.id = pool.deviceId;
+            accessDesc.location.id = static_cast<int>(mLocalDevice);
             accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
             err = cuMemSetAccess(localVa + localOffset, chunk.size, &accessDesc, 1);
             if (err != CUDA_SUCCESS)
