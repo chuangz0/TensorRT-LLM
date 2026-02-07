@@ -18,8 +18,8 @@
 #pragma once
 
 #include "nixl.h"
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/fabricTransfer.h"
 #include "tensorrt_llm/executor/transferAgent.h"
-#include <atomic>
 #include <thread>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -106,6 +106,7 @@ public:
     bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) override;
 
 private:
+    // ========== Original NIXL members ==========
     std::unique_ptr<nixlAgent> mRawAgent;
     nixlBackendH* mRawBackend{};
     nixl_opt_args_t mExtraParams;
@@ -114,6 +115,14 @@ private:
 
     std::vector<char> mDRamSrcBuffer;
     std::vector<char> mDRamDstBuffer;
+
+    // ========== Fabric transfer helper ==========
+    /// @brief Helper for fabric-based memory transfer optimization
+    std::unique_ptr<FabricTransferHelper> mFabricHelper;
+
+    // ========== Fabric transfer helper methods ==========
+    /// @brief Submit transfer using NIXL (fallback)
+    [[nodiscard]] std::unique_ptr<TransferStatus> submitWithNixl(TransferRequest const& request);
 };
 
 class NixlLoopbackAgent final : public BaseLoopbackAgent

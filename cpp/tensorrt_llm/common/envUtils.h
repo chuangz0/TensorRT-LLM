@@ -165,6 +165,13 @@ bool getEnvEplbForceGdrcopy();
 
 bool getEnvPrintSkipSoftmaxStat();
 
+// Fabric transfer optimization for disaggregated KV cache
+bool getEnvDisableFabricTransfer();
+
+// Threshold (in KB) for using cub::DeviceMemcpy::Batched vs cudaMemcpyAsync
+// Default: 16KB - segments smaller than this use cub batch copy
+size_t getEnvFabricBatchThresholdKB();
+
 } // namespace common
 
 TRTLLM_NAMESPACE_END
