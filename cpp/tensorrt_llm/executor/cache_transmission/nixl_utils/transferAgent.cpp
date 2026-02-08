@@ -664,8 +664,8 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc const
         }
     }
 
-    // If parsing failed, treat as old format (plain NIXL blob)
-    if (nixlBlob.empty())
+    // If parsing failed (empty blob or FabricMemInfo magic mismatch), treat as old format (plain NIXL blob)
+    if (nixlBlob.empty() || !fabricInfo.has_value())
     {
         nixlBlob = blob;
     }
@@ -729,14 +729,17 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     nixl_status_t status;
     nixlXferReqH* handle;
 
+    // Use a local copy of mExtraParams to avoid concurrent modification
+    // (mExtraParams.backends is immutable after init, but hasNotif/notifMsg are per-request)
+    nixl_opt_args_t localParams = mExtraParams;
     if (request.getSyncMessage().has_value())
     {
-        mExtraParams.hasNotif = true;
-        mExtraParams.notifMsg = request.getSyncMessage().value();
+        localParams.hasNotif = true;
+        localParams.notifMsg = request.getSyncMessage().value();
     }
     else
     {
-        mExtraParams.hasNotif = false;
+        localParams.hasNotif = false;
     }
 
     // Coalesce contiguous memory regions to reduce transfer count (enabled by default)
@@ -746,7 +749,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     {
         status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()),
             NixlHelper::convertXferDist(request.getSrcDescs()), NixlHelper::convertXferDist(request.getDstDescs()),
-            request.getRemoteName(), handle, &mExtraParams);
+            request.getRemoteName(), handle, &localParams);
     }
     else
     {
@@ -754,7 +757,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
             = NixlHelper::coalesceTransferDescs(request.getSrcDescs(), request.getDstDescs());
         status
             = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(coalescedSrc),
-                NixlHelper::convertXferDist(coalescedDst), request.getRemoteName(), handle, &mExtraParams);
+                NixlHelper::convertXferDist(coalescedDst), request.getRemoteName(), handle, &localParams);
     }
 
     TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS,
@@ -762,7 +765,9 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         mpi::MpiComm::world().getRank(), nixlEnumStrings::statusStr(status).c_str(), mName.c_str(),
         request.getRemoteName().c_str());
 
-    status = mRawAgent->postXferReq(handle, &mExtraParams);
+    status = mRawAgent->postXferReq(handle, &localParams);
+    TLLM_CHECK_WITH_INFO(status == NIXL_IN_PROG || status == NIXL_SUCCESS, "postXferReq failed with status: %s",
+        nixlEnumStrings::statusStr(status).c_str());
     return std::make_unique<NixlTransferStatus>(mRawAgent.get(), handle);
 }
 
@@ -823,6 +828,9 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 
         if (allMapped)
         {
+            TLLM_LOG_INFO("NixlTransferAgent::submitTransferRequests: using fabric path for %zu segments to %s (op=%s)",
+                srcDescs.size(), remoteName.c_str(), request.getOp() == TransferOp::kWRITE ? "WRITE" : "READ");
+
             // Calculate average segment size to choose transfer method
             size_t totalBytes = 0;
             for (auto s : sizes)

@@ -8,7 +8,12 @@ from enum import Enum
 from typing import List, Optional
 
 import msgpack
+import torch
 
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cudart
 import tensorrt_llm.bindings
 from tensorrt_llm import Mapping, logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
@@ -40,6 +45,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.runtime.generation import CUASSERT
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
@@ -585,6 +591,9 @@ class Sender:
             thread_idx: Index of the worker thread (0 to num_threads-1)
         """
         task_queue = self._send_task_queues[thread_idx]
+        torch.cuda.set_device(self._device_id)
+        # ensure the context is created, otherwise, some MPI calls will fail.
+        CUASSERT(cudart.cudaSetDevice(self._device_id))
         while True:
             agent_args = task_queue.get()
             if agent_args is None:
