@@ -475,7 +475,7 @@ bool testPosixFdTransfer(int rank, int worldSize)
         // 4. Verify mapped memory is readable
         // Get the mapped local address for the remote memory
         auto const& pool = fabricInfo->pools[0];
-        void* localMappedPtr = helper.translateToLocalMapping("rank1", pool.registeredAddr);
+        void* localMappedPtr = helper.translateToLocalMapping("rank1", pool.registeredAddr, pool.registeredSize);
         if (localMappedPtr == nullptr)
         {
             printf("[Rank %d] FAIL: translateToLocalMapping returned nullptr\n", rank);
@@ -678,7 +678,7 @@ bool testPosixFdMultiChunk(int rank, int worldSize)
 
         // Verify data for each chunk segment
         auto const& pool = fabricInfo->pools[0];
-        void* localMappedPtr = helper.translateToLocalMapping("rank1_mc", pool.registeredAddr);
+        void* localMappedPtr = helper.translateToLocalMapping("rank1_mc", pool.registeredAddr, pool.registeredSize);
         if (localMappedPtr == nullptr)
         {
             printf("[Rank %d] FAIL: translateToLocalMapping returned nullptr\n", rank);
@@ -1721,7 +1721,7 @@ bool testPosixFdSubRangeDirect(int rank, int worldSize)
 
             // Translate the registered sub-range address to local mapping
             auto const& pool = fabricInfo->pools[0];
-            void* localMapped = helper.translateToLocalMapping("rank1_sub", pool.registeredAddr);
+            void* localMapped = helper.translateToLocalMapping("rank1_sub", pool.registeredAddr, pool.registeredSize);
             if (localMapped == nullptr)
             {
                 printf("[Rank %d] FAIL: translateToLocalMapping returned nullptr\n", rank);
@@ -2207,7 +2207,8 @@ bool testPosixFdMultiChunkSubRangeDirect(int rank, int worldSize)
             printf("[Rank %d] Remote mapping established\n", rank);
 
             auto const& pool = fabricInfo->pools[0];
-            void* localMapped = helper.translateToLocalMapping("rank1_mc_sub", pool.registeredAddr);
+            void* localMapped
+                = helper.translateToLocalMapping("rank1_mc_sub", pool.registeredAddr, pool.registeredSize);
             if (localMapped == nullptr)
             {
                 printf("[Rank %d] FAIL: translateToLocalMapping returned nullptr\n", rank);
@@ -2648,7 +2649,8 @@ bool testMultiChunkUnalignedSubRangeDirect(int rank, int worldSize)
 
             auto const& pool = fabricInfo->pools[0];
             // Translate the unaligned registeredAddr (3MB offset, not chunk-aligned)
-            void* localMapped = helper.translateToLocalMapping("rank1_unaligned", pool.registeredAddr);
+            void* localMapped
+                = helper.translateToLocalMapping("rank1_unaligned", pool.registeredAddr, pool.registeredSize);
             if (localMapped == nullptr)
             {
                 printf("[Rank %d] FAIL: translateToLocalMapping returned nullptr for unaligned addr 0x%llx\n", rank,
@@ -3012,7 +3014,8 @@ bool testSmallCrossBoundaryDirect(int rank, int worldSize)
         else
         {
             auto const& pool = fabricInfo->pools[0];
-            void* localMapped = helper.translateToLocalMapping("rank1_small_cross", pool.registeredAddr);
+            void* localMapped
+                = helper.translateToLocalMapping("rank1_small_cross", pool.registeredAddr, pool.registeredSize);
             if (localMapped == nullptr)
             {
                 printf("[Rank %d] FAIL: translateToLocalMapping returned nullptr\n", rank);
@@ -3189,7 +3192,8 @@ bool testIntraChunkSubRangeDirect(int rank, int worldSize)
         else
         {
             auto const& pool = fabricInfo->pools[0];
-            void* localMapped = helper.translateToLocalMapping("rank1_intra_chunk", pool.registeredAddr);
+            void* localMapped
+                = helper.translateToLocalMapping("rank1_intra_chunk", pool.registeredAddr, pool.registeredSize);
             if (localMapped == nullptr)
             {
                 printf("[Rank %d] FAIL: translateToLocalMapping returned nullptr\n", rank);
@@ -3369,7 +3373,8 @@ bool testWideSpanSubRangeDirect(int rank, int worldSize)
         else
         {
             auto const& pool = fabricInfo->pools[0];
-            void* localMapped = helper.translateToLocalMapping("rank1_wide_span", pool.registeredAddr);
+            void* localMapped
+                = helper.translateToLocalMapping("rank1_wide_span", pool.registeredAddr, pool.registeredSize);
             if (localMapped == nullptr)
             {
                 printf("[Rank %d] FAIL: translateToLocalMapping returned nullptr\n", rank);
@@ -3546,7 +3551,8 @@ bool test4MBChunkIntraDirect(int rank, int worldSize)
         else
         {
             auto const& pool = fabricInfo->pools[0];
-            void* localMapped = helper.translateToLocalMapping("rank1_4mb_intra", pool.registeredAddr);
+            void* localMapped
+                = helper.translateToLocalMapping("rank1_4mb_intra", pool.registeredAddr, pool.registeredSize);
             if (localMapped == nullptr)
             {
                 printf("[Rank %d] FAIL: translateToLocalMapping returned nullptr\n", rank);
@@ -3719,7 +3725,8 @@ bool test4MBChunkCrossBoundaryDirect(int rank, int worldSize)
         else
         {
             auto const& pool = fabricInfo->pools[0];
-            void* localMapped = helper.translateToLocalMapping("rank1_4mb_cross", pool.registeredAddr);
+            void* localMapped
+                = helper.translateToLocalMapping("rank1_4mb_cross", pool.registeredAddr, pool.registeredSize);
             if (localMapped == nullptr)
             {
                 printf("[Rank %d] FAIL: translateToLocalMapping returned nullptr\n", rank);
@@ -3892,7 +3899,8 @@ bool test4MBChunkWideSpanDirect(int rank, int worldSize)
         else
         {
             auto const& pool = fabricInfo->pools[0];
-            void* localMapped = helper.translateToLocalMapping("rank1_4mb_wide", pool.registeredAddr);
+            void* localMapped
+                = helper.translateToLocalMapping("rank1_4mb_wide", pool.registeredAddr, pool.registeredSize);
             if (localMapped == nullptr)
             {
                 printf("[Rank %d] FAIL: translateToLocalMapping returned nullptr\n", rank);
@@ -3927,6 +3935,375 @@ bool test4MBChunkWideSpanDirect(int rank, int worldSize)
     }
 
     printf("[Rank %d] === 4MBChunkWideSpanDirect: %s ===\n", rank, ok ? "PASSED" : "FAILED");
+    return ok;
+}
+
+// ============================================================================
+// CudaIpc Tests — cudaMalloc memory shared via cudaIpcGetMemHandle
+// ============================================================================
+
+/// @brief Test 1: CudaIpc detection — cudaMalloc memory is detected as kCudaIpc
+bool testCudaIpcDetection(int rank)
+{
+    if (rank != 0)
+    {
+        return true; // Only rank 0 runs this
+    }
+
+    printf("[Rank %d] === Test: CudaIpcDetection ===\n", rank);
+
+    bool ok = true;
+    size_t const allocSize = 4 * 1024 * 1024; // 4 MB
+    uint32_t const DEVICE_ID = 0;
+
+    // Allocate with cudaMalloc (legacy IPC capable)
+    void* devPtr = nullptr;
+    TLLM_CUDA_CHECK(cudaMalloc(&devPtr, allocSize));
+    printf("[Rank %d] cudaMalloc: ptr=%p, size=%zu\n", rank, devPtr, allocSize);
+
+    // Register with FabricTransferHelper
+    FabricTransferHelper helper;
+    MemoryDescs regDescs{MemoryType::kVRAM, {MemoryDesc{devPtr, allocSize, DEVICE_ID}}};
+    helper.detectAndExportFabricHandles(regDescs);
+
+    auto const& info = helper.getLocalFabricInfo();
+    if (!info.supported)
+    {
+        printf("[Rank %d] CudaIpc NOT supported (expected supported)\n", rank);
+        ok = false;
+    }
+    else if (info.handleType != VmmHandleType::kCudaIpc)
+    {
+        printf("[Rank %d] Expected handleType=CudaIpc(3), got %d\n", rank, static_cast<int>(info.handleType));
+        ok = false;
+    }
+    else
+    {
+        printf("[Rank %d] handleType = CudaIpc (correct!)\n", rank);
+        printf("[Rank %d] pools=%zu, chunks=%zu\n", rank, info.pools.size(),
+            info.pools.empty() ? 0 : info.pools[0].chunks.size());
+
+        // Verify pool structure
+        if (!info.pools.empty())
+        {
+            auto const& pool = info.pools[0];
+            if (pool.chunks.size() != 1)
+            {
+                printf("[Rank %d] Expected 1 chunk (cudaMalloc), got %zu\n", rank, pool.chunks.size());
+                ok = false;
+            }
+            if (pool.mappedOffset != 0)
+            {
+                printf("[Rank %d] Expected mappedOffset=0, got %lu\n", rank, pool.mappedOffset);
+                ok = false;
+            }
+        }
+    }
+
+    TLLM_CUDA_CHECK(cudaFree(devPtr));
+    printf("[Rank %d] === CudaIpcDetection: %s ===\n", rank, ok ? "PASSED" : "FAILED");
+    return ok;
+}
+
+/// @brief Test 2: CudaIpc cross-process transfer via FabricTransferHelper
+bool testCudaIpcTransfer(int rank, int worldSize)
+{
+    if (worldSize < 2)
+    {
+        if (rank == 0)
+            printf("[Rank %d] Skipping CudaIpcTransfer (need 2 ranks)\n", rank);
+        return true;
+    }
+
+    printf("[Rank %d] === Test: CudaIpcTransfer ===\n", rank);
+    bool ok = true;
+
+    size_t const allocSize = 4 * 1024 * 1024; // 4 MB
+    uint32_t const DEVICE_ID = 0;
+
+    if (rank == 1)
+    {
+        // Source: allocate and fill with pattern via cudaMalloc
+        void* srcPtr = nullptr;
+        TLLM_CUDA_CHECK(cudaMalloc(&srcPtr, allocSize));
+        TLLM_CUDA_CHECK(cudaMemset(srcPtr, 0xCD, allocSize));
+        printf("[Rank %d] cudaMalloc src: ptr=%p, size=%zu, filled with 0xCD\n", rank, srcPtr, allocSize);
+
+        // Export
+        FabricTransferHelper helper;
+        MemoryDescs regDescs{MemoryType::kVRAM, {MemoryDesc{srcPtr, allocSize, DEVICE_ID}}};
+        helper.detectAndExportFabricHandles(regDescs);
+
+        auto const& info = helper.getLocalFabricInfo();
+        std::string serialized = info.serialize();
+        printf("[Rank %d] Exported CudaIpc: handleType=%s, serialized=%zu bytes\n", rank,
+            handleTypeToString(info.handleType), serialized.size());
+
+        // Send metadata to rank 0
+        int metaSize = static_cast<int>(serialized.size());
+        MPI_Send(&metaSize, 1, MPI_INT, 0, 0, MPI_COMM_WORLD);
+        MPI_Send(serialized.data(), metaSize, MPI_BYTE, 0, 1, MPI_COMM_WORLD);
+
+        // Send src address
+        uintptr_t srcAddr = reinterpret_cast<uintptr_t>(srcPtr);
+        MPI_Send(&srcAddr, sizeof(srcAddr), MPI_BYTE, 0, 2, MPI_COMM_WORLD);
+
+        // Wait for rank 0 to finish
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        TLLM_CUDA_CHECK(cudaFree(srcPtr));
+        printf("[Rank %d] Cleanup done\n", rank);
+    }
+    else
+    {
+        // Receiver: rank 0
+
+        // Receive metadata from rank 1
+        int metaSize = 0;
+        MPI_Recv(&metaSize, 1, MPI_INT, 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        std::string serialized(metaSize, '\0');
+        MPI_Recv(serialized.data(), metaSize, MPI_BYTE, 1, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        uintptr_t remoteSrcAddr = 0;
+        MPI_Recv(&remoteSrcAddr, sizeof(remoteSrcAddr), MPI_BYTE, 1, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        printf("[Rank %d] Received metadata (%d bytes), remoteSrcAddr=0x%lx\n", rank, metaSize, remoteSrcAddr);
+
+        // Deserialize
+        auto fabricInfo = FabricMemInfo::deserialize(std::string_view(serialized.data(), serialized.size()));
+        if (!fabricInfo || fabricInfo->handleType != VmmHandleType::kCudaIpc)
+        {
+            printf("[Rank %d] Deserialization failed or wrong type\n", rank);
+            ok = false;
+        }
+        else
+        {
+            printf("[Rank %d] Deserialized: handleType=CudaIpc, pools=%zu\n", rank, fabricInfo->pools.size());
+
+            // Import and map
+            FabricTransferHelper helper;
+            helper.importAndMapRemoteFabric("rank1_cuda_ipc", *fabricInfo);
+
+            // Translate address
+            void* localPtr = helper.translateToLocalMapping("rank1_cuda_ipc", remoteSrcAddr, allocSize);
+            if (!localPtr)
+            {
+                printf("[Rank %d] translateToLocalMapping returned null\n", rank);
+                ok = false;
+            }
+            else
+            {
+                printf("[Rank %d] Mapped local ptr = %p\n", rank, localPtr);
+
+                // Allocate dst and verify via device-to-device copy
+                void* dstPtr = nullptr;
+                TLLM_CUDA_CHECK(cudaMalloc(&dstPtr, allocSize));
+                TLLM_CUDA_CHECK(cudaMemcpy(dstPtr, localPtr, allocSize, cudaMemcpyDeviceToDevice));
+                TLLM_CUDA_CHECK(cudaDeviceSynchronize());
+
+                // Verify
+                std::vector<uint8_t> hostBuf(allocSize);
+                TLLM_CUDA_CHECK(cudaMemcpy(hostBuf.data(), dstPtr, allocSize, cudaMemcpyDeviceToHost));
+
+                bool dataOk = true;
+                for (size_t i = 0; i < allocSize; ++i)
+                {
+                    if (hostBuf[i] != 0xCD)
+                    {
+                        printf("[Rank %d] Data mismatch at byte %zu: expected 0xCD, got 0x%02X\n", rank, i, hostBuf[i]);
+                        dataOk = false;
+                        break;
+                    }
+                }
+                if (dataOk)
+                {
+                    printf("[Rank %d] CudaIpc transfer verification PASSED (all %zu bytes == 0xCD)\n", rank, allocSize);
+                }
+                else
+                {
+                    ok = false;
+                }
+
+                TLLM_CUDA_CHECK(cudaFree(dstPtr));
+            }
+
+            helper.cleanupRemoteFabricMapping("rank1_cuda_ipc");
+        }
+
+        MPI_Barrier(MPI_COMM_WORLD);
+        printf("[Rank %d] Cleanup done\n", rank);
+    }
+
+    printf("[Rank %d] === CudaIpcTransfer: %s ===\n", rank, ok ? "PASSED" : "FAILED");
+    return ok;
+}
+
+/// @brief Test 3: CudaIpc end-to-end through NixlTransferAgent
+bool testNixlAgentCudaIpcTransfer(int rank, int worldSize)
+{
+    if (worldSize < 2)
+    {
+        if (rank == 0)
+            printf("[Rank %d] Skipping NixlAgentCudaIpcTransfer (need 2 ranks)\n", rank);
+        return true;
+    }
+
+    printf("[Rank %d] === Test: NixlAgentCudaIpcTransfer ===\n", rank);
+    bool ok = true;
+
+    size_t const DATA_SIZE = 4 * 1024 * 1024; // 4 MB
+    uint8_t const FILL_PATTERN = 0xFA;
+    uint32_t const DEVICE_ID = 0;
+    std::string const agentName = std::string("nixl_cuda_ipc_agent_") + std::to_string(rank);
+
+    // Create NixlTransferAgent
+    BaseAgentConfig config{agentName, true, false, false, false};
+    std::unique_ptr<BaseTransferAgent> agent;
+    try
+    {
+        agent = std::unique_ptr<BaseTransferAgent>(createNixlTransferAgent(&config));
+    }
+    catch (std::exception const& e)
+    {
+        printf("[Rank %d] Failed to create NixlTransferAgent: %s\n", rank, e.what());
+        return true; // Skip
+    }
+
+    int agentOk = (agent != nullptr) ? 1 : 0;
+    int allOk = 0;
+    MPI_Allreduce(&agentOk, &allOk, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    if (!allOk)
+    {
+        printf("[Rank %d] SKIP: not all ranks created NixlTransferAgent\n", rank);
+        return true;
+    }
+
+    printf("[Rank %d] NixlTransferAgent created: '%s'\n", rank, agentName.c_str());
+
+    if (rank == 1)
+    {
+        // Source side: allocate cudaMalloc memory and fill
+        void* srcPtr = nullptr;
+        TLLM_CUDA_CHECK(cudaMalloc(&srcPtr, DATA_SIZE));
+        TLLM_CUDA_CHECK(cudaMemset(srcPtr, FILL_PATTERN, DATA_SIZE));
+        printf(
+            "[Rank %d] cudaMalloc src: ptr=%p, size=%zu, filled with 0x%02X\n", rank, srcPtr, DATA_SIZE, FILL_PATTERN);
+
+        // Register memory
+        MemoryDescs vmmDescs{MemoryType::kVRAM, {MemoryDesc{srcPtr, DATA_SIZE, DEVICE_ID}}};
+        agent->registerMemory(vmmDescs);
+        printf("[Rank %d] registerMemory done\n", rank);
+
+        // Get agent descriptor
+        auto agentDesc = agent->getLocalAgentDesc();
+        auto const& descStr = agentDesc.getBackendAgentDesc();
+        printf("[Rank %d] getLocalAgentDesc: %zu bytes\n", rank, descStr.size());
+
+        // Send to rank 0
+        int descSize = static_cast<int>(descStr.size());
+        MPI_Send(&descSize, 1, MPI_INT, 0, 30, MPI_COMM_WORLD);
+        MPI_Send(descStr.data(), descSize, MPI_BYTE, 0, 31, MPI_COMM_WORLD);
+
+        // Send address info
+        uintptr_t srcAddr = reinterpret_cast<uintptr_t>(srcPtr);
+        size_t srcSize = DATA_SIZE;
+        MPI_Send(&srcAddr, sizeof(srcAddr), MPI_BYTE, 0, 32, MPI_COMM_WORLD);
+        MPI_Send(&srcSize, sizeof(srcSize), MPI_BYTE, 0, 33, MPI_COMM_WORLD);
+
+        printf("[Rank %d] Sent AgentDesc and address info to rank 0\n", rank);
+
+        // Wait for rank 0 to finish transfer
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        agent->deregisterMemory(vmmDescs);
+        TLLM_CUDA_CHECK(cudaFree(srcPtr));
+        printf("[Rank %d] Cleanup done\n", rank);
+    }
+    else
+    {
+        // Receiver: rank 0
+
+        // Allocate dst with cudaMalloc
+        char* localDst = nullptr;
+        TLLM_CUDA_CHECK(cudaMalloc(&localDst, DATA_SIZE));
+        TLLM_CUDA_CHECK(cudaMemset(localDst, 0, DATA_SIZE));
+
+        // Register dst memory
+        MemoryDescs localDescs{MemoryType::kVRAM, {MemoryDesc{localDst, DATA_SIZE, DEVICE_ID}}};
+        agent->registerMemory(localDescs);
+        printf("[Rank %d] registerMemory done for local dst buffer\n", rank);
+
+        // Receive agent descriptor from rank 1
+        int descSize = 0;
+        MPI_Recv(&descSize, 1, MPI_INT, 1, 30, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        std::string descStr(descSize, '\0');
+        MPI_Recv(descStr.data(), descSize, MPI_BYTE, 1, 31, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        uintptr_t remoteSrcAddr = 0;
+        size_t remoteSrcSize = 0;
+        MPI_Recv(&remoteSrcAddr, sizeof(remoteSrcAddr), MPI_BYTE, 1, 32, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(&remoteSrcSize, sizeof(remoteSrcSize), MPI_BYTE, 1, 33, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        printf("[Rank %d] Received AgentDesc (%d bytes), remoteSrcAddr=0x%lx, remoteSrcSize=%zu\n", rank, descSize,
+            remoteSrcAddr, remoteSrcSize);
+
+        // Load remote agent
+        std::string remoteAgentName = "nixl_cuda_ipc_agent_1";
+        AgentDesc remoteAgentDesc{descStr};
+        agent->loadRemoteAgent(remoteAgentName, remoteAgentDesc);
+        printf("[Rank %d] loadRemoteAgent done for '%s'\n", rank, remoteAgentName.c_str());
+
+        // Submit transfer (READ: remote src → local dst)
+        TransferDescs srcDescs{
+            MemoryType::kVRAM, {MemoryDesc{reinterpret_cast<uintptr_t>(localDst), DATA_SIZE, DEVICE_ID}}};
+        TransferDescs dstDescs{MemoryType::kVRAM, {MemoryDesc{remoteSrcAddr, remoteSrcSize, DEVICE_ID}}};
+
+        TransferRequest readReq{TransferOp::kREAD, srcDescs, dstDescs, remoteAgentName};
+        auto status = agent->submitTransferRequests(readReq);
+        auto result = status->wait();
+
+        printf("[Rank %d] submitTransferRequests result: %s\n", rank,
+            result == TransferState::kSUCCESS ? "SUCCESS"
+                                              : (result == TransferState::kFAILURE ? "FAILURE" : "IN_PROGRESS"));
+
+        if (result != TransferState::kSUCCESS)
+        {
+            ok = false;
+        }
+        else
+        {
+            // Verify data
+            std::vector<uint8_t> hostBuf(DATA_SIZE);
+            TLLM_CUDA_CHECK(cudaMemcpy(hostBuf.data(), localDst, DATA_SIZE, cudaMemcpyDeviceToHost));
+
+            bool dataOk = true;
+            for (size_t i = 0; i < DATA_SIZE; ++i)
+            {
+                if (hostBuf[i] != FILL_PATTERN)
+                {
+                    printf("[Rank %d] Data mismatch at byte %zu: expected 0x%02X, got 0x%02X\n", rank, i, FILL_PATTERN,
+                        hostBuf[i]);
+                    dataOk = false;
+                    break;
+                }
+            }
+
+            if (dataOk)
+            {
+                printf("[Rank %d] NixlAgent CudaIpc transfer PASSED (all %zu bytes == 0x%02X)\n", rank, DATA_SIZE,
+                    FILL_PATTERN);
+            }
+            ok = ok && dataOk;
+        }
+
+        agent->deregisterMemory(localDescs);
+        TLLM_CUDA_CHECK(cudaFree(localDst));
+
+        MPI_Barrier(MPI_COMM_WORLD);
+        printf("[Rank %d] Cleanup done\n", rank);
+    }
+
+    printf("[Rank %d] === NixlAgentCudaIpcTransfer: %s ===\n", rank, ok ? "PASSED" : "FAILED");
     return ok;
 }
 
@@ -4010,6 +4387,16 @@ int main(int argc, char** argv)
 
     MPI_Barrier(MPI_COMM_WORLD);
     allPassed = test4MBChunkWideSpanDirect(rank, worldSize) && allPassed;
+
+    // CudaIpc tests
+    MPI_Barrier(MPI_COMM_WORLD);
+    allPassed = testCudaIpcDetection(rank) && allPassed;
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    allPassed = testCudaIpcTransfer(rank, worldSize) && allPassed;
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    allPassed = testNixlAgentCudaIpcTransfer(rank, worldSize) && allPassed;
 
     MPI_Barrier(MPI_COMM_WORLD);
 

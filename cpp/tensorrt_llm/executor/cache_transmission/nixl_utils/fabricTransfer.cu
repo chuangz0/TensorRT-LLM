@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cub/device/device_memcpy.cuh>
+#include <poll.h>
 #include <random>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -572,16 +573,15 @@ void FabricTransferHelper::startUdsServer()
 
             while (mUdsServerRunning.load(std::memory_order_acquire))
             {
-                // Use a timeout on accept so we can check mUdsServerRunning periodically
-                struct timeval tv;
-                tv.tv_sec = 1;
-                tv.tv_usec = 0;
+                // Use poll() instead of select() to avoid FD_SETSIZE (1024) limit.
+                // When many POSIX FDs are exported, the server socket FD can exceed 1024,
+                // which causes select()/FD_SET to corrupt memory and abort.
+                struct pollfd pfd;
+                pfd.fd = mUdsServerSocket;
+                pfd.events = POLLIN;
+                pfd.revents = 0;
 
-                fd_set readfds;
-                FD_ZERO(&readfds);
-                FD_SET(mUdsServerSocket, &readfds);
-
-                int ret = ::select(mUdsServerSocket + 1, &readfds, nullptr, nullptr, &tv);
+                int ret = ::poll(&pfd, 1, 1000 /* 1 second timeout in ms */);
                 if (ret <= 0)
                 {
                     continue; // Timeout or error, check running flag
@@ -699,20 +699,29 @@ void FabricTransferHelper::detectAndExportFabricHandles(RegisterDescs const& des
         void* attr_data[2] = {&legacy_capable, &allowed_handle_types};
 
         auto err = cuPointerGetAttributes(2, attr_type, attr_data, ptr);
-        if (err != CUDA_SUCCESS || legacy_capable)
+        if (err != CUDA_SUCCESS)
         {
-            continue; // Not VMM memory, skip
+            continue; // Can't query pointer attributes
         }
 
-        // Determine handle type: prefer fabric, fallback to POSIX FD
-        bool fabricSupported = (allowed_handle_types & CU_MEM_HANDLE_TYPE_FABRIC) != 0;
-        bool posixFdSupported = (allowed_handle_types & CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) != 0;
-        if (!fabricSupported && !posixFdSupported)
+        // Determine handle type based on memory allocation type
+        VmmHandleType descHandleType;
+        if (legacy_capable)
         {
-            continue; // No shareable handle type supported
+            // cudaMalloc memory → use CudaIpc (same-machine IPC via cudaIpcGetMemHandle)
+            descHandleType = VmmHandleType::kCudaIpc;
         }
-
-        VmmHandleType descHandleType = fabricSupported ? VmmHandleType::kFabric : VmmHandleType::kPosixFd;
+        else
+        {
+            // VMM memory → prefer fabric, fallback to POSIX FD
+            bool fabricSupported = (allowed_handle_types & CU_MEM_HANDLE_TYPE_FABRIC) != 0;
+            bool posixFdSupported = (allowed_handle_types & CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) != 0;
+            if (!fabricSupported && !posixFdSupported)
+            {
+                continue; // No shareable handle type supported
+            }
+            descHandleType = fabricSupported ? VmmHandleType::kFabric : VmmHandleType::kPosixFd;
+        }
 
         // Ensure consistent handle type across all descriptors
         if (mDetectedHandleType == VmmHandleType::kNone)
@@ -849,7 +858,7 @@ void FabricTransferHelper::detectAndExportFabricHandles(RegisterDescs const& des
     if (mLocalFabricInfo.supported)
     {
         TLLM_LOG_INFO("FabricTransfer: transfer enabled with %zu pools, handleType=%s", mLocalFabricInfo.pools.size(),
-            mDetectedHandleType == VmmHandleType::kFabric ? "Fabric" : "PosixFd");
+            handleTypeToString(mDetectedHandleType));
 
         // For POSIX FD mode, start UDS server for FD sharing with remote processes
         if (mDetectedHandleType == VmmHandleType::kPosixFd)
@@ -988,6 +997,13 @@ size_t FabricTransferHelper::getVmmGranularity()
 void FabricTransferHelper::detectAndExportChunks(CUdeviceptr scanStart, size_t scanSize, CUdeviceptr poolBase,
     size_t poolTotalSize, std::vector<FabricMemChunk>& chunks)
 {
+    // For CudaIpc (cudaMalloc): single contiguous chunk, no VMM chunk iteration needed
+    if (mDetectedHandleType == VmmHandleType::kCudaIpc)
+    {
+        exportSingleChunkCudaIpc(poolBase, poolTotalSize, chunks);
+        return;
+    }
+
     // Iterate through the registered range using cuMemGetAddressRange to discover real chunk boundaries.
     // cuMemGetAddressRange(ptr) returns the [base, size) of the individual cuMemMap mapping that ptr
     // falls within, which directly gives us the physical allocation's VA boundaries. This is O(N)
@@ -1121,6 +1137,36 @@ void FabricTransferHelper::exportSingleChunkPosixFd(
     }
 }
 
+void FabricTransferHelper::exportSingleChunkCudaIpc(
+    CUdeviceptr poolBase, size_t poolTotalSize, std::vector<FabricMemChunk>& chunks)
+{
+    // cudaMalloc allocations are always a single contiguous block — one chunk per pool
+    if (!chunks.empty())
+    {
+        return; // Already exported
+    }
+
+    cudaIpcMemHandle_t ipcHandle;
+    auto err = cudaIpcGetMemHandle(&ipcHandle, reinterpret_cast<void*>(poolBase));
+    if (err != cudaSuccess)
+    {
+        TLLM_LOG_WARNING(
+            "FabricTransfer: failed to get CUDA IPC handle for ptr=0x%lx, error=%d", poolBase, static_cast<int>(err));
+        return;
+    }
+
+    FabricMemChunk chunk;
+    chunk.virtAddrOffset = 0;
+    chunk.size = poolTotalSize;
+    static_assert(sizeof(cudaIpcMemHandle_t) == sizeof(chunk.fabricHandle),
+        "cudaIpcMemHandle_t must be 64 bytes to fit in fabricHandle");
+    std::memcpy(chunk.fabricHandle, &ipcHandle, sizeof(ipcHandle));
+
+    TLLM_LOG_DEBUG("FabricTransfer: exported CudaIpc handle for pool at 0x%lx, size=%zu", poolBase, poolTotalSize);
+
+    chunks.push_back(std::move(chunk));
+}
+
 void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, FabricMemInfo const& fabricInfo)
 {
     TLLM_CUDA_CHECK(cudaSetDevice(static_cast<int>(mLocalDevice)));
@@ -1202,8 +1248,9 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
 
     RemoteFabricMapping mapping;
     mapping.remoteName = name;
-    bool anyImportFailed = false; // Track if any import operation failed
-    size_t fdIndex = 0;           // Index into receivedFds (for POSIX FD mode)
+    mapping.handleType = fabricInfo.handleType; // Store for cleanup path selection
+    bool anyImportFailed = false;               // Track if any import operation failed
+    size_t fdIndex = 0;                         // Index into receivedFds (for POSIX FD mode)
 
     for (auto const& pool : fabricInfo.pools)
     {
@@ -1214,6 +1261,41 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
         poolMapping.registeredSize = pool.registeredSize;
         poolMapping.remoteMappedOffset = pool.mappedOffset;
         poolMapping.mappedSize = pool.mappedSize;
+
+        // ---- CudaIpc path: use cudaIpcOpenMemHandle (much simpler than VMM) ----
+        if (fabricInfo.handleType == VmmHandleType::kCudaIpc)
+        {
+            if (pool.chunks.empty())
+            {
+                TLLM_LOG_WARNING("FabricTransfer: CudaIpc pool has no chunks for '%s'", name.c_str());
+                anyImportFailed = true;
+                continue;
+            }
+
+            // Single chunk per pool for cudaMalloc
+            auto const& chunk = pool.chunks[0];
+            cudaIpcMemHandle_t ipcHandle;
+            std::memcpy(&ipcHandle, chunk.fabricHandle, sizeof(ipcHandle));
+
+            void* devPtr = nullptr;
+            auto cudaErr = cudaIpcOpenMemHandle(&devPtr, ipcHandle, cudaIpcMemLazyEnablePeerAccess);
+            if (cudaErr != cudaSuccess)
+            {
+                TLLM_LOG_WARNING("FabricTransfer: cudaIpcOpenMemHandle failed for '%s', error=%d (%s)", name.c_str(),
+                    static_cast<int>(cudaErr), cudaGetErrorString(cudaErr));
+                anyImportFailed = true;
+                continue;
+            }
+
+            poolMapping.localVirtAddr = reinterpret_cast<CUdeviceptr>(devPtr);
+            // No cuMemMap or cuMemSetAccess needed — cudaIpcOpenMemHandle handles everything
+            mapping.pools.push_back(std::move(poolMapping));
+            TLLM_LOG_DEBUG("FabricTransfer: CudaIpc mapped remote pool at 0x%lx -> local 0x%lx, size=%zu",
+                pool.poolBaseAddr, reinterpret_cast<CUdeviceptr>(devPtr), pool.poolTotalSize);
+            continue;
+        }
+
+        // ---- VMM path (Fabric / PosixFd): reserve VA + import + map ----
 
         // Reserve local virtual address space for the MAPPED range (not registeredSize!)
         // mappedSize may be larger than registeredSize due to chunk alignment
@@ -1277,7 +1359,7 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
             if (err != CUDA_SUCCESS)
             {
                 TLLM_LOG_WARNING("FabricTransfer: failed to import handle for '%s', type=%s, error=%d", name.c_str(),
-                    fabricInfo.handleType == VmmHandleType::kFabric ? "Fabric" : "PosixFd", err);
+                    handleTypeToString(fabricInfo.handleType), err);
                 allChunksMapped = false;
                 anyImportFailed = true;
                 break;
@@ -1347,7 +1429,7 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
         mRemoteFabricMappings[name] = std::move(mapping);
         TLLM_LOG_INFO("FabricTransfer: mapping established for remote agent '%s' with %zu/%zu pools (type=%s)",
             name.c_str(), mRemoteFabricMappings[name].pools.size(), fabricInfo.pools.size(),
-            fabricInfo.handleType == VmmHandleType::kFabric ? "Fabric" : "PosixFd");
+            handleTypeToString(fabricInfo.handleType));
     }
     else if (anyImportFailed)
     {
@@ -1370,37 +1452,68 @@ void FabricTransferHelper::cleanupRemoteFabricMapping(std::string const& name)
         return;
     }
 
-    for (auto& poolMapping : it->second.pools)
+    if (it->second.handleType == VmmHandleType::kCudaIpc)
     {
-        // CUDA VMM requires: unmap -> release -> addressFree
-        if (poolMapping.localVirtAddr != 0)
+        // CudaIpc: just close the IPC mapping (no VMM unmap/release/addressFree)
+        for (auto& poolMapping : it->second.pools)
         {
-            cuMemUnmap(poolMapping.localVirtAddr, poolMapping.mappedSize);
+            if (poolMapping.localVirtAddr != 0)
+            {
+                cudaIpcCloseMemHandle(reinterpret_cast<void*>(poolMapping.localVirtAddr));
+            }
         }
-        for (auto handle : poolMapping.importedHandles)
+    }
+    else
+    {
+        // VMM (Fabric/PosixFd): unmap -> release -> addressFree
+        for (auto& poolMapping : it->second.pools)
         {
-            cuMemRelease(handle);
-        }
-        if (poolMapping.localVirtAddr != 0)
-        {
-            cuMemAddressFree(poolMapping.localVirtAddr, poolMapping.mappedSize);
+            if (poolMapping.localVirtAddr != 0)
+            {
+                cuMemUnmap(poolMapping.localVirtAddr, poolMapping.mappedSize);
+            }
+            for (auto handle : poolMapping.importedHandles)
+            {
+                cuMemRelease(handle);
+            }
+            if (poolMapping.localVirtAddr != 0)
+            {
+                cuMemAddressFree(poolMapping.localVirtAddr, poolMapping.mappedSize);
+            }
         }
     }
     mRemoteFabricMappings.erase(it);
 }
 
-void* FabricTransferHelper::translateToLocalMapping(std::string const& remoteName, uintptr_t remoteAddr) const
+void* FabricTransferHelper::translateToLocalMapping(
+    std::string const& remoteName, uintptr_t remoteAddr, size_t transferSize) const
 {
     auto it = mRemoteFabricMappings.find(remoteName);
     if (it == mRemoteFabricMappings.end())
     {
         return nullptr;
     }
-    return translateToLocalMappingInternal(it->second, remoteAddr);
+    return translateToLocalMappingInternal(it->second, remoteAddr, transferSize);
+}
+
+RemoteFabricMapping const* FabricTransferHelper::getRemoteMapping(std::string const& remoteName) const
+{
+    auto it = mRemoteFabricMappings.find(remoteName);
+    if (it == mRemoteFabricMappings.end())
+    {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+void* FabricTransferHelper::translateAddress(
+    RemoteFabricMapping const& mapping, uintptr_t remoteAddr, size_t transferSize) const
+{
+    return translateToLocalMappingInternal(mapping, remoteAddr, transferSize);
 }
 
 void* FabricTransferHelper::translateToLocalMappingInternal(
-    RemoteFabricMapping const& mapping, uintptr_t remoteAddr) const
+    RemoteFabricMapping const& mapping, uintptr_t remoteAddr, size_t transferSize) const
 {
     for (auto const& pool : mapping.pools)
     {
@@ -1408,6 +1521,19 @@ void* FabricTransferHelper::translateToLocalMappingInternal(
         uint64_t registeredEnd = pool.remoteRegisteredAddr + pool.registeredSize;
         if (remoteAddr >= pool.remoteRegisteredAddr && remoteAddr < registeredEnd)
         {
+            // Validate that the entire range [remoteAddr, remoteAddr + transferSize)
+            // falls within the registered range [remoteRegisteredAddr, registeredEnd)
+            uint64_t transferEnd = remoteAddr + transferSize;
+            if (transferEnd > registeredEnd)
+            {
+                TLLM_LOG_ERROR(
+                    "FabricTransfer: transfer range [0x%lx, 0x%lx) exceeds registered range "
+                    "[0x%lx, 0x%lx). Transfer of %zu bytes rejected.",
+                    remoteAddr, transferEnd, pool.remoteRegisteredAddr, registeredEnd, transferSize);
+                TLLM_THROW("Transfer range [0x%lx, 0x%lx) exceeds registered memory range [0x%lx, 0x%lx)", remoteAddr,
+                    transferEnd, pool.remoteRegisteredAddr, registeredEnd);
+            }
+
             // Address is within registered range
             // Local VA covers [mappedOffset, mappedOffset + mappedSize) relative to remoteBaseAddr
             // Calculate: offset from remoteBaseAddr, then subtract mappedOffset
