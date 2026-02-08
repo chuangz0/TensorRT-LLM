@@ -43,7 +43,20 @@ enum class VmmHandleType : uint8_t
     kNone = 0,    ///< No shareable handle
     kFabric = 1,  ///< CU_MEM_HANDLE_TYPE_FABRIC (cross-node via NVSwitch)
     kPosixFd = 2, ///< CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR (same-machine via UDS)
+    kCudaIpc = 3, ///< cudaMalloc memory via cudaIpcGetMemHandle (same-machine, no UDS needed)
 };
+
+/// @brief Convert VmmHandleType to human-readable string
+inline char const* handleTypeToString(VmmHandleType type)
+{
+    switch (type)
+    {
+    case VmmHandleType::kFabric: return "Fabric";
+    case VmmHandleType::kPosixFd: return "PosixFd";
+    case VmmHandleType::kCudaIpc: return "CudaIpc";
+    default: return "None";
+    }
+}
 
 // ============================================================================
 // Fabric Handle Data Structures for VMM-based KV Cache Transfer Optimization
@@ -115,6 +128,7 @@ struct RemotePoolMapping
 struct RemoteFabricMapping
 {
     std::string remoteName;
+    VmmHandleType handleType{VmmHandleType::kNone}; ///< Handle type used (for cleanup path selection)
     std::vector<RemotePoolMapping> pools;
 };
 
@@ -183,8 +197,19 @@ public:
     /// @brief Clean up remote fabric mapping
     void cleanupRemoteFabricMapping(std::string const& name);
 
-    /// @brief Translate remote address to local mapped address
-    [[nodiscard]] void* translateToLocalMapping(std::string const& remoteName, uintptr_t remoteAddr) const;
+    /// @brief Translate remote address to local mapped address (looks up mapping by name each call)
+    /// @param transferSize Validates that [remoteAddr, remoteAddr + transferSize) is within registered range
+    [[nodiscard]] void* translateToLocalMapping(
+        std::string const& remoteName, uintptr_t remoteAddr, size_t transferSize) const;
+
+    /// @brief Get remote fabric mapping pointer (nullptr if not found). Use to cache the lookup
+    ///        outside hot loops, then call translateAddress() with the cached mapping.
+    [[nodiscard]] RemoteFabricMapping const* getRemoteMapping(std::string const& remoteName) const;
+
+    /// @brief Translate remote address using a pre-looked-up mapping (avoids per-call hash lookup)
+    /// @param transferSize Validates that [remoteAddr, remoteAddr + transferSize) is within registered range
+    [[nodiscard]] void* translateAddress(
+        RemoteFabricMapping const& mapping, uintptr_t remoteAddr, size_t transferSize) const;
 
     /// @brief Submit transfer using cub::DeviceMemcpy::Batched (for small segments)
     [[nodiscard]] std::unique_ptr<TransferStatus> submitWithCubBatched(
@@ -221,8 +246,13 @@ private:
     void exportSingleChunkPosixFd(
         CUdeviceptr chunkBase, size_t chunkSize, CUdeviceptr poolBase, std::vector<FabricMemChunk>& chunks);
 
+    /// @brief Export a cudaMalloc allocation as a single chunk via cudaIpcGetMemHandle
+    void exportSingleChunkCudaIpc(CUdeviceptr poolBase, size_t poolTotalSize, std::vector<FabricMemChunk>& chunks);
+
     /// @brief Translate remote address using specific mapping
-    [[nodiscard]] void* translateToLocalMappingInternal(RemoteFabricMapping const& mapping, uintptr_t remoteAddr) const;
+    /// @param transferSize Validates that [remoteAddr, remoteAddr + transferSize) is within registered range
+    [[nodiscard]] void* translateToLocalMappingInternal(
+        RemoteFabricMapping const& mapping, uintptr_t remoteAddr, size_t transferSize) const;
 
     /// @brief Start UDS server for POSIX FD sharing
     void startUdsServer();

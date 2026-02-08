@@ -51,7 +51,9 @@ class NativePhysMemAllocator:
         prop.allocFlags.gpuDirectRDMACapable = 1
         prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
         if not _is_prop_supported(prop):
-            prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE
+            prop.requestedHandleTypes = (
+                drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+            )
         self._prop = prop
         self._outstanding_handles = set()
 

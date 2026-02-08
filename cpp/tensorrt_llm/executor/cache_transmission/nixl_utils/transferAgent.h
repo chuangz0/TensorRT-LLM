@@ -121,8 +121,9 @@ private:
     std::unique_ptr<FabricTransferHelper> mFabricHelper;
 
     // ========== Fabric transfer helper methods ==========
-    /// @brief Submit transfer using NIXL (fallback)
-    [[nodiscard]] std::unique_ptr<TransferStatus> submitWithNixl(TransferRequest const& request);
+    /// @brief Submit transfer using NIXL (fallback), using pre-coalesced descriptors
+    [[nodiscard]] std::unique_ptr<TransferStatus> submitWithNixl(
+        TransferRequest const& request, MemoryDescs const& coalescedSrc, MemoryDescs const& coalescedDst);
 };
 
 class NixlLoopbackAgent final : public BaseLoopbackAgent

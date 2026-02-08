@@ -724,7 +724,8 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     }
 }
 
-[[nodiscard]] std::unique_ptr<TransferStatus> NixlTransferAgent::submitWithNixl(TransferRequest const& request)
+[[nodiscard]] std::unique_ptr<TransferStatus> NixlTransferAgent::submitWithNixl(
+    TransferRequest const& request, MemoryDescs const& coalescedSrc, MemoryDescs const& coalescedDst)
 {
     nixl_status_t status;
     nixlXferReqH* handle;
@@ -742,23 +743,9 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         localParams.hasNotif = false;
     }
 
-    // Coalesce contiguous memory regions to reduce transfer count (enabled by default)
-    // This matches the coalescing done during registerMemory()
-    // Set TRTLLM_NIXL_DISABLE_COALESCE=1 to disable this optimization
-    if (common::getEnvNixlDisableCoalesce())
-    {
-        status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()),
-            NixlHelper::convertXferDist(request.getSrcDescs()), NixlHelper::convertXferDist(request.getDstDescs()),
-            request.getRemoteName(), handle, &localParams);
-    }
-    else
-    {
-        auto [coalescedSrc, coalescedDst]
-            = NixlHelper::coalesceTransferDescs(request.getSrcDescs(), request.getDstDescs());
-        status
-            = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(coalescedSrc),
-                NixlHelper::convertXferDist(coalescedDst), request.getRemoteName(), handle, &localParams);
-    }
+    // Use pre-coalesced descriptors (coalescing is done once in submitTransferRequests)
+    status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(coalescedSrc),
+        NixlHelper::convertXferDist(coalescedDst), request.getRemoteName(), handle, &localParams);
 
     TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS,
         " rank: %d createXferReq failed with status: %s selfname: %s remoteAgent name: %s",
@@ -773,83 +760,87 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 
 [[nodiscard]] std::unique_ptr<TransferStatus> NixlTransferAgent::submitTransferRequests(TransferRequest const& request)
 {
-
     NVTX3_SCOPED_RANGE(NixlTransferAgent_submitTransferRequests);
-    // ========== Try fabric-based transfer first ==========
+
+    // ========== Step 1: Coalesce transfer descriptors upfront ==========
+    // Merge contiguous src+dst pairs into larger segments to reduce overhead.
+    // Done once here and shared by all three transfer paths (fabric+cub, fabric+cudaMemcpy, NIXL).
+    auto [coalescedSrc, coalescedDst] = common::getEnvNixlDisableCoalesce()
+        ? std::pair<MemoryDescs, MemoryDescs>{request.getSrcDescs(), request.getDstDescs()}
+        : NixlHelper::coalesceTransferDescs(request.getSrcDescs(), request.getDstDescs());
+
+    auto const& srcDescs = coalescedSrc.getDescs();
+    auto const& dstDescs = coalescedDst.getDescs();
+    std::string const& remoteName = request.getRemoteName();
+    size_t const numSegments = srcDescs.size();
+
+    TLLM_CHECK_WITH_INFO(numSegments == dstDescs.size(), "Transfer: srcDescs.size(%zu) != dstDescs.size(%zu)",
+        numSegments, dstDescs.size());
+
+    // ========== Step 2: Try fabric-based transfer ==========
     // Skip fabric path if:
     // 1. Request carries a sync message (needs NIXL notification mechanism)
     // 2. Source or destination is not VRAM (fabric mapping is VRAM-only)
-    bool canUseFabric = mFabricHelper && mFabricHelper->hasRemoteMapping(request.getRemoteName())
-        && !request.getSyncMessage().has_value() && request.getSrcDescs().getType() == MemoryType::kVRAM
-        && request.getDstDescs().getType() == MemoryType::kVRAM;
-    if (canUseFabric)
+    // Look up remote mapping once (O(1) amortized hash lookup), then reuse in the hot loop.
+    // Previously translateToLocalMapping() did this find() on every iteration — 10K+ redundant lookups.
+    RemoteFabricMapping const* remoteMapping
+        = (mFabricHelper && !request.getSyncMessage().has_value() && coalescedSrc.getType() == MemoryType::kVRAM
+              && coalescedDst.getType() == MemoryType::kVRAM)
+        ? mFabricHelper->getRemoteMapping(remoteName)
+        : nullptr;
+
+    if (remoteMapping != nullptr)
     {
-        auto const& srcDescs = request.getSrcDescs().getDescs();
-        auto const& dstDescs = request.getDstDescs().getDescs();
-        std::string const& remoteName = request.getRemoteName();
-
-        TLLM_CHECK_WITH_INFO(srcDescs.size() == dstDescs.size(),
-            "Fabric transfer: srcDescs.size(%zu) != dstDescs.size(%zu)", srcDescs.size(), dstDescs.size());
-
-        // NIXL convention: srcDescs = LOCAL addresses, dstDescs = REMOTE addresses
-        // Translate the REMOTE (dstDescs) addresses to locally mapped pointers
+        // Single loop: translate remote addresses + accumulate totalBytes + build pointer arrays.
+        // Merges what was previously two separate loops to avoid iterating 10K+ descriptors twice.
         std::vector<void*> srcPtrs;
         std::vector<void*> dstPtrs;
         std::vector<size_t> sizes;
-        srcPtrs.reserve(srcDescs.size());
-        dstPtrs.reserve(srcDescs.size());
-        sizes.reserve(srcDescs.size());
+        srcPtrs.reserve(numSegments);
+        dstPtrs.reserve(numSegments);
+        sizes.reserve(numSegments);
 
+        // Hoist the op check out of the hot loop (invariant per request)
+        bool const isWrite = (request.getOp() == TransferOp::kWRITE);
         bool allMapped = true;
-        for (size_t i = 0; i < srcDescs.size(); ++i)
+        size_t totalBytes = 0;
+
+        for (size_t i = 0; i < numSegments; ++i)
         {
-            // dstDescs are REMOTE addresses in NIXL convention
-            auto mappedRemotePtr = mFabricHelper->translateToLocalMapping(remoteName, dstDescs[i].getAddr());
+            // NIXL convention: dstDescs are REMOTE addresses
+            // Use cached mapping to avoid per-iteration hash map lookup
+            size_t const segSize = srcDescs[i].getLen();
+            auto* mappedRemotePtr = mFabricHelper->translateAddress(*remoteMapping, dstDescs[i].getAddr(), segSize);
             if (mappedRemotePtr == nullptr)
             {
                 allMapped = false;
                 break;
             }
 
-            if (request.getOp() == TransferOp::kWRITE)
-            {
-                // WRITE: copy from local(srcDescs) to mapped remote(dstDescs)
-                srcPtrs.push_back(reinterpret_cast<void*>(srcDescs[i].getAddr()));
-                dstPtrs.push_back(mappedRemotePtr);
-            }
-            else
-            {
-                // READ: copy from mapped remote(dstDescs) to local(srcDescs)
-                srcPtrs.push_back(mappedRemotePtr);
-                dstPtrs.push_back(reinterpret_cast<void*>(srcDescs[i].getAddr()));
-            }
-            sizes.push_back(srcDescs[i].getLen());
+            auto* localPtr = reinterpret_cast<void*>(srcDescs[i].getAddr());
+            totalBytes += segSize;
+
+            // WRITE: local -> mapped remote; READ: mapped remote -> local
+            srcPtrs.push_back(isWrite ? localPtr : mappedRemotePtr);
+            dstPtrs.push_back(isWrite ? mappedRemotePtr : localPtr);
+            sizes.push_back(segSize);
         }
 
         if (allMapped)
         {
-            TLLM_LOG_INFO("NixlTransferAgent::submitTransferRequests: using fabric path for %zu segments to %s (op=%s)",
-                srcDescs.size(), remoteName.c_str(), request.getOp() == TransferOp::kWRITE ? "WRITE" : "READ");
-
-            // Calculate average segment size to choose transfer method
-            size_t totalBytes = 0;
-            for (auto s : sizes)
-            {
-                totalBytes += s;
-            }
-            size_t avgSegmentSize = sizes.empty() ? 0 : totalBytes / sizes.size();
-
+            // ========== Step 3: Choose fabric transfer method based on avg segment size ==========
             // Threshold: 16KB. Small segments benefit from cub kernel-based copy;
             // larger segments benefit from cudaMemcpyBatchAsync with DMA engines.
-            static constexpr size_t kCubThreshold = 16 * 1024; // 16 KB
+            size_t const avgSegmentSize = numSegments == 0 ? 0 : totalBytes / numSegments;
+            size_t const kCubThreshold = common::getEnvFabricBatchThresholdKB() * 1024;
+            char const* opStr = isWrite ? "WRITE" : "READ";
 
             if (avgSegmentSize < kCubThreshold)
             {
                 TLLM_LOG_DEBUG(
                     "NixlTransferAgent::submitTransferRequests: fabric+cub path for %zu segments "
-                    "(avgSize=%zuB) to %s (op=%s)",
-                    sizes.size(), avgSegmentSize, remoteName.c_str(),
-                    request.getOp() == TransferOp::kWRITE ? "WRITE" : "READ");
+                    "(avgSize=%zuB, total=%zuB) to %s (op=%s)",
+                    numSegments, avgSegmentSize, totalBytes, remoteName.c_str(), opStr);
 
                 return mFabricHelper->submitWithCubBatched(srcPtrs, dstPtrs, sizes);
             }
@@ -857,9 +848,8 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
             {
                 TLLM_LOG_DEBUG(
                     "NixlTransferAgent::submitTransferRequests: fabric+cudaMemcpyBatch path for %zu segments "
-                    "(avgSize=%zuB) to %s (op=%s)",
-                    sizes.size(), avgSegmentSize, remoteName.c_str(),
-                    request.getOp() == TransferOp::kWRITE ? "WRITE" : "READ");
+                    "(avgSize=%zuB, total=%zuB) to %s (op=%s)",
+                    numSegments, avgSegmentSize, totalBytes, remoteName.c_str(), opStr);
 
                 return mFabricHelper->submitWithCudaMemcpyBatch(srcPtrs, dstPtrs, sizes);
             }
@@ -873,8 +863,10 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         }
     }
 
-    // ========== Fallback to NIXL ==========
-    return submitWithNixl(request);
+    // ========== Step 4: Fallback to NIXL (with pre-coalesced descriptors) ==========
+    TLLM_LOG_DEBUG("NixlTransferAgent::submitTransferRequests: NIXL path for %zu segments to %s (op=%s)", numSegments,
+        remoteName.c_str(), request.getOp() == TransferOp::kWRITE ? "WRITE" : "READ");
+    return submitWithNixl(request, coalescedSrc, coalescedDst);
 }
 
 void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage const& syncMessage)
