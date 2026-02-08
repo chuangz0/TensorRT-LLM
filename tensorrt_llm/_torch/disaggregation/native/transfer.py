@@ -15,7 +15,6 @@ try:
     from cuda.bindings import runtime as cudart
 except ImportError:
     from cuda import cudart
-
 import tensorrt_llm.bindings
 from tensorrt_llm import Mapping, logger
 from tensorrt_llm._torch.disaggregation.base.agent import (
@@ -559,6 +558,9 @@ class Sender:
         CUASSERT(cudart.cudaSetDevice(device_id))
 
         task_queue = self._send_task_queues[thread_idx]
+        torch.cuda.set_device(self._device_id)
+        # ensure the context is created, otherwise, some MPI calls will fail.
+        CUASSERT(cudart.cudaSetDevice(self._device_id))
         while True:
             agent_args = task_queue.get()
             if agent_args is None:

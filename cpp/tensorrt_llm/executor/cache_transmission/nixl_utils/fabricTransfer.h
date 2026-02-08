@@ -85,7 +85,7 @@ struct FabricMemPool
 struct FabricMemInfo
 {
     static constexpr uint32_t kMagic = 0x46414252; ///< "FABR"
-    static constexpr uint32_t kVersion = 4;        ///< Version 4: added handleType + udsPath for POSIX FD support
+    static constexpr uint32_t kVersion = 5;        ///< Version 5: numChunks/numPools widened to uint64
 
     bool supported{false};
     VmmHandleType handleType{VmmHandleType::kNone}; ///< Handle type (fabric or POSIX FD)
@@ -204,27 +204,22 @@ private:
     /// @brief Get VMM allocation granularity
     [[nodiscard]] size_t getVmmGranularity();
 
-    /// @brief Get buffer_id for a given address
-    [[nodiscard]] unsigned long long getBufferId(CUdeviceptr addr);
-
-    /// @brief Detect all chunk boundaries and export fabric handles within registered range
+    /// @brief Detect all chunk boundaries and export fabric handles within registered range.
+    /// Uses cuMemGetAddressRange to iterate through physical chunk mappings — O(N) in chunk count.
     /// @param scanStart Start of the registered range to scan
     /// @param scanSize Size of the registered range to scan
     /// @param poolBase Base address of the entire VMM pool (for virtAddrOffset calculation)
-    void detectAndExportChunks(
-        CUdeviceptr scanStart, size_t scanSize, CUdeviceptr poolBase, std::vector<FabricMemChunk>& chunks);
+    /// @param poolTotalSize Total size of the VMM pool
+    void detectAndExportChunks(CUdeviceptr scanStart, size_t scanSize, CUdeviceptr poolBase, size_t poolTotalSize,
+        std::vector<FabricMemChunk>& chunks);
 
-    /// @brief Find all chunk boundaries recursively using binary search
-    void findAllBoundariesRecursive(
-        CUdeviceptr left, CUdeviceptr right, size_t granularity, std::vector<CUdeviceptr>& boundaries);
-
-    /// @brief Export a single chunk's fabric handle
+    /// @brief Export a single chunk's fabric handle (chunkBase/chunkSize are real boundaries)
     void exportSingleChunk(
-        CUdeviceptr chunkAddr, size_t chunkSize, CUdeviceptr poolBase, std::vector<FabricMemChunk>& chunks);
+        CUdeviceptr chunkBase, size_t chunkSize, CUdeviceptr poolBase, std::vector<FabricMemChunk>& chunks);
 
-    /// @brief Export a single chunk's POSIX FD handle
+    /// @brief Export a single chunk's POSIX FD handle (chunkBase/chunkSize are real boundaries)
     void exportSingleChunkPosixFd(
-        CUdeviceptr chunkAddr, size_t chunkSize, CUdeviceptr poolBase, std::vector<FabricMemChunk>& chunks);
+        CUdeviceptr chunkBase, size_t chunkSize, CUdeviceptr poolBase, std::vector<FabricMemChunk>& chunks);
 
     /// @brief Translate remote address using specific mapping
     [[nodiscard]] void* translateToLocalMappingInternal(RemoteFabricMapping const& mapping, uintptr_t remoteAddr) const;
@@ -239,6 +234,7 @@ private:
     // CUDA resources for fabric batch transfer
     std::shared_ptr<runtime::CudaStream> mFabricStream;
     std::shared_ptr<runtime::BufferManager> mBufferManager;
+    std::once_flag mCudaResourcesInitFlag; ///< Ensures CUDA resources initialized exactly once
 
     // Pre-allocated buffers for cub::DeviceMemcpy::Batched
     struct PreallocatedBuffers
@@ -273,6 +269,7 @@ private:
     // ========== POSIX FD specific members ==========
     // Exported file descriptors (one per chunk, in pool/chunk order)
     std::vector<int> mExportedFds;
+    std::mutex mExportedFdsMutex; ///< Protects mExportedFds (shared with UDS server thread)
 
     // UDS server for sharing POSIX FDs with remote processes
     std::string mUdsPath;                       ///< UDS socket file path

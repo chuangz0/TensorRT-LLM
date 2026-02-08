@@ -235,7 +235,7 @@ void FabricMemPool::serialize(std::ostream& os) const
     os.write(reinterpret_cast<char const*>(&registeredSize), sizeof(registeredSize));
     os.write(reinterpret_cast<char const*>(&mappedOffset), sizeof(mappedOffset));
     os.write(reinterpret_cast<char const*>(&mappedSize), sizeof(mappedSize));
-    uint32_t numChunks = static_cast<uint32_t>(chunks.size());
+    uint64_t numChunks = chunks.size();
     os.write(reinterpret_cast<char const*>(&numChunks), sizeof(numChunks));
     for (auto const& chunk : chunks)
     {
@@ -253,10 +253,16 @@ FabricMemPool FabricMemPool::deserialize(std::istream& is)
     is.read(reinterpret_cast<char*>(&pool.registeredSize), sizeof(pool.registeredSize));
     is.read(reinterpret_cast<char*>(&pool.mappedOffset), sizeof(pool.mappedOffset));
     is.read(reinterpret_cast<char*>(&pool.mappedSize), sizeof(pool.mappedSize));
-    uint32_t numChunks;
+    uint64_t numChunks;
     is.read(reinterpret_cast<char*>(&numChunks), sizeof(numChunks));
+    constexpr uint64_t kMaxChunks = 1000000; // ~80MB at 80 bytes/chunk, OOM guard only
+    if (numChunks > kMaxChunks)
+    {
+        is.setstate(std::ios::failbit);
+        return pool;
+    }
     pool.chunks.reserve(numChunks);
-    for (uint32_t i = 0; i < numChunks; ++i)
+    for (uint64_t i = 0; i < numChunks; ++i)
     {
         pool.chunks.push_back(FabricMemChunk::deserialize(is));
     }
@@ -284,7 +290,7 @@ std::string FabricMemInfo::serialize() const
         oss.write(udsPath.data(), udsPathLen);
     }
     // Pools
-    uint32_t numPools = static_cast<uint32_t>(pools.size());
+    uint64_t numPools = pools.size();
     oss.write(reinterpret_cast<char const*>(&numPools), sizeof(numPools));
     for (auto const& pool : pools)
     {
@@ -329,10 +335,15 @@ std::optional<FabricMemInfo> FabricMemInfo::deserialize(std::string_view data)
     }
 
     // Pools
-    uint32_t numPools;
+    uint64_t numPools;
     iss.read(reinterpret_cast<char*>(&numPools), sizeof(numPools));
+    constexpr uint64_t kMaxPools = 100000; // OOM guard only
+    if (numPools > kMaxPools)
+    {
+        return std::nullopt;
+    }
     info.pools.reserve(numPools);
-    for (uint32_t i = 0; i < numPools; ++i)
+    for (uint64_t i = 0; i < numPools; ++i)
     {
         info.pools.push_back(FabricMemPool::deserialize(iss));
     }
@@ -369,6 +380,11 @@ bool FabricTransferStatus::isCompleted() const
         mCompleted.store(true, std::memory_order_release);
         return true;
     }
+    if (result != cudaErrorNotReady)
+    {
+        TLLM_LOG_ERROR("FabricTransfer: cudaEventQuery returned unexpected error: %d (%s)", static_cast<int>(result),
+            cudaGetErrorString(result));
+    }
     return false;
 }
 
@@ -396,6 +412,12 @@ TransferState FabricTransferStatus::wait(int64_t timeout_ms) const
         {
             mCompleted.store(true, std::memory_order_release);
             return TransferState::kSUCCESS;
+        }
+        if (result != cudaErrorNotReady)
+        {
+            TLLM_LOG_ERROR("FabricTransfer: cudaEventQuery returned unexpected error: %d (%s)",
+                static_cast<int>(result), cudaGetErrorString(result));
+            return TransferState::kFAILURE;
         }
 
         auto elapsed
@@ -443,14 +465,17 @@ FabricTransferHelper::~FabricTransferHelper()
     {
         for (auto& poolMapping : mapping.pools)
         {
-            // Unmap and release handles
+            // CUDA VMM requires: unmap -> release -> addressFree
+            if (poolMapping.localVirtAddr != 0)
+            {
+                cuMemUnmap(poolMapping.localVirtAddr, poolMapping.mappedSize);
+            }
             for (auto handle : poolMapping.importedHandles)
             {
                 cuMemRelease(handle);
             }
             if (poolMapping.localVirtAddr != 0)
             {
-                cuMemUnmap(poolMapping.localVirtAddr, poolMapping.mappedSize);
                 cuMemAddressFree(poolMapping.localVirtAddr, poolMapping.mappedSize);
             }
         }
@@ -471,11 +496,16 @@ bool FabricTransferHelper::hasFabricImportFailed(std::string const& remoteName) 
 
 void FabricTransferHelper::ensureCudaResourcesInitialized()
 {
-    if (!mFabricStream)
-    {
-        mFabricStream = std::make_shared<runtime::CudaStream>();
-        mBufferManager = std::make_shared<runtime::BufferManager>(mFabricStream);
-    }
+    std::call_once(mCudaResourcesInitFlag,
+        [this]()
+        {
+            // CRITICAL: Set the correct CUDA device before creating stream/buffers.
+            // This may be called from a background thread (e.g., Python's _process_task_queue)
+            // where the default CUDA device is 0, not necessarily mLocalDevice.
+            TLLM_CUDA_CHECK(cudaSetDevice(static_cast<int>(mLocalDevice)));
+            mFabricStream = std::make_shared<runtime::CudaStream>();
+            mBufferManager = std::make_shared<runtime::BufferManager>(mFabricStream);
+        });
 }
 
 void FabricTransferHelper::ensurePreallocBuffers(size_t batchSize, size_t cubTempBytes)
@@ -577,6 +607,9 @@ void FabricTransferHelper::startUdsServer()
                     continue;
                 }
 
+                // Lock mExportedFds for thread-safe access (shared with removeFabricHandles)
+                std::lock_guard<std::mutex> fdHanldeLock(mExportedFdsMutex);
+
                 uint32_t numAvailable = static_cast<uint32_t>(mExportedFds.size());
                 ssize_t bytesWritten = ::write(clientSocket, &numAvailable, sizeof(numAvailable));
                 if (bytesWritten != sizeof(numAvailable))
@@ -646,6 +679,8 @@ void FabricTransferHelper::stopUdsServer()
 
 void FabricTransferHelper::detectAndExportFabricHandles(RegisterDescs const& descs)
 {
+    TLLM_CUDA_CHECK(cudaSetDevice(static_cast<int>(mLocalDevice)));
+
     // Track which pools we've already processed to avoid duplicates
     // Key: poolBaseAddr, Value: index in mLocalFabricInfo.pools
     std::unordered_map<uint64_t, size_t> processedPools;
@@ -691,14 +726,32 @@ void FabricTransferHelper::detectAndExportFabricHandles(RegisterDescs const& des
             continue;
         }
 
-        // Step 2: Get the entire virtual address range
-        // Note: cuMemGetAddressRange returns the full reserved VA range, not just the registered portion
+        // Step 2: Get the virtual address range
+        // Note: For VMM multi-chunk pools (multiple cuMemMap calls within a single cuMemAddressReserve),
+        // cuMemGetAddressRange returns the range of the individual mapping that the pointer falls in,
+        // NOT the entire reserved VA range. We query both the start and end of the registered region
+        // and take the union to cover all physical allocations that overlap with the registered range.
         CUdeviceptr basePtr;
         size_t totalSize;
         err = cuMemGetAddressRange(&basePtr, &totalSize, ptr);
         if (err != CUDA_SUCCESS)
         {
             continue;
+        }
+
+        // Query end of registered range to handle multi-chunk VMM pools
+        if (descSize > 1)
+        {
+            CUdeviceptr endBasePtr;
+            size_t endTotalSize;
+            CUresult endErr = cuMemGetAddressRange(&endBasePtr, &endTotalSize, ptr + descSize - 1);
+            if (endErr == CUDA_SUCCESS)
+            {
+                CUdeviceptr poolStart = std::min(basePtr, endBasePtr);
+                CUdeviceptr poolEndAddr = std::max(basePtr + totalSize, endBasePtr + endTotalSize);
+                basePtr = poolStart;
+                totalSize = poolEndAddr - poolStart;
+            }
         }
 
         // Step 3: Check if we've already processed this pool (same base address)
@@ -717,14 +770,15 @@ void FabricTransferHelper::detectAndExportFabricHandles(RegisterDescs const& des
             if (newStart < existingStart)
             {
                 size_t extendSize = std::min(existingStart, newEnd) - newStart;
-                detectAndExportChunks(newStart, extendSize, basePtr, existingPool.chunks);
+                detectAndExportChunks(newStart, extendSize, basePtr, existingPool.poolTotalSize, existingPool.chunks);
             }
             // Case 2: new range extends after existing range
             if (newEnd > existingEnd)
             {
                 CUdeviceptr extendStart = std::max(existingEnd, newStart);
                 size_t extendSize = newEnd - extendStart;
-                detectAndExportChunks(extendStart, extendSize, basePtr, existingPool.chunks);
+                detectAndExportChunks(
+                    extendStart, extendSize, basePtr, existingPool.poolTotalSize, existingPool.chunks);
             }
 
             // Update registered range to cover both
@@ -763,7 +817,7 @@ void FabricTransferHelper::detectAndExportFabricHandles(RegisterDescs const& des
         pool.registeredSize = descSize; // Record actual registered size
 
         // Only export chunks that overlap with the registered range [ptr, ptr + descSize)
-        detectAndExportChunks(ptr, descSize, basePtr, pool.chunks);
+        detectAndExportChunks(ptr, descSize, basePtr, totalSize, pool.chunks);
 
         if (!pool.chunks.empty())
         {
@@ -808,6 +862,8 @@ void FabricTransferHelper::detectAndExportFabricHandles(RegisterDescs const& des
 
 void FabricTransferHelper::removeFabricHandles(RegisterDescs const& descs)
 {
+    TLLM_CUDA_CHECK(cudaSetDevice(static_cast<int>(mLocalDevice)));
+
     if (mLocalFabricInfo.pools.empty())
     {
         return;
@@ -836,38 +892,42 @@ void FabricTransferHelper::removeFabricHandles(RegisterDescs const& descs)
         return;
     }
 
-    // Remove matching pools (iterate in reverse to handle index shifting from erase)
+    // Remove matching pools (forward iteration with erase-return pattern)
     bool isPosixFdMode = (mDetectedHandleType == VmmHandleType::kPosixFd);
     for (auto it = mLocalFabricInfo.pools.begin(); it != mLocalFabricInfo.pools.end();)
     {
         if (poolBasesToRemove.find(it->poolBaseAddr) != poolBasesToRemove.end())
         {
             // For POSIX FD mode: close and remove corresponding exported FDs
-            if (isPosixFdMode && !mExportedFds.empty())
+            if (isPosixFdMode)
             {
-                // Calculate the FD offset for this pool (sum of chunks in earlier pools)
-                size_t fdOffset = 0;
-                for (auto prev = mLocalFabricInfo.pools.begin(); prev != it; ++prev)
+                std::lock_guard<std::mutex> fdHanldeLock(mExportedFdsMutex);
+                if (!mExportedFds.empty())
                 {
-                    fdOffset += prev->chunks.size();
-                }
-                size_t fdCount = it->chunks.size();
-
-                // Close FDs for this pool
-                size_t fdEnd = std::min(fdOffset + fdCount, mExportedFds.size());
-                for (size_t i = fdOffset; i < fdEnd; ++i)
-                {
-                    if (mExportedFds[i] >= 0)
+                    // Calculate the FD offset for this pool (sum of chunks in earlier pools)
+                    size_t fdOffset = 0;
+                    for (auto prev = mLocalFabricInfo.pools.begin(); prev != it; ++prev)
                     {
-                        ::close(mExportedFds[i]);
+                        fdOffset += prev->chunks.size();
                     }
-                }
+                    size_t fdCount = it->chunks.size();
 
-                // Erase FDs from the vector
-                if (fdOffset < mExportedFds.size())
-                {
-                    mExportedFds.erase(mExportedFds.begin() + static_cast<ptrdiff_t>(fdOffset),
-                        mExportedFds.begin() + static_cast<ptrdiff_t>(fdEnd));
+                    // Close FDs for this pool
+                    size_t fdEnd = std::min(fdOffset + fdCount, mExportedFds.size());
+                    for (size_t i = fdOffset; i < fdEnd; ++i)
+                    {
+                        if (mExportedFds[i] >= 0)
+                        {
+                            ::close(mExportedFds[i]);
+                        }
+                    }
+
+                    // Erase FDs from the vector
+                    if (fdOffset < mExportedFds.size())
+                    {
+                        mExportedFds.erase(mExportedFds.begin() + static_cast<ptrdiff_t>(fdOffset),
+                            mExportedFds.begin() + static_cast<ptrdiff_t>(fdEnd));
+                    }
                 }
             }
 
@@ -914,6 +974,7 @@ size_t FabricTransferHelper::getVmmGranularity()
     CUmemAllocationProp prop = {};
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = static_cast<int>(mLocalDevice);
 
     size_t granularity = 0;
     auto err = cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
@@ -924,349 +985,110 @@ size_t FabricTransferHelper::getVmmGranularity()
     return granularity;
 }
 
-unsigned long long FabricTransferHelper::getBufferId(CUdeviceptr addr)
+void FabricTransferHelper::detectAndExportChunks(CUdeviceptr scanStart, size_t scanSize, CUdeviceptr poolBase,
+    size_t poolTotalSize, std::vector<FabricMemChunk>& chunks)
 {
-    unsigned long long bufferId = 0;
-    auto err = cuPointerGetAttribute(&bufferId, CU_POINTER_ATTRIBUTE_BUFFER_ID, addr);
-    // Return 0 for unmapped/invalid addresses - this will be treated as a boundary
-    if (err != CUDA_SUCCESS)
-    {
-        return 0;
-    }
-    return bufferId;
-}
-
-void FabricTransferHelper::detectAndExportChunks(
-    CUdeviceptr scanStart, size_t scanSize, CUdeviceptr poolBase, std::vector<FabricMemChunk>& chunks)
-{
-    // scanStart/scanSize: the registered range to scan (user's registerMemory range)
-    // poolBase: the base of the entire VMM pool (from cuMemGetAddressRange), used for virtAddrOffset calculation
-    size_t granularity = getVmmGranularity();
-
-    // Check if scanStart is mapped
-    unsigned long long startBufferId = getBufferId(scanStart);
-    if (startBufferId == 0)
-    {
-        TLLM_LOG_DEBUG("FabricTransfer: scanStart 0x%lx is not mapped, scanning for mapped regions", scanStart);
-    }
-
+    // Iterate through the registered range using cuMemGetAddressRange to discover real chunk boundaries.
+    // cuMemGetAddressRange(ptr) returns the [base, size) of the individual cuMemMap mapping that ptr
+    // falls within, which directly gives us the physical allocation's VA boundaries. This is O(N)
+    // in the number of chunks, far simpler than the previous binary search approach.
+    CUdeviceptr current = scanStart;
     CUdeviceptr scanEnd = scanStart + scanSize;
 
-    // Dispatch to correct export function based on detected handle type
-    auto exportChunkFn = [this](CUdeviceptr addr, size_t size, CUdeviceptr base, std::vector<FabricMemChunk>& c)
+    while (current < scanEnd)
     {
+        // Get the real mapping range for this address
+        CUdeviceptr chunkBase;
+        size_t chunkSize;
+        CUresult err = cuMemGetAddressRange(&chunkBase, &chunkSize, current);
+        if (err != CUDA_SUCCESS)
+        {
+            // Unmapped region — skip forward by granularity to find next mapped region
+            size_t granularity = getVmmGranularity();
+            CUdeviceptr nextAligned = ((current / granularity) + 1) * granularity;
+            current = nextAligned;
+            continue;
+        }
+
+        // Export this chunk with its real physical boundaries
         if (mDetectedHandleType == VmmHandleType::kPosixFd)
         {
-            exportSingleChunkPosixFd(addr, size, base, c);
+            exportSingleChunkPosixFd(chunkBase, chunkSize, poolBase, chunks);
         }
         else
         {
-            exportSingleChunk(addr, size, base, c);
-        }
-    };
-
-    if (scanSize <= granularity)
-    {
-        // Single chunk - only export if mapped
-        if (startBufferId != 0)
-        {
-            exportChunkFn(scanStart, scanSize, poolBase, chunks);
-        }
-        return;
-    }
-
-    // Find all chunk boundaries using binary search with buffer_id
-    std::vector<CUdeviceptr> boundaries;
-    findAllBoundariesRecursive(scanStart, scanEnd, granularity, boundaries);
-    std::sort(boundaries.begin(), boundaries.end());
-
-    // Export each chunk based on boundaries
-    // Note: boundaries now include transitions to/from unmapped regions
-    CUdeviceptr chunkStart = scanStart;
-    for (CUdeviceptr boundary : boundaries)
-    {
-        // Only export if the chunk is mapped (has valid buffer_id)
-        if (getBufferId(chunkStart) != 0 && boundary > chunkStart)
-        {
-            exportChunkFn(chunkStart, boundary - chunkStart, poolBase, chunks);
-        }
-        chunkStart = boundary;
-    }
-
-    // Export the last chunk if mapped
-    if (chunkStart < scanEnd && getBufferId(chunkStart) != 0)
-    {
-        exportChunkFn(chunkStart, scanEnd - chunkStart, poolBase, chunks);
-    }
-}
-
-void FabricTransferHelper::findAllBoundariesRecursive(
-    CUdeviceptr left, CUdeviceptr right, size_t granularity, std::vector<CUdeviceptr>& boundaries)
-{
-    if (right - left <= granularity)
-    {
-        return; // Range too small, no boundary possible
-    }
-
-    // Get buffer_id at left and right endpoints
-    unsigned long long leftId = getBufferId(left);
-
-    // If left address is unmapped (buffer_id == 0), skip this region
-    // This can happen if the reserved VA range has gaps in mapping
-    if (leftId == 0)
-    {
-        // Try to find the first mapped address
-        CUdeviceptr probe = left + granularity;
-        while (probe < right)
-        {
-            unsigned long long probeId = getBufferId(probe);
-            if (probeId != 0)
-            {
-                // Found a mapped region, record boundary and continue from here
-                boundaries.push_back(probe);
-                findAllBoundariesRecursive(probe, right, granularity, boundaries);
-                return;
-            }
-            probe += granularity;
-        }
-        return; // Entire range is unmapped
-    }
-
-    CUdeviceptr rightProbe = right - granularity; // right is open interval
-    if (rightProbe < left)
-    {
-        rightProbe = left;
-    }
-    unsigned long long rightId = getBufferId(rightProbe);
-
-    // If right is unmapped or same as left, check if there's a boundary
-    if (rightId == 0 || leftId == rightId)
-    {
-        // If rightId == 0, there might be an unmapped gap - need to find it
-        if (rightId == 0 && leftId != 0)
-        {
-            // Binary search to find where mapping ends
-            CUdeviceptr lo = left;
-            CUdeviceptr hi = right;
-
-            while (hi - lo > granularity)
-            {
-                CUdeviceptr mid = lo + ((hi - lo) / 2 / granularity) * granularity;
-                if (mid <= lo)
-                {
-                    mid = lo + granularity;
-                }
-
-                unsigned long long midId = getBufferId(mid);
-                if (midId == leftId)
-                {
-                    lo = mid;
-                }
-                else
-                {
-                    hi = mid;
-                }
-            }
-            // hi is where the current chunk ends (either unmapped or different chunk)
-            if (hi < right)
-            {
-                boundaries.push_back(hi);
-                findAllBoundariesRecursive(hi, right, granularity, boundaries);
-            }
-        }
-        return; // Same chunk or no more boundaries
-    }
-
-    // At least one boundary exists, use binary search to find the first one
-    CUdeviceptr lo = left;
-    CUdeviceptr hi = right;
-
-    while (hi - lo > granularity)
-    {
-        // Calculate midpoint, aligned to granularity
-        CUdeviceptr mid = lo + ((hi - lo) / 2 / granularity) * granularity;
-        if (mid <= lo)
-        {
-            mid = lo + granularity; // Ensure progress
+            exportSingleChunk(chunkBase, chunkSize, poolBase, chunks);
         }
 
-        unsigned long long midId = getBufferId(mid);
-
-        if (midId == leftId)
-        {
-            lo = mid; // Boundary is in (mid, hi)
-        }
-        else
-        {
-            hi = mid; // Boundary is in [lo, mid], or mid is the boundary
-        }
+        // Advance past this chunk's mapping
+        current = chunkBase + chunkSize;
     }
-
-    // hi is the found boundary (start of new chunk)
-    boundaries.push_back(hi);
-
-    // Recursively find more boundaries in [hi, right)
-    findAllBoundariesRecursive(hi, right, granularity, boundaries);
 }
 
 void FabricTransferHelper::exportSingleChunk(
-    CUdeviceptr chunkAddr, size_t chunkSize, CUdeviceptr poolBase, std::vector<FabricMemChunk>& chunks)
+    CUdeviceptr chunkBase, size_t chunkSize, CUdeviceptr poolBase, std::vector<FabricMemChunk>& chunks)
 {
-    // IMPORTANT: chunkAddr might be in the middle of a physical memory block!
-    // cuMemRetainAllocationHandle returns the handle for the ENTIRE physical block.
-    // cuMemMap requires the EXACT size of the physical block, so we must use the real boundaries.
+    // chunkBase/chunkSize are the real physical allocation boundaries (from cuMemGetAddressRange).
+    // No boundary discovery needed — just retain, dedup, export.
+
+    // Deduplication: skip if this chunk was already exported
+    uint64_t offset = chunkBase - poolBase;
+    for (auto const& existing : chunks)
+    {
+        if (existing.virtAddrOffset == offset)
+        {
+            return; // Already exported
+        }
+    }
 
     // Get allocation handle (must retain before export)
     CUmemGenericAllocationHandle allocHandle;
-    auto err = cuMemRetainAllocationHandle(&allocHandle, reinterpret_cast<void*>(chunkAddr));
+    auto err = cuMemRetainAllocationHandle(&allocHandle, reinterpret_cast<void*>(chunkBase));
     if (err != CUDA_SUCCESS)
     {
         return; // Not VMM allocated memory
     }
 
-    // Get the REAL physical chunk boundaries using cuMemGetAllocationGranularity approach
-    // The handle represents the entire physical allocation, we need its actual size
-    CUmemAllocationProp prop = {};
-    err = cuMemGetAllocationPropertiesFromHandle(&prop, allocHandle);
-    if (err != CUDA_SUCCESS)
-    {
-        cuMemRelease(allocHandle);
-        return;
-    }
-
-    // Get the actual mapped range for this address to find the true chunk start
-    // Note: Within a VMM pool, each physical chunk is mapped contiguously
-    // The buffer_id tells us chunk boundaries, but we need the actual start address
-    CUdeviceptr actualChunkStart = chunkAddr;
-    size_t actualChunkSize = chunkSize;
-
-    // Find the real chunk start by checking buffer_id going backwards
-    // This is necessary because chunkAddr might be in the middle of a physical chunk
-    size_t granularity = getVmmGranularity();
-    unsigned long long currentBufferId = getBufferId(chunkAddr);
-    if (currentBufferId != 0)
-    {
-        // Search backwards to find the real start of this chunk
-        CUdeviceptr probe = chunkAddr;
-        while (probe > poolBase)
-        {
-            CUdeviceptr prevAddr = probe - granularity;
-            if (prevAddr < poolBase)
-            {
-                break;
-            }
-            unsigned long long prevBufferId = getBufferId(prevAddr);
-            if (prevBufferId != currentBufferId)
-            {
-                break; // Found the boundary
-            }
-            probe = prevAddr;
-        }
-        actualChunkStart = probe;
-
-        // Search forwards to find the real end of this chunk
-        CUdeviceptr endProbe = chunkAddr + chunkSize;
-        // We need to find the true end, not just chunkAddr + chunkSize
-        while (true)
-        {
-            unsigned long long probeBufferId = getBufferId(endProbe);
-            if (probeBufferId != currentBufferId)
-            {
-                break;
-            }
-            endProbe += granularity;
-        }
-        actualChunkSize = endProbe - actualChunkStart;
-    }
-
-    // Check if we've already exported this exact chunk (same start address)
-    for (auto const& existing : chunks)
-    {
-        if (existing.virtAddrOffset == actualChunkStart - poolBase)
-        {
-            // Already exported this chunk
-            cuMemRelease(allocHandle);
-            return;
-        }
-    }
-
     FabricMemChunk chunk;
-    chunk.virtAddrOffset = actualChunkStart - poolBase; // Use REAL chunk start
-    chunk.size = actualChunkSize;                       // Use REAL chunk size
+    chunk.virtAddrOffset = offset;
+    chunk.size = chunkSize;
 
     // Export fabric handle
     err = cuMemExportToShareableHandle(
         reinterpret_cast<void*>(chunk.fabricHandle), allocHandle, CU_MEM_HANDLE_TYPE_FABRIC, 0);
 
-    // Must release retained handle to avoid memory leak
     cuMemRelease(allocHandle);
 
     if (err == CUDA_SUCCESS)
     {
-        TLLM_LOG_DEBUG("FabricTransfer: exported fabric chunk at offset=%lu, size=%zu (requested addr=0x%lx)",
-            chunk.virtAddrOffset, chunk.size, chunkAddr);
+        TLLM_LOG_DEBUG(
+            "FabricTransfer: exported fabric chunk at offset=%lu, size=%zu", chunk.virtAddrOffset, chunk.size);
         chunks.push_back(std::move(chunk));
     }
 }
 
 void FabricTransferHelper::exportSingleChunkPosixFd(
-    CUdeviceptr chunkAddr, size_t chunkSize, CUdeviceptr poolBase, std::vector<FabricMemChunk>& chunks)
+    CUdeviceptr chunkBase, size_t chunkSize, CUdeviceptr poolBase, std::vector<FabricMemChunk>& chunks)
 {
-    // Same chunk boundary detection as exportSingleChunk, but exports to POSIX FD instead of fabric handle
+    // chunkBase/chunkSize are the real physical allocation boundaries (from cuMemGetAddressRange).
+    // No boundary discovery needed — just retain, dedup, export.
+
+    // Deduplication: skip if this chunk was already exported
+    uint64_t offset = chunkBase - poolBase;
+    for (auto const& existing : chunks)
+    {
+        if (existing.virtAddrOffset == offset)
+        {
+            return; // Already exported
+        }
+    }
 
     // Get allocation handle (must retain before export)
     CUmemGenericAllocationHandle allocHandle;
-    auto err = cuMemRetainAllocationHandle(&allocHandle, reinterpret_cast<void*>(chunkAddr));
+    auto err = cuMemRetainAllocationHandle(&allocHandle, reinterpret_cast<void*>(chunkBase));
     if (err != CUDA_SUCCESS)
     {
         return; // Not VMM allocated memory
-    }
-
-    // Get real chunk boundaries using buffer_id (same logic as exportSingleChunk)
-    CUdeviceptr actualChunkStart = chunkAddr;
-    size_t actualChunkSize = chunkSize;
-    size_t granularity = getVmmGranularity();
-    unsigned long long currentBufferId = getBufferId(chunkAddr);
-    if (currentBufferId != 0)
-    {
-        // Search backwards
-        CUdeviceptr probe = chunkAddr;
-        while (probe > poolBase)
-        {
-            CUdeviceptr prevAddr = probe - granularity;
-            if (prevAddr < poolBase)
-            {
-                break;
-            }
-            if (getBufferId(prevAddr) != currentBufferId)
-            {
-                break;
-            }
-            probe = prevAddr;
-        }
-        actualChunkStart = probe;
-
-        // Search forwards
-        CUdeviceptr endProbe = chunkAddr + chunkSize;
-        while (true)
-        {
-            if (getBufferId(endProbe) != currentBufferId)
-            {
-                break;
-            }
-            endProbe += granularity;
-        }
-        actualChunkSize = endProbe - actualChunkStart;
-    }
-
-    // Check deduplication
-    for (auto const& existing : chunks)
-    {
-        if (existing.virtAddrOffset == actualChunkStart - poolBase)
-        {
-            cuMemRelease(allocHandle);
-            return; // Already exported
-        }
     }
 
     // Export to POSIX file descriptor
@@ -1277,28 +1099,32 @@ void FabricTransferHelper::exportSingleChunkPosixFd(
 
     if (err != CUDA_SUCCESS)
     {
-        TLLM_LOG_WARNING(
-            "FabricTransfer: failed to export POSIX FD for chunk at 0x%lx, error=%d", actualChunkStart, err);
+        TLLM_LOG_WARNING("FabricTransfer: failed to export POSIX FD for chunk at 0x%lx, error=%d", chunkBase, err);
         return;
     }
 
-    // Store chunk metadata (fabricHandle[64] is zeroed - FD is sent via UDS)
+    // Store chunk metadata (fabricHandle[64] is zeroed — FD is sent via UDS)
     FabricMemChunk chunk;
-    chunk.virtAddrOffset = actualChunkStart - poolBase;
-    chunk.size = actualChunkSize;
+    chunk.virtAddrOffset = offset;
+    chunk.size = chunkSize;
     std::memset(chunk.fabricHandle, 0, sizeof(chunk.fabricHandle));
 
-    TLLM_LOG_DEBUG("FabricTransfer: exported POSIX FD=%d for chunk at offset=%lu, size=%zu (requested addr=0x%lx)", fd,
-        chunk.virtAddrOffset, chunk.size, chunkAddr);
+    TLLM_LOG_DEBUG(
+        "FabricTransfer: exported POSIX FD=%d for chunk at offset=%lu, size=%zu", fd, chunk.virtAddrOffset, chunk.size);
 
     chunks.push_back(std::move(chunk));
 
     // Store FD for UDS server to share with remote processes
-    mExportedFds.push_back(fd);
+    {
+        std::lock_guard<std::mutex> fdHanldeLock(mExportedFdsMutex);
+        mExportedFds.push_back(fd);
+    }
 }
 
 void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, FabricMemInfo const& fabricInfo)
 {
+    TLLM_CUDA_CHECK(cudaSetDevice(static_cast<int>(mLocalDevice)));
+
     // Skip if we've already tried and failed for this remote agent
     if (mFailedFabricImports.find(name) != mFailedFabricImports.end())
     {
@@ -1404,6 +1230,7 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
         poolMapping.localVirtAddr = localVa;
 
         bool allChunksMapped = true;
+        size_t fdIndexBeforePool = fdIndex; // Track FD index at pool start for skip-on-failure
         for (auto const& chunk : pool.chunks)
         {
             // Calculate local offset: chunk.virtAddrOffset is relative to poolBase,
@@ -1415,6 +1242,7 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
                 TLLM_LOG_ERROR("FabricTransfer: chunk offset %lu < mapped offset %lu, skipping", chunk.virtAddrOffset,
                     pool.mappedOffset);
                 fdIndex++;
+                allChunksMapped = false;
                 continue;
             }
             uint64_t localOffset = chunk.virtAddrOffset - pool.mappedOffset;
@@ -1490,7 +1318,16 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
         }
         else
         {
-            // Clean up on failure - use mappedSize (not poolTotalSize) since that's what we reserved
+            // Skip remaining unconsumed FDs for this pool to keep fdIndex aligned
+            if (fabricInfo.handleType == VmmHandleType::kPosixFd)
+            {
+                size_t expectedFdsForPool = pool.chunks.size();
+                size_t consumedFdsForPool = fdIndex - fdIndexBeforePool;
+                fdIndex += (expectedFdsForPool - consumedFdsForPool);
+            }
+
+            // Clean up on failure: CUDA VMM requires unmap -> release -> addressFree
+            cuMemUnmap(localVa, pool.mappedSize);
             for (auto handle : poolMapping.importedHandles)
             {
                 cuMemRelease(handle);
@@ -1522,6 +1359,8 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
 
 void FabricTransferHelper::cleanupRemoteFabricMapping(std::string const& name)
 {
+    TLLM_CUDA_CHECK(cudaSetDevice(static_cast<int>(mLocalDevice)));
+
     // Also clear failed import record so it can be retried if needed
     mFailedFabricImports.erase(name);
 
@@ -1533,14 +1372,17 @@ void FabricTransferHelper::cleanupRemoteFabricMapping(std::string const& name)
 
     for (auto& poolMapping : it->second.pools)
     {
+        // CUDA VMM requires: unmap -> release -> addressFree
+        if (poolMapping.localVirtAddr != 0)
+        {
+            cuMemUnmap(poolMapping.localVirtAddr, poolMapping.mappedSize);
+        }
         for (auto handle : poolMapping.importedHandles)
         {
             cuMemRelease(handle);
         }
         if (poolMapping.localVirtAddr != 0)
         {
-            // Use registeredSize (not totalSize) because we only reserved that much
-            cuMemUnmap(poolMapping.localVirtAddr, poolMapping.mappedSize);
             cuMemAddressFree(poolMapping.localVirtAddr, poolMapping.mappedSize);
         }
     }
@@ -1570,6 +1412,12 @@ void* FabricTransferHelper::translateToLocalMappingInternal(
             // Local VA covers [mappedOffset, mappedOffset + mappedSize) relative to remoteBaseAddr
             // Calculate: offset from remoteBaseAddr, then subtract mappedOffset
             uint64_t offsetFromPoolBase = remoteAddr - pool.remoteBaseAddr;
+            if (offsetFromPoolBase < pool.remoteMappedOffset)
+            {
+                TLLM_LOG_ERROR("FabricTransfer: address underflow: offset %lu < mappedOffset %lu for addr 0x%lx",
+                    offsetFromPoolBase, pool.remoteMappedOffset, remoteAddr);
+                return nullptr;
+            }
             uint64_t localOffset = offsetFromPoolBase - pool.remoteMappedOffset;
             return reinterpret_cast<void*>(pool.localVirtAddr + localOffset);
         }
