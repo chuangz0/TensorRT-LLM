@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -469,15 +470,15 @@ FabricTransferHelper::~FabricTransferHelper()
             // CUDA VMM requires: unmap -> release -> addressFree
             if (poolMapping.localVirtAddr != 0)
             {
-                cuMemUnmap(poolMapping.localVirtAddr, poolMapping.mappedSize);
+                TLLM_CU_CHECK_FREE_RESOURCE(cuMemUnmap(poolMapping.localVirtAddr, poolMapping.mappedSize));
             }
             for (auto handle : poolMapping.importedHandles)
             {
-                cuMemRelease(handle);
+                TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(handle));
             }
             if (poolMapping.localVirtAddr != 0)
             {
-                cuMemAddressFree(poolMapping.localVirtAddr, poolMapping.mappedSize);
+                TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(poolMapping.localVirtAddr, poolMapping.mappedSize));
             }
         }
     }
@@ -1073,7 +1074,7 @@ void FabricTransferHelper::exportSingleChunk(
     err = cuMemExportToShareableHandle(
         reinterpret_cast<void*>(chunk.fabricHandle), allocHandle, CU_MEM_HANDLE_TYPE_FABRIC, 0);
 
-    cuMemRelease(allocHandle);
+    TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(allocHandle));
 
     if (err == CUDA_SUCCESS)
     {
@@ -1111,7 +1112,7 @@ void FabricTransferHelper::exportSingleChunkPosixFd(
     int fd = -1;
     err = cuMemExportToShareableHandle(&fd, allocHandle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0);
 
-    cuMemRelease(allocHandle);
+    TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(allocHandle));
 
     if (err != CUDA_SUCCESS)
     {
@@ -1371,7 +1372,7 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
             {
                 TLLM_LOG_WARNING(
                     "FabricTransfer: failed to map remote chunk at localOffset=%lu, error=%d", localOffset, err);
-                cuMemRelease(importedHandle);
+                TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(importedHandle));
                 allChunksMapped = false;
                 anyImportFailed = true;
                 break;
@@ -1382,12 +1383,7 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
             accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             accessDesc.location.id = static_cast<int>(mLocalDevice);
             accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-            err = cuMemSetAccess(localVa + localOffset, chunk.size, &accessDesc, 1);
-            if (err != CUDA_SUCCESS)
-            {
-                TLLM_LOG_WARNING("FabricTransfer: failed to set access for remote chunk, error=%d", err);
-                // Continue anyway, access might work for read operations
-            }
+            TLLM_CU_CHECK(cuMemSetAccess(localVa + localOffset, chunk.size, &accessDesc, 1));
 
             poolMapping.importedHandles.push_back(importedHandle);
         }
@@ -1409,12 +1405,12 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
             }
 
             // Clean up on failure: CUDA VMM requires unmap -> release -> addressFree
-            cuMemUnmap(localVa, pool.mappedSize);
+            TLLM_CU_CHECK_FREE_RESOURCE(cuMemUnmap(localVa, pool.mappedSize));
             for (auto handle : poolMapping.importedHandles)
             {
-                cuMemRelease(handle);
+                TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(handle));
             }
-            cuMemAddressFree(localVa, pool.mappedSize);
+            TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(localVa, pool.mappedSize));
         }
     }
 
@@ -1470,15 +1466,15 @@ void FabricTransferHelper::cleanupRemoteFabricMapping(std::string const& name)
         {
             if (poolMapping.localVirtAddr != 0)
             {
-                cuMemUnmap(poolMapping.localVirtAddr, poolMapping.mappedSize);
+                TLLM_CU_CHECK_FREE_RESOURCE(cuMemUnmap(poolMapping.localVirtAddr, poolMapping.mappedSize));
             }
             for (auto handle : poolMapping.importedHandles)
             {
-                cuMemRelease(handle);
+                TLLM_CU_CHECK_FREE_RESOURCE(cuMemRelease(handle));
             }
             if (poolMapping.localVirtAddr != 0)
             {
-                cuMemAddressFree(poolMapping.localVirtAddr, poolMapping.mappedSize);
+                TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(poolMapping.localVirtAddr, poolMapping.mappedSize));
             }
         }
     }
