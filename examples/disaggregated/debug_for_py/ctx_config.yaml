@@ -1,0 +1,18 @@
+disable_overlap_scheduler: True
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  # max_tokens_in_buffer: 1024
+print_iter_log: True
+# backend: tensorrt
+cuda_graph_config: null
+kv_cache_config:
+  # max_attention_window:  [512, 512, 512, 512, 512, 32768]
+  enable_block_reuse: False
+  # free_gpu_memory_fraction: 0.1
+  # use_kv_cache_manager_v2: True
+# cuda_graph_config: None
+sampler_type: TRTLLMSampler
+
+tensor_parallel_size: 1
+pipeline_parallel_size: 4

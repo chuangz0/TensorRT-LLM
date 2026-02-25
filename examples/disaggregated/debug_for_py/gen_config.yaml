@@ -1,0 +1,28 @@
+cache_transceiver_config:
+  # max_tokens_in_buffer: 1024
+  backend: NIXL
+  transceiver_runtime: PYTHON
+print_iter_log: True
+# backend: tensorrt
+kv_cache_config:
+  # max_attention_window:  [512, 512, 512, 512, 512, 32768]
+  enable_block_reuse: False
+  # free_gpu_memory_fraction: 0.1
+  # use_kv_cache_manager_v2: True
+
+
+cuda_graph_config: null
+
+# moe_config:
+#     backend: WIDEEP
+#     use_low_precision_moe_combine: true
+#     load_balancer:
+#       num_slots: 288
+#       layer_updates_per_iter: 1
+sampler_type: TRTLLMSampler
+num_postprocess_workers: 4
+
+stream_interval: 20
+
+tensor_parallel_size: 4
+pipeline_parallel_size: 1
