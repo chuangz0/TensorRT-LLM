@@ -3,11 +3,12 @@ import os
 import queue
 import threading
 import weakref
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional
 
 import msgpack
+import numpy as np
 import torch
 
 try:
@@ -61,17 +62,29 @@ class RecvReqInfo:
     sender_req_id: int
     instance_name: str
     instance_rank: int
-    block_ids: list[int]
+    block_ids: np.ndarray  # dtype=np.int64
     unique_rid: int
     start_token_idx: Optional[int] = None
     aux_slot: Optional[int] = None
 
     def to_bytes(self) -> bytes:
-        return msgpack.packb(asdict(self))
+        return msgpack.packb(
+            {
+                "sender_req_id": self.sender_req_id,
+                "instance_name": self.instance_name,
+                "instance_rank": self.instance_rank,
+                "block_ids": self.block_ids.tobytes(),
+                "unique_rid": self.unique_rid,
+                "start_token_idx": self.start_token_idx,
+                "aux_slot": self.aux_slot,
+            }
+        )
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RecvReqInfo":
-        return cls(**msgpack.unpackb(data, raw=False))
+        d = msgpack.unpackb(data, raw=False)
+        d["block_ids"] = np.frombuffer(d["block_ids"], dtype=np.int64).copy()
+        return cls(**d)
 
 
 @dataclass
@@ -88,13 +101,13 @@ class WriteMeta:
     expected_transfers: int
     peer_name: str
     peer_rank: int
-    src_kv_ptrs: List[int] = None
-    dst_kv_ptrs: List[int] = None
-    kv_sizes: List[int] = None
+    src_kv_ptrs: np.ndarray = None  # dtype=np.int64
+    dst_kv_ptrs: np.ndarray = None  # dtype=np.int64
+    kv_sizes: np.ndarray = None  # dtype=np.int64
     dst_device_id: int = None
-    src_aux_ptrs: List[int] = None
-    dst_aux_ptrs: List[int] = None
-    aux_sizes: List[int] = None
+    src_aux_ptrs: np.ndarray = None  # dtype=np.int64
+    dst_aux_ptrs: np.ndarray = None  # dtype=np.int64
+    aux_sizes: np.ndarray = None  # dtype=np.int64
     peer_endpoint: Optional[str] = None  # used for send state
     unique_rid: Optional[int] = None
     slice_id: Optional[int] = None
@@ -162,9 +175,9 @@ class AuxSendTask:
                 )
             return WriteMeta(
                 future_for_task=self._future,
-                src_aux_ptrs=[],
-                dst_aux_ptrs=[],
-                aux_sizes=[],
+                src_aux_ptrs=np.array([], dtype=np.int64),
+                dst_aux_ptrs=np.array([], dtype=np.int64),
+                aux_sizes=np.array([], dtype=np.int64),
                 expected_transfers=expected_transfers,
                 is_only_aux=True,
                 peer_name=req_info.instance_name + str(req_info.instance_rank),
@@ -182,15 +195,15 @@ class AuxSendTask:
 
         src_aux_meta = self._registrar.self_rank_info.aux_meta
 
-        src_ptrs = [
-            ptr + item_size * self._slot
-            for ptr, item_size in zip(src_aux_meta.ptrs, src_aux_meta.item_sizes)
-        ]
-        dst_ptrs = [
-            ptr + item_size * peer_slot
-            for ptr, item_size in zip(peer_aux_meta.ptrs, peer_aux_meta.item_sizes)
-        ]
-        size = [item_size for item_size in src_aux_meta.item_sizes]
+        src_ptrs_arr = np.array(src_aux_meta.ptrs, dtype=np.int64)
+        src_item_sizes = np.array(src_aux_meta.item_sizes, dtype=np.int64)
+        src_ptrs = src_ptrs_arr + src_item_sizes * self._slot
+
+        dst_ptrs_arr = np.array(peer_aux_meta.ptrs, dtype=np.int64)
+        dst_item_sizes = np.array(peer_aux_meta.item_sizes, dtype=np.int64)
+        dst_ptrs = dst_ptrs_arr + dst_item_sizes * peer_slot
+
+        size = src_item_sizes
 
         if self._perf_timer is not None:
             self._perf_timer.record_prepare_args_end(peer_rank_info.instance_rank)
@@ -328,9 +341,9 @@ class KVSendTask:
                 self._perf_timer.record_transfer_sizes(peer_ri.instance_rank, 0, 0)
             return WriteMeta(
                 future_for_task=self._future,
-                src_kv_ptrs=[],
-                dst_kv_ptrs=[],
-                kv_sizes=[],
+                src_kv_ptrs=np.array([], dtype=np.int64),
+                dst_kv_ptrs=np.array([], dtype=np.int64),
+                kv_sizes=np.array([], dtype=np.int64),
                 expected_transfers=expected_transfers,
                 peer_name=peer_ri.instance_name + str(peer_ri.instance_rank),
                 peer_rank=peer_ri.instance_rank,
@@ -366,7 +379,7 @@ class KVSendTask:
         src_frags = region_pair.src.memory.ptrs
         dst_frags = region_pair.dst.memory.ptrs
         frag_size = region_pair.src.memory.bytes_per_region
-        kv_sizes = [frag_size] * len(src_frags)
+        kv_sizes = np.full(len(src_frags), frag_size, dtype=np.int64)
 
         if self._perf_timer is not None:
             transfer_total_size = frag_size * len(src_frags)
@@ -409,7 +422,7 @@ class KVSendTask:
         self_tp_rank_in_dp_group = self_ri.tp_rank % self_tp_size_per_dp_group
         return (peer_dp_rank % dup_head_factor) == (self_tp_rank_in_dp_group % dup_head_factor)
 
-    def _filter_kv_blocks(self, src_block_ids, dst_block_ids) -> tuple[list[int], list[int]]:
+    def _filter_kv_blocks(self, src_block_ids, dst_block_ids) -> tuple[np.ndarray, np.ndarray]:
         # TODO: filter the kv block_ids according to the peer_overlap
         return src_block_ids, dst_block_ids
 
@@ -562,38 +575,36 @@ class Sender:
     def _make_agent_request(agent_args: WriteMeta, is_aux: bool, device_id: int):
         if is_aux:
             assert agent_args.src_aux_ptrs is not None and agent_args.dst_aux_ptrs is not None
-            src_list = [
-                (src_ptr, size, 0)
-                for src_ptr, size in zip(agent_args.src_aux_ptrs, agent_args.aux_sizes)
-            ]
-            dst_list = [
-                (dst_ptr, size, 0)
-                for dst_ptr, size in zip(agent_args.dst_aux_ptrs, agent_args.aux_sizes)
-            ]
-            src_mem_type = MemoryType.DRAM
-            dst_mem_type = MemoryType.DRAM
-            peer_name = agent_args.peer_name
+            src_ptrs = agent_args.src_aux_ptrs
+            dst_ptrs = agent_args.dst_aux_ptrs
+            sizes = agent_args.aux_sizes
+            mem_type = MemoryType.DRAM
+            src_dev_id = 0
+            dst_dev_id = 0
         else:
             assert agent_args.src_kv_ptrs is not None and agent_args.dst_kv_ptrs is not None
-            src_list = [
-                (src_ptr, size, device_id)
-                for src_ptr, size in zip(agent_args.src_kv_ptrs, agent_args.kv_sizes)
-            ]
-            dst_list = [
-                (dst_ptr, size, agent_args.dst_device_id)
-                for dst_ptr, size in zip(agent_args.dst_kv_ptrs, agent_args.kv_sizes)
-            ]
-            src_mem_type = MemoryType.VRAM
-            dst_mem_type = MemoryType.VRAM
-            peer_name = agent_args.peer_name
+            src_ptrs = agent_args.src_kv_ptrs
+            dst_ptrs = agent_args.dst_kv_ptrs
+            sizes = agent_args.kv_sizes
+            mem_type = MemoryType.VRAM
+            src_dev_id = device_id
+            dst_dev_id = agent_args.dst_device_id
 
-        # Use C++ MemoryDescs directly with batch constructor (list of tuples)
-        src_memory_descs = MemoryDescs(src_mem_type, src_list)
-        dst_memory_descs = MemoryDescs(dst_mem_type, dst_list)
+        n = len(src_ptrs)
+        peer_name = agent_args.peer_name
+        if n == 0:
+            src_memory_descs = MemoryDescs(mem_type, [])
+            dst_memory_descs = MemoryDescs(mem_type, [])
+        else:
+            src_dev_ids = np.full(n, src_dev_id, dtype=np.int32)
+            dst_dev_ids = np.full(n, dst_dev_id, dtype=np.int32)
+            src_memory_descs = MemoryDescs(mem_type, src_ptrs, sizes, src_dev_ids)
+            dst_memory_descs = MemoryDescs(mem_type, dst_ptrs, sizes, dst_dev_ids)
+
         request = TransferRequest(
             TransferOp.WRITE, src_memory_descs, dst_memory_descs, peer_name, None
         )
-        return request, src_list, dst_list
+        return request
 
     @nvtx_range("_deliver_kv_to_agent")
     def _deliver_kv_to_agent(self, agent_args: WriteMeta):
@@ -601,6 +612,7 @@ class Sender:
         assert len(agent_args.kv_sizes) == len(agent_args.src_kv_ptrs)
         assert agent_args.is_only_aux is False, "agent_args.is_only_aux should be False"
 
+        skip_send = len(agent_args.src_kv_ptrs) == 0
         unique_rid = agent_args.unique_rid
         slice_id = agent_args.slice_id
         peer_endpoint = agent_args.peer_endpoint
@@ -612,11 +624,7 @@ class Sender:
         assert session.state.status != SessionStatus.ERROR
         session.state.status = SessionStatus.TRANSFERRING
         task.status = TaskStatus.TRANSFERRING
-        request, src_kv_list, _ = Sender._make_agent_request(
-            agent_args, is_aux=False, device_id=self._device_id
-        )
-
-        skip_send = len(src_kv_list) == 0
+        request = Sender._make_agent_request(agent_args, is_aux=False, device_id=self._device_id)
         logger.debug(f"Submitting transfer request to transfer agent: {request}")
         agent_handler = None
         if task._perf_timer is not None:
@@ -687,9 +695,7 @@ class Sender:
         sync_status = "SUCCESS"
         agent_handler = None
         if not skip_send:
-            request, _, _ = Sender._make_agent_request(
-                agent_args, is_aux=True, device_id=self._device_id
-            )
+            request = Sender._make_agent_request(agent_args, is_aux=True, device_id=self._device_id)
             agent_handler = self._agent.submit_transfer_requests(request)
 
             if session._aux_task._perf_timer is not None:

@@ -2,6 +2,7 @@ import random
 import time
 import uuid
 
+import numpy as np
 import pytest
 import torch
 
@@ -314,7 +315,8 @@ def add_and_verify_request(
         ]
 
         send_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids=ctx_block_id) for ctx_block_id in ctx_block_ids
+            KVSlice(is_last_slice=True, block_ids=np.asarray(ctx_block_id, dtype=np.int64))
+            for ctx_block_id in ctx_block_ids
         ]
         send_slice_tasks = [
             sender_session._kv_tasks[sender_session.send(send_kv_slice)]
@@ -329,7 +331,8 @@ def add_and_verify_request(
             for gen_transfer_worker in valid_gen_transfer_workers
         ]
         recv_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids=gen_block_id) for gen_block_id in gen_block_ids
+            KVSlice(is_last_slice=True, block_ids=np.asarray(gen_block_id, dtype=np.int64))
+            for gen_block_id in gen_block_ids
         ]
         recv_slice_tasks = [
             receiver_session._kv_tasks[receiver_session.receive(recv_kv_slice)]
@@ -342,7 +345,8 @@ def add_and_verify_request(
             for gen_transfer_worker in valid_gen_transfer_workers
         ]
         recv_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids=gen_block_id) for gen_block_id in gen_block_ids
+            KVSlice(is_last_slice=True, block_ids=np.asarray(gen_block_id, dtype=np.int64))
+            for gen_block_id in gen_block_ids
         ]
         recv_slice_tasks = [
             receiver_session._kv_tasks[receiver_session.receive(recv_kv_slice)]
@@ -362,7 +366,8 @@ def add_and_verify_request(
             assert sender_session.state.status != SessionStatus.INIT
 
         send_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids=ctx_block_id) for ctx_block_id in ctx_block_ids
+            KVSlice(is_last_slice=True, block_ids=np.asarray(ctx_block_id, dtype=np.int64))
+            for ctx_block_id in ctx_block_ids
         ]
         send_slice_tasks = [
             sender_session._kv_tasks[sender_session.send(send_kv_slice)]

@@ -3,6 +3,7 @@ import uuid
 from itertools import chain
 from typing import Any, Dict, List
 
+import numpy as np
 import torch
 
 import tensorrt_llm
@@ -100,7 +101,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
 
     def _create_kv_slice(self, req: LlmRequest):
         block_ids = self.kv_cache_manager.get_batch_cache_indices([req.py_request_id])[0]
-        return KVSlice(is_last_slice=True, block_ids=block_ids)
+        return KVSlice(is_last_slice=True, block_ids=np.asarray(block_ids, dtype=np.int64))
 
     def respond_and_send_async(self, req: LlmRequest):
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS

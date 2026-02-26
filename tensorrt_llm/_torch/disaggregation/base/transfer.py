@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional
 
+import numpy as np
+
 from tensorrt_llm import DisaggregatedParams
 
 
@@ -44,7 +46,7 @@ class KVSlice:
 
     token_range: Optional[TokenRange] = None
     layer_range: Optional[LayerRange] = None
-    block_ids: List[int] = field(default_factory=list)  # Physical block IDs
+    block_ids: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64))
     is_last_slice: bool = False
 
 

@@ -28,10 +28,24 @@ class MemoryDesc(NamedTuple):
     name: Optional[str] = None
 
 
-@dataclass
 class MemoryDescs:
-    type: str
-    descs: List[MemoryDesc]
+    """Describes a set of memory regions with a common type.
+
+    Supports two construction forms matching the C++ binding API:
+    - MemoryDescs(type, descs)  — descs is a list of tuples
+    - MemoryDescs(type, addrs, sizes, device_ids)  — numpy arrays for batch construction
+    """
+
+    __slots__ = ("type", "descs")
+
+    def __init__(self, type, descs_or_addrs, sizes=None, device_ids=None):
+        self.type = type
+        if sizes is not None:
+            self.descs = [
+                (int(a), int(s), int(d)) for a, s, d in zip(descs_or_addrs, sizes, device_ids)
+            ]
+        else:
+            self.descs = descs_or_addrs
 
 
 @dataclass

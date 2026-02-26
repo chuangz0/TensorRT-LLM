@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import List
 
+import numpy as np
+
 from tensorrt_llm._torch.disaggregation.base.region import (
     DataLayout,
     MemRegionGroup,
@@ -73,7 +75,7 @@ class KVRegionExtractorV1(RegionExtractorBase):
 
         return KVPoolAttrs(pool_ptrs=ptrs, block_bytes=block_sizes)
 
-    def extract(self, region_ids: List[int]) -> SpecRegion:
+    def extract(self, region_ids: np.ndarray) -> SpecRegion:
         """
         Given a list of region_ids, returns a single SpecRegion,
         whose memory is a MemRegionGroup containing all blocks described
@@ -82,8 +84,7 @@ class KVRegionExtractorV1(RegionExtractorBase):
         assert len(self._kv_pool_attrs.pool_ptrs) == 1
         pool_idx = 0
         attrs = self._kv_pool_attrs
-        ptrs = [
-            attrs.pool_ptrs[pool_idx] + block_id * attrs.block_bytes[0] for block_id in region_ids
-        ]
+        region_arr = region_ids
+        ptrs = attrs.pool_ptrs[pool_idx] + region_arr * attrs.block_bytes[0]
         memory = MemRegionGroup(ptrs=ptrs, bytes_per_region=attrs.block_bytes[0])
         return SpecRegion(memory=memory)
