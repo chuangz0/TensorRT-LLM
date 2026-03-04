@@ -81,4 +81,19 @@ if(NIXL_ROOT)
     posixFdTransferTest
     PRIVATE tensorrt_llm_nixl_wrapper NIXL::nixl ${SHARED_TARGET} CUDA::cudart
             CUDA::cuda_driver MPI::MPI_CXX)
+
+  # Fabric Transfer Test (single-process, requires 1 GPU)
+  add_executable(fabricTransferTest fabricTransferTest.cu)
+  target_compile_options(fabricTransferTest PRIVATE -Wno-error)
+  target_include_directories(fabricTransferTest
+                             PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  target_link_libraries(
+    fabricTransferTest
+    PRIVATE tensorrt_llm_nixl_wrapper
+            NIXL::nixl
+            ${SHARED_TARGET}
+            CUDA::cudart
+            CUDA::cuda_driver
+            gtest_main
+            gmock_main)
 endif()

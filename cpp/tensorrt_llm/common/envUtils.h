@@ -172,6 +172,11 @@ bool getEnvDisableFabricTransfer();
 // Default: 16KB - segments smaller than this use cub batch copy
 size_t getEnvFabricBatchThresholdKB();
 
+// Number of threads for parallel cudaMemcpyBatchAsync submission.
+// Default: 2 (each thread gets its own stream, splitting the batch evenly).
+// Set to 1 to disable multi-thread submission.
+int getEnvFabricBatchCopyThreads();
+
 } // namespace common
 
 TRTLLM_NAMESPACE_END

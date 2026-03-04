@@ -22,9 +22,12 @@
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include <atomic>
+#include <condition_variable>
 #include <cuda.h>
+#include <functional>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <sstream>
 #include <thread>
 #include <unordered_set>
@@ -133,14 +136,69 @@ struct RemoteFabricMapping
 };
 
 // ============================================================================
+// BatchCopyWorkerPool - Persistent thread pool for parallel cudaMemcpyBatchAsync
+// ============================================================================
+
+/// @brief A task submitted to a batch copy worker thread.
+/// Owns copies of the pointer/size arrays so that the caller can return immediately.
+struct BatchCopyTask
+{
+    std::vector<void*> dst;
+    std::vector<void const*> src;
+    std::vector<size_t> sizes;
+    cudaStream_t stream;
+    cudaEvent_t completionEvent;    ///< Worker records this after the API call
+    std::atomic<int>* batchPending; ///< Per-batch counter, decremented after event recording
+};
+
+/// @brief Persistent thread pool that calls cudaSetDevice once per thread.
+/// Workers dequeue BatchCopyTask items and call cudaMemcpyBatchAsync on them.
+class BatchCopyWorkerPool
+{
+public:
+    BatchCopyWorkerPool(int numWorkers, int cudaDevice);
+    ~BatchCopyWorkerPool();
+
+    // Non-copyable
+    BatchCopyWorkerPool(BatchCopyWorkerPool const&) = delete;
+    BatchCopyWorkerPool& operator=(BatchCopyWorkerPool const&) = delete;
+
+    /// @brief Submit a copy task (non-blocking). The task owns its data, so the caller's vectors can be destroyed.
+    void submit(BatchCopyTask&& task);
+
+    /// @brief Wait until all submitted tasks have been dequeued and their API calls returned.
+    void waitAll();
+
+    /// @brief Non-blocking check: returns true when all submitted tasks have completed their API calls.
+    [[nodiscard]] bool isDone() const;
+
+private:
+    void workerLoop();
+
+    std::vector<std::thread> mWorkers;
+    std::mutex mMutex;
+    std::condition_variable mCv;
+    std::condition_variable mDoneCv;
+    std::queue<BatchCopyTask> mQueue;
+    bool mShutdown{false};
+    std::atomic<int> mPending{0};
+};
+
+// ============================================================================
 // FabricTransferStatus - Transfer status for fabric batch copy operations
 // ============================================================================
 
 class FabricTransferStatus final : public TransferStatus
 {
 public:
+    /// @brief Single-event mode (for single-thread and cub paths)
     FabricTransferStatus(
         std::shared_ptr<runtime::CudaStream> stream, std::shared_ptr<runtime::CudaEvent> completionEvent);
+
+    /// @brief Multi-event mode (for multi-thread batch copy path).
+    /// Workers record events after their API calls and decrement the per-batch pending counter.
+    FabricTransferStatus(
+        std::shared_ptr<std::atomic<int>> batchPending, std::vector<std::shared_ptr<runtime::CudaEvent>> workerEvents);
 
     ~FabricTransferStatus() override = default;
 
@@ -148,8 +206,14 @@ public:
     [[nodiscard]] TransferState wait(int64_t timeout_ms = -1) const override;
 
 private:
+    // Single-event mode
     std::shared_ptr<runtime::CudaStream> mStream;
     std::shared_ptr<runtime::CudaEvent> mCompletionEvent;
+
+    // Multi-event mode (per-batch isolation — safe with concurrent submitters)
+    std::shared_ptr<std::atomic<int>> mBatchPending;
+    std::vector<std::shared_ptr<runtime::CudaEvent>> mWorkerEvents;
+
     mutable std::atomic<bool> mCompleted{false};
 };
 
@@ -260,6 +324,9 @@ private:
     /// @brief Stop UDS server
     void stopUdsServer();
 
+    /// @brief Initialize the batch copy worker pool (lazy, called once)
+    void ensureBatchCopyWorkersInitialized();
+
 private:
     // CUDA resources for fabric batch transfer
     std::shared_ptr<runtime::CudaStream> mFabricStream;
@@ -306,6 +373,12 @@ private:
     int mUdsServerSocket{-1};                   ///< Server listening socket
     std::thread mUdsServerThread;               ///< Server accept/send thread
     std::atomic<bool> mUdsServerRunning{false}; ///< Controls server thread lifetime
+
+    // Multi-thread batch copy (NT-NS) for cudaMemcpyBatchAsync
+    int mBatchCopyThreads{0};                                  ///< Number of worker threads (0 = not yet initialized)
+    std::unique_ptr<BatchCopyWorkerPool> mBatchCopyWorkerPool; ///< Persistent worker pool
+    std::vector<std::shared_ptr<runtime::CudaStream>> mBatchCopyStreams; ///< Per-worker streams
+    std::once_flag mBatchCopyInitFlag;                                   ///< Ensures worker pool initialized once
 };
 
 } // namespace tensorrt_llm::executor::kv_cache

@@ -588,6 +588,12 @@ size_t getEnvFabricBatchThresholdKB()
     return threshold;
 }
 
+int getEnvFabricBatchCopyThreads()
+{
+    static int const threads = getIntEnv("TRTLLM_FABRIC_BATCH_COPY_THREADS").value_or(2);
+    return threads;
+}
+
 } // namespace common
 
 TRTLLM_NAMESPACE_END

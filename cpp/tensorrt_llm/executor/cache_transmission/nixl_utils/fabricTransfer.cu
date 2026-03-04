@@ -35,6 +35,102 @@ namespace tensorrt_llm::executor::kv_cache
 {
 
 // ============================================================================
+// BatchCopyWorkerPool Implementation
+// ============================================================================
+
+BatchCopyWorkerPool::BatchCopyWorkerPool(int numWorkers, int cudaDevice)
+{
+    for (int i = 0; i < numWorkers; ++i)
+    {
+        mWorkers.emplace_back(
+            [this, cudaDevice]()
+            {
+                TLLM_CUDA_CHECK(cudaSetDevice(cudaDevice));
+                workerLoop();
+            });
+    }
+}
+
+BatchCopyWorkerPool::~BatchCopyWorkerPool()
+{
+    {
+        std::lock_guard<std::mutex> lk(mMutex);
+        mShutdown = true;
+    }
+    mCv.notify_all();
+    for (auto& w : mWorkers)
+    {
+        w.join();
+    }
+}
+
+void BatchCopyWorkerPool::submit(BatchCopyTask&& task)
+{
+    {
+        std::lock_guard<std::mutex> lk(mMutex);
+        mQueue.push(std::move(task));
+        mPending.fetch_add(1, std::memory_order_relaxed);
+    }
+    mCv.notify_one();
+}
+
+bool BatchCopyWorkerPool::isDone() const
+{
+    return mPending.load(std::memory_order_acquire) == 0;
+}
+
+void BatchCopyWorkerPool::waitAll()
+{
+    std::unique_lock<std::mutex> lk(mMutex);
+    mDoneCv.wait(lk, [this]() { return mPending.load(std::memory_order_relaxed) == 0; });
+}
+
+void BatchCopyWorkerPool::workerLoop()
+{
+    while (true)
+    {
+        BatchCopyTask task;
+        {
+            std::unique_lock<std::mutex> lk(mMutex);
+            mCv.wait(lk, [this]() { return mShutdown || !mQueue.empty(); });
+            if (mShutdown && mQueue.empty())
+            {
+                return;
+            }
+            task = std::move(mQueue.front());
+            mQueue.pop();
+        }
+
+        // Execute the batch copy (task owns the pointer/size arrays)
+        size_t count = task.dst.size();
+        cudaMemcpyAttributes attr{};
+        attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+
+        std::vector<size_t> idx(count, 0);
+        TLLM_CUDA_CHECK(cudaMemcpyBatchAsync(
+            task.dst.data(), task.src.data(), task.sizes.data(), count, &attr, idx.data(), 1, task.stream));
+
+        // Record completion event so that the status object can track GPU work
+        if (task.completionEvent)
+        {
+            TLLM_CUDA_CHECK(cudaEventRecord(task.completionEvent, task.stream));
+        }
+
+        // Decrement per-batch counter (signals that this task's event is recorded)
+        if (task.batchPending)
+        {
+            task.batchPending->fetch_sub(1, std::memory_order_release);
+        }
+
+        if (mPending.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        {
+            mDoneCv.notify_all();
+        }
+    }
+}
+
+// ============================================================================
 // Unix Domain Socket Utilities for POSIX FD Passing (SCM_RIGHTS)
 // ============================================================================
 
@@ -368,6 +464,13 @@ FabricTransferStatus::FabricTransferStatus(
 {
 }
 
+FabricTransferStatus::FabricTransferStatus(
+    std::shared_ptr<std::atomic<int>> batchPending, std::vector<std::shared_ptr<runtime::CudaEvent>> workerEvents)
+    : mBatchPending(std::move(batchPending))
+    , mWorkerEvents(std::move(workerEvents))
+{
+}
+
 bool FabricTransferStatus::isCompleted() const
 {
     if (mCompleted.load(std::memory_order_acquire))
@@ -375,7 +478,32 @@ bool FabricTransferStatus::isCompleted() const
         return true;
     }
 
-    // Use cudaEventQuery for non-blocking check
+    if (mBatchPending)
+    {
+        // Multi-event mode: workers must finish API calls (and event recording) first
+        if (mBatchPending->load(std::memory_order_acquire) > 0)
+        {
+            return false;
+        }
+        for (auto const& event : mWorkerEvents)
+        {
+            auto result = cudaEventQuery(event->get());
+            if (result == cudaErrorNotReady)
+            {
+                return false;
+            }
+            if (result != cudaSuccess)
+            {
+                TLLM_LOG_ERROR("FabricTransfer: cudaEventQuery returned unexpected error: %d (%s)",
+                    static_cast<int>(result), cudaGetErrorString(result));
+                return false;
+            }
+        }
+        mCompleted.store(true, std::memory_order_release);
+        return true;
+    }
+
+    // Single-event mode
     auto result = cudaEventQuery(mCompletionEvent->get());
     if (result == cudaSuccess)
     {
@@ -397,15 +525,69 @@ TransferState FabricTransferStatus::wait(int64_t timeout_ms) const
         return TransferState::kSUCCESS;
     }
 
+    if (mBatchPending)
+    {
+        // Multi-event mode: first spin until all workers have recorded their events
+        while (mBatchPending->load(std::memory_order_acquire) > 0)
+        {
+            std::this_thread::yield();
+        }
+
+        if (timeout_ms < 0)
+        {
+            for (auto const& event : mWorkerEvents)
+            {
+                event->synchronize();
+            }
+            mCompleted.store(true, std::memory_order_release);
+            return TransferState::kSUCCESS;
+        }
+
+        // Timed wait: poll all events
+        auto startTime = std::chrono::steady_clock::now();
+        while (true)
+        {
+            bool allDone = true;
+            for (auto const& event : mWorkerEvents)
+            {
+                auto result = cudaEventQuery(event->get());
+                if (result == cudaErrorNotReady)
+                {
+                    allDone = false;
+                    break;
+                }
+                if (result != cudaSuccess)
+                {
+                    TLLM_LOG_ERROR("FabricTransfer: cudaEventQuery returned unexpected error: %d (%s)",
+                        static_cast<int>(result), cudaGetErrorString(result));
+                    return TransferState::kFAILURE;
+                }
+            }
+            if (allDone)
+            {
+                mCompleted.store(true, std::memory_order_release);
+                return TransferState::kSUCCESS;
+            }
+
+            auto elapsed
+                = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime)
+                      .count();
+            if (elapsed >= timeout_ms)
+            {
+                return TransferState::kIN_PROGRESS;
+            }
+            std::this_thread::yield();
+        }
+    }
+
+    // Single-event mode (original path)
     if (timeout_ms < 0)
     {
-        // Infinite wait: synchronize on event
         mCompletionEvent->synchronize();
         mCompleted.store(true, std::memory_order_release);
         return TransferState::kSUCCESS;
     }
 
-    // Timed wait: poll and check
     auto startTime = std::chrono::steady_clock::now();
     while (true)
     {
@@ -1605,42 +1787,99 @@ std::unique_ptr<TransferStatus> FabricTransferHelper::submitWithCubBatched(
     return std::make_unique<FabricTransferStatus>(mFabricStream, completionEvent);
 }
 
+void FabricTransferHelper::ensureBatchCopyWorkersInitialized()
+{
+    std::call_once(mBatchCopyInitFlag,
+        [this]()
+        {
+            mBatchCopyThreads = std::max(1, common::getEnvFabricBatchCopyThreads());
+            if (mBatchCopyThreads > 1)
+            {
+                TLLM_CUDA_CHECK(cudaSetDevice(static_cast<int>(mLocalDevice)));
+
+                // Create per-worker streams
+                for (int i = 0; i < mBatchCopyThreads; ++i)
+                {
+                    mBatchCopyStreams.push_back(std::make_shared<runtime::CudaStream>());
+                }
+
+                // Create persistent worker pool
+                mBatchCopyWorkerPool
+                    = std::make_unique<BatchCopyWorkerPool>(mBatchCopyThreads, static_cast<int>(mLocalDevice));
+
+                TLLM_LOG_INFO("FabricTransfer: batch copy worker pool initialized with %d threads", mBatchCopyThreads);
+            }
+        });
+}
+
 std::unique_ptr<TransferStatus> FabricTransferHelper::submitWithCudaMemcpyBatch(
     std::vector<void*> const& srcPtrs, std::vector<void*> const& dstPtrs, std::vector<size_t> const& sizes)
 {
     ensureCudaResourcesInitialized();
+    ensureBatchCopyWorkersInitialized();
 
     size_t numOps = srcPtrs.size();
     if (numOps == 0)
     {
-        // Empty transfer, complete immediately
         auto event = std::make_shared<runtime::CudaEvent>();
         mFabricStream->record(*event);
         return std::make_unique<FabricTransferStatus>(mFabricStream, event);
     }
 
-    // Use cudaMemcpyBatchAsync with overlap compute
-    // API: cudaMemcpyBatchAsync(dsts, srcs, sizes, count, attrs, attrsIdxs, numAttrs, stream)
-
-    // Setup single attribute for all segments - overlap with compute
-    cudaMemcpyAttributes attrs = {};
-    attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-    attrs.flags |= cudaMemcpyFlagPreferOverlapWithCompute;
-
-    // All segments use the same attribute (index 0)
-    std::vector<size_t> attrIndices(numOps, 0);
-
-    // Note: srcPtrs needs to be const void* const*, cast from void* const*
+    // Build const src pointer array (API requires const void* const*)
     std::vector<void const*> constSrcPtrs(srcPtrs.begin(), srcPtrs.end());
 
-    TLLM_CUDA_CHECK(cudaMemcpyBatchAsync(dstPtrs.data(), constSrcPtrs.data(), sizes.data(), numOps, &attrs,
-        attrIndices.data(), 1, mFabricStream->get()));
+    // Single-thread path: submit directly on mFabricStream
+    if (mBatchCopyThreads <= 1 || numOps < static_cast<size_t>(mBatchCopyThreads))
+    {
+        cudaMemcpyAttributes attr{};
+        attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+        attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
+        std::vector<size_t> idx(numOps, 0);
 
-    // Record event
-    auto completionEvent = std::make_shared<runtime::CudaEvent>();
-    mFabricStream->record(*completionEvent);
+        TLLM_CUDA_CHECK(cudaMemcpyBatchAsync(
+            dstPtrs.data(), constSrcPtrs.data(), sizes.data(), numOps, &attr, idx.data(), 1, mFabricStream->get()));
 
-    return std::make_unique<FabricTransferStatus>(mFabricStream, completionEvent);
+        auto completionEvent = std::make_shared<runtime::CudaEvent>();
+        mFabricStream->record(*completionEvent);
+        return std::make_unique<FabricTransferStatus>(mFabricStream, completionEvent);
+    }
+
+    // Multi-thread path: split entries across N workers, each with its own stream.
+    // Workers call cudaMemcpyBatchAsync in parallel, reducing per-entry API overhead.
+    // Tasks own copies of the pointer/size arrays so we can return immediately.
+    int numWorkers = mBatchCopyThreads;
+    size_t perWorker = numOps / numWorkers;
+
+    // Per-batch pending counter: workers decrement after recording their event.
+    // Isolates this batch from concurrent submitters.
+    auto batchPending = std::make_shared<std::atomic<int>>(numWorkers);
+
+    // Create per-worker completion events (owned by the status object)
+    std::vector<std::shared_ptr<runtime::CudaEvent>> workerEvents;
+    workerEvents.reserve(numWorkers);
+
+    for (int t = 0; t < numWorkers; ++t)
+    {
+        size_t off = t * perWorker;
+        size_t cnt = (t == numWorkers - 1) ? (numOps - off) : perWorker;
+
+        auto event = std::make_shared<runtime::CudaEvent>();
+
+        BatchCopyTask task;
+        task.dst.assign(dstPtrs.begin() + off, dstPtrs.begin() + off + cnt);
+        task.src.assign(constSrcPtrs.begin() + off, constSrcPtrs.begin() + off + cnt);
+        task.sizes.assign(sizes.begin() + off, sizes.begin() + off + cnt);
+        task.stream = mBatchCopyStreams[t]->get();
+        task.completionEvent = event->get();
+        task.batchPending = batchPending.get();
+
+        mBatchCopyWorkerPool->submit(std::move(task));
+        workerEvents.push_back(std::move(event));
+    }
+
+    // Return immediately — waiting is deferred to FabricTransferStatus::wait()
+    return std::make_unique<FabricTransferStatus>(std::move(batchPending), std::move(workerEvents));
 }
 
 } // namespace tensorrt_llm::executor::kv_cache

@@ -139,10 +139,10 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def_prop_ro("remote_name", &kvc::TransferRequest::getRemoteName)
         .def_prop_ro("sync_message", &kvc::TransferRequest::getSyncMessage);
 
-    // TransferStatus base class
+    // TransferStatus base class - release GIL for blocking operations
     nb::class_<kvc::TransferStatus>(m, "TransferStatus")
-        .def("is_completed", &kvc::TransferStatus::isCompleted)
-        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1);
+        .def("is_completed", &kvc::TransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
+        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1, nb::call_guard<nb::gil_scoped_release>());
 
     // BaseAgentConfig struct
     nb::class_<kvc::BaseAgentConfig>(m, "BaseAgentConfig")
@@ -166,29 +166,36 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def_rw("enable_telemetry", &kvc::BaseAgentConfig::enableTelemetry)
         .def_rw("backend_params", &kvc::BaseAgentConfig::backendParams);
 
-    // BaseTransferAgent class (abstract base)
+    // BaseTransferAgent class (abstract base) - release GIL for potentially blocking operations
     nb::class_<kvc::BaseTransferAgent>(m, "BaseTransferAgent")
-        .def("register_memory", &kvc::BaseTransferAgent::registerMemory, nb::arg("descs"))
-        .def("deregister_memory", &kvc::BaseTransferAgent::deregisterMemory, nb::arg("descs"))
+        .def("register_memory", &kvc::BaseTransferAgent::registerMemory, nb::arg("descs"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("deregister_memory", &kvc::BaseTransferAgent::deregisterMemory, nb::arg("descs"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("load_remote_agent",
             nb::overload_cast<std::string const&, kvc::AgentDesc const&>(&kvc::BaseTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("agent_desc"))
+            nb::arg("name"), nb::arg("agent_desc"), nb::call_guard<nb::gil_scoped_release>())
         .def("load_remote_agent_by_connection",
             nb::overload_cast<std::string const&, kvc::ConnectionInfoType const&>(
                 &kvc::BaseTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("connection_info"))
-        .def("get_local_agent_desc", &kvc::BaseTransferAgent::getLocalAgentDesc)
-        .def("invalidate_remote_agent", &kvc::BaseTransferAgent::invalidateRemoteAgent, nb::arg("name"))
+            nb::arg("name"), nb::arg("connection_info"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_local_agent_desc", &kvc::BaseTransferAgent::getLocalAgentDesc,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("invalidate_remote_agent", &kvc::BaseTransferAgent::invalidateRemoteAgent, nb::arg("name"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "submit_transfer_requests",
             [](kvc::BaseTransferAgent& self, kvc::TransferRequest const& request)
             { return self.submitTransferRequests(request).release(); },
-            nb::arg("request"), nb::rv_policy::take_ownership)
-        .def(
-            "notify_sync_message", &kvc::BaseTransferAgent::notifySyncMessage, nb::arg("name"), nb::arg("sync_message"))
-        .def("get_notified_sync_messages", &kvc::BaseTransferAgent::getNotifiedSyncMessages)
-        .def("get_local_connection_info", &kvc::BaseTransferAgent::getLocalConnectionInfo)
-        .def("check_remote_descs", &kvc::BaseTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"));
+            nb::arg("request"), nb::rv_policy::take_ownership, nb::call_guard<nb::gil_scoped_release>())
+        .def("notify_sync_message", &kvc::BaseTransferAgent::notifySyncMessage, nb::arg("name"),
+            nb::arg("sync_message"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_notified_sync_messages", &kvc::BaseTransferAgent::getNotifiedSyncMessages,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_local_connection_info", &kvc::BaseTransferAgent::getLocalConnectionInfo,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("check_remote_descs", &kvc::BaseTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"),
+            nb::call_guard<nb::gil_scoped_release>());
 
 #ifdef ENABLE_NIXL
     // NixlTransferStatus class - release GIL for blocking operations
@@ -197,30 +204,37 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def("wait", &kvc::NixlTransferStatus::wait, nb::arg("timeout_ms") = -1,
             nb::call_guard<nb::gil_scoped_release>());
 
-    // NixlTransferAgent class
+    // NixlTransferAgent class - release GIL for all potentially blocking operations
     nb::class_<kvc::NixlTransferAgent, kvc::BaseTransferAgent>(m, "NixlTransferAgent")
-        .def(nb::init<kvc::BaseAgentConfig const&>(), nb::arg("config"))
-        .def("register_memory", &kvc::NixlTransferAgent::registerMemory, nb::arg("descs"))
-        .def("deregister_memory", &kvc::NixlTransferAgent::deregisterMemory, nb::arg("descs"))
+        .def(nb::init<kvc::BaseAgentConfig const&>(), nb::arg("config"), nb::call_guard<nb::gil_scoped_release>())
+        .def("register_memory", &kvc::NixlTransferAgent::registerMemory, nb::arg("descs"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("deregister_memory", &kvc::NixlTransferAgent::deregisterMemory, nb::arg("descs"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("load_remote_agent",
             nb::overload_cast<std::string const&, kvc::AgentDesc const&>(&kvc::NixlTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("agent_desc"))
+            nb::arg("name"), nb::arg("agent_desc"), nb::call_guard<nb::gil_scoped_release>())
         .def("load_remote_agent_by_connection",
             nb::overload_cast<std::string const&, kvc::ConnectionInfoType const&>(
                 &kvc::NixlTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("connection_info"))
-        .def("get_local_agent_desc", &kvc::NixlTransferAgent::getLocalAgentDesc)
-        .def("get_local_connection_info", &kvc::NixlTransferAgent::getLocalConnectionInfo)
-        .def("invalidate_remote_agent", &kvc::NixlTransferAgent::invalidateRemoteAgent, nb::arg("name"))
+            nb::arg("name"), nb::arg("connection_info"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_local_agent_desc", &kvc::NixlTransferAgent::getLocalAgentDesc,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_local_connection_info", &kvc::NixlTransferAgent::getLocalConnectionInfo,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("invalidate_remote_agent", &kvc::NixlTransferAgent::invalidateRemoteAgent, nb::arg("name"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "submit_transfer_requests",
             [](kvc::NixlTransferAgent& self, kvc::TransferRequest const& request)
             { return self.submitTransferRequests(request).release(); },
             nb::arg("request"), nb::rv_policy::take_ownership, nb::call_guard<nb::gil_scoped_release>())
-        .def(
-            "notify_sync_message", &kvc::NixlTransferAgent::notifySyncMessage, nb::arg("name"), nb::arg("sync_message"))
-        .def("get_notified_sync_messages", &kvc::NixlTransferAgent::getNotifiedSyncMessages)
-        .def("check_remote_descs", &kvc::NixlTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"));
+        .def("notify_sync_message", &kvc::NixlTransferAgent::notifySyncMessage, nb::arg("name"),
+            nb::arg("sync_message"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_notified_sync_messages", &kvc::NixlTransferAgent::getNotifiedSyncMessages,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("check_remote_descs", &kvc::NixlTransferAgent::checkRemoteDescs, nb::arg("name"), nb::arg("memory_descs"),
+            nb::call_guard<nb::gil_scoped_release>());
 #endif
 
 #ifdef ENABLE_MOONCAKE
@@ -230,31 +244,37 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         .def("wait", &kvc::MooncakeTransferStatus::wait, nb::arg("timeout_ms") = -1,
             nb::call_guard<nb::gil_scoped_release>());
 
-    // MooncakeTransferAgent class
+    // MooncakeTransferAgent class - release GIL for all potentially blocking operations
     nb::class_<kvc::MooncakeTransferAgent, kvc::BaseTransferAgent>(m, "MooncakeTransferAgent")
-        .def(nb::init<kvc::BaseAgentConfig const&>(), nb::arg("config"))
-        .def("register_memory", &kvc::MooncakeTransferAgent::registerMemory, nb::arg("descs"))
-        .def("deregister_memory", &kvc::MooncakeTransferAgent::deregisterMemory, nb::arg("descs"))
+        .def(nb::init<kvc::BaseAgentConfig const&>(), nb::arg("config"), nb::call_guard<nb::gil_scoped_release>())
+        .def("register_memory", &kvc::MooncakeTransferAgent::registerMemory, nb::arg("descs"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("deregister_memory", &kvc::MooncakeTransferAgent::deregisterMemory, nb::arg("descs"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def("load_remote_agent",
             nb::overload_cast<std::string const&, kvc::AgentDesc const&>(&kvc::MooncakeTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("agent_desc"))
+            nb::arg("name"), nb::arg("agent_desc"), nb::call_guard<nb::gil_scoped_release>())
         .def("load_remote_agent_by_connection",
             nb::overload_cast<std::string const&, kvc::ConnectionInfoType const&>(
                 &kvc::MooncakeTransferAgent::loadRemoteAgent),
-            nb::arg("name"), nb::arg("connection_info"))
-        .def("get_local_agent_desc", &kvc::MooncakeTransferAgent::getLocalAgentDesc)
-        .def("get_local_connection_info", &kvc::MooncakeTransferAgent::getLocalConnectionInfo)
-        .def("invalidate_remote_agent", &kvc::MooncakeTransferAgent::invalidateRemoteAgent, nb::arg("name"))
+            nb::arg("name"), nb::arg("connection_info"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_local_agent_desc", &kvc::MooncakeTransferAgent::getLocalAgentDesc,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("get_local_connection_info", &kvc::MooncakeTransferAgent::getLocalConnectionInfo,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("invalidate_remote_agent", &kvc::MooncakeTransferAgent::invalidateRemoteAgent, nb::arg("name"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "submit_transfer_requests",
             [](kvc::MooncakeTransferAgent& self, kvc::TransferRequest const& request)
             { return self.submitTransferRequests(request).release(); },
             nb::arg("request"), nb::rv_policy::take_ownership, nb::call_guard<nb::gil_scoped_release>())
         .def("notify_sync_message", &kvc::MooncakeTransferAgent::notifySyncMessage, nb::arg("name"),
-            nb::arg("sync_message"))
-        .def("get_notified_sync_messages", &kvc::MooncakeTransferAgent::getNotifiedSyncMessages)
+            nb::arg("sync_message"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_notified_sync_messages", &kvc::MooncakeTransferAgent::getNotifiedSyncMessages,
+            nb::call_guard<nb::gil_scoped_release>())
         .def("check_remote_descs", &kvc::MooncakeTransferAgent::checkRemoteDescs, nb::arg("name"),
-            nb::arg("memory_descs"));
+            nb::arg("memory_descs"), nb::call_guard<nb::gil_scoped_release>());
 #endif
 
     // Factory function to create transfer agent by backend name (uses dynamic loading)
@@ -262,7 +282,7 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
         "make_transfer_agent",
         [](std::string const& backend, kvc::BaseAgentConfig const& config) -> kvc::BaseTransferAgent*
         { return kvc::makeTransferAgent(backend, &config).release(); },
-        nb::arg("backend"), nb::arg("config"), nb::rv_policy::take_ownership,
+        nb::arg("backend"), nb::arg("config"), nb::rv_policy::take_ownership, nb::call_guard<nb::gil_scoped_release>(),
         "Create a transfer agent by backend name ('nixl' or 'mooncake'). Uses dynamic loading.");
 
     // Expose which backends are available
