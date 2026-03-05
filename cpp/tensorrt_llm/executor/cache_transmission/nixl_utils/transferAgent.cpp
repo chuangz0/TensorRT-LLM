@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -783,7 +783,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     // 2. Source or destination is not VRAM (fabric mapping is VRAM-only)
     // Look up remote mapping once (O(1) amortized hash lookup), then reuse in the hot loop.
     // Previously translateToLocalMapping() did this find() on every iteration — 10K+ redundant lookups.
-    RemoteFabricMapping const* remoteMapping
+    std::shared_ptr<RemoteFabricMapping const> remoteMapping
         = (mFabricHelper && !request.getSyncMessage().has_value() && coalescedSrc.getType() == MemoryType::kVRAM
               && coalescedDst.getType() == MemoryType::kVRAM)
         ? mFabricHelper->getRemoteMapping(remoteName)

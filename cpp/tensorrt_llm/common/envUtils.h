@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -176,6 +176,11 @@ size_t getEnvFabricBatchThresholdKB();
 // Default: 2 (each thread gets its own stream, splitting the batch evenly).
 // Set to 1 to disable multi-thread submission.
 int getEnvFabricBatchCopyThreads();
+
+/// Whether cub batch copy reads parameters directly from pinned host memory (zero-copy).
+/// 0 = H2D copy to GPU then cub reads from HBM (default)
+/// 1 = cub kernel reads pinned host directly over PCIe (skips H2D copy)
+bool getEnvFabricCubZeroCopy();
 
 } // namespace common
 

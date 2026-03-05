@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +28,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <shared_mutex>
 #include <sstream>
 #include <thread>
 #include <unordered_set>
@@ -218,6 +219,24 @@ private:
 };
 
 // ============================================================================
+// CudaEventPool - Pool of reusable CUDA events to avoid create/destroy overhead
+// ============================================================================
+
+class CudaEventPool : public std::enable_shared_from_this<CudaEventPool>
+{
+public:
+    /// @brief Acquire an event from the pool (creates new if pool is empty).
+    /// Returned shared_ptr has a custom deleter that returns the event to the pool.
+    [[nodiscard]] std::shared_ptr<runtime::CudaEvent> acquire();
+
+private:
+    void release(runtime::CudaEvent* event);
+
+    std::mutex mMutex;
+    std::vector<std::unique_ptr<runtime::CudaEvent>> mFreeEvents;
+};
+
+// ============================================================================
 // FabricTransferHelper - Helper class for fabric transfer operations
 // ============================================================================
 
@@ -266,9 +285,10 @@ public:
     [[nodiscard]] void* translateToLocalMapping(
         std::string const& remoteName, uintptr_t remoteAddr, size_t transferSize) const;
 
-    /// @brief Get remote fabric mapping pointer (nullptr if not found). Use to cache the lookup
+    /// @brief Get remote fabric mapping (nullptr if not found). Use to cache the lookup
     ///        outside hot loops, then call translateAddress() with the cached mapping.
-    [[nodiscard]] RemoteFabricMapping const* getRemoteMapping(std::string const& remoteName) const;
+    ///        Returns shared_ptr to keep the mapping alive even if cleanupRemoteFabricMapping runs concurrently.
+    [[nodiscard]] std::shared_ptr<RemoteFabricMapping const> getRemoteMapping(std::string const& remoteName) const;
 
     /// @brief Translate remote address using a pre-looked-up mapping (avoids per-call hash lookup)
     /// @param transferSize Validates that [remoteAddr, remoteAddr + transferSize) is within registered range
@@ -336,9 +356,8 @@ private:
     // Pre-allocated buffers for cub::DeviceMemcpy::Batched
     struct PreallocatedBuffers
     {
-        runtime::IBuffer::UniquePtr srcPtrs;        ///< Source pointer array (GPU)
-        runtime::IBuffer::UniquePtr dstPtrs;        ///< Destination pointer array (GPU)
-        runtime::IBuffer::UniquePtr sizes;          ///< Size array (GPU)
+        runtime::IBuffer::UniquePtr combinedGpu;    ///< [srcPtrs|dstPtrs|sizes] on GPU (H2D mode only)
+        runtime::IBuffer::UniquePtr combinedPinned; ///< [srcPtrs|dstPtrs|sizes] on pinned host
         runtime::IBuffer::UniquePtr cubTempStorage; ///< cub temporary storage
         size_t maxBatchSize{0};                     ///< Current max batch size
         size_t cubTempStorageSize{0};               ///< Current cub temp storage size
@@ -346,6 +365,12 @@ private:
 
     PreallocatedBuffers mPreallocBuffers;
     std::mutex mBufferMutex; ///< Protects pre-allocated buffers
+
+    // CUDA event pool (avoids per-transfer cudaEventCreate/Destroy overhead)
+    std::shared_ptr<CudaEventPool> mEventPool;
+
+    // Whether cub reads parameter arrays directly from pinned host (zero-copy)
+    bool mCubZeroCopy{false};
 
     // Local fabric memory information
     FabricMemInfo mLocalFabricInfo;
@@ -356,12 +381,15 @@ private:
     // Local CUDA device ID (queried once at construction)
     CUdevice mLocalDevice{0};
 
-    // Remote fabric memory mappings
-    std::unordered_map<std::string, RemoteFabricMapping> mRemoteFabricMappings;
+    // Remote fabric memory mappings (stored as shared_ptr for safe concurrent access)
+    std::unordered_map<std::string, std::shared_ptr<RemoteFabricMapping>> mRemoteFabricMappings;
 
     // Set of remote agents where fabric import has failed (e.g., not in same NVLink domain)
     // We track these to avoid retrying failed imports and to ensure proper fallback to NIXL
     std::unordered_set<std::string> mFailedFabricImports;
+
+    // Protects mRemoteFabricMappings and mFailedFabricImports for concurrent read/write access
+    mutable std::shared_mutex mRemoteMappingsMutex;
 
     // ========== POSIX FD specific members ==========
     // Exported file descriptors (one per chunk, in pool/chunk order)

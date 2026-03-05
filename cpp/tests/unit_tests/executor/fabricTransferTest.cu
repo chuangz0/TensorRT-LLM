@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -573,4 +573,244 @@ TEST_F(FabricTransferTest, SubmitBatchIsCompletedPolling)
     }
 
     EXPECT_TRUE(status->isCompleted());
+}
+
+// ============================================================================
+// CudaEventPool Tests
+// ============================================================================
+
+TEST_F(FabricTransferTest, EventPoolAcquireAndReuse)
+{
+    // Acquire event, capture underlying cudaEvent_t handle, release, acquire again.
+    // Pool should reuse the same underlying event.
+    auto pool = std::make_shared<CudaEventPool>();
+
+    cudaEvent_t firstHandle;
+    {
+        auto event = pool->acquire();
+        firstHandle = event->get();
+        // event goes out of scope → returned to pool
+    }
+
+    auto event2 = pool->acquire();
+    EXPECT_EQ(event2->get(), firstHandle) << "Pool should reuse the same underlying CUDA event";
+}
+
+TEST_F(FabricTransferTest, EventPoolConcurrentAccess)
+{
+    // 8 threads × 100 acquire/release cycles — verify no crashes.
+    auto pool = std::make_shared<CudaEventPool>();
+    constexpr int kNumThreads = 8;
+    constexpr int kNumCycles = 100;
+
+    std::atomic<int> totalAcquires{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kNumThreads);
+
+    for (int t = 0; t < kNumThreads; ++t)
+    {
+        threads.emplace_back(
+            [&pool, &totalAcquires]()
+            {
+                for (int i = 0; i < kNumCycles; ++i)
+                {
+                    auto event = pool->acquire();
+                    ASSERT_NE(event, nullptr);
+                    totalAcquires.fetch_add(1, std::memory_order_relaxed);
+                    // event released at end of each iteration
+                }
+            });
+    }
+
+    for (auto& t : threads)
+    {
+        t.join();
+    }
+
+    EXPECT_EQ(totalAcquires.load(), kNumThreads * kNumCycles);
+}
+
+TEST_F(FabricTransferTest, EventPoolDestroyedBeforeEventsReturned)
+{
+    // Acquire event, destroy pool, verify event still usable.
+    // The weak_ptr in the deleter should expire gracefully.
+    auto pool = std::make_shared<CudaEventPool>();
+    auto event = pool->acquire();
+    ASSERT_NE(event, nullptr);
+
+    auto stream = std::make_shared<runtime::CudaStream>();
+
+    // Destroy pool while event is still alive
+    pool.reset();
+
+    // Event should still be usable: record and synchronize
+    stream->record(*event);
+    event->synchronize();
+
+    // Event destruction should not crash (weak_ptr expired → normal delete)
+    event.reset();
+}
+
+// ============================================================================
+// FabricTransferHelper::submitWithCubBatched Tests (merged pinned H2D path)
+// ============================================================================
+
+TEST_F(FabricTransferTest, SubmitCubBatchedMergedH2D)
+{
+    // Allocate N GPU src buffers with known patterns, N zeroed dst buffers.
+    // Call submitWithCubBatched, wait, verify dst contents match src patterns.
+    FabricTransferHelper helper;
+
+    constexpr int kNumEntries = 16;
+    constexpr size_t kEntrySize = 4096;
+
+    std::vector<void*> srcPtrs, dstPtrs;
+    std::vector<size_t> sizes;
+
+    for (int ii = 0; ii < kNumEntries; ++ii)
+    {
+        srcPtrs.push_back(allocGpuWithPattern(kEntrySize, static_cast<uint8_t>(ii + 1)));
+        dstPtrs.push_back(allocGpuZeroed(kEntrySize));
+        sizes.push_back(kEntrySize);
+    }
+
+    auto status = helper.submitWithCubBatched(srcPtrs, dstPtrs, sizes);
+    ASSERT_NE(status, nullptr);
+
+    auto result = status->wait(-1);
+    EXPECT_EQ(result, TransferState::kSUCCESS);
+
+    // Verify each entry
+    for (int ii = 0; ii < kNumEntries; ++ii)
+    {
+        std::vector<uint8_t> hostBuf(kEntrySize);
+        TLLM_CUDA_CHECK(cudaMemcpy(hostBuf.data(), dstPtrs[ii], kEntrySize, cudaMemcpyDeviceToHost));
+        EXPECT_EQ(hostBuf[0], static_cast<uint8_t>(ii + 1)) << "Entry " << ii << " first byte mismatch";
+        EXPECT_EQ(hostBuf[kEntrySize - 1], static_cast<uint8_t>(ii + 1)) << "Entry " << ii << " last byte mismatch";
+    }
+}
+
+TEST_F(FabricTransferTest, SubmitCubBatchedEmptyInput)
+{
+    // Empty input should return immediately-completed status.
+    FabricTransferHelper helper;
+
+    std::vector<void*> srcPtrs, dstPtrs;
+    std::vector<size_t> sizes;
+
+    auto status = helper.submitWithCubBatched(srcPtrs, dstPtrs, sizes);
+    ASSERT_NE(status, nullptr);
+
+    auto result = status->wait(-1);
+    EXPECT_EQ(result, TransferState::kSUCCESS);
+}
+
+TEST_F(FabricTransferTest, SubmitCubBatchedConsecutiveCalls)
+{
+    // Two consecutive submitWithCubBatched calls on the same helper.
+    // Verifies buffer reuse and correctness across calls.
+    FabricTransferHelper helper;
+
+    constexpr int kNumEntries = 8;
+    constexpr size_t kEntrySize = 2048;
+
+    for (int batch = 0; batch < 2; ++batch)
+    {
+        std::vector<void*> srcPtrs, dstPtrs;
+        std::vector<size_t> sizes;
+        uint8_t pattern = static_cast<uint8_t>(0xC0 + batch);
+
+        for (int ii = 0; ii < kNumEntries; ++ii)
+        {
+            srcPtrs.push_back(allocGpuWithPattern(kEntrySize, pattern));
+            dstPtrs.push_back(allocGpuZeroed(kEntrySize));
+            sizes.push_back(kEntrySize);
+        }
+
+        auto status = helper.submitWithCubBatched(srcPtrs, dstPtrs, sizes);
+        ASSERT_NE(status, nullptr);
+
+        auto result = status->wait(-1);
+        EXPECT_EQ(result, TransferState::kSUCCESS) << "Batch " << batch << " failed";
+
+        for (int ii = 0; ii < kNumEntries; ++ii)
+        {
+            std::vector<uint8_t> hostBuf(kEntrySize);
+            TLLM_CUDA_CHECK(cudaMemcpy(hostBuf.data(), dstPtrs[ii], kEntrySize, cudaMemcpyDeviceToHost));
+            EXPECT_EQ(hostBuf[0], pattern) << "Batch " << batch << " entry " << ii;
+        }
+    }
+}
+
+// ============================================================================
+// Thread Safety Tests for Remote Mappings
+// ============================================================================
+
+TEST_F(FabricTransferTest, RemoteMappingConcurrentReadWrite)
+{
+    // 4 reader threads calling hasRemoteMapping/hasFabricImportFailed/getRemoteMapping in a loop
+    // 2 writer threads calling importAndMapRemoteFabric (with empty pools → fails) +
+    //   cleanupRemoteFabricMapping in a loop.
+    // Run for 500 iterations; verify no crashes.
+    FabricTransferHelper helper;
+
+    constexpr int kNumReaders = 4;
+    constexpr int kNumWriters = 2;
+    constexpr int kIterations = 500;
+
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> threads;
+
+    // Reader threads
+    for (int r = 0; r < kNumReaders; ++r)
+    {
+        threads.emplace_back(
+            [&helper, &stop, r]()
+            {
+                while (!stop.load(std::memory_order_acquire))
+                {
+                    std::string name = "remote_" + std::to_string(r % 4);
+                    // These should not crash regardless of concurrent writes
+                    [[maybe_unused]] auto has = helper.hasRemoteMapping(name);
+                    [[maybe_unused]] auto failed = helper.hasFabricImportFailed(name);
+                    [[maybe_unused]] auto mapping = helper.getRemoteMapping(name);
+                    std::this_thread::yield();
+                }
+            });
+    }
+
+    // Writer threads
+    for (int w = 0; w < kNumWriters; ++w)
+    {
+        threads.emplace_back(
+            [&helper, &stop, w]()
+            {
+                for (int i = 0; i < kIterations; ++i)
+                {
+                    std::string name = "remote_" + std::to_string(w);
+                    // Empty FabricMemInfo → import will fail gracefully (no pools)
+                    FabricMemInfo emptyInfo;
+                    emptyInfo.supported = true;
+                    emptyInfo.handleType = VmmHandleType::kFabric;
+                    // This will record name in mFailedFabricImports (no pools to map)
+                    helper.importAndMapRemoteFabric(name, emptyInfo);
+                    // Clean up (removes from mFailedFabricImports and mRemoteFabricMappings)
+                    helper.cleanupRemoteFabricMapping(name);
+                }
+            });
+    }
+
+    // Wait for writers to finish, then stop readers
+    for (int i = kNumReaders; i < static_cast<int>(threads.size()); ++i)
+    {
+        threads[i].join();
+    }
+    stop.store(true, std::memory_order_release);
+    for (int i = 0; i < kNumReaders; ++i)
+    {
+        threads[i].join();
+    }
+
+    // If we got here without crashing, the test passes
+    SUCCEED();
 }

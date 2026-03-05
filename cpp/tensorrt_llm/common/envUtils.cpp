@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -592,6 +592,12 @@ int getEnvFabricBatchCopyThreads()
 {
     static int const threads = getIntEnv("TRTLLM_FABRIC_BATCH_COPY_THREADS").value_or(2);
     return threads;
+}
+
+bool getEnvFabricCubZeroCopy()
+{
+    static bool const zeroCopy = getIntEnv("TRTLLM_FABRIC_CUB_ZERO_COPY").value_or(0) != 0;
+    return zeroCopy;
 }
 
 } // namespace common

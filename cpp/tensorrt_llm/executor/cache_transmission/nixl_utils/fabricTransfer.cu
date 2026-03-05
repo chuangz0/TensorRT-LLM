@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -617,6 +617,50 @@ TransferState FabricTransferStatus::wait(int64_t timeout_ms) const
 }
 
 // ============================================================================
+// CudaEventPool Implementation
+// ============================================================================
+
+std::shared_ptr<runtime::CudaEvent> CudaEventPool::acquire()
+{
+    std::unique_ptr<runtime::CudaEvent> event;
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (!mFreeEvents.empty())
+        {
+            event = std::move(mFreeEvents.back());
+            mFreeEvents.pop_back();
+        }
+    }
+    if (!event)
+    {
+        event = std::make_unique<runtime::CudaEvent>();
+    }
+
+    // Custom deleter returns the event to the pool (or deletes if pool is gone)
+    auto weak = weak_from_this();
+    auto* rawPtr = event.release();
+    return std::shared_ptr<runtime::CudaEvent>(rawPtr,
+        [weak](runtime::CudaEvent* e)
+        {
+            auto pool = weak.lock();
+            if (pool)
+            {
+                pool->release(e);
+            }
+            else
+            {
+                delete e;
+            }
+        });
+}
+
+void CudaEventPool::release(runtime::CudaEvent* event)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    mFreeEvents.push_back(std::unique_ptr<runtime::CudaEvent>(event));
+}
+
+// ============================================================================
 // FabricTransferHelper Implementation
 // ============================================================================
 
@@ -645,9 +689,9 @@ FabricTransferHelper::~FabricTransferHelper()
     mExportedFds.clear();
 
     // Clean up all remote fabric mappings
-    for (auto& [name, mapping] : mRemoteFabricMappings)
+    for (auto& [name, mappingPtr] : mRemoteFabricMappings)
     {
-        for (auto& poolMapping : mapping.pools)
+        for (auto& poolMapping : mappingPtr->pools)
         {
             // CUDA VMM requires: unmap -> release -> addressFree
             if (poolMapping.localVirtAddr != 0)
@@ -668,6 +712,7 @@ FabricTransferHelper::~FabricTransferHelper()
 
 bool FabricTransferHelper::hasRemoteMapping(std::string const& remoteName) const
 {
+    std::shared_lock lock(mRemoteMappingsMutex);
     // Check if we have a valid mapping and haven't previously failed
     return mRemoteFabricMappings.find(remoteName) != mRemoteFabricMappings.end()
         && mFailedFabricImports.find(remoteName) == mFailedFabricImports.end();
@@ -675,6 +720,7 @@ bool FabricTransferHelper::hasRemoteMapping(std::string const& remoteName) const
 
 bool FabricTransferHelper::hasFabricImportFailed(std::string const& remoteName) const
 {
+    std::shared_lock lock(mRemoteMappingsMutex);
     return mFailedFabricImports.find(remoteName) != mFailedFabricImports.end();
 }
 
@@ -689,6 +735,8 @@ void FabricTransferHelper::ensureCudaResourcesInitialized()
             TLLM_CUDA_CHECK(cudaSetDevice(static_cast<int>(mLocalDevice)));
             mFabricStream = std::make_shared<runtime::CudaStream>();
             mBufferManager = std::make_shared<runtime::BufferManager>(mFabricStream);
+            mEventPool = std::make_shared<CudaEventPool>();
+            mCubZeroCopy = common::getEnvFabricCubZeroCopy();
         });
 }
 
@@ -716,10 +764,17 @@ void FabricTransferHelper::ensurePreallocBuffers(size_t batchSize, size_t cubTem
     // Synchronize stream to ensure previous operations are complete before releasing old buffers
     mFabricStream->synchronize();
 
-    // Reallocate
-    mPreallocBuffers.srcPtrs = mBufferManager->gpu(newBatchSize * sizeof(void*));
-    mPreallocBuffers.dstPtrs = mBufferManager->gpu(newBatchSize * sizeof(void*));
-    mPreallocBuffers.sizes = mBufferManager->gpu(newBatchSize * sizeof(size_t));
+    // Combined buffer: [srcPtrs | dstPtrs | sizes] — one contiguous allocation
+    size_t combinedSize = newBatchSize * (sizeof(void*) + sizeof(void*) + sizeof(size_t));
+    mPreallocBuffers.combinedPinned = runtime::BufferManager::pinned(combinedSize);
+    if (!mCubZeroCopy)
+    {
+        mPreallocBuffers.combinedGpu = mBufferManager->gpu(combinedSize);
+    }
+    else
+    {
+        mPreallocBuffers.combinedGpu = nullptr; // Not needed in zero-copy mode
+    }
     mPreallocBuffers.cubTempStorage = mBufferManager->gpu(newCubTempSize);
     mPreallocBuffers.maxBatchSize = newBatchSize;
     mPreallocBuffers.cubTempStorageSize = newCubTempSize;
@@ -1354,11 +1409,14 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
 {
     TLLM_CUDA_CHECK(cudaSetDevice(static_cast<int>(mLocalDevice)));
 
-    // Skip if we've already tried and failed for this remote agent
-    if (mFailedFabricImports.find(name) != mFailedFabricImports.end())
+    // Fast-path check under shared lock: skip if previously failed
     {
-        TLLM_LOG_DEBUG("FabricTransfer: skipping import for '%s' (previously failed)", name.c_str());
-        return;
+        std::shared_lock lock(mRemoteMappingsMutex);
+        if (mFailedFabricImports.find(name) != mFailedFabricImports.end())
+        {
+            TLLM_LOG_DEBUG("FabricTransfer: skipping import for '%s' (previously failed)", name.c_str());
+            return;
+        }
     }
 
     // For POSIX FD mode: receive FDs from remote UDS server first
@@ -1368,6 +1426,7 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
         if (fabricInfo.udsPath.empty())
         {
             TLLM_LOG_WARNING("FabricTransfer: POSIX FD mode but no UDS path for '%s'", name.c_str());
+            std::unique_lock lock(mRemoteMappingsMutex);
             mFailedFabricImports.insert(name);
             return;
         }
@@ -1385,6 +1444,7 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
         {
             TLLM_LOG_WARNING(
                 "FabricTransfer: failed to connect to UDS at '%s' for '%s'", fabricInfo.udsPath.c_str(), name.c_str());
+            std::unique_lock lock(mRemoteMappingsMutex);
             mFailedFabricImports.insert(name);
             return;
         }
@@ -1395,6 +1455,7 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
         {
             TLLM_LOG_WARNING("FabricTransfer: UDS protocol error (write numExpected) for '%s'", name.c_str());
             ::close(udsSocket);
+            std::unique_lock lock(mRemoteMappingsMutex);
             mFailedFabricImports.insert(name);
             return;
         }
@@ -1405,6 +1466,7 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
         {
             TLLM_LOG_WARNING("FabricTransfer: UDS protocol error (read numAvailable) for '%s'", name.c_str());
             ::close(udsSocket);
+            std::unique_lock lock(mRemoteMappingsMutex);
             mFailedFabricImports.insert(name);
             return;
         }
@@ -1422,6 +1484,7 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
             {
                 ::close(fd);
             }
+            std::unique_lock lock(mRemoteMappingsMutex);
             mFailedFabricImports.insert(name);
             return;
         }
@@ -1602,18 +1665,23 @@ void FabricTransferHelper::importAndMapRemoteFabric(std::string const& name, Fab
         ::close(receivedFds[i]);
     }
 
-    if (!mapping.pools.empty())
+    // Final insert under unique_lock
     {
-        mRemoteFabricMappings[name] = std::move(mapping);
-        TLLM_LOG_INFO("FabricTransfer: mapping established for remote agent '%s' with %zu/%zu pools (type=%s)",
-            name.c_str(), mRemoteFabricMappings[name].pools.size(), fabricInfo.pools.size(),
-            handleTypeToString(fabricInfo.handleType));
-    }
-    else if (anyImportFailed)
-    {
-        // All imports failed - record this to avoid retrying and ensure fallback to NIXL
-        mFailedFabricImports.insert(name);
-        TLLM_LOG_WARNING("FabricTransfer: import failed for '%s', will use NIXL fallback.", name.c_str());
+        std::unique_lock lock(mRemoteMappingsMutex);
+        if (!mapping.pools.empty())
+        {
+            auto mappingPtr = std::make_shared<RemoteFabricMapping>(std::move(mapping));
+            size_t numPools = mappingPtr->pools.size();
+            mRemoteFabricMappings[name] = std::move(mappingPtr);
+            TLLM_LOG_INFO("FabricTransfer: mapping established for remote agent '%s' with %zu/%zu pools (type=%s)",
+                name.c_str(), numPools, fabricInfo.pools.size(), handleTypeToString(fabricInfo.handleType));
+        }
+        else if (anyImportFailed)
+        {
+            // All imports failed - record this to avoid retrying and ensure fallback to NIXL
+            mFailedFabricImports.insert(name);
+            TLLM_LOG_WARNING("FabricTransfer: import failed for '%s', will use NIXL fallback.", name.c_str());
+        }
     }
 }
 
@@ -1621,19 +1689,27 @@ void FabricTransferHelper::cleanupRemoteFabricMapping(std::string const& name)
 {
     TLLM_CUDA_CHECK(cudaSetDevice(static_cast<int>(mLocalDevice)));
 
-    // Also clear failed import record so it can be retried if needed
-    mFailedFabricImports.erase(name);
-
-    auto it = mRemoteFabricMappings.find(name);
-    if (it == mRemoteFabricMappings.end())
+    // Move the mapping out under unique_lock, then do GPU cleanup without holding the lock
+    std::shared_ptr<RemoteFabricMapping> mappingPtr;
     {
-        return;
+        std::unique_lock lock(mRemoteMappingsMutex);
+        // Also clear failed import record so it can be retried if needed
+        mFailedFabricImports.erase(name);
+
+        auto it = mRemoteFabricMappings.find(name);
+        if (it == mRemoteFabricMappings.end())
+        {
+            return;
+        }
+        mappingPtr = std::move(it->second);
+        mRemoteFabricMappings.erase(it);
     }
 
-    if (it->second.handleType == VmmHandleType::kCudaIpc)
+    // GPU cleanup outside lock (heavy I/O)
+    if (mappingPtr->handleType == VmmHandleType::kCudaIpc)
     {
         // CudaIpc: just close the IPC mapping (no VMM unmap/release/addressFree)
-        for (auto& poolMapping : it->second.pools)
+        for (auto& poolMapping : mappingPtr->pools)
         {
             if (poolMapping.localVirtAddr != 0)
             {
@@ -1644,7 +1720,7 @@ void FabricTransferHelper::cleanupRemoteFabricMapping(std::string const& name)
     else
     {
         // VMM (Fabric/PosixFd): unmap -> release -> addressFree
-        for (auto& poolMapping : it->second.pools)
+        for (auto& poolMapping : mappingPtr->pools)
         {
             if (poolMapping.localVirtAddr != 0)
             {
@@ -1660,28 +1736,29 @@ void FabricTransferHelper::cleanupRemoteFabricMapping(std::string const& name)
             }
         }
     }
-    mRemoteFabricMappings.erase(it);
 }
 
 void* FabricTransferHelper::translateToLocalMapping(
     std::string const& remoteName, uintptr_t remoteAddr, size_t transferSize) const
 {
+    std::shared_lock lock(mRemoteMappingsMutex);
     auto it = mRemoteFabricMappings.find(remoteName);
     if (it == mRemoteFabricMappings.end())
     {
         return nullptr;
     }
-    return translateToLocalMappingInternal(it->second, remoteAddr, transferSize);
+    return translateToLocalMappingInternal(*it->second, remoteAddr, transferSize);
 }
 
-RemoteFabricMapping const* FabricTransferHelper::getRemoteMapping(std::string const& remoteName) const
+std::shared_ptr<RemoteFabricMapping const> FabricTransferHelper::getRemoteMapping(std::string const& remoteName) const
 {
+    std::shared_lock lock(mRemoteMappingsMutex);
     auto it = mRemoteFabricMappings.find(remoteName);
     if (it == mRemoteFabricMappings.end())
     {
         return nullptr;
     }
-    return &it->second;
+    return it->second;
 }
 
 void* FabricTransferHelper::translateAddress(
@@ -1749,7 +1826,7 @@ std::unique_ptr<TransferStatus> FabricTransferHelper::submitWithCubBatched(
     if (numBuffers == 0)
     {
         // Empty transfer, complete immediately
-        auto event = std::make_shared<runtime::CudaEvent>();
+        auto event = mEventPool->acquire();
         mFabricStream->record(*event);
         return std::make_unique<FabricTransferStatus>(mFabricStream, event);
     }
@@ -1765,23 +1842,48 @@ std::unique_ptr<TransferStatus> FabricTransferHelper::submitWithCubBatched(
     // Ensure pre-allocated buffers are large enough
     ensurePreallocBuffers(numBuffers, cubTempBytes);
 
-    // Copy pointer arrays to GPU (H2D, using pre-allocated buffers)
-    TLLM_CUDA_CHECK(cudaMemcpyAsync(mPreallocBuffers.srcPtrs->data(), srcPtrs.data(), numBuffers * sizeof(void*),
-        cudaMemcpyHostToDevice, mFabricStream->get()));
-    TLLM_CUDA_CHECK(cudaMemcpyAsync(mPreallocBuffers.dstPtrs->data(), dstPtrs.data(), numBuffers * sizeof(void*),
-        cudaMemcpyHostToDevice, mFabricStream->get()));
-    TLLM_CUDA_CHECK(cudaMemcpyAsync(mPreallocBuffers.sizes->data(), sizes.data(), numBuffers * sizeof(size_t),
-        cudaMemcpyHostToDevice, mFabricStream->get()));
+    // Fill contiguous pinned host buffer: [srcPtrs | dstPtrs | sizes]
+    size_t const srcBytes = numBuffers * sizeof(void*);
+    size_t const dstBytes = numBuffers * sizeof(void*);
+    size_t const sizesBytes = numBuffers * sizeof(size_t);
+    size_t const totalBytes = srcBytes + dstBytes + sizesBytes;
+
+    auto* pinnedBase = static_cast<uint8_t*>(mPreallocBuffers.combinedPinned->data());
+    std::memcpy(pinnedBase, srcPtrs.data(), srcBytes);
+    std::memcpy(pinnedBase + srcBytes, dstPtrs.data(), dstBytes);
+    std::memcpy(pinnedBase + srcBytes + dstBytes, sizes.data(), sizesBytes);
+
+    // Determine pointers for cub kernel based on mode
+    void const** cubSrcPtrs;
+    void** cubDstPtrs;
+    size_t* cubSizes;
+
+    if (mCubZeroCopy)
+    {
+        // Zero-copy: cub reads directly from pinned host over PCIe (no H2D copy)
+        cubSrcPtrs = reinterpret_cast<void const**>(pinnedBase);
+        cubDstPtrs = reinterpret_cast<void**>(pinnedBase + srcBytes);
+        cubSizes = reinterpret_cast<size_t*>(pinnedBase + srcBytes + dstBytes);
+    }
+    else
+    {
+        // H2D mode: single memcpy to GPU, cub reads from HBM
+        auto* gpuBase = static_cast<uint8_t*>(mPreallocBuffers.combinedGpu->data());
+        TLLM_CUDA_CHECK(
+            cudaMemcpyAsync(gpuBase, pinnedBase, totalBytes, cudaMemcpyHostToDevice, mFabricStream->get()));
+        cubSrcPtrs = reinterpret_cast<void const**>(gpuBase);
+        cubDstPtrs = reinterpret_cast<void**>(gpuBase + srcBytes);
+        cubSizes = reinterpret_cast<size_t*>(gpuBase + srcBytes + dstBytes);
+    }
 
     // Execute batch memcpy (async, reusing pre-allocated temp storage)
     size_t actualTempBytes = mPreallocBuffers.cubTempStorageSize;
-    TLLM_CUDA_CHECK(cub::DeviceMemcpy::Batched(mPreallocBuffers.cubTempStorage->data(), actualTempBytes,
-        static_cast<void const**>(mPreallocBuffers.srcPtrs->data()),
-        static_cast<void**>(mPreallocBuffers.dstPtrs->data()), static_cast<size_t*>(mPreallocBuffers.sizes->data()),
+    TLLM_CUDA_CHECK(cub::DeviceMemcpy::Batched(
+        mPreallocBuffers.cubTempStorage->data(), actualTempBytes, cubSrcPtrs, cubDstPtrs, cubSizes,
         numBuffers, mFabricStream->get()));
 
     // Record event on stream
-    auto completionEvent = std::make_shared<runtime::CudaEvent>();
+    auto completionEvent = mEventPool->acquire();
     mFabricStream->record(*completionEvent);
 
     return std::make_unique<FabricTransferStatus>(mFabricStream, completionEvent);
@@ -1821,7 +1923,7 @@ std::unique_ptr<TransferStatus> FabricTransferHelper::submitWithCudaMemcpyBatch(
     size_t numOps = srcPtrs.size();
     if (numOps == 0)
     {
-        auto event = std::make_shared<runtime::CudaEvent>();
+        auto event = mEventPool->acquire();
         mFabricStream->record(*event);
         return std::make_unique<FabricTransferStatus>(mFabricStream, event);
     }
@@ -1840,7 +1942,7 @@ std::unique_ptr<TransferStatus> FabricTransferHelper::submitWithCudaMemcpyBatch(
         TLLM_CUDA_CHECK(cudaMemcpyBatchAsync(
             dstPtrs.data(), constSrcPtrs.data(), sizes.data(), numOps, &attr, idx.data(), 1, mFabricStream->get()));
 
-        auto completionEvent = std::make_shared<runtime::CudaEvent>();
+        auto completionEvent = mEventPool->acquire();
         mFabricStream->record(*completionEvent);
         return std::make_unique<FabricTransferStatus>(mFabricStream, completionEvent);
     }
@@ -1864,7 +1966,7 @@ std::unique_ptr<TransferStatus> FabricTransferHelper::submitWithCudaMemcpyBatch(
         size_t off = t * perWorker;
         size_t cnt = (t == numWorkers - 1) ? (numOps - off) : perWorker;
 
-        auto event = std::make_shared<runtime::CudaEvent>();
+        auto event = mEventPool->acquire();
 
         BatchCopyTask task;
         task.dst.assign(dstPtrs.begin() + off, dstPtrs.begin() + off + cnt);
