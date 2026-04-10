@@ -1803,6 +1803,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Plus 1 for cuda graph dummy request.
         max_num_sequences = max_batch_size * mapping.pp_size
         self.index_mapper = IndexMapper(max_num_sequences + 1, max_beam_width)
+        self._early_freed_index_requests: set[int] = set()
         self.index_scales = torch.empty(self.num_pools,
                                         dtype=torch.int32,
                                         pin_memory=prefer_pinned(),
@@ -2353,6 +2354,17 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return requests
 
+    def release_index_slot(self, request_id: int) -> None:
+        """Release IndexMapper slot early while keeping KV cache blocks allocated.
+
+        After prefill completes on a context-only worker, the IndexMapper slot
+        (used for host_kv_cache_block_offsets during model forward) is no longer
+        needed.  Releasing it early allows new requests to be scheduled while
+        the KV cache blocks are still being transferred via NIXL/UCX.
+        """
+        self.index_mapper.remove_sequence(request_id)
+        self._early_freed_index_requests.add(request_id)
+
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
@@ -2367,7 +2379,10 @@ class KVCacheManagerV2(BaseResourceManager):
                                       context_current_position])
             kv_cache.stop_committing()
         kv_cache.close()
-        self.index_mapper.remove_sequence(request.py_request_id)
+        if request.py_request_id in self._early_freed_index_requests:
+            self._early_freed_index_requests.discard(request.py_request_id)
+        else:
+            self.index_mapper.remove_sequence(request.py_request_id)
 
     def get_batch_cache_indices(self,
                                 request_ids: List[int],
