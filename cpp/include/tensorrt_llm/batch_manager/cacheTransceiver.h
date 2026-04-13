@@ -26,6 +26,7 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <fstream>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -293,6 +294,10 @@ private:
     rnn_state_manager::RnnStateManager* mRnnStateManager{nullptr};
     // TODO(shreyasm): update this to use same container as kv by using base trans buffers instead
     std::unique_ptr<rnn_state_manager::RnnCacheTransBufferManager> mRnnCacheTransBufferManager{nullptr};
+
+    // Gen-side transfer summary CSV (written after timing sync)
+    std::ofstream mGenTransferSummaryFile;
+    std::mutex mGenTransferSummaryMutex;
 
     // library handle to the communicator related features,
     // this is used to defer dependency resolution until needed.

@@ -54,6 +54,8 @@
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <algorithm>
 #include <cstddef>
+#include <filesystem>
+#include <fstream>
 #include <numeric>
 #include <unordered_set>
 
@@ -416,14 +418,26 @@ std::vector<LlmRequest::RequestIdType> gatherRequestIds(
     return retData;
 }
 
-void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm, LlmRequest* request)
+void batchUpdateKVCacheTransferBW(
+    std::shared_ptr<CacheTransceiverComm> const& comm, std::vector<LlmRequest*> const& requests)
 {
-    namespace su = executor::serialize_utils;
-    int worldSize = mComm->getSize();
+    if (requests.empty())
+    {
+        return;
+    }
 
+    namespace su = executor::serialize_utils;
+    int const worldSize = comm->getSize();
+    std::size_t const numReqs = requests.size();
+
+    // --- Pack timing for all requests into one buffer ---
     std::ostringstream oStream;
-    su::serialize(request->getKvCacheTransferStart(), oStream);
-    su::serialize(request->getKvCacheTransferEnd(), oStream);
+    su::serialize(numReqs, oStream);
+    for (auto* req : requests)
+    {
+        su::serialize(req->getKvCacheTransferStart(), oStream);
+        su::serialize(req->getKvCacheTransferEnd(), oStream);
+    }
 
     auto str = oStream.str();
     std::vector<char> sendBuffer(str.begin(), str.end());
@@ -433,50 +447,61 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
 
     if (useMPI())
     {
-        mComm->allgather(sendBuffer.data(), recvBuffer.data(), sendBufferSize, mpi::MpiType::kCHAR);
+        comm->allgather(sendBuffer.data(), recvBuffer.data(), sendBufferSize, mpi::MpiType::kCHAR);
     }
     else
     {
-        mComm->allgather(std::ref(sendBuffer), std::ref(recvBuffer), {});
+        comm->allgather(std::ref(sendBuffer), std::ref(recvBuffer), {});
     }
+
+    // --- Pack sizes into one buffer ---
+    std::vector<std::size_t> localSizes(numReqs);
+    for (std::size_t i = 0; i < numReqs; ++i)
+    {
+        localSizes[i] = requests[i]->getKvCacheSize();
+    }
+    std::vector<std::size_t> allSizes(numReqs * worldSize, 0);
+
+    if (useMPI())
+    {
+        comm->allgather(localSizes.data(), allSizes.data(), numReqs, mpi::MpiType::kUINT64);
+    }
+    else
+    {
+        comm->allgather(localSizes.data(), std::ref(allSizes), {});
+    }
+
+    // --- Merge: per-request min(start), max(end), sum(size) across ranks ---
+    using TimePoint = executor::RequestPerfMetrics::TimePoint;
+    std::vector<TimePoint> minStarts(numReqs, TimePoint::max());
+    std::vector<TimePoint> maxEnds(numReqs, TimePoint::min());
+    std::vector<std::size_t> totalSizes(numReqs, 0);
 
     su::VectorWrapBuf<char> strbuf(recvBuffer);
     std::istream is(&strbuf);
 
-    auto minStartTime = executor::RequestPerfMetrics::TimePoint::max();
-    auto maxEndTime = executor::RequestPerfMetrics::TimePoint::min();
-
-    for (int rank = 0; rank < worldSize; rank++)
+    for (int rank = 0; rank < worldSize; ++rank)
     {
-        minStartTime = std::min(su::deserialize<executor::RequestPerfMetrics::TimePoint>(is), minStartTime);
-        maxEndTime = std::max(su::deserialize<executor::RequestPerfMetrics::TimePoint>(is), maxEndTime);
+        auto rankNumReqs = su::deserialize<std::size_t>(is);
+        TLLM_CHECK_WITH_INFO(rankNumReqs == numReqs,
+            "Rank %d has %zu completed requests but local rank has %zu — mismatch in batched timing sync", rank,
+            rankNumReqs, numReqs);
+        for (std::size_t i = 0; i < numReqs; ++i)
+        {
+            auto start = su::deserialize<TimePoint>(is);
+            auto end = su::deserialize<TimePoint>(is);
+            minStarts[i] = std::min(minStarts[i], start);
+            maxEnds[i] = std::max(maxEnds[i], end);
+            totalSizes[i] += allSizes[rank * numReqs + i];
+        }
     }
 
-    // Handle KV cache size separately - gather all sizes to the leader rank
-    std::size_t localKVCacheSize = request->getKvCacheSize();
-    std::vector<std::size_t> allKVCacheSizes(worldSize, 0);
-
-    if (useMPI())
+    // Update all ranks
+    for (std::size_t i = 0; i < numReqs; ++i)
     {
-        mComm->allgather(&localKVCacheSize, allKVCacheSizes.data(), 1, mpi::MpiType::kUINT64);
-    }
-    else
-    {
-        mComm->allgather(&localKVCacheSize, std::ref(allKVCacheSizes), {});
-    }
-
-    std::size_t totalKVCacheSize = 0;
-    for (int rank = 0; rank < worldSize; rank++)
-    {
-        totalKVCacheSize += allKVCacheSizes[rank];
-    }
-
-    // Update the latest KV cache transfer time for leader rank
-    if (mComm->getRank() == 0)
-    {
-        request->setKvCacheTransferStart(minStartTime);
-        request->setKvCacheTransferEnd(maxEndTime);
-        request->setKvCacheSize(totalKVCacheSize);
+        requests[i]->setKvCacheTransferStart(minStarts[i]);
+        requests[i]->setKvCacheTransferEnd(maxEnds[i]);
+        requests[i]->setKvCacheSize(totalSizes[i]);
     }
 }
 
@@ -709,6 +734,8 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
             atLeastRequestNum.value_or(0));
     }
+    // Phase 1: Wait on futures and collect completed requests.
+    std::vector<LlmRequest*> completedRequests;
     for (auto it = mRequesterFutures.begin(); it != mRequesterFutures.end();)
     {
         if (blockAll || toCompleteIdSet.find(it->first->mRequestId) != toCompleteIdSet.end())
@@ -717,13 +744,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             {
                 it->second.get();
                 it->first->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
-
-                // Gather the kv cache transfer time from all workers and update to leader rank
-                if (!common::getEnvKVCacheTimeOutputPath().empty())
-                {
-                    auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
-                    updateKVCacheTransferBW(syncComm, it->first);
-                }
+                completedRequests.push_back(it->first);
             }
             catch (std::exception const& e)
             {
@@ -748,6 +769,36 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         else
         {
             ++it;
+        }
+    }
+
+    // Phase 2: Batch-sync timing across ranks in one allgather (instead of per-request).
+    if (!completedRequests.empty() && !common::getEnvKVCacheTimeOutputPath().empty())
+    {
+        auto bwSyncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
+        batchUpdateKVCacheTransferBW(bwSyncComm, completedRequests);
+
+        // Write gen-side transfer summary CSV
+        {
+            std::lock_guard<std::mutex> lock(mGenTransferSummaryMutex);
+            if (!mGenTransferSummaryFile.is_open())
+            {
+                namespace fs = std::filesystem;
+                auto outputPath = fs::path(common::getEnvKVCacheTimeOutputPath());
+                fs::create_directories(outputPath);
+                int rank
+                    = useMPI() ? mpi::MpiComm::world().getRank() : tensorrt_llm::pg_utils::get_world_pg()->getRank();
+                auto filePath = outputPath / ("rank_" + std::to_string(rank) + "_gen_transfer_summary.csv");
+                mGenTransferSummaryFile.open(filePath);
+                mGenTransferSummaryFile << "RequestID,gen_side_transfer_time(ms),kv_cache_size" << '\n';
+            }
+            for (auto* req : completedRequests)
+            {
+                auto reqId = req->getContextPhaseParams().value().getReqId();
+                mGenTransferSummaryFile << reqId << "," << req->getKvCacheTransferTimeMS() << ","
+                                        << req->getKvCacheSize() << '\n';
+            }
+            mGenTransferSummaryFile << std::flush;
         }
     }
 }

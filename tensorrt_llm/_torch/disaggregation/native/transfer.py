@@ -399,6 +399,7 @@ class Sender(SenderBase):
             timer.record_transfer_end(write_meta.peer_rank)
 
         ## TODO: just last slice need to send task state?
+        transfer_size = timer.get_transfer_size(write_meta.peer_rank) if timer else 0
         self._get_or_connect_dealer(write_meta.peer_endpoint).send(
             [
                 MessageType.KV_AGENT_RESULT,
@@ -407,6 +408,7 @@ class Sender(SenderBase):
                 str(write_meta.slice_id).encode("ascii"),
                 str(write_meta.is_last_slice).encode("ascii"),
                 agent_result.value.encode("ascii"),
+                str(transfer_size).encode("ascii"),
             ]
         )
 
@@ -428,6 +430,8 @@ class Sender(SenderBase):
             else:
                 write_meta.task_future.set_result(AgentResult.SUCCESS)
                 task.status = TaskStatus.TRANSFERRED
+                if all(t.status == TaskStatus.TRANSFERRED for t in session.kv_tasks):
+                    session.transfer_end_time = tensorrt_llm.bindings.steady_clock_now()
 
         logger.debug(
             f"deliver_kv_to_agent completed: unique_rid={write_meta.unique_rid}, "
@@ -818,6 +822,8 @@ class TxSession(TxSessionBase):
 
         self._exception: Optional[Exception] = None
         self._closed = False
+        self.transfer_start_time = None
+        self.transfer_end_time = None
         # Must be last: makes session visible to listener thread,
         # so all attributes above must be initialized first.
         self._sender.setup_session(self)
@@ -838,6 +844,8 @@ class TxSession(TxSessionBase):
         return SessionStatus.READY if self.receiver_ready else SessionStatus.INIT
 
     def send(self, slice: KVSlice) -> concurrent.futures.Future:
+        if self.transfer_start_time is None:
+            self.transfer_start_time = tensorrt_llm.bindings.steady_clock_now()
         with self.lock:
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
@@ -1129,9 +1137,9 @@ class Receiver(ReceiverBase):
         self._messenger.start_listener(handle_message)
 
     def _process_kv_agent_result(self, _send_id: bytes, message: list[bytes]):
-        msg_type, peer_rank, unique_rid, slice_id_str, is_last_slice_str, status = decode_message(
-            message
-        )
+        fields = decode_message(message)
+        msg_type, peer_rank, unique_rid, slice_id_str, is_last_slice_str, status = fields[:6]
+        transfer_size = int(fields[6]) if len(fields) > 6 else 0
         peer_rank = int(peer_rank)
         unique_rid = int(unique_rid)
         slice_id = int(slice_id_str)
@@ -1147,7 +1155,11 @@ class Receiver(ReceiverBase):
             )
             return
         session.process_kv_agent_result(
-            peer_rank, slice_id, is_last_slice_str == "True", AgentResult(status)
+            peer_rank,
+            slice_id,
+            is_last_slice_str == "True",
+            AgentResult(status),
+            transfer_size=transfer_size,
         )
 
     def _process_aux_agent_result(self, _send_id: bytes, message: list[bytes]):
@@ -1200,6 +1212,9 @@ class RxSession(RxSessionBase):
         self.aux_slot = aux_buffer.alloc_slot().id if aux_buffer is not None else None
         self._exception: Optional[Exception] = None
         self._closed = False
+        self.transfer_start_time = None
+        self.transfer_end_time = None
+        self.kv_cache_size_bytes: int = 0
         self._kv_tasks: list[KVRecvTask] = []
         self._aux_count = 0
         self._aux_status: TaskStatus = TaskStatus.INIT
@@ -1223,6 +1238,8 @@ class RxSession(RxSessionBase):
         self._kv_tasks[slice_id].status = TaskStatus.TRANSFERRING
 
     def receive(self, slice: KVSlice) -> concurrent.futures.Future:
+        if self.transfer_start_time is None:
+            self.transfer_start_time = tensorrt_llm.bindings.steady_clock_now()
         params = self._base_args.params
         slice_id = len(self._kv_tasks)
         task = KVRecvTask(
@@ -1237,8 +1254,14 @@ class RxSession(RxSessionBase):
         return task.future
 
     def process_kv_agent_result(
-        self, peer_rank: int, slice_id: int, is_last_slice: bool, status: AgentResult
+        self,
+        peer_rank: int,
+        slice_id: int,
+        is_last_slice: bool,
+        status: AgentResult,
+        transfer_size: int = 0,
     ):
+        self.kv_cache_size_bytes += transfer_size
         task = self._kv_tasks[slice_id]
         if status == AgentResult.SUCCESS:
             if is_last_slice:
@@ -1247,6 +1270,8 @@ class RxSession(RxSessionBase):
                     if not task.future.done():
                         task.future.set_result(AgentResult.SUCCESS)
                     task.status = TaskStatus.TRANSFERRED
+                    if all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks):
+                        self.transfer_end_time = tensorrt_llm.bindings.steady_clock_now()
 
                     logger.debug(
                         f"KV transfer complete for request {self.request_id} slice {slice_id}"
