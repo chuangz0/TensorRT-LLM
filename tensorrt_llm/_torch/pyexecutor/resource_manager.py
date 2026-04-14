@@ -1228,7 +1228,8 @@ class KVCacheManager(BaseResourceManager):
                 list(range(self.num_local_layers))
             }
         for local_layer_idx in range(self.num_local_layers):
-            window_size = self.max_attention_window_vec[local_layer_idx %
+            global_layer_idx = self.pp_layers[local_layer_idx]
+            window_size = self.max_attention_window_vec[global_layer_idx %
                                                         pattern_len]
             window_size_to_layers_map[window_size].append(local_layer_idx)
         return window_size_to_layers_map
@@ -1928,7 +1929,8 @@ class KVCacheManagerV2(BaseResourceManager):
                         ) for role in buffer_type
                     ],
                     sliding_window_size=self.max_attention_window_vec[
-                        layer_id % len(self.max_attention_window_vec)],
+                        self.pp_layers[layer_id] %
+                        len(self.max_attention_window_vec)],
                     num_sink_tokens=None,
                 ) for layer_id in typed_range(LayerId(self.num_local_layers))
             ],

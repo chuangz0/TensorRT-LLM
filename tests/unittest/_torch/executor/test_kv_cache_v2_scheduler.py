@@ -107,6 +107,7 @@ def make_disagg_request(request_id):
     req.is_context_init_state = False
     req.is_generation_in_progress_state = False
     req.is_first_context_chunk = True
+    req.py_draft_tokens = None
     return req
 
 
@@ -118,6 +119,7 @@ def make_filtered_request(request_id, state_value=0):
     req.is_context_init_state = False
     req.is_generation_in_progress_state = False
     req.is_first_context_chunk = True
+    req.py_draft_tokens = None
     return req
 
 
