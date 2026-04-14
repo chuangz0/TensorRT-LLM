@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <pybind11/pybind11.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/custom_class.h>
@@ -294,6 +295,9 @@ private:
     rnn_state_manager::RnnStateManager* mRnnStateManager{nullptr};
     // TODO(shreyasm): update this to use same container as kv by using base trans buffers instead
     std::unique_ptr<rnn_state_manager::RnnCacheTransBufferManager> mRnnCacheTransBufferManager{nullptr};
+
+    // Unique instance identifier for CSV file naming (avoids collisions across gen instances)
+    std::string mInstanceId;
 
     // Gen-side transfer summary CSV (written after timing sync)
     std::ofstream mGenTransferSummaryFile;
