@@ -56,11 +56,35 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <numeric>
+#include <random>
+#include <sstream>
 #include <unordered_set>
 
 namespace tensorrt_llm::batch_manager
 {
+
+namespace
+{
+
+/// Generate a UUID-like hex string (e.g. "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+/// to uniquely identify a CacheTransceiver instance across gen instances.
+std::string generateInstanceId()
+{
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<uint64_t> dis;
+    uint64_t a = dis(gen);
+    uint64_t b = dis(gen);
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0') << std::setw(8) << (a >> 32) << "-" << std::setw(4)
+        << ((a >> 16) & 0xFFFF) << "-" << std::setw(4) << (a & 0xFFFF) << "-" << std::setw(4) << (b >> 48) << "-"
+        << std::setw(12) << (b & 0xFFFFFFFFFFFF);
+    return oss.str();
+}
+
+} // anonymous namespace
 
 std::mutex CacheTransceiver::mDllMutex;
 
@@ -137,6 +161,74 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     else
     {
         mGroupComm = std::make_shared<CacheTransceiverComm>(tensorrt_llm::pg_utils::get_world_pg());
+    }
+
+    // Generate instance ID on rank 0 and broadcast to all ranks in the session
+    // so every rank in the same gen/ctx instance shares the same ID.
+    {
+        if (mGroupComm->getRank() == 0)
+        {
+            mInstanceId = generateInstanceId();
+        }
+        if (useMPI())
+        {
+            int len = static_cast<int>(mInstanceId.size());
+            tensorrt_llm::mpi::MpiComm::session().bcast(&len, 1, mpi::MpiType::kINT32, 0);
+            mInstanceId.resize(len);
+            tensorrt_llm::mpi::MpiComm::session().bcast(mInstanceId.data(), len, mpi::MpiType::kCHAR, 0);
+        }
+        else
+        {
+            // PG path: rank 0 sends via allgather, others receive.
+            constexpr int kUuidLen = 36;
+            std::vector<char> sendBuf(kUuidLen, '\0');
+            if (mGroupComm->getRank() == 0)
+            {
+                std::copy_n(mInstanceId.begin(), std::min<size_t>(mInstanceId.size(), kUuidLen), sendBuf.begin());
+            }
+            std::vector<char> recvBuf(kUuidLen * mGroupComm->getSize(), '\0');
+            mGroupComm->allgather(std::ref(sendBuf), std::ref(recvBuf), {});
+            // Take rank 0's segment.
+            mInstanceId = std::string(recvBuf.begin(), recvBuf.begin() + kUuidLen);
+        }
+    }
+
+    // Calibrate steady_clock across ranks so that cross-node allgather
+    // in batchUpdateKVCacheTransferBW can compare time points.
+    // Python's _set_global_steady_clock_offset writes to the nanobind
+    // module's copy of sGlobalSteadyClockOffset, which is invisible to
+    // libtensorrt_llm.so (separate inline-static instances across .so
+    // boundaries).  We redo the calibration here in the C++ library.
+    if (!LlmRequest::sGlobalSteadyClockOffset.has_value())
+    {
+        using Duration = LlmRequest::Duration;
+        using TimePoint = LlmRequest::TimePoint;
+        // Barrier + take local timestamp
+        if (useMPI())
+        {
+            tensorrt_llm::mpi::MpiComm::session().barrier();
+        }
+        auto localNow = std::chrono::steady_clock::now();
+        auto localNs = std::chrono::duration_cast<std::chrono::nanoseconds>(localNow.time_since_epoch()).count();
+
+        // Allgather timestamps from all ranks
+        std::vector<int64_t> allNs(mGroupComm->getSize(), 0);
+        if (useMPI())
+        {
+            tensorrt_llm::mpi::MpiComm::session().allgather(&localNs, allNs.data(), 1, mpi::MpiType::kINT64);
+        }
+        else
+        {
+            mGroupComm->allgather(localNs, std::ref(allNs), {});
+        }
+
+        // Offset = rank0's timestamp - my timestamp (same formula as Python)
+        auto offsetNs = allNs[0] - localNs;
+        LlmRequest::sGlobalSteadyClockOffset = Duration(offsetNs);
+
+        TLLM_LOG_INFO(mGroupComm->getRank(),
+            "CacheTransceiver: set sGlobalSteadyClockOffset = %.6f sec for rank %d",
+            static_cast<double>(offsetNs) / 1e9, mGroupComm->getRank());
     }
 
     if (worldConfig.isTensorParallel() || worldConfig.isContextParallel())
@@ -287,8 +379,10 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     auto makeCacheTransferLayer
         = [&]() { return CacheTransferLayer(*mCacheState, makeFormatter(), makeRnnFormatter()); };
 
-    mCacheSender = std::make_unique<CacheSender>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
-    mCacheReceiver = std::make_unique<CacheReceiver>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer());
+    mCacheSender
+        = std::make_unique<CacheSender>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer(), mInstanceId);
+    mCacheReceiver
+        = std::make_unique<CacheReceiver>(mManager.get(), worldConfig.getRank(), makeCacheTransferLayer(), mInstanceId);
 
     initializeCommState();
 }
@@ -421,61 +515,73 @@ std::vector<LlmRequest::RequestIdType> gatherRequestIds(
 void batchUpdateKVCacheTransferBW(
     std::shared_ptr<CacheTransceiverComm> const& comm, std::vector<LlmRequest*> const& requests)
 {
-    if (requests.empty())
-    {
-        return;
-    }
+    // Key-based merge: each rank serializes (requestId, start, end, size)
+    // tuples and we use allgatherv so ranks may have different request counts.
+    // The merge matches by requestId, not by position — this tolerates
+    // ordering differences and count mismatches across ranks.
 
     namespace su = executor::serialize_utils;
     int const worldSize = comm->getSize();
+
+    // --- Serialize local entries keyed by requestId ---
     std::size_t const numReqs = requests.size();
 
-    // --- Pack timing for all requests into one buffer ---
     std::ostringstream oStream;
     su::serialize(numReqs, oStream);
     for (auto* req : requests)
     {
+        su::serialize(req->getContextPhaseParams().value().getReqId(), oStream);
         su::serialize(req->getKvCacheTransferStart(), oStream);
         su::serialize(req->getKvCacheTransferEnd(), oStream);
+        su::serialize(req->getKvCacheSize(), oStream);
     }
 
     auto str = oStream.str();
     std::vector<char> sendBuffer(str.begin(), str.end());
-    auto sendBufferSize = sendBuffer.size();
-    auto recvBufferSize = sendBufferSize * worldSize;
-    std::vector<char> recvBuffer(recvBufferSize);
+    int const sendSize = static_cast<int>(sendBuffer.size());
 
+    // --- Step 1: allgather per-rank buffer sizes ---
+    std::vector<int> recvCounts(worldSize, 0);
     if (useMPI())
     {
-        comm->allgather(sendBuffer.data(), recvBuffer.data(), sendBufferSize, mpi::MpiType::kCHAR);
+        comm->allgather(&sendSize, recvCounts.data(), 1, mpi::MpiType::kINT32);
     }
     else
     {
-        comm->allgather(std::ref(sendBuffer), std::ref(recvBuffer), {});
+        comm->allgather(sendSize, std::ref(recvCounts), {});
     }
 
-    // --- Pack sizes into one buffer ---
-    std::vector<std::size_t> localSizes(numReqs);
-    for (std::size_t i = 0; i < numReqs; ++i)
+    // --- Step 2: allgatherv the serialized data ---
+    std::vector<int> displs(worldSize, 0);
+    int totalRecvSize = 0;
+    for (int r = 0; r < worldSize; ++r)
     {
-        localSizes[i] = requests[i]->getKvCacheSize();
+        displs[r] = totalRecvSize;
+        totalRecvSize += recvCounts[r];
     }
-    std::vector<std::size_t> allSizes(numReqs * worldSize, 0);
+    std::vector<char> recvBuffer(totalRecvSize, 0);
 
     if (useMPI())
     {
-        comm->allgather(localSizes.data(), allSizes.data(), numReqs, mpi::MpiType::kUINT64);
+        comm->allgatherv(
+            sendBuffer.data(), sendSize, mpi::MpiType::kCHAR, recvBuffer.data(), recvCounts, displs, mpi::MpiType::kCHAR);
     }
     else
     {
-        comm->allgather(localSizes.data(), std::ref(allSizes), {});
+        comm->allgatherv(std::ref(sendBuffer), std::ref(recvBuffer), recvCounts, {});
     }
 
-    // --- Merge: per-request min(start), max(end), sum(size) across ranks ---
+    // --- Step 3: Deserialize and merge by requestId ---
     using TimePoint = executor::RequestPerfMetrics::TimePoint;
-    std::vector<TimePoint> minStarts(numReqs, TimePoint::max());
-    std::vector<TimePoint> maxEnds(numReqs, TimePoint::min());
-    std::vector<std::size_t> totalSizes(numReqs, 0);
+    using ReqIdType = LlmRequest::RequestIdType;
+
+    struct MergedEntry
+    {
+        TimePoint minStart = TimePoint::max();
+        TimePoint maxEnd = TimePoint::min();
+        std::size_t totalSize = 0;
+    };
+    std::unordered_map<ReqIdType, MergedEntry> merged;
 
     su::VectorWrapBuf<char> strbuf(recvBuffer);
     std::istream is(&strbuf);
@@ -483,25 +589,31 @@ void batchUpdateKVCacheTransferBW(
     for (int rank = 0; rank < worldSize; ++rank)
     {
         auto rankNumReqs = su::deserialize<std::size_t>(is);
-        TLLM_CHECK_WITH_INFO(rankNumReqs == numReqs,
-            "Rank %d has %zu completed requests but local rank has %zu — mismatch in batched timing sync", rank,
-            rankNumReqs, numReqs);
-        for (std::size_t i = 0; i < numReqs; ++i)
+        for (std::size_t i = 0; i < rankNumReqs; ++i)
         {
+            auto rid = su::deserialize<ReqIdType>(is);
             auto start = su::deserialize<TimePoint>(is);
             auto end = su::deserialize<TimePoint>(is);
-            minStarts[i] = std::min(minStarts[i], start);
-            maxEnds[i] = std::max(maxEnds[i], end);
-            totalSizes[i] += allSizes[rank * numReqs + i];
+            auto size = su::deserialize<std::size_t>(is);
+
+            auto& entry = merged[rid];
+            entry.minStart = std::min(entry.minStart, start);
+            entry.maxEnd = std::max(entry.maxEnd, end);
+            entry.totalSize += size;
         }
     }
 
-    // Update all ranks
-    for (std::size_t i = 0; i < numReqs; ++i)
+    // --- Step 4: Update local requests ---
+    for (auto* req : requests)
     {
-        requests[i]->setKvCacheTransferStart(minStarts[i]);
-        requests[i]->setKvCacheTransferEnd(maxEnds[i]);
-        requests[i]->setKvCacheSize(totalSizes[i]);
+        auto reqId = req->getContextPhaseParams().value().getReqId();
+        auto it = merged.find(reqId);
+        if (it != merged.end())
+        {
+            req->setKvCacheTransferStart(it->second.minStart);
+            req->setKvCacheTransferEnd(it->second.maxEnd);
+            req->setKvCacheSize(it->second.totalSize);
+        }
     }
 }
 
@@ -788,7 +900,8 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                 fs::create_directories(outputPath);
                 int rank
                     = useMPI() ? mpi::MpiComm::world().getRank() : tensorrt_llm::pg_utils::get_world_pg()->getRank();
-                auto filePath = outputPath / ("rank_" + std::to_string(rank) + "_gen_transfer_summary.csv");
+                auto filePath
+                    = outputPath / (mInstanceId + "_" + std::to_string(rank) + "_gen_transfer_summary.csv");
                 mGenTransferSummaryFile.open(filePath);
                 mGenTransferSummaryFile << "RequestID,gen_side_transfer_time(ms),kv_cache_size" << '\n';
             }
