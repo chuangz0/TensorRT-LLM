@@ -205,7 +205,8 @@ class Sender(SenderBase):
         self._peer_requests: dict = {}
         self._peer_requests_lock = threading.Lock()
         self._messenger = ZMQMessenger(mode="ROUTER")
-        self._dealers = {}
+        self._dealers = {}  # used by listener thread only (single-threaded path)
+        self._thread_local = threading.local()  # per-thread DEALER cache for worker threads
         self._sessions = {}  # unique_rid -> TxSession
         self._sessions_lock = threading.Lock()  # Protects _sessions access
         self._shutdown = False
@@ -293,31 +294,61 @@ class Sender(SenderBase):
         thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
         self._send_task_queues[thread_idx].put(write_meta)
 
+    def _get_or_connect_thread_dealer(self, endpoint: Optional[str]) -> ZMQMessenger:
+        """Get or create a per-thread DEALER socket via threading.local().
+        Each worker thread gets its own cache so there is no cross-thread
+        access to the same ZMQ socket."""
+        if endpoint is None:
+            raise ValueError("Sender: peer endpoint is None; peer may not have registered yet")
+        dealers = getattr(self._thread_local, "dealers", None)
+        if dealers is None:
+            dealers = {}
+            self._thread_local.dealers = dealers
+        if endpoint not in dealers:
+            dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
+        return dealers[endpoint]
+
     def _process_task_queue(self, thread_idx: int):
         device_id = self._device_id
         torch.cuda.set_device(device_id)
         CUASSERT(cudart.cudaSetDevice(device_id))
 
         task_queue = self._send_task_queues[thread_idx]
-        while True:
-            write_meta = task_queue.get()
-            if write_meta is None:
-                break
-            try:
-                if write_meta.meta_type == WriteMetaType.AUX:
-                    logger.debug(
-                        f"_process_task_queue[{thread_idx}]: delivering aux task to agent: {write_meta}"
+        try:
+            while True:
+                write_meta = task_queue.get()
+                if write_meta is None:
+                    break
+                try:
+                    if write_meta.meta_type == WriteMetaType.AUX:
+                        logger.debug(
+                            f"_process_task_queue[{thread_idx}]: delivering aux task to agent: {write_meta}"
+                        )
+                        self._deliver_aux_to_agent(write_meta)
+                    else:
+                        self._deliver_kv_to_agent(write_meta)
+                except Exception as e:
+                    logger.error(
+                        f"_process_task_queue[{thread_idx}]: unhandled exception for "
+                        f"unique_rid={write_meta.unique_rid}: {e}"
                     )
-                    self._deliver_aux_to_agent(write_meta)
-                else:
-                    self._deliver_kv_to_agent(write_meta)
-            except Exception as e:
-                logger.error(
-                    f"_process_task_queue[{thread_idx}]: unhandled exception for "
-                    f"unique_rid={write_meta.unique_rid}: {e}"
-                )
-                if not write_meta.task_future.done():
-                    write_meta.task_future.set_exception(e)
+                    if not write_meta.task_future.done():
+                        write_meta.task_future.set_exception(e)
+        finally:
+            # Clean up this thread's DEALER sockets. threading.local storage
+            # is only accessible from the owning thread, so shutdown must
+            # happen here rather than in Sender.shutdown().
+            dealers = getattr(self._thread_local, "dealers", None)
+            if dealers:
+                for endpoint, dealer in dealers.items():
+                    try:
+                        dealer.stop()
+                    except Exception as e:
+                        logger.warning(
+                            f"_process_task_queue[{thread_idx}]: failed to stop dealer "
+                            f"for endpoint {endpoint}: {e}"
+                        )
+                dealers.clear()
 
     @staticmethod
     @nvtx_range("_make_agent_request")
@@ -401,7 +432,7 @@ class Sender(SenderBase):
             timer.record_transfer_end(write_meta.peer_rank)
 
         ## TODO: just last slice need to send task state?
-        self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
             [
                 MessageType.KV_AGENT_RESULT,
                 str(self._instance_rank).encode("ascii"),
@@ -466,7 +497,7 @@ class Sender(SenderBase):
             if timer:
                 timer.record_transfer_end(write_meta.peer_rank)
 
-        self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
             [
                 MessageType.AUX_AGENT_RESULT,
                 str(self._instance_rank).encode("ascii"),
