@@ -5,6 +5,7 @@ from .modeling_bert import BertForSequenceClassification
 from .modeling_clip import CLIPVisionModel
 from .modeling_cohere2 import Cohere2ForCausalLM
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
+from .modeling_deepseekv4 import DeepseekV4ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
 from .modeling_exaone_moe import ExaoneMoeForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
@@ -59,6 +60,7 @@ __all__ = [
     "Mistral3VLM",
     "MistralForCausalLM",
     "MixtralForCausalLM",
+    "DeepseekV4ForCausalLM",
     "NemotronH_Nano_VL_V2",
     "NemotronForCausalLM",
     "NemotronHForCausalLM",

@@ -181,6 +181,23 @@ MULTI_CTAS_KV_MODE_FUNCTION(CgaSmemReduction)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+enum class SparseMlaType
+{
+    // Disable the sparse MLA.
+    Disabled = 0,
+    // Sparse MLA with topK lengths.
+    FixedTopKLens,
+    // Sparse MLA with variable topK lengths.
+    VariableTopKLens,
+};
+
+inline bool isSparseMlaEnabled(SparseMlaType sparseMlaType)
+{
+    return sparseMlaType != SparseMlaType::Disabled;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 struct TllmGenFmhaRunnerParams
 {
     // Input layout.
@@ -202,6 +219,8 @@ struct TllmGenFmhaRunnerParams
     void const* vPtr;
     // Packed KV buffer
     void const* kvPtr;
+    // Secondary KV pool base pointer for dual-TMA-descriptor path.
+    void const* secondaryKvBasePtr;
     // Packed KV scaling factor buffer
     void const* kvSfPtr;
     // Packed QKV buffer
@@ -218,6 +237,9 @@ struct TllmGenFmhaRunnerParams
     int32_t* firstSparseMaskOffsetsKvPtr;
     // The counter for the multiCtasKv mode.
     int32_t* multiCtasKvCounterPtr;
+    // The variable sparseMla topK lengths with shape of [numTokensQ]
+    //  where each tokenQ has a corresponding topK length.
+    int32_t const* ptrSparseMlaTopKLens;
     // The sequence length buffer for K/V.
     int const* seqLensKvPtr;
     // The cumulative sequence length buffer for Q and K/V
@@ -285,10 +307,10 @@ struct TllmGenFmhaRunnerParams
     int mSfStartTokenIdx;
     // Skip softmax threshold scale factor.
     float mSkipSoftmaxThresholdScaleFactor;
-    // Whether to use sparse MLA.
-    bool mSparseMla;
     // The top k value for sparse MLA.
     int mSparseMlaTopK;
+    // Whether to use sparse MLA.
+    SparseMlaType mSparseMlaType;
     // The cuda stream.
     cudaStream_t stream;
     // The layer index.

@@ -1226,7 +1226,8 @@ class KVCacheManager(BaseResourceManager):
                 list(range(self.num_local_layers))
             }
         for local_layer_idx in range(self.num_local_layers):
-            window_size = self.max_attention_window_vec[local_layer_idx %
+            global_layer_idx = self.pp_layers[local_layer_idx]
+            window_size = self.max_attention_window_vec[global_layer_idx %
                                                         pattern_len]
             window_size_to_layers_map[window_size].append(local_layer_idx)
         return window_size_to_layers_map
@@ -1612,10 +1613,12 @@ class KVCacheManagerV2(BaseResourceManager):
         is_draft: bool = False,
         kv_connector_manager: Optional[KvCacheConnectorManager] = None,
         execution_stream: Optional[torch.cuda.Stream] = None,
+        is_disagg: bool = False,
         **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
+        self.is_disagg = is_disagg
 
         assert kv_connector_manager is None, "kv_connector_manager is not supported for KVCacheManagerV2"
         assert max_beam_width == 1, "max_beam_width must be 1 for KVCacheManagerV2"
@@ -1733,6 +1736,13 @@ class KVCacheManagerV2(BaseResourceManager):
         assert quota != float(
             'inf'
         ), "Quota not set. Check kv_cache_config.max_tokens or kv_cache_config.max_gpu_total_bytes"
+
+        # Sync KV cache quota across TP ranks so all ranks allocate the same
+        # amount and the scheduler produces identical batches.
+        if mapping.world_size > 1:
+            dist = Distributed.get(mapping)
+            quota = dist.allreduce(quota, op=ReduceOp.MIN)
+
         logger.info(
             f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
@@ -1799,8 +1809,16 @@ class KVCacheManagerV2(BaseResourceManager):
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
         # Plus 1 for cuda graph dummy request.
+        # In disaggregated mode, double the capacity to allow KV transfers
+        # (TRANS_IN_PROGRESS) to overlap with active generation requests.
         max_num_sequences = max_batch_size * mapping.pp_size
-        self.index_mapper = IndexMapper(max_num_sequences + 1, max_beam_width)
+        index_mapper_capacity = max_num_sequences * (2 if is_disagg else 1) + 1
+        logger.info(
+            f"KVCacheManagerV2: IndexMapper capacity={index_mapper_capacity} "
+            f"(max_num_sequences={max_num_sequences}, is_disagg={is_disagg}, max_beam_width={max_beam_width})"
+        )
+        self.index_mapper = IndexMapper(index_mapper_capacity, max_beam_width)
+        self._early_freed_index_requests: set[int] = set()
         self.index_scales = torch.empty(self.num_pools,
                                         dtype=torch.int32,
                                         pin_memory=prefer_pinned(),
@@ -1823,7 +1841,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.host_kv_cache_block_offsets = torch.empty(
             self.num_pools,
-            (max_num_sequences + 1) * max_beam_width,
+            index_mapper_capacity * max_beam_width,
             2,  # key and value
             self.max_blocks_per_seq,
             dtype=torch.int32,
@@ -1925,7 +1943,8 @@ class KVCacheManagerV2(BaseResourceManager):
                         ) for role in buffer_type
                     ],
                     sliding_window_size=self.max_attention_window_vec[
-                        layer_id % len(self.max_attention_window_vec)],
+                        self.pp_layers[layer_id] %
+                        len(self.max_attention_window_vec)],
                     num_sink_tokens=None,
                 ) for layer_id in typed_range(LayerId(self.num_local_layers))
             ],
@@ -2049,6 +2068,25 @@ class KVCacheManagerV2(BaseResourceManager):
         return kv_cache.resize(
             self._required_gen_capacity(req, kv_cache.capacity))
 
+    def revert_allocate_generation(self, req: LlmRequest) -> None:
+        """Undo the capacity growth from try_allocate_generation.
+
+        When attention DP causes can_queue=False after scheduling, the
+        forward pass is skipped but the scheduler already grew each
+        generation request's KV cache capacity by 1 (+draft tokens).
+        This method shrinks capacity back to undo that spurious growth
+        so it does not accumulate across iterations and overflow the
+        host page-index buffer.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None or not kv_cache.is_active:
+            return
+        draft_len = get_draft_token_length(req)
+        reverted_cap = kv_cache.capacity - 1 - draft_len
+        if reverted_cap < 0:
+            return
+        kv_cache.resize(reverted_cap)
+
     def _restore_page_index_bufs(self, request_id: int, kv_cache) -> None:
         """Re-connect host page-index buffers after resume().
 
@@ -2096,6 +2134,8 @@ class KVCacheManagerV2(BaseResourceManager):
                     req.py_request_id, req.lora_task_id,
                     req.get_tokens(DEFAULT_BEAM_INDEX)[:-1]
                     if self.enable_block_reuse else None)
+                if kv_cache is None:
+                    return False
                 kv_cache.cuda_stream = self._stream.cuda_stream
 
             if not self.enable_block_reuse:
@@ -2264,6 +2304,8 @@ class KVCacheManagerV2(BaseResourceManager):
             # during warmup.
             token_num = token_nums[
                 i] if token_nums is not None else 1 + max_num_draft_tokens
+            # token_num - 1 is the past history length in generation.
+            history_hint = max(0, token_num - 1) if is_gen else None
             # TODO: support cross attention
             encoder_input_tokens = None
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
@@ -2287,7 +2329,10 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 kv_cache.stop_committing()
                 dummy_capacity = token_num + self.num_extra_kv_tokens + num_extra_decoding_steps
-                success = kv_cache.resize(dummy_capacity)
+                # Need to hint the committed history to activate stale-block
+                # optimization and match the solver's pool budget.
+                success = kv_cache.resize(dummy_capacity,
+                                          history_length=history_hint)
                 if not success:
                     release_resources(req)
                     return None
@@ -2313,7 +2358,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
                     new_capacity = kv_cache.capacity + max_num_draft_tokens + 1
-                    success = kv_cache.resize(new_capacity)
+                    success = kv_cache.resize(new_capacity,
+                                              history_length=history_hint)
                     if not success:
                         release_resources(req)
                         return None
@@ -2341,6 +2387,17 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return requests
 
+    def release_index_slot(self, request_id: int) -> None:
+        """Release IndexMapper slot early while keeping KV cache blocks allocated.
+
+        After prefill completes on a context-only worker, the IndexMapper slot
+        (used for host_kv_cache_block_offsets during model forward) is no longer
+        needed.  Releasing it early allows new requests to be scheduled while
+        the KV cache blocks are still being transferred via NIXL/UCX.
+        """
+        self.index_mapper.remove_sequence(request_id)
+        self._early_freed_index_requests.add(request_id)
+
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
@@ -2355,7 +2412,10 @@ class KVCacheManagerV2(BaseResourceManager):
                                       context_current_position])
             kv_cache.stop_committing()
         kv_cache.close()
-        self.index_mapper.remove_sequence(request.py_request_id)
+        if request.py_request_id in self._early_freed_index_requests:
+            self._early_freed_index_requests.discard(request.py_request_id)
+        else:
+            self.index_mapper.remove_sequence(request.py_request_id)
 
     def get_batch_cache_indices(self,
                                 request_ids: List[int],
@@ -2561,23 +2621,22 @@ class KVCacheManagerV2(BaseResourceManager):
         mem_per_token *= kv_factor
         return mem_per_token
 
-    def update_resources(self,
-                         scheduled_batch: ScheduledRequests,
-                         attn_metadata: "AttentionMetadata" = None,
-                         kv_cache_dtype_byte_size: float = None):
-        if not self.is_draft:
-            _update_kv_cache_draft_token_location(self, scheduled_batch,
-                                                  attn_metadata,
-                                                  kv_cache_dtype_byte_size)
+    def update_context_resources(self, scheduled_batch: ScheduledRequests):
+        """Update KV cache for context requests in the current batch.
+
+        This is separated from update_resources (which handles generation
+        requests only) because the overlap executor needs context KV cache
+        updates to happen before next batch scheduling. Otherwise, the scheduler would under-estimate available KV cache for sliding-window attention layer. In non-overlap scheduler, you should call it together with update_resources().
+        """
         for req in scheduled_batch.context_requests:
             if req.py_request_id not in self.kv_cache_map:
                 continue
             kv_cache = self.kv_cache_map[req.py_request_id]
             # In the overlap scheduler, iteration N+1's eviction may
             # suspend a ctx request's KV cache while iteration N's
-            # update_resources still needs to process it.  Skip the
-            # resize — the request will be resumed by the scheduler
-            # on the next iteration.
+            # update still needs to process it.  Skip the resize — the
+            # request will be resumed by the scheduler on the next
+            # iteration.
             if not kv_cache.is_active:
                 continue
             if self.enable_block_reuse and not self.is_draft and not req.is_dummy_request:
@@ -2602,6 +2661,16 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"Failed to resize history length of KV cache for request {req.py_request_id} to {req.context_current_position} tokens at context update"
                     )
 
+    def update_resources(self,
+                         scheduled_batch: ScheduledRequests,
+                         attn_metadata: "AttentionMetadata" = None,
+                         kv_cache_dtype_byte_size: float = None):
+        if not self.is_draft:
+            _update_kv_cache_draft_token_location(self, scheduled_batch,
+                                                  attn_metadata,
+                                                  kv_cache_dtype_byte_size)
+        # Context request KV cache updates are handled by
+        # update_context_resources, called separately from the executor loop.
         for req in scheduled_batch.generation_requests:
             if req.py_request_id not in self.kv_cache_map:
                 continue
@@ -2640,6 +2709,13 @@ class KVCacheManagerV2(BaseResourceManager):
     def _create_kv_cache(self, request_id: int, lora_task_id: int | None,
                          input_tokens: Sequence[TokenIdExt] | None):
         assert request_id not in self.kv_cache_map, f"KV cache for request {request_id} already exists"
+        if self.index_mapper.num_free_slots() == 0:
+            logger.warning(
+                "No free IndexMapper slots for request %s "
+                "(%d/%d slots in use, likely held by DISAGG_GENERATION_TRANS_IN_PROGRESS requests). "
+                "Skipping KV cache creation; request will retry next iteration.",
+                request_id, self.index_mapper.size(), self.index_mapper.size())
+            return None
         kv_cache = self.impl.create_kv_cache(lora_task_id, input_tokens)
         self.kv_cache_map[request_id] = kv_cache
         index = self.index_mapper.add_new_sequence(request_id)

@@ -87,6 +87,8 @@ struct KernelParams
     CUtensorMap tmaK_;
     // TMA descriptor for V.
     CUtensorMap tmaV_;
+    // TMA descriptor for secondary KV pool (e.g., SWA).
+    CUtensorMap tmaKSecondary_;
     // The descriptor for O.
     CUtensorMap tmaO_;
 
@@ -152,6 +154,9 @@ struct KernelParams
     int32_t* ptrReservedBuffer;
     // The softmax stats buffer.
     float2* ptrSoftmaxStats;
+    // The variable sparseMla topK lengths with shape of [numTokensQ]
+    //  where each tokenQ has a corresponding topK length.
+    int32_t const* ptrSparseMlaTopKLens;
 
     // The attention window size for sliding window attention.
     int32_t mAttentionWindowSize;
@@ -771,7 +776,7 @@ struct KernelParams
 
         // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout (numTokensKvInPagedKv,
         // headDimQk).
-        if (options.mSparseMla)
+        if (isSparseMlaEnabled(options.mSparseMlaType))
         {
             shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk), static_cast<uint64_t>(INT_MAX)};
             strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
@@ -782,6 +787,18 @@ struct KernelParams
         params.tmaK_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeK, strideK, tileShapeKv,
             const_cast<void*>(kPtr),
             /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
+
+        // Build the secondary TMA descriptor for the secondary KV pool.
+        // Same shape/stride as tmaK_ for sparse MLA, but with a different base pointer.
+        if (options.mSparseMlaType == SparseMlaType::VariableTopKLens)
+        {
+            TLLM_CHECK_WITH_INFO(options.secondaryKvBasePtr != nullptr,
+                "Secondary KV base pointer must be provided when SparseMlaType::VariableTopKLens is used.");
+            params.tmaKSecondary_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeK, strideK, tileShapeKv,
+                const_cast<void*>(options.secondaryKvBasePtr),
+                /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
+        }
+
         // Build tma descriptor for V.
         params.tmaV_ = buildNdTmaDescriptor(options, kernelMeta.mDataTypeKv, shapeV, strideV, tileShapeKv,
             const_cast<void*>(vPtr),
@@ -859,6 +876,9 @@ struct KernelParams
         params.ptrScaleSfKv = options.kvSfScalePtr;
         params.ptrScaleSfO = options.oSfScalePtr;
 
+        // The variable sparseMla topK lengths
+        params.ptrSparseMlaTopKLens = options.ptrSparseMlaTopKLens;
+
         // The softmax stats buffer with shape of [numTokensQ x numHeadsQ].
         // The max/sum values are packed into float2.
         params.ptrSoftmaxStats = options.softmaxStatsPtr;
@@ -901,8 +921,8 @@ struct KernelParams
         params.mScaleSoftmaxLog2 = (1.f / (std::sqrt((float) (options.mHeadDimQk)) * options.mScaleQ)) * M_LOG2E;
         params.mStartTokenIdx = options.mSfStartTokenIdx;
         // The sparseMlaTopK needs to be a multiple of 4 as we use 16B cpAsync instructions for the indices.
-        TLLM_CHECK_WITH_INFO(
-            !options.mSparseMla || (options.mSparseMlaTopK % 4) == 0, "SparseMlaTopK must be a multiple of 4");
+        TLLM_CHECK_WITH_INFO(!isSparseMlaEnabled(options.mSparseMlaType) || (options.mSparseMlaTopK % 4) == 0,
+            "SparseMlaTopK must be a multiple of 4");
         params.mSparseMlaTopK = options.mSparseMlaTopK;
         params.mUseBlockSparseAttention = options.mUseBlockSparseAttention;
         // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).

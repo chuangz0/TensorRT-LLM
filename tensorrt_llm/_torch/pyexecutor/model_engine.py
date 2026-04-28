@@ -40,7 +40,7 @@ from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
-from ..memory_buffer_utils import with_shared_pool
+from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
@@ -722,6 +722,7 @@ class PyTorchModelEngine(ModelEngine):
         curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
+        curr_max_num_tokens = int(curr_max_num_tokens)
         max_batch_size = min(
             self.batch_size, curr_max_num_tokens //
             (1 + self.max_total_draft_tokens) // self.max_beam_width)
@@ -818,6 +819,14 @@ class PyTorchModelEngine(ModelEngine):
             f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
         )
         AutoTuner.get().print_profiling_cache()
+
+        # Clear workspace buffers allocated during the autotuner forward pass.
+        # The autotuner runs a context-only forward with max_num_tokens, which
+        # causes the global Buffers pool to cache large MoE/GEMM workspaces.
+        # If not cleared, these inflate the memory baseline seen by the KV cache
+        # profiler, reducing memory available for activations during inference.
+        clear_memory_buffers()
+        torch.cuda.empty_cache()
 
     def _compute_dynamic_draft_len_mapping(self) -> Optional[Dict[int, int]]:
         """Compute graph_bs → draft_len mapping for dynamic draft length feature.

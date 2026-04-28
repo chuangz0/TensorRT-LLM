@@ -9,6 +9,7 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
                        CudaGraphConfig, DeepSeekSparseAttentionConfig,
+                       DeepSeekV4SparseAttentionConfig,
                        DraftTargetDecodingConfig, DynamicBatchConfig,
                        Eagle3DecodingConfig, EagleDecodingConfig,
                        ExtendedRuntimePerfKnobConfig, KvCacheConfig, LlmArgs,
@@ -74,4 +75,5 @@ __all__ = [
     'RocketSparseAttentionConfig',
     'DeepSeekSparseAttentionConfig',
     'SkipSoftmaxAttentionConfig',
+    'DeepSeekV4SparseAttentionConfig',
 ]

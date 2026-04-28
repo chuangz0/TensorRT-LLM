@@ -155,6 +155,8 @@ class ConfigurableMoE(MoE):
             layer_idx=layer_idx,  # ConfigurableMoE needs correct layer_idx for EPLB initialization
             **kwargs,
         )
+        if override_quant_config is not None:
+            self.quant_config = override_quant_config
 
         # Store model_config and aux_stream_dict for later use (e.g., backend setter)
         self.model_config = model_config
@@ -178,29 +180,37 @@ class ConfigurableMoE(MoE):
         tmp_skip_create_weights_in_init = model_config.skip_create_weights_in_init
         model_config._frozen = False
         model_config.skip_create_weights_in_init = True
+        original_quant_config = model_config.quant_config
+        if override_quant_config is not None:
+            model_config.quant_config = override_quant_config
         model_config._frozen = True
 
-        backend = create_moe_backend(
-            moe_cls=moe_cls,
-            routing_method=routing_method,
-            num_experts=self.num_experts,
-            hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size,
-            dtype=self.dtype,
-            reduce_results=self.reduce_results,
-            model_config=model_config,
-            aux_stream_dict=self.aux_stream_dict,
-            weight_loading_mode=self.weight_loading_mode,
-            bias=kwargs.get("bias", False),
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
-            layer_idx=None,
-            swiglu_alpha=kwargs.get("swiglu_alpha"),
-            swiglu_beta=kwargs.get("swiglu_beta"),
-            swiglu_limit=kwargs.get("swiglu_limit"),
-            init_load_balancer=False,
-            without_comm=True,
-            activation_type=self.activation_type,
-        )
+        try:
+            backend = create_moe_backend(
+                moe_cls=moe_cls,
+                routing_method=routing_method,
+                num_experts=self.num_experts,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                dtype=self.dtype,
+                reduce_results=self.reduce_results,
+                model_config=model_config,
+                aux_stream_dict=self.aux_stream_dict,
+                weight_loading_mode=self.weight_loading_mode,
+                bias=kwargs.get("bias", False),
+                apply_router_weight_on_input=self.apply_router_weight_on_input,
+                layer_idx=None,
+                swiglu_alpha=kwargs.get("swiglu_alpha"),
+                swiglu_beta=kwargs.get("swiglu_beta"),
+                swiglu_limit=kwargs.get("swiglu_limit"),
+                init_load_balancer=False,
+                without_comm=True,
+                activation_type=self.activation_type,
+            )
+        finally:
+            model_config._frozen = False
+            model_config.quant_config = original_quant_config
+            model_config._frozen = True
 
         self.validate_backend(backend)
         self.backend = backend
@@ -454,6 +464,7 @@ class ConfigurableMoE(MoE):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         *,
+        input_ids: Optional[torch.IntTensor] = None,
         do_finalize: bool = True,
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
@@ -497,6 +508,7 @@ class ConfigurableMoE(MoE):
             outputs = self._forward_single_chunk(
                 x,
                 router_logits,
+                input_ids,
                 output_dtype,
                 all_rank_num_tokens_padded,
                 use_dp_padding,
@@ -507,6 +519,7 @@ class ConfigurableMoE(MoE):
             outputs = self._forward_multiple_chunks(
                 x,
                 router_logits,
+                input_ids,
                 num_chunks,
                 output_dtype,
                 all_rank_num_tokens_padded,
@@ -566,6 +579,7 @@ class ConfigurableMoE(MoE):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.IntTensor],
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: List[int],
         use_dp_padding: Optional[bool],
@@ -586,6 +600,7 @@ class ConfigurableMoE(MoE):
         outputs = self._forward_chunk_impl(
             x,
             router_logits,
+            input_ids,
             output_dtype,
             all_rank_num_tokens,
             use_dp_padding,
@@ -601,6 +616,7 @@ class ConfigurableMoE(MoE):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.IntTensor],
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: List[int],
         use_dp_padding: bool,
@@ -629,11 +645,19 @@ class ConfigurableMoE(MoE):
         # ========== Step 1: EPLB - Start wait GPU stage ==========
         self._load_balancer_start_wait_gpu_stage(is_first_call)
 
-        # ========== Step 2: Apply routing (only if backend supports load balancer) ==========
+        # ========== Step 2: Apply routing ==========
+        # Routing is done externally (separated) when:
+        # 1. Backend supports load balancer (enables EPLB), OR
+        # 2. Routing method requires external computation (e.g., its scoring
+        #    function is not natively supported by any C++ MoE kernel)
+        _requires_separated_routing = (
+            self.backend._supports_load_balancer() or self.routing_method.requires_separated_routing
+        )
 
-        if self.backend._supports_load_balancer():
-            # Separated routing: ConfigurableMoE calls routing_method
-            token_selected_experts, token_final_scales = self.routing_method.apply(router_logits)
+        if _requires_separated_routing:
+            token_selected_experts, token_final_scales = self.routing_method.apply(
+                router_logits, input_ids
+            )
 
             # Convert to standard dtypes for consistency with other MoE implementations
             token_selected_experts = token_selected_experts.to(torch.int32)
@@ -885,6 +909,7 @@ class ConfigurableMoE(MoE):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.IntTensor],
         num_chunks: int,
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: List[int],
@@ -907,7 +932,7 @@ class ConfigurableMoE(MoE):
                 [val[idx_chunk] for val in all_rank_chunk_size_list]
                 for idx_chunk in range(num_chunks)
             ]
-            chunk_size_list = all_rank_chunk_size_list[self.rank]
+            chunk_size_list = all_rank_chunk_size_list[self.mapping.tp_rank]
 
             # For alltoall, replace 0 with 1 (avoid empty tensor)
             if self.enable_alltoall:
@@ -922,6 +947,9 @@ class ConfigurableMoE(MoE):
 
         x_list = x.split(chunk_size_list)
         router_logits_list = router_logits.split(chunk_size_list)
+        input_ids_list = (
+            input_ids.split(chunk_size_list) if input_ids is not None else [None] * num_chunks
+        )
 
         # Determine if we need multiple streams for overlapped execution
         use_multi_stream = not self.enable_alltoall and self.aux_stream is not None
@@ -945,21 +973,25 @@ class ConfigurableMoE(MoE):
             assert x_list[0].numel() != 0, "chunk 0 shouldn't be empty"
             x_list = list(x_list)
             router_logits_list = list(router_logits_list)
+            input_ids_list = list(input_ids_list)
             for idx_chunk in range(num_chunks):
                 _x = x_list[idx_chunk]
                 if _x.numel() == 0:
                     chunked_used[idx_chunk] = False
                     x_list[idx_chunk] = x_list[0]
                     router_logits_list[idx_chunk] = router_logits_list[0]
+                    input_ids_list[idx_chunk] = input_ids_list[0]
                     all_rank_num_tokens_list[idx_chunk][self.mapping.tp_rank] = (
                         all_rank_num_tokens_list[0][self.mapping.tp_rank]
                     )
             x_list = tuple(x_list)
             router_logits_list = tuple(router_logits_list)
-
+            input_ids_list = tuple(input_ids_list)
         # ========== Execute chunking with overlap ==========
         outputs_list = []
-        for idx_chunk, (x_chunk, router_logits_chunk) in enumerate(zip(x_list, router_logits_list)):
+        for idx_chunk, (x_chunk, router_logits_chunk, input_ids_chunk) in enumerate(
+            zip(x_list, router_logits_list, input_ids_list)
+        ):
             # Calculate EPLB's first/last call
             is_first_call = idx_chunk == 0 and self.repeat_idx == 0
             is_last_call = idx_chunk == num_chunks - 1 and self.repeat_idx == self.repeat_count - 1
@@ -973,6 +1005,7 @@ class ConfigurableMoE(MoE):
                         outputs = self._forward_chunk_impl(
                             x_chunk,
                             router_logits_chunk,
+                            input_ids_chunk,
                             output_dtype,
                             all_rank_num_tokens_list[idx_chunk],
                             use_dp_padding,
@@ -986,6 +1019,7 @@ class ConfigurableMoE(MoE):
                     outputs = self._forward_chunk_impl(
                         x_chunk,
                         router_logits_chunk,
+                        input_ids_chunk,
                         output_dtype,
                         all_rank_num_tokens_list[idx_chunk],
                         use_dp_padding,
@@ -999,6 +1033,7 @@ class ConfigurableMoE(MoE):
                 outputs = self._forward_chunk_impl(
                     x_chunk,
                     router_logits_chunk,
+                    input_ids_chunk,
                     output_dtype,
                     all_rank_num_tokens_list[idx_chunk],
                     use_dp_padding,
@@ -1209,12 +1244,14 @@ class ConfigurableMoE(MoE):
 
         # TRTLLMGen-specific parameters
         elif self.backend.__class__ == TRTLLMGenFusedMoE:
-            # Determine router_logits based on whether routing has been done
-            # If backend doesn't support load balancer, routing is done before communication
-            # In that case, router_logits should be None (routing already done)
+            # Pass router_logits only when routing is fused into the kernel.
+            # When routing was done externally (load balancer enabled or routing
+            # method requires separated routing), pass None.
             router_logits_arg = None
-            if not self.backend._supports_load_balancer():
-                # For fused routing backends, router_logits is only needed if routing hasn't been done yet
+            if (
+                not self.backend._supports_load_balancer()
+                and not self.routing_method.requires_separated_routing
+            ):
                 router_logits_arg = router_logits
 
             kwargs["router_logits"] = router_logits_arg

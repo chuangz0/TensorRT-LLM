@@ -123,7 +123,14 @@ bool FmhaDispatcher::isSupported()
         // Set the kernel type and mask type if sparseMLA is used.
         if (mFixedParams.useSparseMLA)
         {
-            tllmRunnerParams.mSparseMla = true;
+            if (mFixedParams.headSizeV == mFixedParams.headSize)
+            {
+                tllmRunnerParams.mSparseMlaType = SparseMlaType::VariableTopKLens;
+            }
+            else
+            {
+                tllmRunnerParams.mSparseMlaType = SparseMlaType::FixedTopKLens;
+            }
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
         }
@@ -234,13 +241,33 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         // Set the sparse attention parameters if sparseMLA is used.
         if (mFixedParams.useSparseMLA)
         {
-            tllmRunnerParams.mSparseMla = true;
+            if (mFixedParams.headSizeV == mFixedParams.headSize)
+            {
+                tllmRunnerParams.mSparseMlaType = SparseMlaType::VariableTopKLens;
+                tllmRunnerParams.ptrSparseMlaTopKLens = runnerParams.sparse_params.sparse_mla_topk_lens;
+                TLLM_CHECK_WITH_INFO(tllmRunnerParams.ptrSparseMlaTopKLens != nullptr,
+                    "Sparse MLA variable topK lengths must be provided when SparseMlaType::VariableTopKLens is used.");
+            }
+            else
+            {
+                tllmRunnerParams.mSparseMlaType = SparseMlaType::FixedTopKLens;
+                tllmRunnerParams.ptrSparseMlaTopKLens = nullptr;
+            }
             tllmRunnerParams.mSparseMlaTopK = runnerParams.sparse_params.sparse_mla_topk;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
             tllmRunnerParams.kvPageIdxPtr
                 = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);
-            tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_mla_kv_cache_pool;
+            // Dual-pool pointer assignment: the kernel's tmaK_ (primary TMA descriptor) is built from
+            // kvPtr, and tmaKSecondary_ (secondary TMA descriptor) from secondaryKvBasePtr.
+            // In the dual-pool layout, tile 0 (SWA) uses tmaKSecondary_ and remaining tiles use tmaK_.
+            // So kvPtr should point to the pool that non-SWA indices reference (secondary_kv_pool when
+            // provided, i.e., the compress pool), and secondaryKvBasePtr should point to the SWA pool
+            // (kv_cache_pool, which is always the default paged KV pool).
+            tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_mla_secondary_kv_pool != nullptr
+                ? runnerParams.sparse_params.sparse_mla_secondary_kv_pool
+                : runnerParams.sparse_params.sparse_mla_kv_cache_pool;
+            tllmRunnerParams.secondaryKvBasePtr = runnerParams.sparse_params.sparse_mla_kv_cache_pool;
         }
 
         mTllmGenFMHARunner->run(tllmRunnerParams);
