@@ -415,6 +415,8 @@ class PyExecutor:
         self.num_scheduled_requests: int = 0
         self.benchmark_req_queues_size = int(
             os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
+        self.benchmark_fill_stall_timeout_s = float(
+            os.environ.get("TLLM_BENCHMARK_FILL_STALL_TIMEOUT_S", 60.0))
 
         # list of requests in each PP micro batch
         self.num_micro_batches = max(self.dist.pp_size,
@@ -1869,35 +1871,68 @@ class PyExecutor:
             # scheduler could not allocate KV for any of them, the benchmark
             # will hang forever because in-progress generation requests won't
             # release their KV cache.
-            if (self.benchmark_req_queues_size > 0 and not self.is_warmup
-                    and not fitting_disagg_gen_init_requests):
+            #
+            # Only watch during the fill phase: once fill completes the count
+            # stays at its target value through the entire decode, which would
+            # otherwise look like a stall. With ADP, requests are sharded
+            # across TP ranks so the comparison must use the global count
+            # (allgather) against the global target.
+            if (self.is_benchmark_disagg
+                    and self._benchmark_fill_phase_active
+                    and not self.is_warmup):
+                # NOTE: keep the gate condition free of any per-rank state
+                # (e.g. `fitting_disagg_gen_init_requests`).  The
+                # `tp_allgather` below is a collective and every ADP rank
+                # must participate together; otherwise ranks desync and a
+                # later allgather mixes payload shapes (list[int] from
+                # gather_all_rank_states vs int from the gate's
+                # _is_benchmark_disagg_fill_complete), producing TypeErrors
+                # like "argument after * must be an iterable, not int" or
+                # "unsupported operand type(s) for +: 'int' and 'list'".
+                # The per-rank "still has fitting requests" hint is folded
+                # into the same allgather so we can suppress the stall
+                # check globally when any rank is still making progress.
                 local_ready_gen = sum(
                     1 for req in self.active_requests if req.state in (
                         LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
                         LlmRequestState.GENERATION_IN_PROGRESS,
                     ))
-                now = time.time()
-                last_count = getattr(self, "_bench_disagg_last_gen_count", None)
-                last_change_time = getattr(self,
-                                           "_bench_disagg_last_gen_count_time",
-                                           None)
-                if last_count != local_ready_gen or last_change_time is None:
-                    self._bench_disagg_last_gen_count = local_ready_gen
-                    self._bench_disagg_last_gen_count_time = now
-                elif now - last_change_time > 60.0:
-                    error_msg = (
-                        f"Benchmark gen request count stalled at "
-                        f"{local_ready_gen} "
-                        f"for {now - last_change_time:.0f}s "
-                        f"(target {self.benchmark_req_queues_size}, "
-                        f"fetched={self.num_fetch_requests}). "
-                        f"Likely causes: KV transfer stuck, KV cache pool "
-                        f"too small, or transceiver deadlock. Aborting all "
-                        f"active requests.")
-                    logger.error(error_msg)
-                    self._handle_errors(error_msg,
-                                        requests=self.active_requests)
-                    return None, None
+                local_has_fitting = 1 if fitting_disagg_gen_init_requests else 0
+                if self.enable_attention_dp:
+                    responses = self.dist.tp_allgather(
+                        [local_ready_gen, local_has_fitting])
+                    total_ready_gen = sum(r[0] for r in responses)
+                    any_rank_has_fitting = any(r[1] for r in responses)
+                else:
+                    total_ready_gen = local_ready_gen
+                    any_rank_has_fitting = bool(local_has_fitting)
+
+                if not any_rank_has_fitting:
+                    now = time.time()
+                    last_count = getattr(self, "_bench_disagg_last_gen_count",
+                                         None)
+                    last_change_time = getattr(
+                        self, "_bench_disagg_last_gen_count_time", None)
+                    if (last_count != total_ready_gen
+                            or last_change_time is None):
+                        self._bench_disagg_last_gen_count = total_ready_gen
+                        self._bench_disagg_last_gen_count_time = now
+                    elif (now - last_change_time
+                          > self.benchmark_fill_stall_timeout_s
+                          and total_ready_gen < self.benchmark_req_queues_size):
+                        error_msg = (
+                            f"Benchmark gen request count stalled at "
+                            f"{total_ready_gen} "
+                            f"for {now - last_change_time:.0f}s "
+                            f"(target {self.benchmark_req_queues_size}, "
+                            f"fetched={self.num_fetch_requests}). "
+                            f"Likely causes: KV transfer stuck, KV cache pool "
+                            f"too small, or transceiver deadlock. Aborting all "
+                            f"active requests.")
+                        logger.error(error_msg)
+                        self._handle_errors(error_msg,
+                                            requests=self.active_requests)
+                        return None, None
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
