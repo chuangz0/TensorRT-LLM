@@ -38,8 +38,9 @@ namespace torch_ext
 
 void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, th::Tensor const& indices,
     int64_t next_n, int64_t index_topk, std::optional<th::Tensor> const& pre_idx,
-    std::optional<th::Tensor> const& heuristic_scratch)
+    std::optional<th::Tensor> const& heuristic_scratch, int64_t compress_ratio)
 {
+    TORCH_CHECK(compress_ratio > 0, "compress_ratio must be greater than 0");
 
     TORCH_CHECK(logits.is_cuda() && seq_lens.is_cuda() && indices.is_cuda(),
         "logits, seq_lens, and indices must be CUDA tensors");
@@ -129,21 +130,23 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         tk::invokeIndexerTopKDecode(logits.data_ptr<float>(), seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
             aux_logits.data_ptr<float>(), aux_indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
             logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr,
-            preIdxStride, preIdxCount, static_cast<float*>(heuristicScratchPtr), stream);
+            preIdxStride, preIdxCount, static_cast<float*>(heuristicScratchPtr), static_cast<int32_t>(compress_ratio),
+            stream);
     }
     else if (logits_dtype == at::ScalarType::BFloat16)
     {
         tk::invokeIndexerTopKDecode(reinterpret_cast<__nv_bfloat16 const*>(logits.data_ptr()),
             seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
             logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr,
-            preIdxStride, preIdxCount, static_cast<__nv_bfloat16*>(heuristicScratchPtr), stream);
+            preIdxStride, preIdxCount, static_cast<__nv_bfloat16*>(heuristicScratchPtr),
+            static_cast<int32_t>(compress_ratio), stream);
     }
     else // Half
     {
         tk::invokeIndexerTopKDecode(reinterpret_cast<__half const*>(logits.data_ptr()), seq_lens.data_ptr<int32_t>(),
             indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns, logits_stride_0, logits_stride_1,
             static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride, preIdxCount,
-            static_cast<__half*>(heuristicScratchPtr), stream);
+            static_cast<__half*>(heuristicScratchPtr), static_cast<int32_t>(compress_ratio), stream);
     }
 }
 
@@ -158,6 +161,8 @@ void indexer_topk_prefill(th::Tensor const& logits, th::Tensor const& row_starts
 
     TORCH_CHECK(indices.dim() == 2, "indices must be a 2D Tensor");
     TORCH_CHECK(logits.dim() == 2, "logits must be a 2D Tensor");
+    TORCH_CHECK(indices.size(1) >= index_topk, "indices.size(1) must be >= index_topk, got ", indices.size(1), " < ",
+        index_topk);
 
     auto const inputSize = logits.sizes();
     auto const numRows64 = inputSize[0];
@@ -191,7 +196,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "indexer_topk_decode(Tensor logits, Tensor seq_lens, Tensor indices, int next_n, int index_topk=2048, "
-        "Tensor? pre_idx=None, Tensor? heuristic_scratch=None) -> ()");
+        "Tensor? pre_idx=None, Tensor? heuristic_scratch=None, int compress_ratio=1) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

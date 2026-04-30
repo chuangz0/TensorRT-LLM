@@ -10,13 +10,14 @@ The following is a table of supported models for the PyTorch backend:
 | `DeciLMForCausalLM`                  | Nemotron                           | `nvidia/Llama-3_1-Nemotron-51B-Instruct`     |
 | `DeepseekV3ForCausalLM`              | DeepSeek-V3, Kimi-K2               | `deepseek-ai/DeepSeek-V3`                    |
 | `DeepseekV32ForCausalLM`             | DeepSeek-V3.2                      | `deepseek-ai/DeepSeek-V3.2`                  |
+| `DeepseekV4ForCausalLM` [^12]        | DeepSeek-V4                        | `deepseek-ai/DeepSeek-V4-Pro`                |
 | `Exaone4ForCausalLM`                 | EXAONE 4.0                         | `LGAI-EXAONE/EXAONE-4.0-32B`                 |
 | `ExaoneMoEForCausalLM`               | K-EXAONE                           | `LGAI-EXAONE/K-EXAONE-236B-A23B`             |
 | `Gemma3ForCausalLM`                  | Gemma 3                            | `google/gemma-3-1b-it`                       |
 | `Gemma3nForConditionalGeneration` [^8]| Gemma 3n                           | `google/gemma-3n-E2B-it`, `google/gemma-3n-E4B-it` |
 | `Gemma4ForConditionalGeneration` [^10]| Gemma 4                            | `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it`, `google/gemma-4-26B-A4B-it` [^7], `google/gemma-4-31B-it` [^7] |
 | `Glm4MoeForCausalLM`                 | GLM-4.5, GLM-4.6, GLM-4.7          | `THUDM/GLM-4-100B-A10B`                      |
-| `Glm4MoeLiteForCausalLM` [^6]        | GLM-4.7-Flash                      | `zai-org/GLM-4.7-Flash`                      |
+| `Glm4MoeLiteForCausalLM` [^7]        | GLM-4.7-Flash                      | `zai-org/GLM-4.7-Flash`                      |
 | `GlmMoeDsaForCausalLM`               | GLM-5                              | `zai-org/GLM-5`                              |
 | `GptOssForCausalLM`                  | GPT-OSS                            | `openai/gpt-oss-120b`                        |
 | `KimiK25ForConditionalGeneration`    | Kimi-K2.5                          | `moonshotai/Kimi-K2.5`                       |
@@ -36,7 +37,7 @@ The following is a table of supported models for the PyTorch backend:
 | `Qwen3ForCausalLM`                   | Qwen3                              | `Qwen/Qwen3-8B`                              |
 | `Qwen3MoeForCausalLM`                | Qwen3MoE                           | `Qwen/Qwen3-30B-A3B`                         |
 | `Qwen3NextForCausalLM`               | Qwen3Next                          | `Qwen/Qwen3-Next-80B-A3B-Thinking`           |
-| `Qwen3_5MoeForCausalLM` [^5]         | Qwen3.5-MoE                        | `Qwen/Qwen3.5-397B-A17B`                     |
+| `Qwen3_5MoeForCausalLM` [^6]         | Qwen3.5-MoE                        | `Qwen/Qwen3.5-397B-A17B`                     |
 
 
 ## Model-Feature Support Matrix (Key Models)
@@ -47,6 +48,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | ------------------------------ | ----------------- | ---------- | -------------------------- | --------------------- | --------------- | --- | ---------------------------------- | ----------------------------------- | ------------------------- | ------------- | ---------------- | -------------- | ------------------------ | --------------------- | --------------- |
 | `DeepseekV3ForCausalLM`          | Yes               | Yes        | Yes                        | Yes                   | Yes [^1]        | Yes | No                                 | No                                  | No                        | Yes           | Yes              | Yes [^2]       | N/A                      | Yes                   | Yes             |
 | `DeepseekV32ForCausalLM`         | Yes               | Yes        | Yes                        | Yes                   | Yes             | Yes | No                                 | No                                  | No                        | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
+| `DeepseekV4ForCausalLM` [^12]     | Yes               | Yes        | Yes                        | Untested              | Yes             | Yes | No                                 | No                                  | No                        | Yes           | Yes              | Untested       | Yes                      | Untested              | Untested        |
 | `Glm4MoeForCausalLM`             | Yes               | Yes        | Yes                        | Untested              | Yes             | Yes | No                                 | No                                  | No                        | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes             |
 | `Qwen3MoeForCausalLM`            | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes                                | Yes                                 | Yes                       | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
 | `Qwen3NextForCausalLM` [^3]          | Yes                | Yes        | Yes                         | Untested                    | Yes              | No  | No                                 | No                                  | No                        | Yes            | Yes               | No             | No                       | Untested                    | Untested              |
@@ -68,6 +70,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^9]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD config](../../../examples/auto_deploy/model_registry/configs/minimax_m2.7.yaml).
 [^10]: Requires manually upgrading transformers to 5.5.3 for Gemma 4.
 [^11]: Audio modality only supported on E2B/E4B variants.
+[^12]: DeepSeek-V4 is only supported on Blackwell GPUs (`SM100+`). See the [DeepSeek-V4 example README](../../../examples/models/core/deepseek_v4/README.md) for setup and parallelism.
 
 
 # Multimodal Feature Support Matrix (PyTorch Backend)

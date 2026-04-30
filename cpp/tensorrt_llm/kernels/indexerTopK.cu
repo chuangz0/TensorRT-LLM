@@ -629,7 +629,8 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowPrefill(
 template <int kNumThreadsPerBlock, bool useRadixSort, bool multipleBlocksPerRow = false, bool mergeBlocks = false,
     typename InputT = float>
 static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(InputT const* logits, int const* seqLens,
-    int* outIndices, int stride0, int stride1, int const topK, int next_n, float* outLogits = nullptr,
+    int* outIndices, int stride0, int stride1, int const topK, int next_n, int compressRatio,
+    float* outLogits = nullptr,
     int const numBlocksToMerge = 0, int const* indices = nullptr)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -644,7 +645,8 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(I
     // The range of logits within the row.
     int rowStart = 0;
     int seq_len = seqLens[rowIdx / next_n];
-    int rowEnd = seq_len - next_n + (rowIdx % next_n) + 1;
+    int actual_kv_len = seq_len - next_n + (rowIdx % next_n) + 1;
+    int rowEnd = actual_kv_len / compressRatio;
 
     // Local pointers to this block
     if constexpr (!multipleBlocksPerRow && !mergeBlocks)
@@ -734,7 +736,7 @@ inline SchemeXBounds getSchemeXBounds(int numColumns, int bytesPerElem)
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
     int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
     int const stride1, int const next_n, int const topK, int const* preIdx, int const preIdxStride,
-    int const preIdxCount, float* heuristicScratch, cudaStream_t const stream)
+    int const preIdxCount, float* heuristicScratch, int const compressRatio, cudaStream_t const stream)
 {
 
     // INVARIANT: kSortingAlgorithmThreshold is the ORIGINAL TRT-LLM Radix-path
@@ -807,9 +809,9 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     int const kSeqSmall = bounds.kSeqSmall;
 
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
-    bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && isSupportedTopK && preIdxCount == topK
-        && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold && numColumns >= kSeqSmall
-        && heuristicScratch != nullptr && numRows < kBsLarge;
+    bool const canUseHeuristic = compressRatio == 1 && preIdx != nullptr && stride1 == 1 && isSupportedTopK
+        && preIdxCount == topK && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold
+        && numColumns >= kSeqSmall && heuristicScratch != nullptr && numRows < kBsLarge;
 
     // Optional env-gated dispatch trace (set TRTLLM_SCHEMEX_DEBUG=1 to enable)
     {
@@ -853,8 +855,8 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config.numAttrs = 1;
         config.attrs = attrs;
 
-        cudaLaunchKernelEx(
-            &config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n, nullptr, 0, nullptr);
+        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
+            compressRatio, nullptr, 0, nullptr);
     }
     else if (numColumns < effectiveSplitWorkThreshold)
     {
@@ -872,8 +874,8 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config.numAttrs = 1;
         config.attrs = attrs;
 
-        cudaLaunchKernelEx(
-            &config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n, nullptr, 0, nullptr);
+        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
+            compressRatio, nullptr, 0, nullptr);
     }
     else
     {
@@ -892,7 +894,7 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config_part1.attrs = attrs;
 
         cudaLaunchKernelEx(&config_part1, kernel_instance_part1, logits, seqLens, outIndicesAux, stride0, stride1, topK,
-            next_n, outLogitsAux, 0, nullptr);
+            next_n, compressRatio, outLogitsAux, 0, nullptr);
 
         constexpr int kNumThreadsPerBlockMerge = 1024;
         auto* kernel_instance_part2 = &topKPerRowDecode<kNumThreadsPerBlockMerge, true, false, true>;
@@ -906,7 +908,7 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         config_part2.attrs = attrs;
 
         cudaLaunchKernelEx(&config_part2, kernel_instance_part2, outLogitsAux, seqLens, indices,
-            multipleBlocksPerRowConfig * topK, 1, topK, next_n, nullptr, multipleBlocksPerRowConfig, outIndicesAux);
+            multipleBlocksPerRowConfig * topK, 1, topK, next_n, 1, nullptr, multipleBlocksPerRowConfig, outIndicesAux);
     }
     sync_check_cuda_error(stream);
 }
@@ -941,7 +943,7 @@ template <typename InputT>
 void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
     int const* preIdx, int const preIdxStride, int const preIdxCount, InputT* heuristicScratch,
-    cudaStream_t const stream)
+    int const compressRatio, cudaStream_t const stream)
 {
     static_assert(std::is_same_v<InputT, __nv_bfloat16> || std::is_same_v<InputT, __half>,
         "invokeIndexerTopKDecodeDtype is for bf16/fp16 only");
@@ -957,9 +959,9 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
     int const kSeqSmall = bounds.kSeqSmall;
 
     bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
-    bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && isSupportedTopK && preIdxCount == topK
-        && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold && numColumns >= kSeqSmall
-        && heuristicScratch != nullptr && numRows < kBsLarge;
+    bool const canUseHeuristic = compressRatio == 1 && preIdx != nullptr && stride1 == 1 && isSupportedTopK
+        && preIdxCount == topK && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold
+        && numColumns >= kSeqSmall && heuristicScratch != nullptr && numRows < kBsLarge;
 
     if (canUseHeuristic)
     {
@@ -983,8 +985,8 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
         config.numAttrs = 1;
         config.attrs = attrs;
 
-        cudaLaunchKernelEx(
-            &config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n, nullptr, 0, nullptr);
+        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
+            compressRatio, nullptr, 0, nullptr);
     }
     else if (numColumns < effectiveSplitWorkThreshold)
     {
@@ -1003,8 +1005,8 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
         config.numAttrs = 1;
         config.attrs = attrs;
 
-        cudaLaunchKernelEx(
-            &config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n, nullptr, 0, nullptr);
+        cudaLaunchKernelEx(&config, kernel_instance, logits, seqLens, indices, stride0, stride1, topK, next_n,
+            compressRatio, nullptr, 0, nullptr);
     }
     else
     {
@@ -1023,19 +1025,19 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
 void invokeIndexerTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int* indices,
     int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0, int const stride1,
     int const next_n, int const topK, int const* preIdx, int const preIdxStride, int const preIdxCount,
-    __nv_bfloat16* heuristicScratch, cudaStream_t const stream)
+    __nv_bfloat16* heuristicScratch, int const compressRatio, cudaStream_t const stream)
 {
     invokeIndexerTopKDecodeDtype<__nv_bfloat16>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns,
-        stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, stream);
+        stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, compressRatio, stream);
 }
 
 void invokeIndexerTopKDecode(__half const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
     int const* preIdx, int const preIdxStride, int const preIdxCount, __half* heuristicScratch,
-    cudaStream_t const stream)
+    int const compressRatio, cudaStream_t const stream)
 {
     invokeIndexerTopKDecodeDtype<__half>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns, stride0,
-        stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, stream);
+        stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, compressRatio, stream);
 }
 
 void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int const* rowEnds, int* indices,
