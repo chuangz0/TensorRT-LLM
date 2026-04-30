@@ -2126,8 +2126,7 @@ class KVCacheManagerV2(BaseResourceManager):
         the next tokens_per_block-aligned boundary.
         """
         draft_len = get_draft_token_length(req)
-        if (draft_len == 0
-                and req.is_disagg_generation_transmission_complete
+        if (draft_len == 0 and req.is_disagg_generation_transmission_complete
                 and req.context_phase_params is not None):
             ctx_draft_tokens = req.context_phase_params.draft_tokens
             if ctx_draft_tokens is not None:
@@ -2192,11 +2191,13 @@ class KVCacheManagerV2(BaseResourceManager):
         # resize() requires capacity >= history_length; clamp for safety.
         target_capacity = max(kv_cache.capacity, history_length)
         try:
-            return kv_cache.resize(target_capacity, history_length=history_length)
+            return kv_cache.resize(target_capacity,
+                                   history_length=history_length)
         except Exception as e:
             logger.warning(
                 f"trim_to_history failed for req {req.py_request_id} "
-                f"(capacity={kv_cache.capacity}, target_history={history_length}): {e}")
+                f"(capacity={kv_cache.capacity}, target_history={history_length}): {e}"
+            )
             return False
 
     def revert_allocate_generation(self, req: LlmRequest) -> None:
