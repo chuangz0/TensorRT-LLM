@@ -5,6 +5,7 @@ from .modeling_bert import BertForSequenceClassification
 from .modeling_clip import CLIPVisionModel
 from .modeling_cohere2 import Cohere2ForCausalLM
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
+from .modeling_deepseekv4 import DeepseekV4ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
 from .modeling_exaone_moe import ExaoneMoeForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
@@ -16,7 +17,6 @@ from .modeling_hunyuan_moe import HunYuanMoEV1ForCausalLM
 from .modeling_hyperclovax import HCXVisionForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
-from .modeling_deepseekv4 import DeepseekV4ForCausalLM
 from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
 from .modeling_mistral import Mistral3VLM, MistralForCausalLM
 from .modeling_mixtral import MixtralForCausalLM

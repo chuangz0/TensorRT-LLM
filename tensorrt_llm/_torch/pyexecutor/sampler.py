@@ -3259,7 +3259,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             if -1 in cumsum:
                 cumsum = cumsum[: cumsum.index(-1)]
             longest_stop_word_len = np.max(np.diff(cumsum, prepend=0), initial=0).item()
-            return longest_stop_word_len > 1
+            return bool(longest_stop_word_len > 1)
         return False
 
     @nvtx_range("maybe_create_beam_histories")
