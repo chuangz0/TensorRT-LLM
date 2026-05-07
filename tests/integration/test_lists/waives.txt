@@ -254,6 +254,7 @@ full:H20-3e/accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_f
 full:H20-3e/accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_auto_dtype[tp8ep4-cuda_graph=True] SKIP (https://nvbugs/5574553)
 full:H20-3e/accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_auto_dtype[tp8ep8-cuda_graph=True] SKIP (https://nvbugs/5574553)
 full:H20-3e/accuracy/test_llm_api_pytorch.py::TestLlama4ScoutInstruct::test_fp8[tp8ep8-cuda_graph=True] SKIP (https://nvbugs/5574553)
+full:H20/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dummy_load_format SKIP (https://nvbugs/6152892)
 full:H20/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_chunked_prefill[triton-auto] SKIP (https://nvbugs/6026676)
 full:H20/accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_fp8[tp8-cuda_graph=True] SKIP (https://nvbugs/5574553)
 full:H20/accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_fp8[tp8ep4-cuda_graph=True] SKIP (https://nvbugs/5574553)
