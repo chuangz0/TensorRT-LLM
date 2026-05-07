@@ -152,6 +152,7 @@ def create_moe_backend(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
+    swiglu_limit_scalar: Optional[float] = None,
     init_load_balancer: bool = True,
     without_comm: bool = False,
     activation_type: ActivationType = ActivationType.Swiglu,
@@ -175,7 +176,8 @@ def create_moe_backend(
         layer_idx: Layer index
         swiglu_alpha: SwiGLU alpha parameter
         swiglu_beta: SwiGLU beta parameter
-        swiglu_limit: SwiGLU limit parameter
+        swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
+        swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
         activation_type: Activation type
 
     Returns:
@@ -226,9 +228,11 @@ def create_moe_backend(
         assert swiglu_alpha is not None and swiglu_beta is not None, \
             "Both swiglu_alpha and swiglu_beta must be provided."
 
-    if swiglu_limit is not None:
-        assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE], \
-            f"swiglu_limit is only supported in CutlassFusedMoE, TritonFusedMoE and TRTLLMGenFusedMoE, not in {moe_cls.__name__}."
+    if swiglu_limit is not None or swiglu_limit_scalar is not None:
+        assert moe_cls in [
+            CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE, WideEPMoE,
+            DeepGemmFusedMoE
+        ], f"swiglu_limit is not supported in {moe_cls.__name__}."
 
     if moe_cls == TRTLLMGenFusedMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TRTLLMGenFusedMoE."
@@ -248,6 +252,7 @@ def create_moe_backend(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
             activation_type=activation_type,
@@ -269,6 +274,7 @@ def create_moe_backend(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
             activation_type=activation_type,
@@ -286,6 +292,8 @@ def create_moe_backend(
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
+            swiglu_limit=swiglu_limit,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             activation_type=activation_type)
     elif moe_cls == VanillaMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in VanillaMoE."
@@ -334,6 +342,8 @@ def create_moe_backend(
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
+            swiglu_limit=swiglu_limit,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             without_comm=without_comm,
         )
     elif moe_cls == TritonFusedMoE:
@@ -413,6 +423,7 @@ def create_moe(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
+    swiglu_limit_scalar: Optional[float] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
 ) -> MoE:
     """
@@ -434,7 +445,8 @@ def create_moe(
         layer_idx: Layer index
         swiglu_alpha: SwiGLU alpha parameter
         swiglu_beta: SwiGLU beta parameter
-        swiglu_limit: SwiGLU limit parameter
+        swiglu_limit: SwiGLU limit parameter (per-expert tensor; for NVFP4)
+        swiglu_limit_scalar: SwiGLU limit scalar (uniform across experts; for FP8)
         activation_type: Activation type
 
     Returns:
@@ -483,6 +495,7 @@ def create_moe(
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
+                swiglu_limit_scalar=swiglu_limit_scalar,
                 activation_type=activation_type,
             )
         else:
@@ -522,5 +535,6 @@ def create_moe(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+        swiglu_limit_scalar=swiglu_limit_scalar,
         activation_type=activation_type,
     )
