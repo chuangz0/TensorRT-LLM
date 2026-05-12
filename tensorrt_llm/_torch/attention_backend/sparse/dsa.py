@@ -12,30 +12,28 @@ import torch.nn.functional as F
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionForwardArgs,
-    MLAParams,
-    PositionalEmbeddingParams,
-)
-from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention, TrtllmAttentionMetadata
+    AttentionForwardArgs, MLAParams, PositionalEmbeddingParams)
+from tensorrt_llm._torch.attention_backend.trtllm import (
+    TrtllmAttention, TrtllmAttentionMetadata)
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
+from tensorrt_llm._torch.modules.multi_stream_utils import \
+    maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import maybe_compile
-from tensorrt_llm._utils import get_size_in_bytes, get_sm_version, maybe_pin_memory, prefer_pinned
+from tensorrt_llm._utils import (get_size_in_bytes, get_sm_version,
+                                 maybe_pin_memory, prefer_pinned)
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.deep_gemm import (
-    fp8_fp4_mqa_logits,
-    fp8_fp4_paged_mqa_logits,
-    fp8_mqa_logits,
-    fp8_paged_mqa_logits,
-    get_paged_mqa_logits_metadata,
-)
+from tensorrt_llm.bindings.internal.batch_manager import \
+    CacheType as CacheTypeCpp
+from tensorrt_llm.deep_gemm import (fp8_fp4_mqa_logits,
+                                    fp8_fp4_paged_mqa_logits, fp8_mqa_logits,
+                                    fp8_paged_mqa_logits,
+                                    get_paged_mqa_logits_metadata)
 from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -602,8 +600,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
             global_positions = start_positions[req_indices] + token_offsets
             index_head_dim = self.kv_cache_manager.index_head_dim
-            data_bytes_per_token = (index_head_dim // 2
-                                    if self.kv_cache_manager.use_fp4 else
+            data_bytes_per_token = (index_head_dim //
+                                    2 if self.kv_cache_manager.use_fp4 else
                                     index_head_dim)
             fp8_indices, scale_indices = _compute_slot_mappings(
                 global_positions,
@@ -1118,9 +1116,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # - Remove this once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
         use_dsl = self.sparse_attention_config.use_cute_dsl_paged_mqa_logits
         self.use_expanded_buffers_for_mtp = (not use_dsl and (
-            (self.max_draft_tokens > 1 and get_sm_version() == 90)
-            or ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
-                and get_sm_version() >= 100)))
+            (self.max_draft_tokens > 1 and get_sm_version() == 90) or
+            ((self.max_draft_tokens == 2 or self.max_draft_tokens > 3)
+             and get_sm_version() >= 100)))
         if self.use_expanded_buffers_for_mtp:
             # Expand kv_lens_cuda (only generation)
             num_tokens = self.num_generations * (1 + self.max_draft_tokens)
@@ -2281,8 +2279,7 @@ class Indexer(nn.Module):
                         q_decode.shape[0], q_decode.shape[1], self.n_heads)
                 logits_decode = self._call_paged_mqa_logits(
                     q_decode, k_cache, weights_decode, context_lens,
-                    block_table, scheduler_metadata_buffer,
-                    indexer_max_seq_len,
+                    block_table, scheduler_metadata_buffer, indexer_max_seq_len,
                     decode_q_scale)
 
             if use_custom_topk:
@@ -2338,7 +2335,12 @@ class Indexer(nn.Module):
                                            device=q_decode.device) // next_n
                 next_n_offset = torch.arange(num_gen_tokens,
                                              device=q_decode.device) % next_n
-                index_end_pos = (context_lens[row_indices] - next_n +
+                if context_lens.shape[0] == num_gen_tokens:
+                    context_lens_per_token = context_lens[:num_gen_tokens, 0]
+                else:
+                    context_lens_per_token = context_lens[row_indices,
+                                                          next_n_offset]
+                index_end_pos = (context_lens_per_token - next_n +
                                  next_n_offset).unsqueeze(1)
                 # index_end_pos: [B * N, 1]
                 mask = positions <= index_end_pos

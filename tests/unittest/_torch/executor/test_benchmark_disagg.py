@@ -736,6 +736,7 @@ class TestPrepareAndScheduleBatchNoBlock:
         ex.kv_cache_transceiver = Mock()
         ex.kv_cache_manager = Mock()
         ex.is_benchmark_disagg = True
+        ex._benchmark_fill_phase_active = True
         ex.enable_attention_dp = False
         ex.num_fetch_requests = 0
         ex.dist = Mock(rank=0, tp_size=1)

@@ -50,9 +50,7 @@ class CacheReuseAdapter(ABC):
         clamped up to stale_end*tpb (blocks below it are evicted)."""
         if not self.enable_block_reuse:
             return [0] * len(layer_groups)
-        scalar = self._global_cached_token_count(req)
-        if scalar <= 0:
-            return [0] * len(layer_groups)
+        scalar = max(0, self._global_cached_token_count(req))
         tpb = self.tokens_per_block
         out: List[int] = []
         for lg in layer_groups:
