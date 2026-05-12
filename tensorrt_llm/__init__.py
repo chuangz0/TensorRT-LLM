@@ -60,6 +60,52 @@ def _preload_python_lib():
 
 _preload_python_lib()
 
+
+def _preload_bundled_ucx():
+    """Preload the wheel-bundled UCX before anything else can pull in a system UCX.
+
+    libtorch_cuda.so DT_NEEDEDs libucp.so.0 / libucs.so.0, and `import torch`
+    happens before libtensorrt_llm.so is loaded. On systems where
+    /opt/hpcx/ucx/lib is registered in /etc/ld.so.cache, that older UCX wins
+    the SONAME race and the (newer) bundled NIXL UCX plugin then fails to
+    dlopen with "undefined symbol: ucp_device_local_mem_list_create".
+
+    Explicitly mapping the bundled UCX with RTLD_GLOBAL first occupies the
+    libucp.so.0 / libucs.so.0 SONAMEs in the process, so torch and any other
+    consumer reuse the newer copy.
+
+    Also default NIXL_PLUGIN_DIR so NIXL discovers the bundled plugin
+    directory without the user having to export it.
+    """
+    import platform
+    if platform.system() != "Linux":
+        return
+
+    from ctypes import CDLL, RTLD_GLOBAL
+    from pathlib import Path
+
+    libs_dir = Path(__file__).parent / "libs"
+    ucx_dir = libs_dir / "ucx"
+    nixl_plugin_dir = libs_dir / "nixl" / "plugins"
+
+    # Order matters: libucm has no UCX deps, libucs depends on libucm,
+    # libuct/libucp depend on libucs.
+    if ucx_dir.is_dir():
+        for soname in ("libucm.so.0", "libucs.so.0", "libuct.so.0",
+                       "libucp.so.0"):
+            so_path = ucx_dir / soname
+            if so_path.exists():
+                try:
+                    CDLL(str(so_path), mode=RTLD_GLOBAL)
+                except OSError:
+                    pass
+
+    if nixl_plugin_dir.is_dir():
+        os.environ.setdefault("NIXL_PLUGIN_DIR", str(nixl_plugin_dir))
+
+
+_preload_bundled_ucx()
+
 import sys
 from pathlib import Path
 
