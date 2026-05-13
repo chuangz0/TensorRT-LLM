@@ -203,12 +203,15 @@ class TestAdapterPerLayerGroup:
 # ---------------------------------------------------------------------------
 
 
-def _swa_trim(block_ids, prompt_len, tpb, window_size, scalar_cached_tokens):
+def _swa_trim(block_ids, prompt_len, tpb, window_size, scalar_cached_tokens, is_gen_only=True):
     """Replicate the SWA branch of KvCacheTransceiverV2._create_kv_slice.
 
     Inputs:
       block_ids: list possibly containing stale entries (V1 pre-eviction view).
       scalar_cached_tokens: the cache-manager scalar BEFORE adapter SWA clamp.
+      is_gen_only: True mirrors the gen-side path (adapter-clamped cached_lg);
+        False mirrors the ctx-side path where the adapter is not invoked and
+        cache_skip must stay 0 regardless of ``stale_end``.
     """
     block_ids = np.array(block_ids, dtype=np.int64)
     total_blocks = (prompt_len + tpb - 1) // tpb
@@ -218,9 +221,12 @@ def _swa_trim(block_ids, prompt_len, tpb, window_size, scalar_cached_tokens):
         block_ids = (
             block_ids[-expected_valid:] if expected_valid > 0 else np.array([], dtype=np.int64)
         )
-    # Adapter clamps cached_lg ≥ stale_end*tpb.
-    cached_lg = max(scalar_cached_tokens, stale_end * tpb)
-    cache_skip = cached_lg // tpb - stale_end
+    if is_gen_only:
+        # Adapter clamps cached_lg ≥ stale_end*tpb.
+        cached_lg = max(scalar_cached_tokens, stale_end * tpb)
+        cache_skip = cached_lg // tpb - stale_end
+    else:
+        cache_skip = 0
     if cache_skip > 0:
         block_ids = (
             block_ids[cache_skip:] if cache_skip < block_ids.size else np.array([], dtype=np.int64)
@@ -272,6 +278,22 @@ class TestSwaTrim:
     def test_v1_pre_eviction_includes_stale(self):
         # Pre-eviction list has all 4 blocks; window-trim keeps last expected_valid=2.
         out = _swa_trim([10, 11, 12, 13], self.PROMPT_LEN, self.TPB, self.WINDOW, 0)
+        np.testing.assert_array_equal(out, [12, 13])
+
+    def test_ctx_side_no_adapter_no_skip(self):
+        # Ctx-side path: adapter not invoked, cached_per_lg synthetically 0.
+        # With stale_end>0, the gen-side formula would produce negative cache_skip
+        # and trip the SWA assertion; ctx side must clamp cache_skip to 0 and
+        # send the full valid window. Regression for PR #13937 follow-up.
+        out = _swa_trim([20, 21], self.PROMPT_LEN, self.TPB, self.WINDOW, 0, is_gen_only=False)
+        np.testing.assert_array_equal(out, [20, 21])
+
+    def test_ctx_side_v1_pre_eviction(self):
+        # Ctx-side path with V1 pre-eviction list: window-trim still drops stale
+        # blocks, cache_skip stays 0 so trimmed window is sent in full.
+        out = _swa_trim(
+            [10, 11, 12, 13], self.PROMPT_LEN, self.TPB, self.WINDOW, 0, is_gen_only=False
+        )
         np.testing.assert_array_equal(out, [12, 13])
 
 
