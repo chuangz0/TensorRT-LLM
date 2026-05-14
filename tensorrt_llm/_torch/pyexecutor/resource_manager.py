@@ -2457,10 +2457,11 @@ class KVCacheManagerV2(BaseResourceManager):
                         all_tokens, req, end=len(all_tokens) - 1)
                 else:
                     tokens = None
-                kv_cache = self._create_kv_cache(req.py_request_id,
-                                                 req.lora_task_id,
-                                                 tokens,
-                                                 cache_salt_id=req.cache_salt_id)
+                kv_cache = self._create_kv_cache(
+                    req.py_request_id,
+                    req.lora_task_id,
+                    tokens,
+                    cache_salt_id=req.cache_salt_id)
                 if kv_cache is None:
                     return False
                 kv_cache.cuda_stream = self._stream.cuda_stream
@@ -3135,7 +3136,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 "Skipping KV cache creation; request will retry next iteration.",
                 request_id, self.index_mapper.size(), self.index_mapper.size())
             return None
-        kv_cache = self.impl.create_kv_cache(lora_task_id, input_tokens, cache_salt_id=cache_salt_id)
+        kv_cache = self.impl.create_kv_cache(lora_task_id,
+                                             input_tokens,
+                                             cache_salt_id=cache_salt_id)
         self.kv_cache_map[request_id] = kv_cache
         index = self.index_mapper.add_new_sequence(request_id)
         for i in range(self.max_beam_width):
