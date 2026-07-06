@@ -1,7 +1,11 @@
+from types import SimpleNamespace
+
 import numpy as np
 
+from tensorrt_llm._torch.disaggregation.native import rank_info as rank_info_module
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+from tensorrt_llm.bindings import DataType
 
 
 def test_rank_info_construction():
@@ -75,3 +79,31 @@ def test_rank_info_roundtrip_with_aux_meta():
     np.testing.assert_array_equal(restored.aux_meta.size, [1024, 2048])
     np.testing.assert_array_equal(restored.aux_meta.item_sizes, [64, 128])
     assert restored.aux_meta.device == "cpu"
+
+
+def test_rank_info_represents_subbyte_nvfp4_cache(monkeypatch):
+    monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _manager: None)
+    manager = SimpleNamespace(
+        mapping=SimpleNamespace(
+            rank=0,
+            tp_size=2,
+            tp_rank=0,
+            pp_size=1,
+            pp_rank=0,
+            dp_size=1,
+            cp_size=1,
+            cp_rank=0,
+            enable_attention_dp=False,
+        ),
+        pp_layers=[0],
+        num_kv_heads_per_layer=[4],
+        tokens_per_block=64,
+        head_dim=128,
+        dtype=DataType.NVFP4,
+        kv_factor=2,
+    )
+
+    rank_info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
+
+    assert rank_info.attention.element_bytes == 0.5
+    assert RankInfo.from_bytes(rank_info.to_bytes()).attention.element_bytes == 0.5
