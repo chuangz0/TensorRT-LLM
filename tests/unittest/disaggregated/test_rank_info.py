@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from tensorrt_llm._torch.disaggregation.native import rank_info as rank_info_module
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
@@ -81,7 +82,13 @@ def test_rank_info_roundtrip_with_aux_meta():
     assert restored.aux_meta.device == "cpu"
 
 
-def test_rank_info_represents_subbyte_nvfp4_cache(monkeypatch):
+@pytest.mark.parametrize(
+    ("dtype", "expected_element_bytes", "expected_type"),
+    [(DataType.NVFP4, 0.5, float), (DataType.HALF, 2, int)],
+)
+def test_rank_info_represents_cache_element_bytes(
+    monkeypatch, dtype, expected_element_bytes, expected_type
+):
     monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _manager: None)
     manager = SimpleNamespace(
         mapping=SimpleNamespace(
@@ -99,11 +106,15 @@ def test_rank_info_represents_subbyte_nvfp4_cache(monkeypatch):
         num_kv_heads_per_layer=[4],
         tokens_per_block=64,
         head_dim=128,
-        dtype=DataType.NVFP4,
+        dtype=dtype,
         kv_factor=2,
     )
 
     rank_info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
 
-    assert rank_info.attention.element_bytes == 0.5
-    assert RankInfo.from_bytes(rank_info.to_bytes()).attention.element_bytes == 0.5
+    assert rank_info.attention.element_bytes == expected_element_bytes
+    assert isinstance(rank_info.attention.element_bytes, expected_type)
+
+    restored = RankInfo.from_bytes(rank_info.to_bytes())
+    assert restored.attention.element_bytes == expected_element_bytes
+    assert isinstance(restored.attention.element_bytes, expected_type)
