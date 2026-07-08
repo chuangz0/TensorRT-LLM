@@ -35,7 +35,7 @@ from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
-from .config_utils import resolve_hf_torch_dtype, resolve_mamba_ssm_cache_dtype
+from .config_utils import resolve_hf_torch_dtype, resolve_ssm_cache_dtype
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -52,7 +52,7 @@ def validate_and_set_mamba_ssm_cache_dtype(
         mamba_ssm_philox_rounds: int = 10) -> None:
     if mamba_ssm_cache_dtype == "auto":
         mamba_ssm_cache_dtype = (
-            resolve_mamba_ssm_cache_dtype(config.pretrained_config)
+            resolve_ssm_cache_dtype(config.pretrained_config)
             or resolve_hf_torch_dtype(config.pretrained_config)
             or config.torch_dtype)
     else:
@@ -120,6 +120,34 @@ def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
         raise ValueError(
             "kv_cache_config.cross_kv_cache_fraction should only be set for encoder-decoder models."
         )
+
+
+def validate_encoder_decoder_tp_scope(model_config: ModelConfig) -> None:
+    """Validate initially supported encoder-decoder TP combinations."""
+    if not model_config.is_encoder_decoder:
+        return
+
+    mapping = model_config.mapping
+    if mapping.enable_attention_dp:
+        raise ValueError(
+            "Encoder-decoder models do not support attention DP yet. "
+            "Set enable_attention_dp=False.")
+
+    if mapping.cp_size > 1:
+        raise ValueError(
+            "Encoder-decoder models do not support context parallelism yet. "
+            "Set context_parallel_size=1.")
+
+    if mapping.pp_size > 1:
+        raise ValueError(
+            "Encoder-decoder models do not support pipeline parallelism yet. "
+            "Set pipeline_parallel_size=1.")
+
+    if mapping.tp_size > 1 and model_config.attn_backend != "TRTLLM":
+        raise ValueError(
+            "Encoder-decoder tensor parallelism currently supports "
+            f"attn_backend='TRTLLM' only, but got "
+            f"attn_backend='{model_config.attn_backend}'.")
 
 
 def initialize_dummy_weights(
@@ -1122,7 +1150,8 @@ class ModelLoader:
             use_cute_dsl_blockscaling_mm,
             use_cute_dsl_blockscaling_bmm=self.llm_args.
             use_cute_dsl_blockscaling_bmm,
-            video_pruning_rate=self.llm_args.video_pruning_rate,
+            video_pruning_rate=self.llm_args.multimodal_config.
+            video_pruning_rate,
             multimodal_config=self.llm_args.multimodal_config,
             use_cute_dsl_bf16_bmm=self.llm_args.use_cute_dsl_bf16_bmm,
             use_cute_dsl_bf16_gemm=self.llm_args.use_cute_dsl_bf16_gemm,
@@ -1157,6 +1186,7 @@ class ModelLoader:
                 f"{type(config.pretrained_config).__name__}: {e}. "
                 f"AllReduce pre-allocation will be skipped.")
 
+        validate_encoder_decoder_tp_scope(config)
         validate_encoder_decoder_kv_cache_config(config,
                                                  self.llm_args.kv_cache_config)
         validate_and_set_kv_cache_quant(config,
