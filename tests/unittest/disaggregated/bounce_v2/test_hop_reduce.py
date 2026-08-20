@@ -390,3 +390,159 @@ def test_handshake_decode_with_and_without_caps() -> None:
     # junk trailing bytes shorter than the caps struct are ignored
     parsed = decode(head + ep + b"\x01")
     assert parsed is not None and parsed[5] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Opt B: C++ gather->RDMA chain (TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN)
+# --------------------------------------------------------------------------- #
+
+KIND_EVENT = 0
+KIND_XFER = 1
+N_CHUNKS = 4
+
+
+def _submit(h: Harness, n_chunks: int = N_CHUNKS):
+    """Submit one request of n single-desc chunks (each exactly one page,
+    strided so the planner cannot coalesce them)."""
+    idx = np.arange(n_chunks, dtype=np.uint64)
+    src = idx * np.uint64(2 * K_PAGE) + np.uint64(0x30_0000_0000)
+    dst = idx * np.uint64(2 * K_PAGE) + np.uint64(0x40_0000_0000)
+    sizes = np.full(n_chunks, K_PAGE, dtype=np.uint32)
+    return h.reactor.submit(src, dst, sizes, 0, "peerA")
+
+
+def _grant_all(h: Harness, rid: int, n_chunks: int = N_CHUNKS) -> None:
+    credits = [
+        codec.CreditEntry(REMOTE_BASE + i * K_PAGE, K_PAGE, 0, i * K_PAGE)
+        for i in range(n_chunks)
+    ]
+    h.peer.send(codec.encode_grant(rid, credits))
+
+
+def _ack_all_data(h: Harness, rid: int, n_chunks: int = N_CHUNKS) -> None:
+    entries = []
+    for _ in range(n_chunks):
+        header, _blob = h.peer.recv_typed(codec.BounceMsgType.DATA)
+        assert header.request_id == rid
+        entries.append((header.chunk_idx, header.region_handle))
+    h.peer.send(codec.encode_ack(rid, entries))
+
+
+def test_cpp_chain_arms_instead_of_classic_post(harness_factory) -> None:
+    """Chain enabled + capable agent: every credited chunk is ARMED (one
+    completion per chunk); post_transfer_1to1 is never called, and no gather
+    completion is ever delivered to Python."""
+    h = harness_factory(make_config(enable_cpp_chain=True))
+    assert h.reactor.add_peer("peerA", h.peer.endpoint)
+    fut = _submit(h)
+    header, _ = h.peer.recv_typed(codec.BounceMsgType.WANT)
+    rid = header.request_id
+    _grant_all(h, rid)
+    wait_until(lambda: len(h.agent.arms) == N_CHUNKS, msg="all chunks armed")
+    assert h.agent.posts == []  # classic path never used
+    # Verify each arm carried the right (copy_id, staging addr, remote addr).
+    copy_ids = [c[0] for c in h.pool.calls]
+    for copy_id, _xid, src, dst, nbytes, peer in h.agent.arms:
+        assert copy_id in copy_ids
+        assert ARENA_BASE <= src < ARENA_BASE + h.cfg.arena_size_bytes
+        assert dst >= REMOTE_BASE and nbytes == K_PAGE and peer == "peerA"
+    # The chain resolves each chunk with ONE completion: the reserved xfer id.
+    for _copy_id, xid, *_ in h.agent.arms:
+        h.poller.push(xid, KIND_XFER, 1)
+    _ack_all_data(h, rid)
+    result = fut.result(timeout=DEADLINE_S)
+    assert result.ok, result.reason
+    assert h.agent.posts == []
+
+
+def test_cpp_chain_arm_race_falls_back_to_classic(harness_factory) -> None:
+    """Arm returns -1 (event already terminal in C++): the classic
+    gather-completion -> post path must still complete the request."""
+    h = harness_factory(
+        make_config(enable_cpp_chain=True), agent=FakeAgent(Ids(), arm_accepts=False)
+    )
+    h.agent._ids = h.ids  # share the harness id space
+    assert h.reactor.add_peer("peerA", h.peer.endpoint)
+    fut = _submit(h)
+    header, _ = h.peer.recv_typed(codec.BounceMsgType.WANT)
+    rid = header.request_id
+    _grant_all(h, rid)
+    # Deliver the gather completions Python still owns (arm was refused).
+    wait_until(lambda: len(h.pool.calls) == N_CHUNKS, msg="eager gathers")
+    for copy_id, *_ in list(h.pool.calls):
+        h.poller.push(copy_id, KIND_EVENT, 1)
+    wait_until(lambda: len(h.agent.posts) == N_CHUNKS, msg="classic posts")
+    for xid, *_ in list(h.agent.posts):
+        h.poller.push(xid, KIND_XFER, 1)
+    _ack_all_data(h, rid)
+    result = fut.result(timeout=DEADLINE_S)
+    assert result.ok, result.reason
+
+
+def test_cpp_chain_disabled_never_arms(harness_factory) -> None:
+    """Flag off: even a chain-capable agent is never asked to arm."""
+    h = harness_factory(make_config(enable_cpp_chain=False))
+    assert h.reactor.add_peer("peerA", h.peer.endpoint)
+    fut = _submit(h)
+    header, _ = h.peer.recv_typed(codec.BounceMsgType.WANT)
+    rid = header.request_id
+    _grant_all(h, rid)
+    wait_until(lambda: len(h.pool.calls) == N_CHUNKS, msg="eager gathers")
+    for copy_id, *_ in list(h.pool.calls):
+        h.poller.push(copy_id, KIND_EVENT, 1)
+    wait_until(lambda: len(h.agent.posts) == N_CHUNKS, msg="classic posts")
+    assert h.agent.arms == []
+    for xid, *_ in list(h.agent.posts):
+        h.poller.push(xid, KIND_XFER, 1)
+    _ack_all_data(h, rid)
+    assert fut.result(timeout=DEADLINE_S).ok
+
+
+def test_cpp_chain_legacy_binding_falls_back(harness_factory) -> None:
+    """Flag on but the binding lacks post_transfer_1to1_on_event (old wheel):
+    warn + classic path, never a crash."""
+    h = harness_factory(make_config(enable_cpp_chain=True), agent=LegacyAgent(Ids()))
+    h.agent._ids = h.ids
+    assert h.reactor.add_peer("peerA", h.peer.endpoint)
+    fut = _submit(h)
+    header, _ = h.peer.recv_typed(codec.BounceMsgType.WANT)
+    rid = header.request_id
+    _grant_all(h, rid)
+    wait_until(lambda: len(h.pool.calls) == N_CHUNKS, msg="eager gathers")
+    for copy_id, *_ in list(h.pool.calls):
+        h.poller.push(copy_id, KIND_EVENT, 1)
+    wait_until(lambda: len(h.agent.posts) == N_CHUNKS, msg="classic posts")
+    for xid, *_ in list(h.agent.posts):
+        h.poller.push(xid, KIND_XFER, 1)
+    _ack_all_data(h, rid)
+    assert fut.result(timeout=DEADLINE_S).ok
+
+
+def test_cpp_chain_gather_failure_reports_fail_gather(harness_factory) -> None:
+    """A chained chunk that dies at the gather stage arrives as
+    (reserved id, KIND_EVENT, 0) and must fail with FAIL_GATHER."""
+    h = harness_factory(make_config(enable_cpp_chain=True))
+    assert h.reactor.add_peer("peerA", h.peer.endpoint)
+    fut = _submit(h)
+    header, _ = h.peer.recv_typed(codec.BounceMsgType.WANT)
+    _grant_all(h, header.request_id)
+    wait_until(lambda: len(h.agent.arms) == N_CHUNKS, msg="all chunks armed")
+    h.poller.push(h.agent.arms[0][1], KIND_EVENT, 0)  # gather died in C++
+    result = fut.result(timeout=DEADLINE_S)
+    assert not result.ok
+    assert result.reason == reactor_mod.FAIL_GATHER
+
+
+def test_cpp_chain_write_failure_reports_fail_write(harness_factory) -> None:
+    """A chained chunk whose post/write fails arrives as
+    (reserved id, KIND_XFER, 0) and must fail with FAIL_WRITE."""
+    h = harness_factory(make_config(enable_cpp_chain=True))
+    assert h.reactor.add_peer("peerA", h.peer.endpoint)
+    fut = _submit(h)
+    header, _ = h.peer.recv_typed(codec.BounceMsgType.WANT)
+    _grant_all(h, header.request_id)
+    wait_until(lambda: len(h.agent.arms) == N_CHUNKS, msg="all chunks armed")
+    h.poller.push(h.agent.arms[0][1], KIND_XFER, 0)
+    result = fut.result(timeout=DEADLINE_S)
+    assert not result.ok
+    assert result.reason == reactor_mod.FAIL_WRITE

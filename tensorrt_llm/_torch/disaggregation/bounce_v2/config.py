@@ -97,6 +97,15 @@ class BounceV2Config:
     #: only to peers that advertised CAP_PREGRANT in their handshake, so a
     #: mixed-switch deployment falls back to the windowed behavior per peer.
     enable_pregrant: bool = False
+    #: EXPERIMENTAL (TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN): as a sender, arm the
+    #: gather->RDMA chain in C++ — the CompletionPoller's poll thread posts a
+    #: credited chunk's RDMA write the moment its gather event completes,
+    #: instead of reporting the gather to Python and having the reactor post.
+    #: Python then handles ONE completion per chunk (the write) instead of
+    #: two. Sender-local: no protocol or handshake impact. Requires the
+    #: binding's post_transfer_1to1_on_event; silently (with a warning) falls
+    #: back to the classic path on older bindings.
+    enable_cpp_chain: bool = False
     #: Receiver-side lease on granted regions. Derived (``None`` default) as
     #: 2 x ``request_timeout_ms``: a dead sender emits neither DATA nor a
     #: cancel — unobservable through the protocol alone — so a flow holding

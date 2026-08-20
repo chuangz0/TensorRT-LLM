@@ -57,6 +57,7 @@ from .scheduler import CreditScheduler
 
 __all__ = [
     "BOUNCE_V2_ENV",
+    "BOUNCE_V2_CPP_CHAIN_ENV",
     "BOUNCE_V2_PREGRANT_ENV",
     "BounceEngine",
     "BounceTransferStatus",
@@ -70,6 +71,9 @@ BOUNCE_V2_ENV = "TRTLLM_BOUNCE_V2_ENABLE"
 #: BounceV2Config.enable_pregrant). Effective per peer only when BOTH sides
 #: set it (negotiated via CAP_PREGRANT in the handshake blob).
 BOUNCE_V2_PREGRANT_ENV = "TRTLLM_BOUNCE_V2_EXP_PREGRANT"
+#: EXPERIMENTAL opt-in: sender-side C++ gather->RDMA chain (see
+#: BounceV2Config.enable_cpp_chain). Purely local — no handshake impact.
+BOUNCE_V2_CPP_CHAIN_ENV = "TRTLLM_BOUNCE_V2_EXP_CPP_CHAIN"
 
 _TRUTHY = ("1", "true", "TRUE", "True")
 
@@ -224,7 +228,7 @@ class BounceEngine:
             f"bounce_v2({self_name}): engine ready endpoint={self._reactor.endpoint} "
             f"chunk={config.max_chunk_size_bytes} arena={config.arena_size_bytes} "
             f"inflight={config.max_inflight_chunks_per_request} "
-            f"pregrant={config.enable_pregrant}"
+            f"pregrant={config.enable_pregrant} cpp_chain={config.enable_cpp_chain}"
         )
 
     # ---------------------------- handshake ---------------------------- #
@@ -444,5 +448,6 @@ def create_bounce_v2_engine(
     config = BounceV2Config(
         enabled=True,
         enable_pregrant=os.environ.get(BOUNCE_V2_PREGRANT_ENV, "0") in _TRUTHY,
+        enable_cpp_chain=os.environ.get(BOUNCE_V2_CPP_CHAIN_ENV, "0") in _TRUTHY,
     )
     return BounceEngine(agent, config, device_id, self_name)
