@@ -50,13 +50,14 @@ import numpy as np
 from tensorrt_llm.logger import logger
 
 from .arena import BounceArena
-from .codec import BOUNCE_VERSION
+from .codec import BOUNCE_VERSION, CAP_PREGRANT
 from .config import BounceV2Config
 from .reactor import FAIL_REACTOR_DEAD, FAIL_SHUTDOWN, BounceReactor, BounceResult
 from .scheduler import CreditScheduler
 
 __all__ = [
     "BOUNCE_V2_ENV",
+    "BOUNCE_V2_PREGRANT_ENV",
     "BounceEngine",
     "BounceTransferStatus",
     "NoBounceEngine",
@@ -65,13 +66,23 @@ __all__ = [
 
 #: Opt-in gate for the transceiver integration (no llm_args field yet).
 BOUNCE_V2_ENV = "TRTLLM_BOUNCE_V2_ENABLE"
+#: EXPERIMENTAL opt-in: receiver-side whole-request pregrant (see
+#: BounceV2Config.enable_pregrant). Effective per peer only when BOTH sides
+#: set it (negotiated via CAP_PREGRANT in the handshake blob).
+BOUNCE_V2_PREGRANT_ENV = "TRTLLM_BOUNCE_V2_EXP_PREGRANT"
+
+_TRUTHY = ("1", "true", "TRUE", "True")
 
 # Handshake blob: magic 'BV2H', u16 wire version, u16 control kind (1 = zmq),
 # u64 effective max chunk bytes, u64 arena usable capacity, u32 endpoint len,
-# endpoint bytes. Local-only knobs (stream counts, timeouts, granularity)
+# endpoint bytes, then OPTIONAL trailing u32 capability bitmask (codec.CAP_*;
+# absent = 0 — decoders ignore unknown trailing bytes, so a capability-less
+# build interoperates: it simply advertises nothing and sees baseline
+# behavior). Local-only knobs (stream counts, timeouts, granularity)
 # intentionally do NOT travel.
 _HANDSHAKE_MAGIC = 0x42563248
 _HANDSHAKE_HEADER = struct.Struct("<IHHQQI")
+_HANDSHAKE_CAPS = struct.Struct("<I")
 _CONTROL_KIND_ZMQ = 1
 
 #: Watchdog wait slice: how often a blocked wait() re-checks reactor health.
@@ -212,13 +223,15 @@ class BounceEngine:
         logger.info(
             f"bounce_v2({self_name}): engine ready endpoint={self._reactor.endpoint} "
             f"chunk={config.max_chunk_size_bytes} arena={config.arena_size_bytes} "
-            f"inflight={config.max_inflight_chunks_per_request}"
+            f"inflight={config.max_inflight_chunks_per_request} "
+            f"pregrant={config.enable_pregrant}"
         )
 
     # ---------------------------- handshake ---------------------------- #
 
     def local_handshake_blob(self) -> bytes:
         """The blob to carry in the rank-info exchange."""
+        caps = CAP_PREGRANT if self._cfg.enable_pregrant else 0
         endpoint = self._reactor.endpoint.encode("utf-8")
         return (
             _HANDSHAKE_HEADER.pack(
@@ -230,6 +243,7 @@ class BounceEngine:
                 len(endpoint),
             )
             + endpoint
+            + _HANDSHAKE_CAPS.pack(caps)
         )
 
     def add_peer(self, peer: str, blob: Optional[bytes]) -> bool:
@@ -259,7 +273,7 @@ class BounceEngine:
                 f"-> bounce disabled for this peer (NIXL fallback)"
             )
             return False
-        version, kind, chunk_cap, _arena_cap, endpoint = parsed
+        version, kind, chunk_cap, _arena_cap, endpoint, caps = parsed
         if (
             version != BOUNCE_VERSION
             or kind != _CONTROL_KIND_ZMQ
@@ -278,13 +292,14 @@ class BounceEngine:
                 f"-> bounce disabled for this peer (NIXL fallback)"
             )
             return False
+        self._reactor.set_peer_caps(peer, caps)
         with self._peer_mu:
             self._handshaked_peers.add(peer)
-        logger.info(f"bounce_v2: peer {peer} bounce route ready ({endpoint})")
+        logger.info(f"bounce_v2: peer {peer} bounce route ready ({endpoint}) caps=0x{caps:x}")
         return True
 
     @staticmethod
-    def _decode_handshake(blob: bytes) -> Optional[tuple[int, int, int, int, str]]:
+    def _decode_handshake(blob: bytes) -> Optional[tuple[int, int, int, int, str, int]]:
         if len(blob) < _HANDSHAKE_HEADER.size:
             return None
         magic, version, kind, chunk_cap, arena_cap, ep_len = _HANDSHAKE_HEADER.unpack_from(blob, 0)
@@ -296,7 +311,14 @@ class BounceEngine:
             )
         except UnicodeDecodeError:
             return None
-        return version, kind, chunk_cap, arena_cap, endpoint
+        # Optional trailing capability bitmask; a pre-capability blob simply
+        # ends at the endpoint (caps = 0). Trailing bytes beyond what we know
+        # are ignored (forward compatibility for future capability payloads).
+        caps = 0
+        caps_off = _HANDSHAKE_HEADER.size + ep_len
+        if len(blob) >= caps_off + _HANDSHAKE_CAPS.size:
+            (caps,) = _HANDSHAKE_CAPS.unpack_from(blob, caps_off)
+        return version, kind, chunk_cap, arena_cap, endpoint, caps
 
     def has_peer(self, peer: str) -> bool:
         with self._peer_mu:
@@ -417,6 +439,10 @@ def create_bounce_v2_engine(
     ``TRTLLM_BOUNCE_V2_ENABLE`` is truthy, the null object otherwise.
     Construction errors RAISE (the user explicitly opted in; a silent
     fallback would be a ~1000x perf cliff discovered in production)."""
-    if os.environ.get(BOUNCE_V2_ENV, "0") not in ("1", "true", "TRUE", "True"):
+    if os.environ.get(BOUNCE_V2_ENV, "0") not in _TRUTHY:
         return NoBounceEngine()
-    return BounceEngine(agent, BounceV2Config(enabled=True), device_id, self_name)
+    config = BounceV2Config(
+        enabled=True,
+        enable_pregrant=os.environ.get(BOUNCE_V2_PREGRANT_ENV, "0") in _TRUTHY,
+    )
+    return BounceEngine(agent, config, device_id, self_name)

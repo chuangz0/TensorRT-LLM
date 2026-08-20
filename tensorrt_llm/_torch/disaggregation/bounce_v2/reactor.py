@@ -78,6 +78,7 @@ import zmq
 from tensorrt_llm.logger import logger
 
 from .codec import (
+    CAP_PREGRANT,
     AckEntry,
     BounceMsgHeader,
     BounceMsgType,
@@ -261,6 +262,10 @@ class BounceReactor:
         self._zpoller.register(self._router, zmq.POLLIN)
         self._ch_mu = threading.Lock()
         self._dealers: dict[str, zmq.Socket] = {}
+        # Peer capability bitmasks (codec.CAP_*), set by the engine after a
+        # successful handshake; a WANT-bootstrapped (never handshaked) peer
+        # has no entry and gets baseline behavior. Guarded by _ch_mu.
+        self._peer_caps: dict[str, int] = {}
 
         # --- sender state (under _req_mu) ---
         self._req_mu = threading.Lock()
@@ -338,9 +343,20 @@ class BounceReactor:
             self._dealers[peer] = dealer
             return True
 
+    def set_peer_caps(self, peer: str, caps: int) -> None:
+        """Record the peer's handshake capability bits (codec.CAP_*).
+        Thread-safe; called by the engine after a successful handshake."""
+        with self._ch_mu:
+            self._peer_caps[peer] = int(caps)
+
+    def _get_peer_caps(self, peer: str) -> int:
+        with self._ch_mu:
+            return self._peer_caps.get(peer, 0)
+
     def remove_peer(self, peer: str) -> None:
         """Close the DEALER route to ``peer`` (idempotent). Thread-safe."""
         with self._ch_mu:
+            self._peer_caps.pop(peer, None)
             dealer = self._dealers.pop(peer, None)
             if dealer is not None:
                 dealer.close(linger=0)
@@ -961,8 +977,21 @@ class BounceReactor:
                 f"({len(chunk_sizes)} chunks announced)"
             )
             return
+        # EXPERIMENTAL pregrant (TRTLLM_BOUNCE_V2_EXP_PREGRANT): widen this
+        # flow's in-flight window to the whole request so every chunk that
+        # fits the arena is granted in ONE batched GRANT — no per-chunk
+        # credit-refill round-trip. Gated on BOTH our env switch and the
+        # peer's advertised CAP_PREGRANT: with either side off, the flow gets
+        # the byte-for-byte baseline windowed behavior.
+        window = None
+        if self._cfg.enable_pregrant and (self._get_peer_caps(peer) & CAP_PREGRANT):
+            window = len(chunk_sizes)
+            logger.debug(
+                f"bounce_v2({self._self_name}): pregrant window={window} for {peer} "
+                f"rid={header.request_id}"
+            )
         self._rx_flows[key] = len(chunk_sizes)
-        self._send_grants(self._sched.on_want(key, chunk_sizes))
+        self._send_grants(self._sched.on_want(key, chunk_sizes, max_inflight=window))
 
     def _on_data(self, peer: str, header: BounceMsgHeader, blob: bytes) -> None:
         runs = decode_scatter(blob, header)

@@ -90,6 +90,13 @@ class BounceV2Config:
     enable_eager_gather: bool = True
     #: CI-only escape hatch: fall back to plain device memory for the arena.
     disable_fabric_memory: bool = False
+    #: EXPERIMENTAL (TRTLLM_BOUNCE_V2_EXP_PREGRANT): as a receiver, pregrant a
+    #: whole request's chunks in one GRANT (per-flow in-flight window widened
+    #: to the request's chunk count) instead of refilling one credit per
+    #: scatter completion — removes the per-chunk GRANT round-trip. Applied
+    #: only to peers that advertised CAP_PREGRANT in their handshake, so a
+    #: mixed-switch deployment falls back to the windowed behavior per peer.
+    enable_pregrant: bool = False
     #: Receiver-side lease on granted regions. Derived (``None`` default) as
     #: 2 x ``request_timeout_ms``: a dead sender emits neither DATA nor a
     #: cancel — unobservable through the protocol alone — so a flow holding

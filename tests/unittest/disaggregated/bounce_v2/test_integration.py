@@ -123,11 +123,12 @@ class TestEnvGate:
             blob = eng.local_handshake_blob()
             parsed = BounceEngine._decode_handshake(blob)
             assert parsed is not None
-            version, kind, chunk_cap, arena_cap, endpoint = parsed
+            version, kind, chunk_cap, arena_cap, endpoint, caps = parsed
             assert version == BOUNCE_VERSION
             assert chunk_cap == BounceV2Config(enabled=True).max_chunk_size_bytes
             assert arena_cap > 0
             assert endpoint.startswith("tcp://")
+            assert caps == 0  # pregrant not requested via env -> no cap bits
             # transfer.py wires the blob into rank info as `blob or None`:
             # a live engine's blob must therefore be non-empty (truthy).
             assert blob

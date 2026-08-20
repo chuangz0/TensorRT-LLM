@@ -809,3 +809,128 @@ def test_concurrent_local_and_remote_events_keep_conservation() -> None:
     assert s.local_held_count() == 0
     assert free_regions(s) == n_regions
     assert s.tracked_flows() == 0
+
+
+# --------------------------------------------------------------------------- #
+# pregrant: per-flow in-flight window override (TRTLLM_BOUNCE_V2_EXP_PREGRANT)
+# --------------------------------------------------------------------------- #
+
+
+def test_pregrant_grants_whole_request_in_one_batch() -> None:
+    """With max_inflight=len(chunks) the whole request is granted upfront
+    (bounded by the arena), and no refill grants remain for the flow."""
+    s = make_sched(16, 4)
+    m = Mirror()
+    g = s.on_want("A", want(12), max_inflight=12)
+    m.grant(g)
+    assert len(g) == 12  # default cap (4) bypassed; all 12 fit the arena
+    assert s.held_count("A") == 12
+    check_conservation(s, ["A"], 16)
+    # Scatter completions free regions but grant nothing new (no pending).
+    for off in list(m.owner):
+        m.free(off)
+        assert s.on_scatter_done("A", off) == []
+    assert s.held_count("A") == 0
+    assert free_regions(s) == 16
+    check_conservation(s, ["A"], 16)
+
+
+def test_pregrant_still_bounded_by_arena() -> None:
+    """A pregrant want larger than the arena backpressures exactly like the
+    baseline: N grants now, the rest refill as regions free."""
+    s = make_sched(4, 2)
+    m = Mirror()
+    g = s.on_want("A", want(10), max_inflight=10)
+    m.grant(g)
+    assert len(g) == 4  # arena-bound, not window-bound
+    check_conservation(s, ["A"], 4)
+    first = next(iter(m.owner))
+    m.free(first)
+    re = s.on_scatter_done("A", first)
+    m.grant(re)
+    assert len(re) == 1  # refills continue until the request drains
+    check_conservation(s, ["A"], 4)
+
+
+def test_pregrant_none_is_byte_for_byte_baseline() -> None:
+    """max_inflight=None must replay the DEFAULT windowed behavior exactly:
+    same grant streams (flow/offset/addr/length) for a scripted sequence."""
+    script_wants = [("A", 10), ("B", 3)]
+
+    def run(pass_none: bool) -> list[tuple]:
+        s = make_sched(8, 4)
+        out: list[tuple] = []
+
+        def snap(grants: Sequence["Grant"]) -> None:
+            out.extend((g.flow, g.offset, g.addr, g.length) for g in grants)
+
+        for flow, n in script_wants:
+            if pass_none:
+                snap(s.on_want(flow, want(n), max_inflight=None))
+            else:
+                snap(s.on_want(flow, want(n)))
+        # Drain a few completions in a deterministic order.
+        held_a = [off for f, off, _, _ in out if f == "A"]
+        for off in held_a[:2]:
+            snap(s.on_scatter_done("A", off))
+        return out
+
+    assert run(pass_none=True) == run(pass_none=False)
+
+
+def test_pregrant_per_flow_only_and_fair_rotation() -> None:
+    """The override applies to ONE flow: a concurrent default flow keeps the
+    scheduler cap, and rotation still interleaves grants fairly."""
+    s = make_sched(16, 2)
+    m = Mirror()
+    ga = s.on_want("A", want(8), max_inflight=8)
+    m.grant(ga)
+    assert len(ga) == 8
+    gb = s.on_want("B", want(8))  # default cap = 2
+    m.grant(gb)
+    assert len(gb) == 2
+    assert s.held_count("A") == 8
+    assert s.held_count("B") == 2
+    check_conservation(s, ["A", "B"], 16)
+
+
+def test_pregrant_window_clamps_to_one() -> None:
+    s = make_sched(8, 4)
+    g = s.on_want("A", want(5), max_inflight=0)  # nonsense values clamp to 1
+    assert len(g) == 1
+    check_conservation(s, ["A"], 8)
+
+
+def test_pregrant_refresh_want_resets_override() -> None:
+    """A fresh WANT without an override returns the flow to the default cap
+    (cancel + re-want is the only legal re-WANT path, but the state reset
+    must hold regardless)."""
+    s = make_sched(8, 2)
+    m = Mirror()
+    g = s.on_want("A", want(6), max_inflight=6)
+    m.grant(g)
+    assert len(g) == 6
+    for off in list(m.owner):
+        m.free(off)
+        s.on_scatter_done("A", off)
+    g2 = s.on_want("A", want(6))
+    assert len(g2) == 2  # back to the scheduler default
+    check_conservation(s, ["A"], 8)
+
+
+def test_pregrant_conservation_under_forget() -> None:
+    """Reclaiming a pregrant flow frees/quarantines exactly its held regions
+    (conservation across forget + quarantine reap)."""
+    clock = FakeClock()
+    s = make_sched(8, 2, now_fn=clock)
+    m = Mirror()
+    g = s.on_want("A", want(8), max_inflight=8)
+    m.grant(g)
+    assert len(g) == 8
+    grants, deferred = s.forget("A", quarantine_s=5.0)
+    assert grants == [] and deferred == []
+    assert s.held_count("A") == 0
+    assert free_regions(s) == 0  # all quarantined, none re-grantable
+    clock.advance(6.0)
+    assert s.reap_quarantine() == []
+    assert free_regions(s) == 8

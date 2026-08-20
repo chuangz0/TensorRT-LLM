@@ -467,7 +467,7 @@ class TestFailurePaths:
         good = dst.engine.local_handshake_blob()
         parsed = BounceEngine._decode_handshake(good)
         assert parsed is not None
-        version, kind, chunk_cap, arena_cap, endpoint = parsed
+        version, kind, chunk_cap, arena_cap, endpoint, _caps = parsed
         tampered = _forged_handshake(chunk_cap + MIB, endpoint, arena_cap)
 
         # add_peer is REPLACEMENT: the incompatible re-registration must both

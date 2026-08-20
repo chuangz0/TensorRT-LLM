@@ -50,6 +50,7 @@ from .plan import SCATTER_RUN_DTYPE
 __all__ = [
     "BOUNCE_MAGIC",
     "BOUNCE_VERSION",
+    "CAP_PREGRANT",
     "AckEntry",
     "BounceMsgHeader",
     "BounceMsgType",
@@ -71,6 +72,17 @@ __all__ = [
 BOUNCE_MAGIC = 0x424E4332  # 'B''N''C''2'
 #: v3: batched ACK (see module docstring). v2 (C++) is intentionally refused.
 BOUNCE_VERSION = 3
+
+#: Handshake capability bits (u32 bitmask appended to the handshake blob;
+#: absent = 0). Capabilities are OPTIONAL behaviors negotiated per peer on
+#: top of the strict version/chunk-cap equality — a peer that does not
+#: advertise a bit simply gets the baseline behavior, never an error.
+#: CAP_PREGRANT: the peer runs with TRTLLM_BOUNCE_V2_EXP_PREGRANT — as a
+#: RECEIVER it may pregrant a whole request's chunks past the default
+#: in-flight window (the GRANT wire format is unchanged; senders always
+#: accept credit batches of any size, so this bit is informational-defensive:
+#: we only widen the window for peers that opted in on their side too).
+CAP_PREGRANT = 0x1
 
 # u32 magic, u16 version, u16 msgType, u64 requestId, u64 regionHandle,
 # u32 chunkIdx, u32 numChunks, u32 count, u32 payloadBytes, u32 aux

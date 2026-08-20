@@ -77,6 +77,8 @@ class _FlowState:
     pending: deque[int] = field(default_factory=deque)  # chunk bytes awaiting a grant (FIFO)
     held: set[int] = field(default_factory=set)  # region offsets granted to this flow
     blocked_at_grant_sequence: Optional[int] = None  # first grant seq where head did not fit
+    #: Per-flow in-flight cap override (pregrant). ``None`` = scheduler default.
+    max_inflight: Optional[int] = None
     # Lease stamp: last WANT / grant issued / scatter completed. stale_flows()
     # reports flows idle beyond the receiver's lease so a dead sender cannot
     # leak regions forever.
@@ -149,6 +151,11 @@ class CreditScheduler:
     # internal helpers (call with self._mu held)
     # ------------------------------------------------------------------ #
 
+    def _flow_cap(self, st: _FlowState) -> int:
+        """Effective in-flight cap for one flow: its per-flow override (set by
+        a pregrant ``on_want``) or the scheduler default."""
+        return self._max_inflight if st.max_inflight is None else st.max_inflight
+
     def _ensure_in_ring(self, flow: str) -> None:
         if flow not in self._ring:
             self._ring.append(flow)
@@ -190,7 +197,7 @@ class CreditScheduler:
                 continue
             if (
                 not st.pending
-                or len(st.held) >= self._max_inflight
+                or len(st.held) >= self._flow_cap(st)
                 or st.blocked_at_grant_sequence is None
             ):
                 continue
@@ -223,7 +230,7 @@ class CreditScheduler:
             self._maybe_activate_drain()
             if self._drain_flow is not None:
                 st = self._flows.get(self._drain_flow)
-                if st is None or not st.pending or len(st.held) >= self._max_inflight:
+                if st is None or not st.pending or len(st.held) >= self._flow_cap(st):
                     self._drain_flow = None
                     continue
                 want = st.pending[0]
@@ -249,7 +256,7 @@ class CreditScheduler:
                 st = self._flows.get(self._ring[idx])
                 if st is None:
                     continue  # ring/flows invariant says this cannot happen; skip
-                if not st.pending or len(st.held) >= self._max_inflight:
+                if not st.pending or len(st.held) >= self._flow_cap(st):
                     continue
                 want = st.pending[0]
                 off = self._arena.allocate(want)
@@ -303,9 +310,23 @@ class CreditScheduler:
     # receiver-role events
     # ------------------------------------------------------------------ #
 
-    def on_want(self, flow: str, chunk_bytes: Sequence[int]) -> list[Grant]:
+    def on_want(
+        self,
+        flow: str,
+        chunk_bytes: Sequence[int],
+        max_inflight: Optional[int] = None,
+    ) -> list[Grant]:
         """A flow announces the per-chunk byte sizes it wants to write (in
         order). EMPTY = cancel. Returns the grants to send now.
+
+        ``max_inflight`` (pregrant, experimental) overrides the scheduler's
+        per-flow in-flight cap FOR THIS FLOW ONLY (values < 1 clamp to 1;
+        ``None`` keeps the default). With ``max_inflight=len(chunk_bytes)``
+        the whole request may be granted at once — arena capacity still
+        backpressures naturally, the round-robin sweep still rotates one
+        grant at a time across flows, and drain anti-starvation still
+        protects a blocked head, so fairness and the conservation invariant
+        are unchanged; only the refill round-trips disappear.
 
         The caller (reactor) MUST validate decoded WANT chunk sizes —
         ``0 < size <= min(max_chunk_size_bytes, arena_capacity)`` — before
@@ -318,6 +339,7 @@ class CreditScheduler:
         with self._mu:
             st = self._flows.setdefault(flow, _FlowState())
             st.pending = deque(int(b) for b in chunk_bytes)
+            st.max_inflight = None if max_inflight is None else max(1, int(max_inflight))
             st.blocked_at_grant_sequence = None
             st.last_progress = self._now()  # a fresh WANT renews the lease
             if st.pending:
