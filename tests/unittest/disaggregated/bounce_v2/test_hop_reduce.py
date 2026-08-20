@@ -369,6 +369,68 @@ def test_pregrant_refills_stop_after_full_grant(harness_factory) -> None:
         h.peer.recv_typed(codec.BounceMsgType.GRANT, timeout_s=0.3)
 
 
+def test_pregrant_caps_via_want_sideband(harness_factory) -> None:
+    """round39 regression: in disagg the rank-info handshake blob only
+    travels TOWARD the KV sender, so the receiver never sees the sender's
+    blob (set_peer_caps is never called on it). The sender therefore
+    declares its caps inline in the WANT — the receiver's pregrant gate
+    must open from that alone."""
+    h = harness_factory(make_config(enable_pregrant=True))
+    # NO set_peer_caps: the receiver never loaded the sender's handshake.
+    h.peer.send(
+        codec.encode_want(11, [K_PAGE] * 12, h.peer.endpoint, caps=codec.CAP_PREGRANT)
+    )
+    header, blob = h.peer.recv_typed(codec.BounceMsgType.GRANT)
+    credits = codec.decode_credits(blob, header)
+    assert credits is not None and len(credits) == 12  # whole request granted
+    stats = h.reactor.stats()
+    assert stats.get("rx_pregrant_wants") == 1
+    assert stats.get("rx_credits_at_want") == 12
+    assert stats.get("rx_grant_msgs") == 1
+
+
+def test_pregrant_sender_declares_caps_in_want(harness_factory) -> None:
+    """A pregrant-enabled sender declares CAP_PREGRANT inline in every WANT;
+    with the env off the WANT is byte-for-byte legacy (aux = chunk count)."""
+    for enabled in (True, False):
+        h = harness_factory(make_config(enable_pregrant=enabled, enable_cpp_chain=False))
+        assert h.reactor.add_peer("peerA", h.peer.endpoint)
+        _submit(h)
+        header, _ = h.peer.recv_typed(codec.BounceMsgType.WANT)
+        if enabled:
+            assert codec.decode_want_caps(header) == codec.CAP_PREGRANT
+        else:
+            assert codec.decode_want_caps(header) == 0
+            assert header.aux == header.count  # legacy encoding untouched
+
+
+def test_want_caps_codec_roundtrip() -> None:
+    ep = "tcp://127.0.0.1:1"
+    # capability-less WANT: legacy aux == count, caps decode to 0
+    blob = codec.encode_want(1, [K_PAGE] * 3, ep)
+    header = codec.decode_header(blob)
+    assert header is not None and header.aux == 3
+    assert codec.decode_want_caps(header) == 0
+    assert codec.decode_want(blob, header) == ([K_PAGE] * 3, ep)
+    # caps-tagged WANT: marker in the high half, payload identical
+    blob = codec.encode_want(1, [K_PAGE] * 3, ep, caps=codec.CAP_PREGRANT)
+    header = codec.decode_header(blob)
+    assert header is not None
+    assert codec.decode_want_caps(header) == codec.CAP_PREGRANT
+    assert codec.decode_want(blob, header) == ([K_PAGE] * 3, ep)
+    # an ODD legacy chunk count must not read as a caps bit
+    blob = codec.encode_want(1, [K_PAGE] * 7, ep)
+    header = codec.decode_header(blob)
+    assert header is not None and codec.decode_want_caps(header) == 0
+    # caps ride only on WANT headers
+    grant = codec.encode_grant(1, [codec.CreditEntry(1, K_PAGE, 0, 0)])
+    gh = codec.decode_header(grant)
+    assert gh is not None and codec.decode_want_caps(gh) == 0
+    # caps must fit 16 bits
+    with pytest.raises(ValueError):
+        codec.encode_want(1, [K_PAGE], ep, caps=1 << 16)
+
+
 # --------------------------------------------------------------------------- #
 # handshake capability negotiation (engine-level, no compiled binding)
 # --------------------------------------------------------------------------- #

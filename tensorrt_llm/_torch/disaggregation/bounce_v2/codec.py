@@ -60,6 +60,7 @@ __all__ = [
     "decode_header",
     "decode_scatter",
     "decode_want",
+    "decode_want_caps",
     "encode_ack",
     "encode_cancel",
     "encode_data",
@@ -83,6 +84,20 @@ BOUNCE_VERSION = 3
 #: accept credit batches of any size, so this bit is informational-defensive:
 #: we only widen the window for peers that opted in on their side too).
 CAP_PREGRANT = 0x1
+
+#: WANT aux-field capability marker. The rank-info handshake blob only
+#: travels TOWARD the KV sender (the sender loads the receiver's rank info;
+#: the receiver bootstraps the reverse route from the WANT itself), so the
+#: RECEIVER-side capability gate can never rely on it — the sender declares
+#: its capability bits inline in every WANT instead. The header's ``aux``
+#: field (historically a redundant copy of ``count``) carries
+#: ``(_WANT_CAPS_MARKER << 16) | caps`` when the sender declares a non-zero
+#: capability set. Compatibility is bidirectional: an old receiver never
+#: reads ``aux`` (it decodes chunk sizes via ``count``), and an old sender's
+#: ``aux`` equals its chunk count, whose high half is 0 for any physically
+#: possible request (0xB2CA0000 chunks would be a multi-GB WANT), so
+#: :func:`decode_want_caps` returns 0 for it.
+_WANT_CAPS_MARKER = 0xB2CA
 
 # u32 magic, u16 version, u16 msgType, u64 requestId, u64 regionHandle,
 # u32 chunkIdx, u32 numChunks, u32 count, u32 payloadBytes, u32 aux
@@ -121,7 +136,8 @@ class BounceMsgHeader(NamedTuple):
     num_chunks: int  # DATA
     count: int  # trailing entries (credits / chunk sizes / scatter / acks)
     payload_bytes: int  # bytes of trailing payload
-    aux: int  # WANT: num chunks; 0 elsewhere
+    #: WANT: legacy num chunks, or marker|caps (see decode_want_caps); 0 elsewhere
+    aux: int
 
 
 @dataclass(frozen=True)
@@ -171,24 +187,49 @@ def _header_bytes(
     )
 
 
-def encode_want(request_id: int, chunk_sizes: Sequence[int], endpoint: "str | bytes") -> bytes:
+def encode_want(
+    request_id: int,
+    chunk_sizes: Sequence[int],
+    endpoint: "str | bytes",
+    caps: int = 0,
+) -> bytes:
     """Encode a WANT: the per-chunk byte sizes the sender will write plus the
     sender's own bounce control endpoint (lets the receiver self-bootstrap the
     reverse control path). An EMPTY size list is a cancel (see
     :func:`encode_cancel`). Payload:
-    ``[count * u32 chunk_bytes][u32 endpoint_len][endpoint bytes]``."""
+    ``[count * u32 chunk_bytes][u32 endpoint_len][endpoint bytes]``.
+
+    ``caps`` (16-bit CAP_* bitmask) declares the SENDER's capability bits
+    inline (see ``_WANT_CAPS_MARKER``): 0 keeps the legacy ``aux = count``
+    encoding byte-for-byte."""
     sizes = np.ascontiguousarray(np.asarray(chunk_sizes, dtype=np.uint32)).reshape(-1)
     ep = endpoint.encode("utf-8") if isinstance(endpoint, str) else bytes(endpoint)
     sizes_blob = sizes.tobytes()
     payload = sizes_blob + _U32.pack(len(ep)) + ep
+    if caps:
+        if caps >> 16:
+            raise ValueError(f"bounce_v2: WANT caps must fit 16 bits (got 0x{caps:x})")
+        aux = (_WANT_CAPS_MARKER << 16) | caps
+    else:
+        aux = sizes.shape[0]
     header = _header_bytes(
         BounceMsgType.WANT,
         request_id,
         count=sizes.shape[0],
         payload_bytes=len(payload),
-        aux=sizes.shape[0],
+        aux=aux,
     )
     return header + payload
+
+
+def decode_want_caps(header: BounceMsgHeader) -> int:
+    """The CAP_* bits a WANT's sender declared inline, 0 when absent (legacy
+    ``aux = count`` encoding, non-WANT message, or a capability-less build)."""
+    if header.msg_type != BounceMsgType.WANT:
+        return 0
+    if (header.aux >> 16) != _WANT_CAPS_MARKER:
+        return 0
+    return header.aux & 0xFFFF
 
 
 def encode_cancel(request_id: int, endpoint: "str | bytes" = b"") -> bytes:

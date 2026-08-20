@@ -80,6 +80,7 @@ from tensorrt_llm.logger import logger
 from .codec import (
     CAP_PREGRANT,
     AckEntry,
+    decode_want_caps,
     BounceMsgHeader,
     BounceMsgType,
     CreditEntry,
@@ -393,6 +394,10 @@ class BounceReactor:
             self._dealers[peer] = dealer
             return True
 
+    def _local_caps(self) -> int:
+        """Capability bits this reactor declares in its outbound WANTs."""
+        return CAP_PREGRANT if self._cfg.enable_pregrant else 0
+
     def set_peer_caps(self, peer: str, caps: int) -> None:
         """Record the peer's handshake capability bits (codec.CAP_*).
         Thread-safe; called by the engine after a successful handshake."""
@@ -496,8 +501,14 @@ class BounceReactor:
             )
             self._requests[rid] = req
         # WANT carries our endpoint so the receiver self-bootstraps the
-        # reverse route (sent outside _req_mu, like the C++).
-        self._send_to(peer, encode_want(rid, chunk_bytes, self._endpoint))
+        # reverse route (sent outside _req_mu, like the C++), plus our
+        # capability bits: the rank-info handshake only travels toward the
+        # KV sender, so this inline declaration is the RECEIVER's only
+        # reliable source for our caps (round39 bug: gen never saw ctx's
+        # handshake blob, so its pregrant gate never opened).
+        self._send_to(
+            peer, encode_want(rid, chunk_bytes, self._endpoint, caps=self._local_caps())
+        )
         if self._cfg.enable_eager_gather:
             with self._req_mu:
                 # A racing GRANT may already have pumped (or failed) the request.
@@ -1097,9 +1108,13 @@ class BounceReactor:
         # fits the arena is granted in ONE batched GRANT — no per-chunk
         # credit-refill round-trip. Gated on BOTH our env switch and the
         # peer's advertised CAP_PREGRANT: with either side off, the flow gets
-        # the byte-for-byte baseline windowed behavior.
+        # the byte-for-byte baseline windowed behavior. The peer's caps come
+        # from the WANT itself (the sender declares them inline — the only
+        # channel that reliably reaches the receiver in a one-directional
+        # rank-info exchange) OR from its handshake blob when we did load one.
+        peer_caps = self._get_peer_caps(peer) | decode_want_caps(header)
         window = None
-        if self._cfg.enable_pregrant and (self._get_peer_caps(peer) & CAP_PREGRANT):
+        if self._cfg.enable_pregrant and (peer_caps & CAP_PREGRANT):
             window = len(chunk_sizes)
             self._bump("rx_pregrant_wants")
         self._bump("rx_wants")
