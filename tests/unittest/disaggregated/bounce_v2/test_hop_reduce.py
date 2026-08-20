@@ -312,6 +312,12 @@ def test_pregrant_receiver_grants_whole_request(harness_factory) -> None:
     credits = codec.decode_credits(blob, header)
     assert credits is not None and len(credits) == 12
     assert h.sched.held_count(f"peerA\x1f7") == 12
+    stats = h.reactor.stats()
+    assert stats.get("rx_wants") == 1
+    assert stats.get("rx_pregrant_wants") == 1
+    assert stats.get("rx_credits_at_want") == 12
+    assert stats.get("rx_credits_sent") == 12
+    assert stats.get("rx_grant_msgs") == 1
 
 
 def test_pregrant_disabled_env_keeps_window(harness_factory) -> None:
@@ -335,6 +341,7 @@ def test_pregrant_peer_without_cap_falls_back(harness_factory) -> None:
     credits = codec.decode_credits(blob, header)
     assert credits is not None and len(credits) == 4
     assert h.sched.held_count(f"peerA\x1f9") == 4
+    assert h.reactor.stats().get("rx_pregrant_wants") is None  # cap missing
 
 
 def test_pregrant_refills_stop_after_full_grant(harness_factory) -> None:
@@ -453,6 +460,12 @@ def test_cpp_chain_arms_instead_of_classic_post(harness_factory) -> None:
     result = fut.result(timeout=DEADLINE_S)
     assert result.ok, result.reason
     assert h.agent.posts == []
+    stats = h.reactor.stats()
+    assert stats.get("tx_chain_armed") == N_CHUNKS
+    assert stats.get("tx_post_classic") is None
+    assert stats.get("tx_gather_eager") == N_CHUNKS  # launched before credit
+    assert stats.get("tx_data_sent") == N_CHUNKS
+    assert stats.get("tx_acked_chunks") == N_CHUNKS
 
 
 def test_cpp_chain_arm_race_falls_back_to_classic(harness_factory) -> None:
@@ -477,6 +490,9 @@ def test_cpp_chain_arm_race_falls_back_to_classic(harness_factory) -> None:
     _ack_all_data(h, rid)
     result = fut.result(timeout=DEADLINE_S)
     assert result.ok, result.reason
+    stats = h.reactor.stats()
+    assert stats.get("tx_chain_arm_race") == N_CHUNKS  # every arm refused
+    assert stats.get("tx_post_classic") == N_CHUNKS
 
 
 def test_cpp_chain_disabled_never_arms(harness_factory) -> None:
@@ -496,6 +512,10 @@ def test_cpp_chain_disabled_never_arms(harness_factory) -> None:
         h.poller.push(xid, KIND_XFER, 1)
     _ack_all_data(h, rid)
     assert fut.result(timeout=DEADLINE_S).ok
+    stats = h.reactor.stats()
+    assert stats.get("tx_chain_armed") is None
+    assert stats.get("tx_chain_arm_race") is None  # chain disabled: no arm attempts
+    assert stats.get("tx_post_classic") == N_CHUNKS
 
 
 def test_cpp_chain_legacy_binding_falls_back(harness_factory) -> None:
