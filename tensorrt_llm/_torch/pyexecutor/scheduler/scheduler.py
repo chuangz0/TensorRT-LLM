@@ -79,14 +79,18 @@ class SchedulerOutput(
             "num_fitting_requests",
             "scheduled_mm_encoder_items",
             "recompute_paused_requests",
+            "fetch_launch_queue",
         ],
     )
 ):
     """Scheduler result.
 
     ``scheduled_mm_encoder_items`` defaults to ``None``. The V2-only
-    ``recompute_paused_requests`` defaults to a fresh empty list so existing
-    V1 schedulers can keep constructing the original six-field output.
+    ``recompute_paused_requests`` and ``fetch_launch_queue`` default to a fresh
+    empty list so existing V1 schedulers can keep constructing the original
+    six-field output. ``fetch_launch_queue`` holds the context requests whose
+    KV prefix the scheduler reserved pages for this iteration; the KV transfer
+    coordinator launches those fetches after scheduling (integration plan §5).
     """
 
     __slots__ = ()
@@ -101,6 +105,7 @@ class SchedulerOutput(
         num_fitting_requests: int,
         scheduled_mm_encoder_items: dict[int, list[int]] | None = None,
         recompute_paused_requests: RequestList | None = None,
+        fetch_launch_queue: RequestList | None = None,
     ):
         return super(SchedulerOutput, cls).__new__(
             cls,
@@ -112,6 +117,7 @@ class SchedulerOutput(
             num_fitting_requests,
             scheduled_mm_encoder_items,
             [] if recompute_paused_requests is None else recompute_paused_requests,
+            [] if fetch_launch_queue is None else fetch_launch_queue,
         )
 
 

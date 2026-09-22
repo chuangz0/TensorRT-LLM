@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
+    from .kv_transfer_binding import KVTransferEngineBinding
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
@@ -398,6 +399,12 @@ class PyExecutor:
     # If the number of micro batches is too large, the executor will spend too much host memory (No additional GPU memory is required).
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
+
+    # KV transfer coordination layer over the configured cache backends
+    # (integration plan §4); attached by kv_transfer_assembly when
+    # TRTLLM_KV_TRANSFER_CONFIG is set. A class default so that partially
+    # constructed executors read None too.
+    kv_transfer: Optional["KVTransferEngineBinding"] = None
 
     def __init__(
             self,
@@ -740,6 +747,9 @@ class PyExecutor:
         # queue-backed client delivery while retaining normal termination as
         # the single owner of resource and result-queue cleanup.
         self._pending_response_terminations: List[LlmRequest] = []
+        # Context requests the scheduler reserved KV fetch pages for this
+        # iteration (integration plan §4).
+        self._kv_fetch_launch_queue: List[LlmRequest] = []
         # Same buffer-then-synced-flush pattern as _pending_transfer_responses
         # above: _append_iter_stats is reached from per-rank-divergent gates,
         # so its tp_allgather collective is lifted to _flush_iter_stats_synced.
@@ -1806,6 +1816,9 @@ class PyExecutor:
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        if self.kv_transfer is not None:
+            # Plan §5 #9: stop the backends and free held requests before the managers free the pools.
+            self.kv_transfer.close()
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
@@ -3933,6 +3946,9 @@ class PyExecutor:
 
         self.disagg.prepare_context_schedulable(new_requests)
         self.disagg.poll_gen_transfers()
+        if self.kv_transfer is not None:
+            # Plan §5 #1, design §3.2 ①: loop head; this round's schedule sees last round's landings.
+            self.kv_transfer.advance_transfers(self.active_requests)
         self.disagg.check_transfer_timeouts()
 
         iter_stats = self._init_iter_stats_if_sampled(len(new_requests))
@@ -4012,6 +4028,10 @@ class PyExecutor:
 
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, _ = self._schedule(
         )
+        if self.kv_transfer is not None:
+            # Plan §5 #2, design §3.2 ③: start the fetches the scheduler reserved pages for.
+            self.kv_transfer.launch_reserved_fetches(
+                self._kv_fetch_launch_queue)
 
         # Must run after _schedule(): the empty scheduled batch it repairs does
         # not exist until the capacity scheduler has returned its verdict.
@@ -4651,6 +4671,10 @@ class PyExecutor:
                         # Finalize V2 context KV before disagg transfer/response
                         # handling can terminate the request.
                         self._update_v2_context_resources(scheduled_batch)
+                    if self.kv_transfer is not None:
+                        # Plan §5 #3, design §3.2 ④: publish after the forward completed and the blocks were committed.
+                        self.kv_transfer.publish_completed_contexts(
+                            scheduled_batch.context_requests)
                     self._send_kv_async(scheduled_batch.all_requests())
 
                     self._handle_canceled_requests()
@@ -4713,6 +4737,9 @@ class PyExecutor:
 
                 if not can_queue:
                     self.disagg.pace_idle()
+                    if self.kv_transfer is not None:
+                        # Plan §5 #7: sleep ~1 ms while only a backend can make progress.
+                        self.kv_transfer.pace_idle()
 
                 self.iter_counter += 1
 
@@ -5487,6 +5514,11 @@ class PyExecutor:
                             self.previous_batch.sample_state,
                             iteration_id=self.iter_counter)
 
+                    if self.kv_transfer is not None:
+                        # Plan §5 #4, design §3.2 ④: only previous_batch is committed and forward-complete here.
+                        self.kv_transfer.publish_completed_contexts(
+                            self.previous_batch.scheduled_requests.
+                            context_requests)
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
 
@@ -5609,6 +5641,9 @@ class PyExecutor:
 
                 if not can_queue:
                     self.disagg.pace_idle()
+                    if self.kv_transfer is not None:
+                        # Plan §5 #7: sleep ~1 ms while only a backend can make progress.
+                        self.kv_transfer.pace_idle()
 
                 self.iter_counter += 1
 
@@ -5921,9 +5956,13 @@ class PyExecutor:
         # blocking would keep the loop from reaching the
         # `should_stop_processing` check that ends it, deadlocking shutdown()
         # on `shutdown_event`.
-        idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
-                and not self.is_shutdown
-                and not self._has_pending_connector_transfers())
+        idle = (
+            total_num_live_requests == 0 and len(waiting_queue) == 0
+            and not self.is_shutdown
+            and not self._has_pending_connector_transfers()
+            # Plan §5 #6: a request held for a KV transfer is not live, yet only the loop can release it.
+            and not (self.kv_transfer is not None
+                     and self.kv_transfer.has_transfer_in_flight()))
         if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
@@ -6678,6 +6717,8 @@ class PyExecutor:
         scheduled_requests.scheduled_mm_encoder_items = (
             scheduler_output.scheduled_mm_encoder_items)
         scheduled_requests.recompute_paused_requests = scheduler_output.recompute_paused_requests
+        # Plan §5 #2: read by launch_reserved_fetches right after _schedule().
+        self._kv_fetch_launch_queue = scheduler_output.fetch_launch_queue
 
         self._maybe_record_hang_diagnostic_phase("scheduled",
                                                  scheduled_requests)
@@ -8204,6 +8245,10 @@ class PyExecutor:
             if (self._is_kv_manager_v2 and transfers is not None and
                     request.py_request_id in transfers.requests_in_transfer()):
                 return
+        if (self.kv_transfer is not None and not request.is_dummy_request
+                and not self.kv_transfer.on_request_finished(request)):
+            # Plan §5 #5, §9 release gate: this layer holds the request and terminates it later.
+            return
         # Dummy requests don't participate in disagg KV cache transfers,
         # so they must bypass the PP termination handler to avoid stale
         # sequences in the KV cache manager (the handler delays removal,
@@ -8275,6 +8320,10 @@ class PyExecutor:
             connector.release_unstarted_prefix_loads(request)
             if connector.defer_load_termination(request):
                 return False
+        if self.kv_transfer is not None and self.kv_transfer.is_tracking(
+                request):
+            # Plan §5 #8: a parked or held request is this layer's; cancel again once it is released.
+            return False
         if self.kv_cache_transceiver is None:
             return True
 

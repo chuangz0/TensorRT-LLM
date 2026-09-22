@@ -1202,6 +1202,16 @@ def _create_py_executor(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
+    if os.environ.get("TRTLLM_KV_TRANSFER_CONFIG"):
+        # Plan §5 #13, design §7.4: assemble the KV transfer layer once, before the loop starts.
+        from .kv_transfer_assembly import attach_kv_transfer
+        attach_kv_transfer(py_executor,
+                           os.environ["TRTLLM_KV_TRANSFER_CONFIG"],
+                           mapping=mapping,
+                           spec_config=spec_config,
+                           kv_connector_manager=kv_connector_manager,
+                           max_beam_width=max_beam_width)
+
     with _startup_timer.phase("executor_start_worker",
                               metrics=creation_metrics,
                               metric_name="worker_start_seconds"):

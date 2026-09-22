@@ -16,7 +16,7 @@
 import enum
 import os
 from collections import Counter
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
@@ -37,6 +37,9 @@ from .scheduler import (
     drop_decoder_context_requests_waiting_for_encoder_output,
 )
 
+if TYPE_CHECKING:
+    from ...disaggregation.orchestration.planner import FetchPlan
+
 
 class ScheduleAction(enum.Enum):
     """Result of a per-request scheduling attempt."""
@@ -44,6 +47,14 @@ class ScheduleAction(enum.Enum):
     SCHEDULED = "scheduled"  # success — payload contains tokens etc.
     SKIP = "skip"  # skip this request, continue the loop
     STOP = "stop"  # stop the scheduling loop
+
+
+class FetchPathAction(enum.Enum):
+    """Answer of the KV transfer seam for one first-chunk context request (design §5)."""
+
+    NOT_A_FETCH = "not_a_fetch"  # ordinary context path
+    SKIP = "skip"  # deferred or reservation failed; ask again next round
+    RESERVED = "reserved"  # pages reserved; the coordinator launches the fetch
 
 
 class _RecomputePauseState:
@@ -256,6 +267,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._prioritize_first_token_gen = (
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
         )
+        # Read-only hook of the KV transfer coordinator (design §5, plan §5 #10): asked
+        # once per first-chunk context request before any cache is prepared for it, and
+        # answering a plan, None (compute locally) or its ``DEFER`` (skip this round).
+        # Duck-typed and attached by the executor assembly; None keeps every request
+        # on the local compute path.
+        self.kv_transfer_planner = None
 
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
@@ -290,6 +307,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             recompute_paused,
             disagg_candidates,
             has_chunking,
+            fetch_launch_queue,
         ) = self._schedule_loop(active_requests, inflight_request_ids)
 
         # Sort by LoRA task ID
@@ -304,6 +322,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             recompute_paused_requests=recompute_paused,
             fitting_disagg_gen_init_requests=disagg_candidates,
             num_fitting_requests=(len(scheduled_encoder) + len(scheduled_ctx) + len(scheduled_gen)),
+            fetch_launch_queue=fetch_launch_queue,
         )
 
     # ---- Main scheduling loop ----
@@ -315,6 +334,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         evicted: RequestList = []
         recompute_paused: RequestList = []
         disagg_candidates: RequestList = []
+        fetch_launch_queue: RequestList = []
         scheduled_beam_width = 0
         has_chunking = False
 
@@ -534,6 +554,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                     )
                     deferred_behind_contributor = True
                     continue
+            # KV transfer seam (design §5, plan §5 #10): asked before any cache is prepared.
+            fetch_path = self._try_take_fetch_path(req)
+            if fetch_path is FetchPathAction.RESERVED:
+                fetch_launch_queue.append(req)
+            if fetch_path is not FetchPathAction.NOT_A_FETCH:
+                continue
             peft_pages = budget.peft_pages_needed(req)
             if peft_pages is None:
                 continue
@@ -592,7 +618,53 @@ class KVCacheV2Scheduler(RequestScheduler):
             recompute_paused,
             disagg_candidates,
             has_chunking,
+            fetch_launch_queue,
         )
+
+    # ---- KV transfer seam (design §5) ----
+
+    def _try_take_fetch_path(self, req: LlmRequest) -> FetchPathAction:
+        """Ask the KV transfer planner whether a first-chunk context request fetches its prefix.
+
+        ``NOT_A_FETCH``: no planner, not a candidate, or "compute locally"; the
+        request takes the ordinary context path. ``SKIP``: deferred this round, or
+        the reservation failed; the request stays in ``CONTEXT_INIT`` and is asked
+        again next round. ``RESERVED``: pages reserved up to the plan's target;
+        the request goes to the fetch launch queue and, like a disagg gen-init,
+        joins neither the request nor the token budget of this forward pass.
+        """
+        planner = self.kv_transfer_planner
+        if planner is None or not self._is_first_chunk_context(req):
+            return FetchPathAction.NOT_A_FETCH
+        plan = planner.plan_fetch(req)
+        if plan is planner.DEFER:
+            return FetchPathAction.SKIP
+        if plan is None:
+            return FetchPathAction.NOT_A_FETCH
+        return self._try_reserve_fetch_pages(req, plan)
+
+    def _try_reserve_fetch_pages(self, req: LlmRequest, plan: "FetchPlan") -> FetchPathAction:
+        """Reserve pages up to ``plan.token_end`` for a content fetch (plan §5 #11).
+
+        The same allocation as a disagg generation init, with the fetch target in
+        place of the prompt length. A failed reservation must not retain the
+        prefix-reuse holds it took, so the cache is dropped and the cursor rewound,
+        exactly as after a failed first-chunk context admission.
+        """
+        if self.kv_cache_manager.prepare_disagg_gen_init(req, plan.token_end):
+            return FetchPathAction.RESERVED
+        logger.debug(
+            "prepare_disagg_gen_init(token_end=%d) failed for request %s",
+            plan.token_end,
+            req.py_request_id,
+        )
+        if req.py_request_id in self.kv_cache_manager.kv_cache_map:
+            self.kv_cache_manager.free_resources(req)
+        rewind_context_after_cache_drop(req, self.tokens_per_block)
+        return FetchPathAction.SKIP
+
+    def _is_first_chunk_context(self, req: LlmRequest) -> bool:
+        return req.state_value == self._context_init_state_value and req.is_first_context_chunk
 
     # ---- Prefix-aware skip ----
 
@@ -603,7 +675,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         be skipped, and an encoder request contributes to the cross pool, which
         the skip deliberately leaves alone.
         """
-        return req.state_value == self._context_init_state_value and req.is_first_context_chunk
+        return self._is_first_chunk_context(req)
 
     def _skip_pays_off_under_reuse_policy(self) -> bool:
         """Whether a one-iteration deferral can actually be repaid by a reuse hit.
