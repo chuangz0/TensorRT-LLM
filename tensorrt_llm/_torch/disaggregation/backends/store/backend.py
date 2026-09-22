@@ -1,0 +1,628 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""A cache backend over a Mooncake distributed store: ``Fetches``, ``Publishes``, ``RegistersPools``.
+
+One store object per unit. A unit's segments go in as that object's buffer list, so it is stored
+whole or not at all, which is what per-unit atomic visibility needs (contract §6.3). Every
+delivery runs on the backend's own threads; they call the store client and, when staging, the
+copier, and nothing else. ``probe`` is answered the same way on a thread of its own: the first
+call queues the lookup and answers ``None``, a later call returns the answer once.
+
+Reading a unit is two round trips: ``batch_is_exist`` then ``batch_get_into_multi_buffers``. The
+first tells a miss from a failure, which one negative get status could not; the contract forbids
+reporting either as the other (§5.2). A unit that was present at the lookup and gone by the get is
+a miss (the store wrote nothing); any other trouble reading a present unit fails the whole
+attempt, because earlier batches of the same attempt may already have written their destinations
+and the contract says that content is then undefined (§5.2 invariant 3).
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Callable, Iterable, Iterator, Mapping, Optional, Sequence, TypeVar
+
+from ...base.cache_backend import (
+    Attempt,
+    CacheExtent,
+    Delivered,
+    Failed,
+    Outcome,
+    Registration,
+    Route,
+    SubmissionRejected,
+)
+from .client import OBJECT_NOT_FOUND, StoreClient
+from .config import MooncakeStoreConfig
+from .keys import KeyScheme
+from .regions import RegionResolver, Segment
+from .staging import HostStagingPool
+
+__all__ = ["MooncakeStoreBackend", "StoreCounters"]
+
+# The stdlib logger keeps this module import-light (no ``tensorrt_llm`` import); note that
+# ``TLLM_LOG_LEVEL_BY_MODULE`` does not route it, so configure ``logging`` for this name directly.
+logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+
+@dataclass
+class StoreCounters:
+    """Operational counters (contract §6.2 implementation requirement 4). Read-only for callers."""
+
+    fetch_hits: int = 0
+    fetch_misses: int = 0
+    publish_stored: int = 0
+    publish_raced: int = 0
+    """Units the store declined and then turned out to hold: another publisher got there first."""
+    publish_present: int = 0
+    probe_hits: int = 0
+    probe_misses: int = 0
+    failed_attempts: int = 0
+
+
+class _StoreAttempt:
+    """``quiet`` is set once the caller's memory is no longer touched, ``done`` once an outcome is."""
+
+    __slots__ = ("_outcome", "done", "quiet")
+
+    def __init__(self) -> None:
+        self._outcome: Optional[Outcome] = None
+        self.quiet = threading.Event()
+        self.done = threading.Event()
+
+    def poll(self) -> Optional[Outcome]:
+        return self._outcome
+
+    def finish(self, outcome: Outcome) -> None:
+        if self._outcome is None:
+            self._outcome = outcome
+        self.quiet.set()
+        self.done.set()
+
+
+@dataclass
+class _Task:
+    """One unit to move: its key, where it lives, and how big it is."""
+
+    name: bytes
+    key: str
+    segments: tuple[Segment, ...]
+    total: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.total = sum(size for _, size in self.segments)
+
+    def ptrs(self) -> list[int]:
+        return [address for address, _ in self.segments]
+
+    def sizes(self) -> list[int]:
+        return [size for _, size in self.segments]
+
+
+@dataclass
+class _Probe:
+    created: float
+    done: bool = False
+    answer: frozenset[bytes] = frozenset()
+    error: Optional[BaseException] = None
+
+
+class _Registration:
+    def __init__(self, backend: MooncakeStoreBackend, address: int, size: int) -> None:
+        self.address = address
+        self.size = size
+        self.live = True
+        self.closing = False
+        self._backend = backend
+
+    def overlaps(self, address: int, size: int) -> bool:
+        return address < self.address + self.size and self.address < address + size
+
+    def covers(self, address: int, size: int) -> bool:
+        return self.address <= address and address + size <= self.address + self.size
+
+    def close(self) -> None:
+        self._backend._unregister(self)
+
+
+def _batched(items: Sequence[_T], size: int) -> Iterator[Sequence[_T]]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+class MooncakeStoreBackend:
+    """Fetch from and publish to one Mooncake store.
+
+    Args:
+        client: An opened store client. Owned from here on; ``close`` closes it.
+        config: Batch sizes, bounds and whether to stage through host memory.
+        resolver: Maps a unit's local coordinates to its memory segments.
+        layout_fingerprint: Folded into every key; see ``KeyScheme``.
+        staging: Required when ``config.stage_through_host``; ignored otherwise. Owned from here
+            on: ``close`` shuts it down so that no worker stays parked waiting for a slot.
+    """
+
+    def __init__(
+        self,
+        client: StoreClient,
+        config: MooncakeStoreConfig,
+        resolver: RegionResolver,
+        layout_fingerprint: bytes,
+        *,
+        staging: HostStagingPool | None = None,
+    ) -> None:
+        if config.stage_through_host and staging is None:
+            raise ValueError("stage_through_host needs a HostStagingPool")
+        self._client = client
+        self._config = config
+        self._resolve = resolver
+        self._keys = KeyScheme(config.namespace, layout_fingerprint)
+        self._staging = staging if config.stage_through_host else None
+        self._batch = config.transfer_batch_size
+        if self._staging is not None:
+            self._batch = min(self._batch, self._staging.num_slots)
+        self._lock = threading.Lock()
+        self._registrations: list[_Registration] = []
+        self._pending: set[tuple[int, int]] = set()
+        """Spans whose ``register_buffer`` call is in progress; they refuse overlaps like live ones."""
+        self._probes: dict[tuple[bytes, tuple[bytes, ...]], _Probe] = {}
+        self._inflight = threading.BoundedSemaphore(config.max_inflight_ops)
+        self._pool = ThreadPoolExecutor(config.num_workers, thread_name_prefix="mooncake-store")
+        # Lookups have their own thread so a probe is not queued behind every delivery in flight.
+        self._lookups = ThreadPoolExecutor(1, thread_name_prefix="mooncake-store-probe")
+        self._closed = False
+        self.counters = StoreCounters()
+
+    def key_for(self, name: bytes) -> str:
+        """The store key this backend uses for the unit called ``name``."""
+        return self._keys.key(name)
+
+    # ---- RegistersPools ----
+
+    def register_pool(self, address: int, size: int) -> Registration:
+        if size <= 0:
+            raise ValueError(f"size must be > 0, got {size}")
+        span = (address, size)
+        with self._lock:
+            # Reserved across the client call, which runs outside the lock: Mooncake unregisters
+            # by address, so a concurrent duplicate must be refused before it can make a call
+            # whose cleanup would tear down the winner's registration.
+            self._check_overlap(address, size)
+            self._pending.add(span)
+        try:
+            status = self._client.register_buffer(address, size)
+            if status != 0:
+                raise RuntimeError(f"register_buffer failed with status {status}")
+            reg = _Registration(self, address, size)
+            with self._lock:
+                self._registrations.append(reg)
+        finally:
+            with self._lock:
+                self._pending.discard(span)
+        return reg
+
+    def _check_overlap(self, address: int, size: int) -> None:
+        """Caller holds the lock."""
+        spans = [(reg.address, reg.size) for reg in self._registrations] + sorted(self._pending)
+        for start, length in spans:
+            if address < start + length and start < address + size:
+                raise ValueError(
+                    f"[{address:#x}, {address + size:#x}) overlaps registered "
+                    f"[{start:#x}, {start + length:#x})"
+                )
+
+    def _unregister(self, reg: _Registration) -> None:
+        with self._lock:
+            if not reg.live or reg.closing or self._closed:
+                return
+            reg.closing = True
+        try:
+            status = self._client.unregister_buffer(reg.address)
+        finally:
+            # A close that raised has not closed: the handle stays live and may be retried.
+            reg.closing = False
+        if status != 0:
+            raise RuntimeError(f"unregister_buffer failed with status {status}")
+        with self._lock:
+            reg.live = False
+            self._registrations.remove(reg)
+
+    def _unregistered(self, segments: Sequence[Segment]) -> Optional[Segment]:
+        """The first segment not inside one live registration, if any. Caller holds the lock."""
+        for address, size in segments:
+            if not any(reg.covers(address, size) for reg in self._registrations):
+                return address, size
+        return None
+
+    # ---- Fetches / Publishes ----
+
+    def fetch(self, extent: CacheExtent, *, route: Optional[Route] = None) -> Attempt:
+        if route is not None:
+            raise SubmissionRejected("a store has one source and takes no route")
+        return self._start(extent, self._do_fetch)
+
+    def publish(self, extent: CacheExtent) -> Attempt:
+        return self._start(extent, self._do_publish)
+
+    def probe(self, name: bytes, units: Sequence[bytes]) -> Optional[frozenset[bytes]]:
+        """Queue a lookup on first sight and answer ``None``; hand out the answer once it is in.
+
+        The answer is consumed by the call that receives it, and an unclaimed one expires after
+        ``probe_ttl_s``. A lookup that failed raises here, once, and is then forgotten so the next
+        call asks again.
+        """
+        if not units:
+            return frozenset()
+        key = (name, tuple(units))
+        now = time.monotonic()
+        with self._lock:
+            self._expire_probes(now)
+            entry = self._probes.get(key)
+            if entry is None:
+                if self._closed:
+                    raise RuntimeError("store backend is closed")
+                entry = _Probe(created=now)
+                self._probes[key] = entry
+                try:
+                    self._lookups.submit(self._lookup, entry, key[1])
+                except RuntimeError:
+                    del self._probes[key]
+                    raise
+                return None
+            if not entry.done:
+                return None
+            del self._probes[key]
+        if entry.error is not None:
+            raise RuntimeError("store lookup failed") from entry.error
+        return entry.answer
+
+    def open_route(self, hint: Mapping[str, object]) -> Route:
+        raise NotImplementedError("a store has one source and nothing to route")
+
+    def quiesce(self, attempts: Iterable[Attempt]) -> bool:
+        for attempt in attempts:
+            self._own(attempt).quiet.wait()
+        return True
+
+    def settle(self, attempts: Iterable[Attempt]) -> None:
+        for attempt in attempts:
+            self._own(attempt).done.wait()
+
+    def close(self) -> None:
+        """Finish the work in flight, release registrations, then close the client. Idempotent.
+
+        A worker parked for a staging slot is woken and its delivery fails, so this returns.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        if self._staging is not None:
+            self._staging.shutdown()
+        self._pool.shutdown(wait=True)
+        self._lookups.shutdown(wait=True)
+        with self._lock:
+            live, self._registrations = self._registrations, []
+        for reg in live:
+            reg.live = False
+            status = self._client.unregister_buffer(reg.address)
+            if status != 0:
+                logger.warning(
+                    "unregister_buffer(%#x) failed with status %d during close", reg.address, status
+                )
+        self._client.close()
+
+    # ---- submission ----
+
+    @staticmethod
+    def _own(attempt: Attempt) -> _StoreAttempt:
+        if not isinstance(attempt, _StoreAttempt):
+            raise TypeError(f"attempt {attempt!r} was not made by this backend")
+        return attempt
+
+    def _start(
+        self,
+        extent: CacheExtent,
+        run: Callable[[_StoreAttempt, Sequence[_Task]], Outcome],
+    ) -> Attempt:
+        attempt = _StoreAttempt()
+        if not extent.units:
+            attempt.finish(Delivered(frozenset()))
+            return attempt
+        with self._lock:
+            if self._closed:
+                raise SubmissionRejected("store backend is closed")
+            tasks, problem = self._prepare(extent)
+        if problem is not None:
+            self._fail(attempt, problem)
+            return attempt
+        if not self._inflight.acquire(blocking=False):
+            raise SubmissionRejected(
+                f"{self._config.max_inflight_ops} deliveries already in flight"
+            )
+        try:
+            self._pool.submit(self._run, attempt, run, tasks)
+        except RuntimeError as exc:
+            self._inflight.release()
+            raise SubmissionRejected(str(exc)) from exc
+        return attempt
+
+    def _prepare(self, extent: CacheExtent) -> tuple[list[_Task], Optional[str]]:
+        """Resolve every unit. A unit the backend cannot reach makes the whole delivery fail
+        (§6.4 invariant 3d); nothing has escaped yet, but a wiring error is not back-pressure,
+        so it is reported through the attempt rather than as ``SubmissionRejected``."""
+        tasks: list[_Task] = []
+        for unit in extent.units:
+            try:
+                segments = tuple(self._resolve(unit.local_group, unit.local))
+            except (KeyError, ValueError) as exc:
+                return tasks, f"unit ({unit.local_group}, {unit.local}) does not resolve: {exc}"
+            task = _Task(unit.name, self._keys.key(unit.name), segments)
+            if task.total <= 0:
+                return tasks, f"unit ({unit.local_group}, {unit.local}) resolves to no memory"
+            if self._staging is not None:
+                if not self._staging.fits(task.total):
+                    return tasks, f"unit of {task.total} B exceeds the staging slot"
+            else:
+                bad = self._unregistered(segments)
+                if bad is not None:
+                    return tasks, f"[{bad[0]:#x}, {bad[0] + bad[1]:#x}) is not registered"
+            tasks.append(task)
+        return tasks, None
+
+    def _run(
+        self,
+        attempt: _StoreAttempt,
+        run: Callable[[_StoreAttempt, Sequence[_Task]], Outcome],
+        tasks: Sequence[_Task],
+    ) -> None:
+        outcome: Outcome = Failed("delivery did not run")
+        try:
+            outcome = run(attempt, tasks)
+        except Exception as exc:  # noqa: BLE001 - thread boundary; the outcome carries the error
+            outcome = Failed(f"{type(exc).__name__}: {exc}")
+        except BaseException as exc:
+            outcome = Failed(f"{type(exc).__name__}: {exc}")
+            raise
+        finally:
+            # Whatever happened, the attempt reaches an outcome so no wait on it hangs.
+            self._inflight.release()
+            if isinstance(outcome, Failed):
+                self._fail(attempt, outcome.reason)
+            else:
+                attempt.finish(outcome)
+
+    def _fail(self, attempt: _StoreAttempt, reason: str) -> None:
+        with self._lock:
+            self.counters.failed_attempts += 1
+        logger.warning("mooncake store delivery failed: %s", reason)
+        attempt.finish(Failed(reason))
+
+    def _exists(self, tasks: Sequence[_Task]) -> Sequence[int]:
+        present = self._client.batch_is_exist([task.key for task in tasks])
+        if len(present) != len(tasks):
+            raise RuntimeError(f"batch_is_exist answered {len(present)} of {len(tasks)} keys")
+        return present
+
+    def _staged(self, count: int, body: Callable[[list[int]], _T]) -> _T:
+        """Run ``body`` with ``count`` staging slots. Copies are drained before the slots go back,
+        even when ``body`` raises: a copy still in flight into a slot someone else then reuses
+        would corrupt their delivery, and one out of the caller's memory would break quiescence."""
+        assert self._staging is not None
+        slots = self._staging.acquire(count)
+        try:
+            return body(slots)
+        except BaseException:
+            try:
+                self._staging.sync()
+            except Exception:  # noqa: BLE001 - best effort; the original error is what matters
+                logger.warning("staging sync failed while unwinding a failed delivery")
+            raise
+        finally:
+            self._staging.release(slots)
+
+    # ---- the work ----
+
+    def _do_fetch(self, attempt: _StoreAttempt, tasks: Sequence[_Task]) -> Outcome:
+        served: set[bytes] = set()
+        for batch in _batched(tasks, self._batch):
+            present = self._exists(batch)
+            if any(status < 0 for status in present):
+                return Failed("store lookup failed")
+            hits = [task for task, status in zip(batch, present) if status == 1]
+            misses = len(batch) - len(hits)
+            if hits:
+                if self._staging is None:
+                    results = self._client.batch_get_into_multi_buffers(
+                        [t.key for t in hits], [t.ptrs() for t in hits], [t.sizes() for t in hits]
+                    )
+                    got, bad = _reads(hits, results)
+                else:
+                    got, bad = self._staged(
+                        len(hits), lambda slots, hits=hits: self._staged_get(hits, slots)
+                    )
+                if bad:
+                    return Failed(f"{bad} of {len(hits)} present units could not be read")
+                misses += len(hits) - len(got)
+                served.update(task.name for task in got)
+            with self._lock:
+                self.counters.fetch_hits += len(batch) - misses
+                self.counters.fetch_misses += misses
+        return Delivered(frozenset(served))
+
+    def _staged_get(self, hits: Sequence[_Task], slots: Sequence[int]) -> tuple[list[_Task], int]:
+        assert self._staging is not None
+        results = self._client.batch_get_into_multi_buffers(
+            [t.key for t in hits],
+            [[self._staging.slot_address(slot)] for slot in slots],
+            [[t.total] for t in hits],
+        )
+        got, bad = _reads(hits, results)
+        if not bad:
+            for slot, task in zip(slots, hits):
+                if task in got:
+                    self._staging.scatter(slot, task.segments)
+            self._staging.sync()
+        return got, bad
+
+    def _do_publish(self, attempt: _StoreAttempt, tasks: Sequence[_Task]) -> Outcome:
+        served: set[bytes] = set()
+        pending: list[_Task] = []
+        for batch in _batched(tasks, self._batch):
+            present = self._exists(batch)
+            # Present units are merged, not rewritten (§6.3 requirement 2); a failed lookup is
+            # retried as a write, which the store resolves the same way.
+            pending.extend(task for task, status in zip(batch, present) if status != 1)
+            served.update(task.name for task, status in zip(batch, present) if status == 1)
+        with self._lock:
+            self.counters.publish_present += len(tasks) - len(pending)
+        if self._staging is None:
+            for batch in _batched(pending, self._batch):
+                taken, problem = self._put(
+                    batch, [t.ptrs() for t in batch], [t.sizes() for t in batch]
+                )
+                if problem is not None:
+                    return Failed(problem)
+                served.update(task.name for task in taken)
+            return Delivered(frozenset(served))
+        # Staging goes in rounds of the whole slot pool, gathering a round before writing any of
+        # it, so that an extent no larger than the pool is quiet before its first remote write
+        # (design §10.1). A larger extent is quiet only after its last round's gather.
+        rounds = list(_batched(pending, self._staging.num_slots))
+        for index, group in enumerate(rounds):
+            last = index == len(rounds) - 1
+            problem = self._staged(
+                len(group),
+                lambda slots, group=group, last=last: self._staged_put(
+                    attempt, group, slots, last, served
+                ),
+            )
+            if problem is not None:
+                return Failed(problem)
+        return Delivered(frozenset(served))
+
+    def _staged_put(
+        self,
+        attempt: _StoreAttempt,
+        group: Sequence[_Task],
+        slots: Sequence[int],
+        last: bool,
+        served: set[bytes],
+    ) -> Optional[str]:
+        assert self._staging is not None
+        for slot, task in zip(slots, group):
+            self._staging.gather(slot, task.segments)
+        self._staging.sync()
+        if last:
+            attempt.quiet.set()
+        for batch, batch_slots in zip(_batched(group, self._batch), _batched(slots, self._batch)):
+            taken, problem = self._put(
+                batch,
+                [[self._staging.slot_address(slot)] for slot in batch_slots],
+                [[task.total] for task in batch],
+            )
+            if problem is not None:
+                return problem
+            served.update(task.name for task in taken)
+        return None
+
+    def _put(
+        self, tasks: Sequence[_Task], ptrs: Sequence[Sequence[int]], sizes: Sequence[Sequence[int]]
+    ) -> tuple[list[_Task], Optional[str]]:
+        """Write one batch. Returns the units the store now holds, and a reason if the call failed.
+
+        A unit the store declined but holds anyway lost a race with another publisher and counts
+        as taken; one it declined and does not hold is simply not served. Only a call that itself
+        misbehaves (exception, wrong count, failed lookup) is a failure.
+
+        TODO: the Python bindings expose no error-code table, so every non-zero put status is
+        treated as "declined" here. Once the codes for already-exists and no-space are known,
+        only those should be not-served and any other negative status should fail the attempt.
+        """
+        results = self._client.batch_put_from_multi_buffers([t.key for t in tasks], ptrs, sizes)
+        if len(results) != len(tasks):
+            return [], f"batch_put answered {len(results)} of {len(tasks)} keys"
+        taken = [task for task, status in zip(tasks, results) if status == 0]
+        declined = [task for task, status in zip(tasks, results) if status != 0]
+        raced: list[_Task] = []
+        if declined:
+            present = self._exists(declined)
+            if any(status < 0 for status in present):
+                return taken, "store lookup failed after a declined put"
+            raced = [task for task, status in zip(declined, present) if status == 1]
+            if len(raced) < len(declined):
+                codes = sorted({status for status in results if status != 0})
+                logger.warning(
+                    "mooncake store did not take %d of %d units (put statuses %s)",
+                    len(declined) - len(raced),
+                    len(tasks),
+                    codes,
+                )
+        with self._lock:
+            self.counters.publish_stored += len(taken)
+            self.counters.publish_raced += len(raced)
+        return taken + raced, None
+
+    def _lookup(self, entry: _Probe, units: Sequence[bytes]) -> None:
+        held: set[bytes] = set()
+        try:
+            for batch in _batched(units, self._batch):
+                present = self._client.batch_is_exist([self._keys.key(u) for u in batch])
+                if len(present) != len(batch) or any(status < 0 for status in present):
+                    raise RuntimeError("batch_is_exist failed")
+                held.update(u for u, status in zip(batch, present) if status == 1)
+            with self._lock:
+                self.counters.probe_hits += len(held)
+                self.counters.probe_misses += len(units) - len(held)
+                entry.answer = frozenset(held)
+        except BaseException as exc:  # noqa: BLE001 - thread boundary; re-raised from probe
+            logger.warning("mooncake store lookup failed: %s: %s", type(exc).__name__, exc)
+            with self._lock:
+                entry.error = exc
+            if not isinstance(exc, Exception):
+                raise
+        finally:
+            # Whatever happened, the probe stops pending so the caller is never deferred forever.
+            with self._lock:
+                entry.done = True
+
+    def _expire_probes(self, now: float) -> None:
+        """Caller holds the lock."""
+        ttl = self._config.probe_ttl_s
+        stale = [
+            key for key, entry in self._probes.items() if entry.done and now - entry.created > ttl
+        ]
+        for key in stale:
+            del self._probes[key]
+
+
+def _reads(tasks: Sequence[_Task], results: Sequence[int]) -> tuple[list[_Task], int]:
+    """Split the answer of one get into the units fully delivered and how many went wrong.
+
+    A unit the store no longer holds (gone since the lookup) is neither: nothing was written and
+    it is simply not served. A short read or any other negative status is wrong.
+    """
+    if len(results) != len(tasks):
+        return [], len(tasks)
+    got = [task for task, status in zip(tasks, results) if status == task.total]
+    bad = sum(
+        1 for task, status in zip(tasks, results) if status not in (task.total, OBJECT_NOT_FOUND)
+    )
+    return got, bad
