@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import hashlib
+import itertools
 import math
 import os
 import sys
@@ -93,6 +94,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
+    sequence_to_blockchain_keys,
     typed_range,
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as KVCacheManagerPy
@@ -3709,13 +3711,19 @@ class KVCacheManagerV2(BaseResourceManager):
         target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
         return kv_cache.resize(max(kv_cache.capacity, target))
 
-    def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
-        """Prepare KV cache for a disagg generation init request.
+    def prepare_disagg_gen_init(self, req: LlmRequest, token_end: int | None = None) -> bool:
+        """Reserve pages that a transfer, not this worker, will fill.
 
-        Allocates capacity for the full prompt (+ draft) and sets
-        ``kv_cache.history_length`` to ``prompt_len``. Returns True on
-        success, False if preparation or resize failed (cache is suspended
-        on resize failure).
+        With ``token_end`` unset (a disagg generation init request) this
+        allocates capacity for the full prompt (+ draft) and declares
+        ``prompt_len`` as history. With ``token_end`` set (a content fetch for
+        an ordinary context request) it allocates and declares history up to
+        ``token_end`` only; the rest of the prompt is computed locally once the
+        fetch has landed. Either way history is declared at allocation time so
+        that windowed layer groups never hold pages they will not read.
+
+        Returns True on success, False if preparation or resize failed (cache
+        is suspended on resize failure).
         """
         reused = self.prepare_context_cache(req)
         if reused is None:
@@ -3727,22 +3735,33 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None:
             return False
 
-        # prompt_len is the full incoming prompt length, robust to block
-        # reuse (which may leave a non-zero context_current_position).
-        # Helix requests carry the rank-local strided slice in prompt_len;
-        # the global ledger sizes off the full prompt instead.
-        prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
-        target = prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
+        if token_end is None:
+            # prompt_len is the full incoming prompt length, robust to block
+            # reuse (which may leave a non-zero context_current_position).
+            # Helix requests carry the rank-local strided slice in prompt_len;
+            # the global ledger sizes off the full prompt instead.
+            history = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+            target = history + get_draft_token_length(req) + self.num_extra_kv_tokens
+        else:
+            # Fetched content lands in these pages, so scratch slots are ruled
+            # out for the same reason as on a gen-init receive.
+            kv_cache.enable_swa_scratch_reuse = False
+            # Local reuse may already have declared history past token_end (a
+            # plan trimmed to an empty ask is legal, design §7.2 step 6), and
+            # history never decreases.
+            history = target = max(kv_cache.history_length, token_end)
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
-        success = kv_cache.resize(capacity, prompt_len)
+        success = kv_cache.resize(capacity, history)
         if not success:
             if req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
         self._fill_fresh_kv_pages(req.py_request_id)
-        self._log_window_crossing(req, kv_cache, pre_cap, capacity, "disagg_gen_init")
+        self._log_window_crossing(
+            req, kv_cache, pre_cap, capacity, "disagg_gen_init" if token_end is None else "kv_fetch"
+        )
         req.py_ctx_pre_resize_cap = pre_cap if capacity > pre_cap else None
         # RDMA cannot observe cache-stream ordering. Capture readiness here so
         # receive publication waits for admission's copies and recycled-slot
@@ -3751,6 +3770,21 @@ class KVCacheManagerV2(BaseResourceManager):
         ready.record(self._stream)
         self._disagg_receive_ready[req.py_request_id] = ready
         return True
+
+    def context_block_keys(self, req: LlmRequest) -> list[bytes]:
+        """Radix-tree key of every *full* prompt block, by block ordinal.
+
+        The keys are the ones ``prepare_context_cache`` matches and
+        ``try_commit_blocks`` commits under, so a peer that computed the same
+        prompt names the same blocks. The last prompt token never takes part in
+        reuse, so an aligned prompt has one key fewer than it has full blocks.
+        """
+        tokens = self._context_reuse_tokens(req)
+        scope = ReuseScope(lora_id=req.lora_task_id, salt=self._derive_reuse_salt(req.cache_salt))
+        num_full_blocks = len(tokens) // self.tokens_per_block
+        chain = sequence_to_blockchain_keys(self.tokens_per_block, scope, tokens)
+        next(chain)  # the root: the reuse-scope digest, not a block
+        return [bytes(key) for _, key in itertools.islice(chain, num_full_blocks)]
 
     def get_history_length(self, req: LlmRequest) -> int | None:
         """Return the cache's current history_length, or None if no cache.
@@ -5243,9 +5277,13 @@ class KVCacheManagerV2(BaseResourceManager):
         the KV cache blocks are still being transferred via NIXL/UCX.
         """
         kv_cache = self.kv_cache_map.get(request_id)
-        if self.is_draft and (kv_cache is None or request_id in self._early_freed_index_requests):
-            # The draft mirror only holds a slot for requests it actually
-            # mirrored, and the target may release the same request twice.
+        if request_id in self._early_freed_index_requests:
+            # Two transfer owners (a disagg send and a store publish) may each
+            # release the same request's slot; the second release has nothing
+            # left to do.
+            return
+        if self.is_draft and kv_cache is None:
+            # The draft mirror only holds a slot for requests it actually mirrored.
             return
         if kv_cache is not None:
             for i in range(self.max_beam_width):

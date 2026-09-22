@@ -253,6 +253,12 @@ class KVTransferCoordinator:
     def has_inflight(self) -> bool:
         return any(rec.state is RecordState.IN_FLIGHT for rec in self._records.values())
 
+    def inflight_request_ids(self) -> frozenset[int]:
+        """Requests with a record still ``IN_FLIGHT``: a backend may still touch their pages."""
+        return frozenset(
+            rec.request_id for rec in self._records.values() if rec.state is RecordState.IN_FLIGHT
+        )
+
     def status_dump(self) -> dict:
         return {
             "records": [

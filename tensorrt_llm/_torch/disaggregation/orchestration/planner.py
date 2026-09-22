@@ -21,9 +21,10 @@ and a served set, so the rule that says what "arrived" means can be tested with 
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from itertools import chain
-from typing import Iterator, Literal, Mapping, Sequence
+from typing import Callable, Iterator, Literal, Mapping, Sequence
 
 from .kv_transfer_interfaces import (
     DEFER,
@@ -76,6 +77,14 @@ class FetchPlan:
     reuse_end: int
     tokens_per_block: int
     mode: Literal["PREFETCH"] = "PREFETCH"
+
+
+@dataclass
+class _Deferral:
+    """One request's wait for a store lookup: rounds charged so far, and when it began."""
+
+    first_deferred_at: float
+    rounds: int = 0
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -169,7 +178,14 @@ class Planner:
         reader: This rank's resource view.
         tokens_per_block: ``tpb``.
         probe_budget_rounds: How many rounds a request may be deferred waiting for a store's
-            ``probe`` before the unanswered probe counts as "not held".
+            ``probe`` before the unanswered probe counts as "not held". ``None`` leaves the
+            wait to ``probe_timeout_s`` alone.
+        probe_timeout_s: How long, from its first deferral, a request may wait for a store's
+            ``probe`` before the unanswered probe counts as "not held". ``None`` (the default)
+            leaves the wait to ``probe_budget_rounds`` alone; the engine assembly sets it from
+            the config. Whichever budget runs out first ends the wait.
+        clock: Source of ``probe_timeout_s`` time; the engine's loop clock, so that the same
+            clock drives this budget and the coordinator's deadlines.
     """
 
     def __init__(
@@ -178,13 +194,18 @@ class Planner:
         reader: ResourceReader,
         tokens_per_block: int,
         *,
-        probe_budget_rounds: int = 2,
+        probe_budget_rounds: int | None = 2,
+        probe_timeout_s: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._sources = tuple(sources)
         self._reader = reader
         self._tpb = tokens_per_block
         self._probe_budget_rounds = probe_budget_rounds
-        self._defer_rounds: dict[int, int] = {}
+        self._probe_timeout_s = probe_timeout_s
+        self._clock = clock
+        self._deferrals: dict[int, _Deferral] = {}
+        """Per deferred request: how many rounds it has waited, and since when."""
 
     def probe_query(self, req: RequestView) -> tuple[bytes, tuple[bytes, ...]] | None:
         """``(name, unit names)`` to ask a store about, or ``None`` if the request has nothing
@@ -201,7 +222,34 @@ class Planner:
 
     def forget(self, req_id: int) -> None:
         """Drop per-request planning state once a request is decided or gone."""
-        self._defer_rounds.pop(req_id, None)
+        self._deferrals.pop(req_id, None)
+
+    def _spend_probe_round(self, req_id: int) -> bool:
+        """Spend one deferred round of ``req_id``'s probe budget; ``False`` if none was left.
+
+        The wait ends when either budget is spent: the round budget, or the wall-clock budget
+        counted from the first deferral. An idle loop round is about a millisecond, so rounds
+        alone would give a real store lookup no time to answer; time alone would let a busy loop
+        defer a request for very many rounds.
+        """
+        now = self._clock()
+        deferral = self._deferrals.setdefault(req_id, _Deferral(first_deferred_at=now))
+        if self._probe_budget_is_spent(deferral, now):
+            return False
+        deferral.rounds += 1
+        return True
+
+    def _probe_budget_is_spent(self, deferral: _Deferral, now: float) -> bool:
+        rounds_spent = (
+            self._probe_budget_rounds is not None and deferral.rounds >= self._probe_budget_rounds
+        )
+        # The first deferral only starts the clock; time is measured from the second one on.
+        time_spent = (
+            self._probe_timeout_s is not None
+            and deferral.rounds > 0
+            and now - deferral.first_deferred_at >= self._probe_timeout_s
+        )
+        return rounds_spent or time_spent
 
     def decide(
         self,
@@ -263,9 +311,7 @@ class Planner:
                 break
 
         if chosen is None:
-            rounds = self._defer_rounds.get(req.py_request_id, 0)
-            if pending and rounds < self._probe_budget_rounds:
-                self._defer_rounds[req.py_request_id] = rounds + 1
+            if pending and self._spend_probe_round(req.py_request_id):
                 return DEFER
             self.forget(req.py_request_id)
             return None
