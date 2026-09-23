@@ -55,12 +55,26 @@ from .staging import HostStagingPool
 from .store import BlobStore, BlobStoreError, GetStatus, PutStatus
 from .worker_pool import DaemonWorkerPool
 
-__all__ = ["MAX_PROBES", "BlobStoreBackend", "BlobStoreConfig", "StoreCounters"]
+__all__ = [
+    "LOOKUP_RETRIES",
+    "LOOKUP_RETRY_DELAY_S",
+    "MAX_PROBES",
+    "BlobStoreBackend",
+    "BlobStoreConfig",
+    "StoreCounters",
+]
 
 MAX_PROBES = 1024
 """Bound on remembered lookups, pending or answered. A lookup thread that stopped answering must
 not let the table grow without end; past the bound a new ``probe`` raises and the caller plans
 without the store."""
+
+LOOKUP_RETRIES = 2
+"""Times a probe's store lookup is asked again after a ``BlobStoreError`` (so up to three tries),
+``LOOKUP_RETRY_DELAY_S`` apart: one RPC hiccup must not consume the planner's probe budget;
+anything longer is a real failure and shows up as ``probe_failed``."""
+
+LOOKUP_RETRY_DELAY_S = 0.005
 
 # The stdlib logger keeps this module import-light (no ``tensorrt_llm`` import); note that
 # ``TLLM_LOG_LEVEL_BY_MODULE`` does not route it, so configure ``logging`` for this name directly.
@@ -315,8 +329,9 @@ class BlobStoreBackend:
 
         The answer is consumed by the call that receives it, and an unclaimed one expires after
         ``probe_ttl_s``, as does a lookup still pending after that long (it is asked again on the
-        next call). A lookup that failed raises here, once, and is then forgotten so the next
-        call asks again. With ``MAX_PROBES`` lookups remembered, a new one raises instead.
+        next call). A lookup whose store call fails is retried (``LOOKUP_RETRIES``); one that
+        still failed raises here, once, and is then forgotten so the next call asks again. With
+        ``MAX_PROBES`` lookups remembered, a new one raises instead.
         """
         if not units:
             return frozenset()
@@ -342,7 +357,8 @@ class BlobStoreBackend:
                 return None
             del self._probes[key]
         if entry.error is not None:
-            raise RuntimeError("store lookup failed") from entry.error
+            # The cause's text rides in the message: the caller logs ``str(exc)`` only.
+            raise RuntimeError(f"store lookup failed: {entry.error}") from entry.error
         return entry.answer
 
     def open_route(self, hint: Mapping[str, object]) -> Route:
@@ -647,11 +663,30 @@ class BlobStoreBackend:
             self.counters.publish_raced += len(raced)
         return stored + raced, None
 
+    def _holds_with_retry(self, keys: Sequence[str]) -> Sequence[bool]:
+        """``_holds``, asked again up to ``LOOKUP_RETRIES`` times after a ``BlobStoreError``.
+
+        The last try's error propagates; any other exception propagates at once.
+        """
+        for tried in range(1, LOOKUP_RETRIES + 1):
+            try:
+                return self._holds(keys)
+            except BlobStoreError as exc:
+                logger.debug(
+                    "blob store [%s]: lookup try %d of %d failed, retrying: %s",
+                    self._store.describe(),
+                    tried,
+                    LOOKUP_RETRIES + 1,
+                    exc,
+                )
+                time.sleep(LOOKUP_RETRY_DELAY_S)
+        return self._holds(keys)
+
     def _lookup(self, entry: _Probe, units: Sequence[bytes]) -> None:
         held: set[bytes] = set()
         try:
             for batch in _batched(units, self._batch):
-                present = self._holds([self._keys.key(u) for u in batch])
+                present = self._holds_with_retry([self._keys.key(u) for u in batch])
                 held.update(u for u, is_held in zip(batch, present) if is_held)
             with self._lock:
                 self.counters.probe_hits += len(held)

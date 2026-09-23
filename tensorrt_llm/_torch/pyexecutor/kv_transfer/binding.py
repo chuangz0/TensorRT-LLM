@@ -33,6 +33,7 @@ Known follow-ups:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -60,6 +61,48 @@ _IDLE_BACKEND_WAIT_S = 0.001
 """How long an idle loop pass sleeps while only a backend can make progress."""
 
 _CONTEXT_INIT_STATE_VALUE = LlmRequestState.CONTEXT_INIT.value
+
+_DISAGGREGATION_LOGGER_NAME = "tensorrt_llm._torch.disaggregation"
+"""The stdlib logger namespace of the import-light layers below this one (coordinator, backends).
+They log through ``logging`` because they do not import ``tensorrt_llm``; the engine forwards
+their WARNING+ records to the TRT-LLM logger so a store outage shows up in the engine's log."""
+
+
+class _ForwardToTrtllmLogger(logging.Handler):
+    """Re-emits each stdlib record it receives through ``tensorrt_llm.logger.logger`` at the
+    matching severity. Installed once per namespace by ``install_log_forwarding``."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 - a malformed record must not break the caller's log
+            self.handleError(record)
+            return
+        if record.levelno >= logging.CRITICAL:
+            logger.critical(message)
+        elif record.levelno >= logging.ERROR:
+            logger.error(message)
+        else:
+            logger.warning(message)
+
+
+def install_log_forwarding() -> _ForwardToTrtllmLogger:
+    """Attach the forwarding handler to the disaggregation logger namespace, unless one is there
+    already, and return the attached one."""
+    target = logging.getLogger(_DISAGGREGATION_LOGGER_NAME)
+    for handler in target.handlers:
+        if isinstance(handler, _ForwardToTrtllmLogger):
+            return handler
+    handler = _ForwardToTrtllmLogger()
+    target.addHandler(handler)
+    return handler
+
+
+def remove_log_forwarding(handler: _ForwardToTrtllmLogger) -> None:
+    logging.getLogger(_DISAGGREGATION_LOGGER_NAME).removeHandler(handler)
 
 
 class KVTransferEngineBinding:
@@ -110,6 +153,7 @@ class KVTransferEngineBinding:
         self._num_deferred_requests = 0
         """Requests still undecided after the last advance (or, on a follower, after the last
         adoption); each is waiting on a store lookup."""
+        self._log_forwarding = install_log_forwarding()
 
     # ---- loop entry points ----
 
@@ -218,8 +262,9 @@ class KVTransferEngineBinding:
         }
 
     def close(self) -> None:
-        """Stop the backends within ``close_timeout_s``, free every request this layer still
-        holds or has parked, then write the status dump (plan §5 #9, §9).
+        """Stop the backends within ``close_timeout_s``, stop forwarding the layers' logs, free
+        every request this layer still holds or has parked, then write the status dump (plan §5
+        #9, §9).
 
         When the backends do not stop in time, a request whose transfer record is still in flight
         keeps its pages: a backend that may still be writing them must not see them freed. Its
@@ -229,6 +274,7 @@ class KVTransferEngineBinding:
             return
         self._is_closed = True
         backends_closed = self._close_backends_within_timeout()
+        remove_log_forwarding(self._log_forwarding)
         still_in_flight = (
             frozenset() if backends_closed else self.coordinator.inflight_request_ids()
         )

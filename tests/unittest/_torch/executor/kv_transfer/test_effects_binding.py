@@ -957,6 +957,30 @@ class TestClose:
         binding_logger.error.assert_not_called()
         wait_for_closer_thread_to_exit()
 
+    def test_layer_warnings_reach_the_trtllm_logger_once_until_close(self, monkeypatch):
+        """The coordinator and the backends log through stdlib ``logging`` (they do not import
+        ``tensorrt_llm``); the binding forwards their WARNING+ records to the TRT-LLM logger,
+        exactly once each however many bindings were built, and stops when it closes."""
+        import logging
+
+        from tensorrt_llm.logger import logger as trtllm_logger
+
+        forwarded = Mock()
+        monkeypatch.setattr(trtllm_logger, "warning", forwarded)
+        layer_logger = logging.getLogger(
+            "tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.coordinator"
+        )
+        rig = Rig()
+        Rig()  # a second binding installs no second handler
+        layer_logger.warning("probe on %s failed, answer stays pending: %s", "store", "down")
+        forwarded.assert_called_once_with("probe on store failed, answer stays pending: down")
+        layer_logger.info("not forwarded: below WARNING")
+        assert forwarded.call_count == 1
+        rig.binding.close()
+        layer_logger.warning("after close")
+        assert forwarded.call_count == 1
+        wait_for_closer_thread_to_exit()
+
     def test_status_dump_schema(self, tmp_path):
         dump_path = tmp_path / "kvt.json"
         rig = Rig(status_dump_path=str(dump_path))

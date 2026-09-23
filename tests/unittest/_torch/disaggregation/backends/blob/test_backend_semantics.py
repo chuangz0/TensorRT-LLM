@@ -424,26 +424,52 @@ def test_probe_lookup_failure_raises_once_and_never_reads_as_empty():
         assert rank.backend.probe(b"n", [u.name]) == frozenset()
 
 
+def _probe_until_decided(rank, name, units, timeout: float = 5.0):
+    """Poll ``probe`` until it answers or raises; returns ``(answer, exception)``."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            answer = rank.backend.probe(name, units)
+        except RuntimeError as exc:
+            return None, exc
+        if answer is not None:
+            return answer, None
+        time.sleep(0.002)
+    pytest.fail("probe never decided")
+
+
 def test_probe_lookup_the_store_reports_failed_is_an_outage_not_an_empty_answer():
+    """A store that keeps failing its lookup is asked a bounded number of times (``1 +
+    LOOKUP_RETRIES``), then the probe raises once, naming the store's error, and counts one
+    ``probe_failed``; nothing is read as a miss."""
+    from disaggregation.backends.blob.backend import LOOKUP_RETRIES
+
     with make_rank() as rank:
         u = rank.unit(0, 0, 8)
-
-        def down(keys):
-            raise BlobStoreError("down")
-
-        rank.store.holds = down
+        for _ in range(LOOKUP_RETRIES + 5):  # more failures armed than tries allowed
+            rank.store.fail_next("holds", BlobStoreError("down"))
         assert rank.backend.probe(b"n", [u.name]) is None
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            try:
-                answer = rank.backend.probe(b"n", [u.name])
-            except RuntimeError:
-                break
-            assert answer is None
-            time.sleep(0.002)
-        else:
-            pytest.fail("outage never raised")
+        answer, exc = _probe_until_decided(rank, b"n", [u.name])
+        assert answer is None and "lookup failed: down" in str(exc)
+        assert rank.store.count("holds") == 1 + LOOKUP_RETRIES
+        assert rank.backend.counters.probe_failed == 1
         assert rank.backend.counters.probe_misses == 0
+
+
+def test_probe_lookup_that_fails_once_is_retried_and_answers():
+    """One RPC hiccup does not fail the probe: the lookup is asked again and the first answer
+    the caller sees is the full one, with no ``probe_failed`` counted."""
+    with make_rank() as rank:
+        a, b = rank.unit(0, 0, 8), rank.unit(0, 1, 8)
+        assert isinstance(rank.finish(rank.backend.publish(extent([a, b]))), Delivered)
+        lookups_before = rank.store.count("holds")  # the publish's own lookup
+        rank.store.fail_next("holds", BlobStoreError("hiccup"))
+        assert rank.backend.probe(b"n", [a.name, b.name]) is None
+        answer, exc = _probe_until_decided(rank, b"n", [a.name, b.name])
+        assert exc is None and answer == frozenset({a.name, b.name})
+        assert rank.store.count("holds") == lookups_before + 2  # the failed try and the retry
+        assert rank.backend.counters.probe_failed == 0
+        assert rank.backend.counters.probe_hits == 2
 
 
 def test_probe_is_answered_while_every_delivery_worker_is_blocked():
