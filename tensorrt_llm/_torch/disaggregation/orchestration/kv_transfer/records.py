@@ -29,15 +29,25 @@ from ...base.cache_backend import Attempt, CacheExtent, Cancelled, Delivered, Fa
 
 if TYPE_CHECKING:
     from ...remote_cache import FetchPlan
+    from .interfaces import Landing
 
-__all__ = ["AttemptRecord", "Direction", "RecordKey", "RecordState", "TransferRecord"]
+__all__ = [
+    "AttemptRecord",
+    "Direction",
+    "RecordKey",
+    "RecordState",
+    "TransferRecord",
+    "is_failure",
+]
 
 Direction = Literal["fetch", "publish"]
 RecordKey = tuple[int, str]
 """``(request_id, direction)``: the record table's key, and the id carried in the allgather."""
 
 
-def _is_failure(outcome: Outcome | None) -> bool:
+def is_failure(outcome: Outcome | None) -> bool:
+    """``Failed``, or ``Cancelled`` by the peer. A local cancel is an ordinary end that served
+    nothing; ``None`` is no outcome yet."""
     if isinstance(outcome, Failed):
         return True
     return isinstance(outcome, Cancelled) and outcome.by_peer
@@ -45,9 +55,17 @@ def _is_failure(outcome: Outcome | None) -> bool:
 
 class RecordState(Enum):
     """The observable states of a record. Release is an event, not a state: a released record
-    leaves the table."""
+    leaves the table.
+
+    ``STAGING`` and ``STAGED`` belong to a fetch from a ``LandsOnHost`` source only: the units
+    are on their way to the backend's host memory, then landed there and waiting for the
+    scheduler to reserve pages. Neither holds a page; the request stays schedulable. The copy
+    into the pages that follows is an ordinary ``IN_FLIGHT``.
+    """
 
     PLANNED = "PLANNED"
+    STAGING = "STAGING"
+    STAGED = "STAGED"
     IN_FLIGHT = "IN_FLIGHT"
     LANDED = "LANDED"
     FAILED = "FAILED"
@@ -107,6 +125,14 @@ class TransferRecord:
             than ``UNLAUNCHED`` for the same record. Bounds how long an unlaunched rank may hold
             the others up (``unlaunched_timeout_s``). Cleared when this rank launches or the plan
             is dropped.
+        landing: Host-first fetch only; the current try's ``Landing``, from ``fetch_to_host``
+            until the coordinator releases it. Never among ``attempts``.
+        committed_names: Fetch only; units the plan asked for that ``fetch_extent`` left out of
+            the launched extent because the local cache had committed them meanwhile. They count
+            as served when the delivery is merged.
+        waiting_since: Host-first fetch only; when this rank started waiting for something the
+            backend or the scheduler has yet to give: the landing memory (``fetch_to_host``
+            refused) or the pages (``STAGED``). Bounded by ``landing_wait_timeout_s``.
     """
 
     request_id: int
@@ -123,6 +149,9 @@ class TransferRecord:
     consecutive_launch_failures: int = 0
     launch_gave_up: bool = False
     peer_launched_at: float | None = None
+    landing: Landing | None = None
+    committed_names: frozenset[bytes] = frozenset()
+    waiting_since: float | None = None
 
     @property
     def key(self) -> RecordKey:
@@ -145,7 +174,7 @@ class TransferRecord:
 
     def any_failed(self) -> bool:
         """Some attempt of the current try ended ``Failed`` or ``Cancelled(by_peer=True)``."""
-        return any(_is_failure(a.outcome) for a in self.current_try_attempts())
+        return any(is_failure(a.outcome) for a in self.current_try_attempts())
 
     def merged_served(self) -> frozenset[bytes]:
         """Union of ``Delivered.served`` over the current try; a local cancel contributes

@@ -22,6 +22,7 @@ from engine_fakes import (
     FakeFetches,
     FakeKVCache,
     FakeKVCacheManager,
+    FakeLandsOnHost,
     FakePublishes,
     FakeReader,
     FakeSlotManager,
@@ -58,7 +59,8 @@ CONTEXT_INIT = LlmRequestState.CONTEXT_INIT
 
 
 class Rig:
-    """One executor with the real coordinator, planner, effects and hooks over fakes."""
+    """One executor with the real coordinator, planner, effects and hooks over fakes. With
+    ``host_first`` the store lands in its own memory first (``LandsOnHost``)."""
 
     def __init__(
         self,
@@ -70,12 +72,17 @@ class Rig:
         publish: bool = True,
         fetch_timeout_s=None,
         publish_timeout_s=None,
+        host_first: bool = False,
     ) -> None:
         self.kv = FakeKVCacheManager(TPB)
         self.slots = FakeSlotManager()
         self.executor = make_executor(self.kv, self.slots)
         self.reader = FakeReader(self.kv)
-        self.store = FakeFetches(name="store", probe_answer=probe_answer)
+        self.store = (
+            FakeLandsOnHost(name="store")
+            if host_first
+            else FakeFetches(name="store", probe_answer=probe_answer)
+        )
         self.publisher = FakePublishes()
         sources = [FetchSource("store", self.store, None)]
         self.planner = Planner(sources, self.reader, TPB, probe_timeout_s=0.05)
@@ -1008,6 +1015,8 @@ class TestClose:
                 "token_end",
                 "launch_gave_up",
                 "peer_launched_at",
+                "has_landing",
+                "waiting_since",
             }
         assert records[(1, "publish")]["state"] == "IN_FLIGHT"
         assert records[(2, "fetch")]["state"] == "IN_FLIGHT"
@@ -1365,3 +1374,84 @@ class TestCandidatesAndPublishers:
         assert rig.publisher.count("publish") == 1
         extent = rig.publisher.attempts[0].payload
         assert extent.is_last and len(extent.units) == 3  # (100 - 1) // 32 nameable blocks
+
+
+# =============================================================================================
+# Host-first fetch through the scheduler seam
+# =============================================================================================
+
+
+class TestHostFirstSchedulerSeam:
+    """A ``LandsOnHost`` store: the landing starts when the plan is decided, with no pages; the
+    scheduler is asked to reserve only once the landing is complete, and keeps being asked
+    while it cannot; the placement into the pages then parks the request as a fetch does."""
+
+    def scheduler_round(self, rig: Rig, req) -> bool:
+        """The scheduler's fetch path for one request in one round: ask for the plan, reserve
+        pages for it, queue the request for launch when the reservation went through."""
+        plan = rig.hooks.plan_fetch(req)
+        if not isinstance(plan, FetchPlan):
+            return False
+        if not rig.kv.reserve_transfer_pages(req, plan.token_end):
+            return False
+        req.py_ctx_pre_resize_cap = 0
+        rig.slots.add(req)
+        rig.hooks.launch_reserved_fetches([req])
+        return True
+
+    def test_landing_starts_with_the_plan_and_wants_no_pages_yet(self):
+        rig = Rig(host_first=True)
+        req = make_request(1, 100)
+        rig.advance(req)
+        assert rig.store.count("fetch_to_host") == 1 and rig.hooks.plan_fetch(req) is DEFER
+        assert rig.kv.count("reserve_transfer_pages") == 0
+        assert req.state == CONTEXT_INIT and not rig.hooks.is_tracking(req)
+        assert rig.hooks.has_transfer_in_flight()  # a landing paces the idle loop ...
+        assert rig.hooks.inflight_request_ids() == frozenset()  # ... but protects no page
+        assert [r["state"] for r in rig.records()] == ["STAGING"]
+        assert rig.executor._try_cancel_request(req) is True  # not parked: cancellable
+
+    def test_staged_request_is_asked_for_pages_every_round_and_placed_once_they_come(self):
+        rig = Rig(host_first=True)
+        req = make_request(1, 100)
+        rig.advance(req)
+        landing = rig.store.landings[0]
+        landing.deliver_all()
+        rig.advance(req)
+        assert [r["state"] for r in rig.records()] == ["STAGED"]
+
+        rig.kv.reserve_answer = False
+        for _ in range(3):
+            assert self.scheduler_round(rig, req) is False
+            rig.advance(req)
+        assert rig.kv.count("reserve_transfer_pages") == 3
+        assert [r["state"] for r in rig.records()] == ["STAGED"]
+        assert rig.store.count("place") == 0 and req.state == CONTEXT_INIT
+        assert landing.releases == 0
+
+        rig.kv.reserve_answer = True
+        assert self.scheduler_round(rig, req) is True
+        assert rig.store.count("place") == 1
+        assert req.state == KV_FETCH_IN_PROGRESS and rig.coord.parked_request_ids() == {1}
+        assert rig.hooks.is_tracking(req) and rig.hooks.inflight_request_ids() == {1}
+        (placed,) = rig.store.attempts
+        assert extent_names(placed.payload) == rig.reader.unit_names(req, range(3))
+
+        placed.deliver_all()
+        rig.advance(req)
+        assert req.state == CONTEXT_INIT and req.context_current_position == 96
+        assert landing.releases == 1 and not rig.hooks.is_tracking(req)
+        assert [r["state"] for r in rig.records()] == ["LANDED"]
+
+    def test_request_finished_while_staging_is_not_held_and_releases_at_once(self):
+        rig = Rig(host_first=True)
+        req = make_request(1, 100)
+        rig.advance(req)
+        landing = rig.store.landings[0]
+        rig.executor._terminate_request(req)
+        rig.executor._do_terminate_request.assert_called_once_with(req)  # not held
+        assert rig.coord.held_request_ids() == frozenset()
+        assert landing.releases == 1 and rig.records() == []
+        assert rig.reader.forgotten == [1]
+        rig.advance()
+        assert rig.terminations() == 1

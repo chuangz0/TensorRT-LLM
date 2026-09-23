@@ -132,6 +132,65 @@ class FakeFetches:
         return sum(1 for m, _ in self.calls if m == method)
 
 
+class FakeLanding:
+    """A ``Landing`` the test finishes; ``place`` returns a pending attempt; ``releases`` counts."""
+
+    def __init__(self, backend: FakeLandsOnHost, units: Sequence[bytes]) -> None:
+        self.backend = backend
+        self.units = tuple(units)
+        self._outcome: Outcome | None = None
+        self.releases = 0
+
+    def poll(self) -> Outcome | None:
+        return self._outcome
+
+    def finish(self, outcome: Outcome) -> None:
+        self._outcome = outcome
+
+    def deliver_all(self) -> None:
+        self.finish(Delivered(frozenset(self.units)))
+
+    def place(self, extent: CacheExtent) -> FakeAttempt:
+        self.backend.calls.append(("place", (self, extent)))
+        attempt = FakeAttempt(extent)
+        self.backend.attempts.append(attempt)
+        return attempt
+
+    def release(self) -> None:
+        self.releases += 1
+
+
+class FakeLandsOnHost:
+    """A store that lands in its own memory first (``LandsOnHost``); ``probe`` answers every
+    unit asked about, ``fetch_to_host`` returns a pending landing the test finishes."""
+
+    def __init__(self, *, name: str = "host") -> None:
+        self.name = name
+        self.calls: list[tuple[str, tuple]] = []
+        self.landings: list[FakeLanding] = []
+        self.attempts: list[FakeAttempt] = []
+
+    def fetch_to_host(self, name: bytes, units: Sequence[bytes]) -> FakeLanding:
+        self.calls.append(("fetch_to_host", (name, tuple(units))))
+        landing = FakeLanding(self, units)
+        self.landings.append(landing)
+        return landing
+
+    def quiesce(self, attempts: Iterable) -> bool:
+        self.calls.append(("quiesce", (tuple(attempts), True)))
+        return True
+
+    def settle(self, attempts: Iterable) -> None:
+        self.calls.append(("settle", (tuple(attempts),)))
+
+    def probe(self, name: bytes, units: Sequence[bytes]):
+        self.calls.append(("probe", (name, tuple(units))))
+        return frozenset(units)
+
+    def count(self, method: str) -> int:
+        return sum(1 for m, _ in self.calls if m == method)
+
+
 class FakePublishes:
     def __init__(self, *, name: str = "pub") -> None:
         self.name = name
@@ -332,18 +391,30 @@ class FakeReader:
     def gen_first_ready(self, request) -> bool:
         return True
 
-    def fetch_extent(self, request, plan) -> CacheExtent:
-        self.calls.append(("fetch_extent", request.py_request_id))
-        keys = plan.block_keys
-        units = [
-            Unit(name=g.spec.tag + keys[o], local_group=g.spec.local_group, local=o)
-            for g in plan.group_plans
-            for o in g.ordinals
-            if o < len(keys)
-        ]
-        return CacheExtent(
-            name=f"fetch:{request.py_request_id}".encode(), units=tuple(units), is_last=True
+    def fetch_extent(self, request, plan) -> tuple[CacheExtent, frozenset[bytes]]:
+        """As the real reader: a block the cache already committed is returned by name instead
+        of being fetched over."""
+        rid = request.py_request_id
+        self.calls.append(("fetch_extent", rid))
+        kv_cache = self.kv.kv_cache_map.get(rid)
+        committed = (
+            0 if kv_cache is None else kv_cache.num_committed_tokens // self.tokens_per_block
         )
+        keys = plan.block_keys
+        units = []
+        committed_names = set()
+        for g in plan.group_plans:
+            for o in g.ordinals:
+                if o >= len(keys):
+                    continue
+                if o < committed:
+                    committed_names.add(g.spec.tag + keys[o])
+                else:
+                    units.append(
+                        Unit(name=g.spec.tag + keys[o], local_group=g.spec.local_group, local=o)
+                    )
+        extent = CacheExtent(name=f"fetch:{rid}".encode(), units=tuple(units), is_last=True)
+        return extent, frozenset(committed_names)
 
     def publish_description(self, request):
         self.calls.append(("publish_description", request.py_request_id))

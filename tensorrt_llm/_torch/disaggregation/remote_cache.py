@@ -24,11 +24,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import chain
-from typing import Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Iterator, Mapping, Sequence
 
 from .base.backend import CacheKind
 from .base.cache_backend import Fetches
 from .base.views import GroupSpec, RequestView, ResourceReader
+
+if TYPE_CHECKING:
+    from .orchestration.kv_transfer.interfaces import LandsOnHost
 
 __all__ = [
     "DEFER",
@@ -40,6 +43,7 @@ __all__ = [
     "merge",
     "required_ordinals",
     "servable_end",
+    "unit_names",
 ]
 
 
@@ -66,13 +70,15 @@ class FetchSource:
 
     Attributes:
         name: Stable identifier; recorded on plans and attempts, and used as the allgather key.
-        backend: The backend itself.
+        backend: The backend itself: one that writes the caller's pages directly (``Fetches``)
+            or one that lands in its own host memory first (``LandsOnHost``; a store, so
+            ``hint_key`` is ``None``).
         hint_key: Which routing hint on a request this backend reads. ``None`` for a backend whose
             destination is unique (a store), which then never gets ``open_route``.
     """
 
     name: str
-    backend: Fetches
+    backend: Fetches | LandsOnHost
     hint_key: str | None
 
 
@@ -109,6 +115,19 @@ class FetchPlan:
     block_keys: tuple[bytes, ...]
     reuse_end: int
     tokens_per_block: int
+
+
+def unit_names(plan: FetchPlan) -> tuple[bytes, ...]:
+    """Every unit name the plan asks for, group by group and ordinal by ordinal: what a
+    ``LandsOnHost`` backend is handed to land, and what a full delivery serves. An ordinal past
+    the last key has no name and is skipped, as ``fetch_extent`` skips it."""
+    keys = plan.block_keys
+    return tuple(
+        group.spec.tag + keys[o]
+        for group in plan.group_plans
+        for o in group.ordinals
+        if o < len(keys)
+    )
 
 
 def _ceil_div(a: int, b: int) -> int:

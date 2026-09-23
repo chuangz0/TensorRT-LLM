@@ -113,6 +113,7 @@ def test_minimal_entry_defaults_to_both_roles_and_no_timeouts(tmp_path):
     )
     assert config.fetch_timeout_s is None and config.publish_timeout_s is None
     assert config.unlaunched_timeout_s == 30.0  # finite by default, unlike the fetch deadline
+    assert config.landing_wait_timeout_s == 30.0
     assert config.probe_timeout_s == 0.05
     assert config.backends[0].roles == frozenset(BACKEND_ROLES)
     assert config.backends[0].options == {}
@@ -215,6 +216,7 @@ def test_duplicate_backend_names_are_refused(tmp_path):
         ("fetch_timeout_s: 0", "fetch_timeout_s must be > 0 or null"),
         ("publish_timeout_s: -1", "publish_timeout_s must be > 0 or null"),
         ("unlaunched_timeout_s: 0", "unlaunched_timeout_s must be > 0 or null"),
+        ("landing_wait_timeout_s: 0", "landing_wait_timeout_s must be > 0 or null"),
         ("probe_timeout_s: -0.1", "probe_timeout_s must be >= 0"),
         ("close_timeout_s: 0", "close_timeout_s must be > 0"),
     ],
@@ -231,13 +233,14 @@ def test_null_timeouts_and_zero_probe_are_allowed(tmp_path):
         fetch_timeout_s: null
         publish_timeout_s: null
         unlaunched_timeout_s: null
+        landing_wait_timeout_s: null
         probe_timeout_s: 0
         backends:
           - {name: a, type: fake}
         """,
     )
     assert config.fetch_timeout_s is None and config.probe_timeout_s == 0
-    assert config.unlaunched_timeout_s is None
+    assert config.unlaunched_timeout_s is None and config.landing_wait_timeout_s is None
 
 
 def test_missing_file_raises_os_error(tmp_path):

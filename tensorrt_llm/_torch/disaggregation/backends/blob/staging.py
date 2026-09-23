@@ -20,31 +20,20 @@ put and scattered out of one after a get. A slot holds the unit's segments conca
 order, which is the same byte string the direct path produces from the same segments, so a pool
 written by either path is readable by the other.
 
-Nothing here imports torch or CUDA at module load. Copies go through a ``Copier``; the default one
-is created lazily by ``open_default_staging``.
+Nothing here imports torch or CUDA at module load. Copies go through a ``Copier``
+(``backends/host_copy.py``); the default one is created lazily by ``open_default_staging``.
 """
 
 from __future__ import annotations
 
 import threading
-from typing import Literal, Protocol, Sequence
+from typing import Sequence
 
 from ...base.region import Segment
+from ..host_copy import Copier, CudaCopier
 from .store import BlobStore, BlobStoreError
 
-__all__ = ["Copier", "HostStagingPool", "open_default_staging", "plan_slot_geometry"]
-
-CopyKind = Literal["d2h", "h2d"]
-
-
-class Copier(Protocol):
-    """Asynchronous copies between the caller's memory and host slots, on the calling thread."""
-
-    def copy(self, dst: int, src: int, size: int, kind: CopyKind) -> None: ...
-
-    def sync(self) -> None:
-        """Block until every copy this thread issued has completed."""
-        ...
+__all__ = ["HostStagingPool", "open_default_staging", "plan_slot_geometry"]
 
 
 def plan_slot_geometry(
@@ -168,55 +157,6 @@ class HostStagingPool:
         self._copier.sync()
 
 
-class _CudaCopier:
-    """``cudaMemcpyAsync`` on a per-thread stream, on the rank's device.
-
-    Torch's current device is thread-local, so each worker thread that copies first selects the
-    device the pools live on; a stream created before that would belong to device 0.
-    """
-
-    def __init__(self, device_index: int | None) -> None:
-        try:
-            from cuda.bindings import runtime as cudart
-        except ImportError:
-            from cuda import cudart
-        self._cudart = cudart
-        self._device_index = device_index
-        self._local = threading.local()
-        self._kinds = {
-            "d2h": cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
-            "h2d": cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
-        }
-
-    def _stream(self) -> int:
-        stream = getattr(self._local, "stream", None)
-        if stream is None:
-            if self._device_index is not None:
-                self._check(self._cudart.cudaSetDevice(self._device_index))
-            status, stream = self._cudart.cudaStreamCreate()
-            self._check((status,))
-            self._local.stream = stream
-        return stream
-
-    def _check(self, result: Sequence[object]) -> None:
-        status = result[0]
-        if status != self._cudart.cudaError_t.cudaSuccess:
-            raise RuntimeError(f"CUDA runtime call failed with {status}")
-
-    def copy(self, dst: int, src: int, size: int, kind: CopyKind) -> None:
-        status = self._cudart.cudaMemcpyAsync(
-            int(dst), int(src), int(size), self._kinds[kind], self._stream()
-        )[0]
-        if status != self._cudart.cudaError_t.cudaSuccess:
-            raise RuntimeError(
-                f"cudaMemcpyAsync({kind}) failed with {status}: dst={int(dst):#x} "
-                f"src={int(src):#x} size={size} device={self._device_index}"
-            )
-
-    def sync(self) -> None:
-        self._check(self._cudart.cudaStreamSynchronize(self._stream()))
-
-
 def open_default_staging(
     store: BlobStore,
     *,
@@ -239,4 +179,4 @@ def open_default_staging(
         raise BlobStoreError(
             f"{exc} for the staging buffer at [{base:#x}, {base + buffer.numel():#x})"
         ) from exc
-    return HostStagingPool(base, slot_bytes, num_slots, _CudaCopier(device_index), keepalive=buffer)
+    return HostStagingPool(base, slot_bytes, num_slots, CudaCopier(device_index), keepalive=buffer)

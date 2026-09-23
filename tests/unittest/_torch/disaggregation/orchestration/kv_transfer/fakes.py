@@ -37,6 +37,7 @@ from disaggregation.remote_cache import (  # noqa: E402
     GroupPlan,
     Planner,
     required_ordinals,
+    unit_names,
 )
 from disaggregation.resource.naming import group_tag  # noqa: E402
 
@@ -112,10 +113,7 @@ def ordinals_by_group(plan: FetchPlan) -> dict[int, tuple[int, ...]]:
 
 def plan_unit_names(plan: FetchPlan) -> frozenset[bytes]:
     """Every unit name the plan asks for, across groups; what a full delivery serves."""
-    keys = plan.block_keys
-    return frozenset(
-        g.spec.tag + keys[o] for g in plan.group_plans for o in g.ordinals if o < len(keys)
-    )
+    return frozenset(unit_names(plan))
 
 
 def names(spec: GroupSpec, keys: Sequence[bytes], ordinals: Iterable[int]) -> frozenset[bytes]:
@@ -364,6 +362,131 @@ class FakeChunk:
     step: int
 
 
+class FakeLanding:
+    """A ``Landing`` whose outcome tests set with ``finish`` (or ``deliver_all``); ``place``
+    hands out a ``FakeAttempt`` scripted on the owning ``FakeLandsOnHost``; ``releases`` counts
+    ``release`` calls."""
+
+    def __init__(
+        self, backend: FakeLandsOnHost, name: bytes, units: Sequence[bytes], outcome=None
+    ) -> None:
+        self.backend = backend
+        self.name = name
+        self.units = tuple(units)
+        self._outcome = outcome
+        self.polls = 0
+        self.releases = 0
+        self.placements: list[FakeAttempt] = []
+
+    def poll(self) -> Outcome | None:
+        self.polls += 1
+        return self._outcome
+
+    def finish(self, outcome: Outcome) -> None:
+        self._outcome = outcome
+
+    def deliver_all(self) -> None:
+        self.finish(Delivered(frozenset(self.units)))
+
+    def deliver_all_but(self, *missing: bytes) -> None:
+        self.finish(Delivered(frozenset(self.units) - frozenset(missing)))
+
+    def place(self, extent: CacheExtent) -> FakeAttempt:
+        return self.backend._place(self, extent)
+
+    def release(self) -> None:
+        self.releases += 1
+        self.backend.calls.append(("release", (self,)))
+
+
+class FakeLandsOnHost:
+    """Scripted ``LandsOnHost``: a store that lands in its own memory first.
+
+    * ``script(outcome)`` queues an outcome for the next ``fetch_to_host``'s landing, in call
+      order; unscripted landings start in flight (``None``) and tests ``finish`` them.
+    * ``script_place(outcome)`` does the same for the attempts ``Landing.place`` returns.
+    * ``reject_next`` / ``reject_place_next`` make that many upcoming ``fetch_to_host`` /
+      ``place`` calls raise ``SubmissionRejected``.
+    * ``probe`` answers ``probe_answers`` one per call, else ``probe_default``: ``"all"`` means
+      every unit asked about (the store holds the whole prompt).
+    * ``quiesce_answers`` as ``FakeFetches``; every call is appended to ``calls``.
+    """
+
+    def __init__(
+        self, *, name: str = "host", probe_default="all", trace: list | None = None
+    ) -> None:
+        self.name = name
+        self.probe_default = probe_default
+        self.trace = trace
+        self.calls: list[tuple[str, tuple]] = []
+        self.landings: list[FakeLanding] = []
+        self.attempts: list[FakeAttempt] = []
+        self.quiesce_answers: deque[bool] = deque()
+        self.probe_answers: deque = deque()
+        self.reject_next = 0
+        self.reject_place_next = 0
+        self._landing_outcomes: deque = deque()
+        self._place_outcomes: deque = deque()
+
+    # -- scripting --
+
+    def script(self, *outcomes) -> None:
+        self._landing_outcomes.extend(outcomes)
+
+    def script_place(self, *outcomes) -> None:
+        self._place_outcomes.extend(outcomes)
+
+    # -- LandsOnHost --
+
+    def fetch_to_host(self, name: bytes, units: Sequence[bytes]) -> FakeLanding:
+        self.calls.append(("fetch_to_host", (name, tuple(units))))
+        if self.reject_next > 0:
+            self.reject_next -= 1
+            raise SubmissionRejected(f"{self.name} refused a landing")
+        outcome = self._landing_outcomes.popleft() if self._landing_outcomes else None
+        landing = FakeLanding(self, name, units, outcome)
+        self.landings.append(landing)
+        return landing
+
+    def _place(self, landing: FakeLanding, extent: CacheExtent) -> FakeAttempt:
+        self.calls.append(("place", (landing, extent)))
+        if self.reject_place_next > 0:
+            self.reject_place_next -= 1
+            raise SubmissionRejected(f"{self.name} refused a placement")
+        outcome = self._place_outcomes.popleft() if self._place_outcomes else None
+        attempt = FakeAttempt(extent, outcome(extent) if callable(outcome) else outcome)
+        landing.placements.append(attempt)
+        self.attempts.append(attempt)
+        return attempt
+
+    def quiesce(self, attempts: Iterable) -> bool:
+        attempts = tuple(attempts)
+        answer = self.quiesce_answers.popleft() if self.quiesce_answers else True
+        self.calls.append(("quiesce", (attempts, answer)))
+        if self.trace is not None:
+            self.trace.append(("quiesce", (self.name, attempts, answer)))
+        return answer
+
+    def settle(self, attempts: Iterable) -> None:
+        self.calls.append(("settle", (tuple(attempts),)))
+
+    def probe(self, name: bytes, units: Sequence[bytes]):
+        self.calls.append(("probe", (name, tuple(units))))
+        answer = self.probe_answers.popleft() if self.probe_answers else self.probe_default
+        if isinstance(answer, BaseException):
+            raise answer
+        return frozenset(units) if answer == "all" else answer
+
+    # -- convenience --
+
+    def count(self, method: str) -> int:
+        return sum(1 for m, _ in self.calls if m == method)
+
+    def releases(self) -> int:
+        """``release`` calls over every landing this backend handed out."""
+        return sum(landing.releases for landing in self.landings)
+
+
 # ---------------------------------------------------------------------------------------------
 # Engine-side fakes
 # ---------------------------------------------------------------------------------------------
@@ -535,7 +658,10 @@ class FakeReader:
     * ``groups``: the layer groups this rank holds.
     * ``reuse_tokens[rid]``: tokens the local radix tree already serves (default 0).
     * ``gen_first_ready``: answer for gen-first context requests (per rid, default ``ready_default``).
-    * ``fetch_extent`` names ``tag + key`` for every ordinal in every group plan, ``is_last=True``.
+    * ``fetch_extent`` names ``tag + key`` for every ordinal in every group plan, ``is_last=True``,
+      minus what the reservation looks like at launch: ordinals below ``committed_blocks[rid]``
+      are returned as committed names instead, ordinals at or above ``reserved_blocks[rid]`` are
+      dropped (the reservation fell short).
     * ``publish_description`` pops the next scripted ``(extent, chunk)`` for the request
       (``script_publish``), or builds one covering every full block with no chunk.
     """
@@ -552,6 +678,8 @@ class FakeReader:
         self.reuse_tokens: dict[int, int] = {}
         self.ready: dict[int, bool] = {}
         self.ready_default = ready_default
+        self.committed_blocks: dict[int, int] = {}
+        self.reserved_blocks: dict[int, int] = {}
         self._publish_steps: dict[int, deque] = {}
         self.calls: list[tuple[str, tuple]] = []
 
@@ -574,16 +702,28 @@ class FakeReader:
     def gen_first_ready(self, request) -> bool:
         return self.ready.get(request.py_request_id, self.ready_default)
 
-    def fetch_extent(self, request, plan) -> CacheExtent:
+    def fetch_extent(self, request, plan) -> tuple[CacheExtent, frozenset[bytes]]:
         self.calls.append(("fetch_extent", (request, plan)))
+        rid = request.py_request_id
+        committed = self.committed_blocks.get(rid, 0)
+        reserved = self.reserved_blocks.get(rid, len(plan.block_keys))
         keys = plan.block_keys
-        units = [
-            Unit(name=g.spec.tag + keys[o], local_group=g.spec.local_group, local=o)
-            for g in plan.group_plans
-            for o in g.ordinals
-            if o < len(keys)
-        ]
-        return CacheExtent(name=f"fetch:{request.seed}".encode(), units=tuple(units), is_last=True)
+        units = []
+        committed_names = set()
+        for g in plan.group_plans:
+            for o in g.ordinals:
+                if o >= len(keys):
+                    continue
+                if o < committed:
+                    committed_names.add(g.spec.tag + keys[o])
+                elif o < reserved:
+                    units.append(
+                        Unit(name=g.spec.tag + keys[o], local_group=g.spec.local_group, local=o)
+                    )
+        extent = CacheExtent(
+            name=f"fetch:{request.seed}".encode(), units=tuple(units), is_last=True
+        )
+        return extent, frozenset(committed_names)
 
     def publish_description(self, request):
         self.calls.append(("publish_description", (request,)))
@@ -644,7 +784,8 @@ class Rig:
     """Everything one coordinator needs, wired with defaults; tests override by keyword.
 
     Sources are ``worker`` (hint key ``"ctx"``) followed by ``store`` (no hint key) unless
-    ``sources`` is given. ``trace`` interleaves backend ``quiesce`` calls with effects. The
+    ``sources`` is given; ``host`` is a ``FakeLandsOnHost`` store that holds every prompt. ``trace``
+    interleaves backend ``quiesce`` calls with effects. The
     collective is ``FakeDist`` unless a ``dist`` (``LockstepGather``, ``PeerGather``) is given;
     ``payloads()`` lists what this rank sent either way. ``probe_timeout_s`` is measured on the
     ``now`` tests pass to ``advance``: with the default, a request deferred at 0.0 and 1.0 is
@@ -668,9 +809,11 @@ class Rig:
         self.reader = FakeReader(groups=groups, tokens_per_block=tpb)
         self.worker = FakeFetches(name="worker", trace=self.trace)
         self.store = FakeFetches(name="store", single_destination=True, trace=self.trace)
+        self.host = FakeLandsOnHost(name="host", trace=self.trace)
         table = {
             "worker": FetchSource("worker", self.worker, "ctx"),
             "store": FetchSource("store", self.store, None),
+            "host": FetchSource("host", self.host, None),
         }
         self.sources = [table[name] for name in sources]
         self.publishers = list(publishers or [])
@@ -722,6 +865,25 @@ class Rig:
         self.coord.launch_fetches([req], now)
         assert len(self.worker.attempts) == before + 1, "launch did not create a worker attempt"
         return self.worker.attempts[-1]
+
+    def plan_and_land(self, req: FakeRequest, now: float = 0.0) -> FakeLanding:
+        """``advance`` with ``req`` as the only candidate on the ``host`` source: the plan is
+        decided and its landing started in the same round; returns that landing."""
+        before = len(self.host.landings)
+        self.coord.advance([req], now)
+        assert len(self.host.landings) == before + 1, "deciding the plan did not start a landing"
+        return self.host.landings[-1]
+
+    def reserve_and_place(self, req: FakeRequest, now: float) -> FakeAttempt:
+        """The scheduler's part for a ``STAGED`` record: read the plan (reserving is implied),
+        then ``launch_fetches``; returns the placement attempt."""
+        plan = self.coord.plan_fetch(req)
+        assert isinstance(plan, FetchPlan), f"expected a plan to reserve for, got {plan!r}"
+        self.plans[req.py_request_id] = plan
+        before = len(self.host.attempts)
+        self.coord.launch_fetches([req], now)
+        assert len(self.host.attempts) == before + 1, "launch did not place the landing"
+        return self.host.attempts[-1]
 
 
 def worker_request(rid: int = 1, prompt_len: int = 29, **kw) -> FakeRequest:

@@ -17,12 +17,15 @@ from disaggregation.base.cache_backend import (  # noqa: E402
 )
 from disaggregation.orchestration.kv_transfer.interfaces import (  # noqa: E402
     CarriesAux,
+    Landing,
+    LandsOnHost,
     PlacesPieces,
 )
 from fakes import (  # noqa: E402
     FakeAttempt,
     FakeAuxAttempt,
     FakeFetches,
+    FakeLandsOnHost,
     FakePlacingPublishes,
     FakePublishes,
     FakeRequest,
@@ -110,3 +113,15 @@ def test_fake_request_has_the_request_view_surface():
     ):
         assert hasattr(req, attr)
     assert req.route_hints == {}
+
+
+def test_lands_on_host_and_landing_are_non_empty_and_disjoint_from_fetches():
+    host = FakeLandsOnHost()
+    assert isinstance(host, LandsOnHost)
+    assert not isinstance(host, Fetches)  # no ``fetch``, no ``open_route``
+    assert not isinstance(FakeFetches(), LandsOnHost)  # no ``fetch_to_host``
+    assert not isinstance(object(), LandsOnHost)
+    landing = host.fetch_to_host(b"fetch:1", [b"u"])
+    assert isinstance(landing, Landing)
+    assert not isinstance(object(), Landing)
+    assert isinstance(landing.place(CacheExtent(name=b"x", units=(), is_last=True)), Attempt)

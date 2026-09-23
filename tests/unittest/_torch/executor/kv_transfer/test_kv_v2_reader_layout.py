@@ -29,6 +29,7 @@ from tensorrt_llm._torch.disaggregation.remote_cache import (
     FetchSource,
     Planner,
     _stale_range,
+    merge,
     required_ordinals,
     servable_end,
 )
@@ -271,7 +272,7 @@ class TestFetchExtent:
         # The scheduler's reservation, then the extent the coordinator launches.
         assert manager.reserve_transfer_pages(request, plan.token_end)
         assert manager.get_history_length(request) == plan.token_end
-        extent = reader.fetch_extent(view, plan)
+        extent, committed = reader.fetch_extent(view, plan)
 
         assert extent.name == b"fetch:2" and extent.is_last is True
         assert len(extent.units) == 6 - 2 == 4
@@ -297,7 +298,7 @@ class TestFetchExtent:
         plan = planner.decide(view, {"store": frozenset(units)}, now=0.0)
         assert plan.token_end == NAMEABLE * TPB == 224
         assert manager.reserve_transfer_pages(request, plan.token_end)
-        extent = reader.fetch_extent(view, plan)
+        extent, committed = reader.fetch_extent(view, plan)
         assert len(extent.units) == NAMEABLE
         assert frozenset(u.name for u in extent.units) == frozenset(units)
 
@@ -309,10 +310,41 @@ class TestFetchExtent:
         _, units = planner.probe_query(view)
         plan = planner.decide(view, {"store": frozenset(units)}, now=0.0)
         assert manager.reserve_transfer_pages(request, 3 * TPB)  # fewer pages than planned
-        extent = reader.fetch_extent(view, plan)
+        extent, committed = reader.fetch_extent(view, plan)
         assert [u.name for u in extent.units] == [
             reader.group_specs()[0].tag + k for k in reader.block_keys(view)[:3]
         ]
+        assert committed == frozenset()  # a shortfall is not "already here"
+
+    def test_blocks_committed_since_the_plan_are_returned_by_name_not_fetched_over(
+        self, manager, reader
+    ):
+        """The plan was made when nothing was local; by the time the scheduler reserves, another
+        request has committed the first two blocks. The reservation shares their pages, so the
+        extent leaves them out and names them as committed; merged together they still reach
+        the plan's target."""
+        request = make_request(2, prompt_tokens(1))
+        view = EngineRequestView(request)
+        keys = reader.block_keys(view)
+        (spec,) = reader.group_specs()
+        store = FakeFetches(name="store", probe_answer="all")
+        planner = Planner([FetchSource("store", store, None)], reader, TPB)
+        _, units = planner.probe_query(view)
+        plan = planner.decide(view, {"store": frozenset(units)}, now=0.0)
+        assert plan.reuse_end == 0 and [g.ordinals for g in plan.group_plans] == [
+            tuple(range(NAMEABLE))
+        ]
+
+        local = prompt_tokens(1)[: 2 * TPB] + prompt_tokens(99)[2 * TPB :]
+        compute_and_commit(manager, make_request(1, local))  # meanwhile, elsewhere
+        assert manager.reserve_transfer_pages(request, plan.token_end)
+        assert manager.kv_cache_map[2].num_committed_tokens == 2 * TPB
+
+        extent, committed = reader.fetch_extent(view, plan)
+        assert committed == frozenset(spec.tag + keys[o] for o in range(2))
+        assert [u.name for u in extent.units] == [spec.tag + keys[o] for o in range(2, NAMEABLE)]
+        assert merge(plan, frozenset(u.name for u in extent.units) | committed) == plan.token_end
+        assert merge(plan, frozenset(u.name for u in extent.units)) == 0  # without the names
 
 
 # ---------------------------------------------------------------------------------------------
@@ -624,7 +656,8 @@ class TestVariableSlidingWindow:
 
         assert vswa_manager.reserve_transfer_pages(request, plan.token_end)
         assert vswa_manager.get_history_length(request) == B
-        extent = vswa_reader.fetch_extent(view, plan)
+        extent, committed = vswa_reader.fetch_extent(view, plan)
+        assert committed == frozenset()
         # Every required ordinal has a page: the reservation skipped exactly the stale range.
         assert len(extent.units) == sum(len(g.ordinals) for g in plan.group_plans) == 9
         kv_cache = vswa_manager.kv_cache_map[1]

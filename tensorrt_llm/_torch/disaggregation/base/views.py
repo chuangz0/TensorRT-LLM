@@ -116,8 +116,13 @@ class ResourceReader(Protocol):
         """For a gen-first context request: whether the generation side is ready."""
         ...
 
-    def fetch_extent(self, request: RequestView, plan: object) -> CacheExtent:
-        """The extent for a fetch the scheduler has already allocated pages for."""
+    def fetch_extent(
+        self, request: RequestView, plan: object
+    ) -> tuple[CacheExtent, frozenset[bytes]]:
+        """The extent for a fetch the scheduler has already allocated pages for, and the names
+        of the plan's units left out of it because the local cache committed them meanwhile
+        (they count as served). A unit the reservation has no page for is left out silently:
+        the delivery then comes up short and is retried."""
         ...
 
     def publish_description(self, request: RequestView) -> tuple[CacheExtent, Chunk | None]:

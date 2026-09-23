@@ -1063,6 +1063,8 @@ def test_status_dump_shape():
             "token_end": END,
             "launch_gave_up": False,
             "peer_launched_at": None,
+            "has_landing": False,
+            "waiting_since": None,
         }
     ]
 
@@ -1207,3 +1209,303 @@ def test_three_consecutive_rejections_fail_a_gen_init_fetch():
     loop_advance(rig, req, 3.0)  # the FAILED vote lands: a gen-init fetch has no retry
     assert rig.effects.only("fail_requests") == [((req,), "kv fetch launch given up")]
     assert rig.coord.plan_fetch(req) is None and rig.records() == []
+
+
+# =============================================================================================
+# Host-first fetch: PLANNED -> STAGING -> STAGED -> IN_FLIGHT (placement) -> LANDED
+# =============================================================================================
+
+
+def host_rig(**kw) -> Rig:
+    """A single ``LandsOnHost`` store that holds every prompt."""
+    return Rig(sources=("host",), **kw)
+
+
+def host_request(rid: int = 1, prompt_len: int = 29) -> FakeRequest:
+    return FakeRequest(rid, prompt_len)
+
+
+def land_and_stage(rig: Rig, req: FakeRequest, now: float = 0.0):
+    """Decide the plan (which starts the landing), deliver the landing, agree: ``STAGED``."""
+    landing = rig.plan_and_land(req, now)
+    landing.deliver_all()
+    rig.coord.advance([], now + 1.0)
+    assert rig.record(req.py_request_id)["state"] == "STAGED"
+    return landing
+
+
+def test_host_first_plan_starts_its_landing_when_decided_and_parks_nothing():
+    rig = host_rig()
+    req = host_request()
+    rig.plan_and_land(req)
+    assert [m for m, _ in rig.host.calls] == ["probe", "fetch_to_host"]
+    name, units = rig.host.calls[-1][1]
+    assert name == b"fetch:1" and frozenset(units) == rig.reader.unit_names(req, range(7))
+    rec = rig.record(1)
+    assert rec["state"] == "STAGING" and rec["has_landing"] and rec["attempts"] == 0
+    assert rig.effects.calls == []  # no pages: nothing prepared, nothing parked
+    assert rig.coord.plan_fetch(req) is DEFER
+    # A landing is work in flight for pacing, but it names no page and parks no request.
+    assert rig.coord.has_inflight() is True
+    assert rig.coord.inflight_request_ids() == frozenset()
+    assert rig.coord.parked_request_ids() == frozenset()
+
+
+def test_plan_fetch_answers_defer_defer_plan_none_none_along_the_host_first_path():
+    rig = host_rig()
+    req = host_request()
+    landing = rig.plan_and_land(req)
+    assert rig.coord.plan_fetch(req) is DEFER  # STAGING: the units are on their way
+    landing.deliver_all()
+    rig.coord.advance([], 1.0)
+    plan = rig.coord.plan_fetch(req)  # STAGED: reserve pages for exactly this plan
+    assert isinstance(plan, FetchPlan) and plan.token_end == END and plan.source == "host"
+    assert plan is rig.fetch_record(1).plan
+    attempt = rig.reserve_and_place(req, 1.0)
+    assert rig.coord.plan_fetch(req) is None  # IN_FLIGHT: parked, out of the scheduler's reach
+    attempt.deliver_all()
+    rig.coord.advance([], 2.0)
+    assert rig.record(1)["state"] == "LANDED" and rig.coord.plan_fetch(req) is None
+
+
+def test_refused_landing_keeps_the_plan_votes_unlaunched_and_is_asked_again_next_round():
+    rig = host_rig()
+    req = host_request()
+    rig.host.reject_next = 1
+    rig.coord.advance([req], 0.0)
+    rec = rig.fetch_record(1)
+    assert rec.state.value == "PLANNED" and rec.plan is not None and rec.landing is None
+    assert rec.consecutive_launch_failures == 0  # not page back-pressure
+    assert rec.waiting_since == 0.0
+    assert rig.coord.plan_fetch(req) is DEFER and rig.effects.calls == []
+
+    loop_advance(rig, req, 1.0)
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "UNLAUNCHED", 0, 0)]
+    assert rig.host.count("fetch_to_host") == 2 and rig.host.count("probe") == 1
+    rec = rig.record(1)
+    assert rec["state"] == "STAGING" and rec["waiting_since"] is None and rec["has_landing"]
+
+
+@pytest.mark.parametrize("ending", ["short", "failed"])
+def test_landing_that_fails_or_comes_up_short_is_released_and_replanned_without_pages(ending):
+    rig = host_rig()
+    req = host_request()
+    landing = rig.plan_and_land(req)
+    if ending == "short":
+        landing.deliver_all_but(*rig.reader.unit_names(req, [6]))
+    else:
+        landing.finish(Failed("store gone"))
+    rig.coord.advance([], 1.0)
+    kind = ("TERMINAL", END - 4, END - 4) if ending == "short" else ("FAILED", 0, 0)
+    assert rig.payloads()[-1][0] == [((1, "fetch"), *kind)]
+    assert landing.releases == 1
+    assert rig.effects.count("give_back_fetch_pages") == 0 and rig.host.count("quiesce") == 0
+    assert rig.effects.count("unpark") == 0 and rig.effects.count("fail_requests") == 0
+    rec = rig.fetch_record(1)
+    assert rec.state.value == "PLANNED" and rec.plan is None and rec.landing is None
+    assert rec.retries_left == 0 and rig.coord.plan_fetch(req) is DEFER
+
+    rig.coord.advance([req], 2.0)  # replanned, and the new landing starts in the same round
+    assert rig.host.count("fetch_to_host") == 2
+    replan = rig.fetch_record(1).plan
+    assert replan.token_end == (END - 4 if ending == "short" else END)
+    assert rig.record(1)["state"] == "STAGING"
+
+
+def test_placement_lands_unparks_and_releases_the_landing_in_the_same_round():
+    rig = host_rig()
+    req = host_request()
+    landing = land_and_stage(rig, req)
+    rec = rig.record(1)
+    assert rec["has_landing"] and rec["waiting_since"] == 1.0  # waiting for pages since landed
+
+    attempt = rig.reserve_and_place(req, 2.0)
+    assert rig.effects.names() == ["prepare_fetch_resources", "park_for_fetch"]
+    assert extent_names(attempt.payload) == plan_unit_names(rig.plans[1])
+    rec = rig.record(1)
+    assert rec["state"] == "IN_FLIGHT" and rec["attempts"] == 1 and rec["try_index"] == 0
+    assert rec["waiting_since"] is None and landing.releases == 0
+    assert rig.coord.parked_request_ids() == {1} and rig.coord.inflight_request_ids() == {1}
+
+    attempt.deliver_all()
+    rig.coord.advance([], 3.0)
+    assert rig.effects.only("unpark") == [(req, END, False, None)]
+    assert landing.releases == 1  # the copy was complete before its outcome: gone at once
+    rec = rig.record(1)
+    assert rec["state"] == "LANDED" and rec["has_landing"] is False  # the record stays
+    assert rig.host.count("quiesce") == 0
+    rig.coord.notify_request_finished(req)
+    assert rig.host.calls[-1] == ("quiesce", ((attempt,), True))  # the placement's release point
+    assert rig.records() == [] and landing.releases == 1
+
+
+def test_placement_served_short_quiesces_gives_back_and_releases_the_landing():
+    rig = host_rig()
+    req = host_request()
+    landing = land_and_stage(rig, req)
+    attempt = rig.reserve_and_place(req, 2.0)
+    attempt.deliver_all_but(*rig.reader.unit_names(req, [6]))
+    rig.coord.advance([], 3.0)
+    q, gb = quiesce_indices(rig.trace), effect_indices(rig.trace, "give_back_fetch_pages")
+    assert len(q) == 1 and len(gb) == 1 and q[0] < gb[0]
+    assert rig.host.calls[-1] == ("release", (landing,))  # after quiesce and give-back
+    assert landing.releases == 1 and rig.effects.count("unpark") == 0
+    rec = rig.fetch_record(1)
+    assert rec.state.value == "PLANNED" and rec.plan is None and rec.landing is None
+    assert rec.retries_left == 0 and rec.retry_hint == END - 4
+
+    rig.coord.advance([req], 4.0)  # the retry lands on the host afresh
+    assert rig.host.count("fetch_to_host") == 2 and rig.record(1)["state"] == "STAGING"
+    assert rig.fetch_record(1).plan.token_end == END - 4
+
+
+@pytest.mark.parametrize("source", ["host", "worker"])
+def test_units_the_local_cache_committed_meanwhile_count_as_served(source):
+    """Pages the reservation found already committed (another request computed the same
+    prefix while the fetch waited) are not fetched over, and do not make the delivery short."""
+    rig = Rig(sources=(source,))
+    req = worker_request() if source == "worker" else host_request()
+    rig.reader.committed_blocks[1] = 2
+    if source == "host":
+        land_and_stage(rig, req)
+        attempt = rig.reserve_and_place(req, 2.0)
+    else:
+        attempt = rig.plan_and_launch(req)
+    assert extent_names(attempt.payload) == rig.reader.unit_names(req, range(2, 7))
+    assert rig.fetch_record(1).committed_names == rig.reader.unit_names(req, range(2))
+    attempt.deliver_all()
+    rig.coord.advance([], 3.0)
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", END, END)]
+    assert rig.effects.only("unpark") == [(req, END, False, None)]
+    assert rig.effects.count("give_back_fetch_pages") == 0
+
+
+def test_placement_of_an_empty_extent_parks_for_one_round_then_unparks():
+    rig = host_rig()
+    req = host_request()
+    landing = land_and_stage(rig, req)
+    rig.reader.committed_blocks[1] = 7  # every block committed locally while landing
+    rig.host.script_place(Delivered(frozenset()))  # nothing to copy: done at once
+    attempt = rig.reserve_and_place(req, 2.0)
+    assert attempt.payload.units == ()
+    assert rig.effects.names() == ["prepare_fetch_resources", "park_for_fetch"]
+    assert rig.record(1)["state"] == "IN_FLIGHT"
+    rig.coord.advance([], 3.0)
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", END, END)]
+    assert rig.effects.only("unpark") == [(req, END, False, None)]
+    assert landing.releases == 1
+
+
+@pytest.mark.parametrize("source", ["host", "worker"])
+def test_units_the_reservation_has_no_page_for_make_the_delivery_short(source):
+    rig = Rig(sources=(source,))
+    req = worker_request() if source == "worker" else host_request()
+    rig.reader.reserved_blocks[1] = 5  # the scheduler reserved fewer pages than planned
+    if source == "host":
+        landing = land_and_stage(rig, req)
+        attempt = rig.reserve_and_place(req, 2.0)
+    else:
+        attempt = rig.plan_and_launch(req)
+    assert extent_names(attempt.payload) == rig.reader.unit_names(req, range(5))
+    assert rig.fetch_record(1).committed_names == frozenset()
+    attempt.deliver_all()
+    rig.coord.advance([], 3.0)
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", 20, 20)]
+    assert rig.effects.count("unpark") == 0 and rig.effects.count("give_back_fetch_pages") == 1
+    assert rig.record(1)["state"] == "PLANNED"
+    if source == "host":
+        assert landing.releases == 1
+
+
+def test_placement_refused_three_times_gives_up_and_the_agreement_replans():
+    rig = host_rig()
+    req = host_request()
+    landing = land_and_stage(rig, req)
+    rig.host.reject_place_next = 3
+    for index, now in enumerate((2.0, 3.0, 4.0)):
+        assert isinstance(rig.coord.plan_fetch(req), FetchPlan)
+        rig.coord.launch_fetches([req], now)
+        rec = rig.fetch_record(1)
+        assert rec.state.value == "STAGED" and rec.consecutive_launch_failures == index + 1
+    assert rig.effects.count("give_back_fetch_pages") == 3  # page back-pressure, counted as such
+    assert rig.fetch_record(1).launch_gave_up and rig.coord.plan_fetch(req) is DEFER
+    assert landing.releases == 0
+
+    loop_advance(rig, req, 5.0)
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0, 0)]
+    rec = rig.fetch_record(1)
+    assert landing.releases == 1 and rec.landing is None
+    assert rec.state.value == "PLANNED" and rec.plan is None and rec.retries_left == 0
+    assert rig.host.count("quiesce") == 0 and rig.effects.count("fail_requests") == 0
+
+
+def test_staging_expiry_fails_the_request_and_releases_the_landing_at_once():
+    rig = host_rig(fetch_timeout_s=10.0)
+    req = host_request()
+    landing = rig.plan_and_land(req, now=0.0)
+    assert rig.record(1)["deadline"] == 10.0
+    rig.coord.advance([], 10.0)
+    assert rig.effects.names() == ["fail_requests"]  # no pages: nothing to hold
+    assert rig.effects.only("fail_requests") == [((req,), "kv fetch timed out")]
+    # The landing names no page, so nothing waits for its outcome: record and landing go now.
+    assert landing.releases == 1 and rig.records() == []
+    assert rig.coord.held_request_ids() == frozenset()
+    assert rig.coord.status_dump() == {
+        "plan_authority": "VOTED",
+        "records": [],
+        "decided_plans": 0,
+        "finished_pending": [],
+    }
+    landing.deliver_all()  # late, and moot
+    rig.coord.advance([], 11.0)
+    assert landing.releases == 1 and rig.effects.names() == ["fail_requests"]
+
+
+def test_request_ending_while_staging_is_not_held_and_releases_the_landing_at_once():
+    rig = host_rig()
+    req = host_request()
+    landing = rig.plan_and_land(req)
+    rig.coord.notify_request_finished(req)
+    assert rig.effects.calls == [] and rig.coord.held_request_ids() == frozenset()
+    assert landing.releases == 1 and rig.records() == []
+    assert rig.host.count("quiesce") == 0  # nothing ever touched the pages
+    assert rig.coord.status_dump()["finished_pending"] == []
+
+
+def test_request_ending_while_staged_releases_the_landing_at_once():
+    rig = host_rig()
+    req = host_request()
+    landing = land_and_stage(rig, req)
+    rig.coord.notify_request_finished(req)
+    assert landing.releases == 1 and rig.records() == [] and rig.effects.calls == []
+    assert rig.host.count("quiesce") == 0  # nothing ever touched the pages
+
+
+def test_landing_wait_timeout_spends_a_retry_at_each_wait_then_computes_locally():
+    """The rank's own clock: refused landing memory (PLANNED) and pages that never come (STAGED)
+    each time out once; the second timeout is out of retries and the request computes locally."""
+    rig = host_rig(landing_wait_timeout_s=5.0)
+    req = host_request()
+    rig.host.reject_next = 100
+    rig.coord.advance([req], 0.0)
+    loop_advance(rig, req, 4.9)
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "UNLAUNCHED", 0, 0)]
+    loop_advance(rig, req, 5.0)
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0, 0)]
+    rec = rig.fetch_record(1)
+    assert rec.retries_left == 0 and rec.plan is None and rec.waiting_since is None
+    assert rig.coord.plan_fetch(req) is DEFER and rig.effects.count("fail_requests") == 0
+
+    rig.host.reject_next = 0
+    loop_advance(rig, req, 6.0)  # planned afresh; the landing memory is there this time
+    landing = rig.host.landings[-1]
+    landing.deliver_all()
+    rig.coord.advance([], 7.0)
+    assert rig.record(1)["state"] == "STAGED" and rig.record(1)["waiting_since"] == 7.0
+    loop_advance(rig, req, 11.9)  # the scheduler never finds pages
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "UNLAUNCHED", 0, 0)]
+    loop_advance(rig, req, 12.0)
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0, 0)]
+    assert landing.releases == 1 and rig.records() == []
+    assert rig.coord.plan_fetch(req) is None and rig.effects.count("fail_requests") == 0
+    assert rig.effects.count("give_back_fetch_pages") == 0 and rig.host.count("quiesce") == 0

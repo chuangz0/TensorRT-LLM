@@ -46,12 +46,14 @@ _COORDINATOR_KEYS = (
     "fetch_timeout_s",
     "publish_timeout_s",
     "unlaunched_timeout_s",
+    "landing_wait_timeout_s",
     "probe_timeout_s",
     "close_timeout_s",
 )
 _DEFAULT_PROBE_TIMEOUT_S = 0.05
 _DEFAULT_CLOSE_TIMEOUT_S = 30.0
 _DEFAULT_UNLAUNCHED_TIMEOUT_S = 30.0
+_DEFAULT_LANDING_WAIT_TIMEOUT_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,10 @@ class KVTransferConfig:
             reserved) after another rank has launched it, before the ranks give the fetch up
             and plan again. Independent of ``fetch_timeout_s``; ``None`` disables and must be
             given explicitly.
+        landing_wait_timeout_s: Host-first fetches only. Longest a rank waits for the backend's
+            landing memory (``fetch_to_host`` refused) or, once landed, for the scheduler's
+            pages, before it votes the fetch failed so that the ranks give it up, release the
+            landing and plan again. ``None`` disables and must be given explicitly.
         probe_timeout_s: Longest a request waits for a store lookup before it computes locally.
         close_timeout_s: Longest ``close`` waits for the backends to finish before it gives them
             up and releases the requests they were holding.
@@ -124,6 +130,7 @@ class KVTransferConfig:
     fetch_timeout_s: float | None = None
     publish_timeout_s: float | None = None
     unlaunched_timeout_s: float | None = _DEFAULT_UNLAUNCHED_TIMEOUT_S
+    landing_wait_timeout_s: float | None = _DEFAULT_LANDING_WAIT_TIMEOUT_S
     probe_timeout_s: float = _DEFAULT_PROBE_TIMEOUT_S
     close_timeout_s: float = _DEFAULT_CLOSE_TIMEOUT_S
 
@@ -133,7 +140,12 @@ class KVTransferConfig:
         names = [entry.name for entry in self.backends]
         if len(set(names)) != len(names):
             raise ValueError(f"backend names must be unique, got {names}")
-        for key in ("fetch_timeout_s", "publish_timeout_s", "unlaunched_timeout_s"):
+        for key in (
+            "fetch_timeout_s",
+            "publish_timeout_s",
+            "unlaunched_timeout_s",
+            "landing_wait_timeout_s",
+        ):
             value = getattr(self, key)
             if value is not None and value <= 0:
                 raise ValueError(f"{key} must be > 0 or null, got {value}")

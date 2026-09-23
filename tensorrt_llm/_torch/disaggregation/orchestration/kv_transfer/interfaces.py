@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """What the KV transfer coordinator needs from the engine side, and the optional backend
-capabilities it recognises.
+capabilities it recognises (``PlacesPieces``, ``CarriesAux``, ``LandsOnHost`` with its ``Landing``).
 
 Everything here is a ``Protocol`` or an enum. The engine adapter (``pyexecutor``) provides the
 ``KVTransferEffects``, the ``EngineQueue`` and the ``DistLike``, so the coordinator can be driven
@@ -26,9 +26,9 @@ module imports the engine.
 from __future__ import annotations
 
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, Mapping, Protocol, Sequence, runtime_checkable
+from typing import TYPE_CHECKING, Callable, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
-from ...base.cache_backend import Attempt
+from ...base.cache_backend import Attempt, CacheExtent, Outcome
 from ...base.views import RequestView
 
 if TYPE_CHECKING:
@@ -39,6 +39,8 @@ __all__ = [
     "DistLike",
     "EngineQueue",
     "KVTransferEffects",
+    "Landing",
+    "LandsOnHost",
     "PlacesPieces",
     "PlanAuthority",
 ]
@@ -160,3 +162,60 @@ class CarriesAux(Protocol):
     draft tokens, context usage). The coordinator hands it to ``unpark`` unread."""
 
     def aux(self) -> Mapping[str, object]: ...
+
+
+@runtime_checkable
+class Landing(Protocol):
+    """One host-first landing: the content of a plan's units in the backend's own memory.
+
+    ``poll`` reports how the landing ended; ``Delivered.served`` names the units that arrived.
+    ``place`` copies the units of ``extent`` from the landing into the caller's pages, on the
+    backend's own thread and stream, and reports through the returned ``Attempt`` once the copy
+    has completed. ``release`` says the landing is no longer needed.
+    """
+
+    def poll(self) -> Outcome | None:
+        """Non-blocking. ``None`` while the units are still on their way to the backend."""
+        ...
+
+    def place(self, extent: CacheExtent) -> Attempt:
+        """Start copying the units named by ``extent`` into the caller's memory. Only
+        ``SubmissionRejected`` may be raised, and only while nothing has been touched; any other
+        failure is reported through the attempt. An empty extent completes at once."""
+        ...
+
+    def release(self) -> None:
+        """Give the landing's memory back. Runs on the caller's thread and must not block or
+        wait for I/O; it may be called before ``poll`` has an outcome, and calling it again, or
+        after the backend has closed, does nothing."""
+        ...
+
+
+@runtime_checkable
+class LandsOnHost(Protocol):
+    """Optional backend capability: a fetch lands in the backend's own host memory first, and
+    is copied into the caller's pages afterwards, so no page is held while the network is slow.
+
+    ``Delivered`` from the landing means the content reached the backend, not the caller. Like
+    ``Fetches`` it probes, quiesces and settles; unlike it there is no ``fetch`` or ``open_route``,
+    so a backend is one or the other. ``quiesce`` and ``settle`` only ever receive the attempts
+    ``Landing.place`` returned: those are the only ones that touch the caller's memory.
+    """
+
+    def fetch_to_host(self, name: bytes, units: Sequence[bytes]) -> Landing:
+        """Start landing ``units`` in the backend's memory. Non-blocking. Only
+        ``SubmissionRejected`` may be raised; short capacity is not an error but a wait the
+        backend absorbs (the caller bounds it with its own clock)."""
+        ...
+
+    def probe(self, name: bytes, units: Sequence[bytes]) -> frozenset[bytes] | None:
+        """As ``Fetches.probe``."""
+        ...
+
+    def quiesce(self, attempts: Iterable[Attempt]) -> bool:
+        """As ``Fetches.quiesce``, for placement attempts."""
+        ...
+
+    def settle(self, attempts: Iterable[Attempt]) -> None:
+        """As ``Fetches.settle``, for placement attempts."""
+        ...

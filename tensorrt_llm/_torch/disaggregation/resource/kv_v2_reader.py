@@ -93,21 +93,33 @@ class KVv2ResourceReader:
         """Always ready: the store path has no context request waiting on a generation side."""
         return True
 
-    def fetch_extent(self, request, plan) -> CacheExtent:
-        """Units for the pages the scheduler reserved with ``reserve_transfer_pages``."""
+    def fetch_extent(self, request, plan) -> tuple[CacheExtent, frozenset[bytes]]:
+        """Units for the pages the scheduler reserved with ``reserve_transfer_pages``, and the
+        names of the plan's blocks that reservation found committed locally.
+
+        The reservation matches the prompt against the radix tree first, so a block another
+        request committed since the plan was made is already in a shared page: it is not
+        fetched over (its name is returned instead, to count as served). A block the reservation
+        has no page for is left out and not returned: the fetch comes up short and is retried.
+        """
         kv_cache = self._kv_cache_manager.kv_cache_map[request.py_request_id]
+        committed_blocks = int(kv_cache.num_committed_tokens) // self._tokens_per_block
         units: list[Unit] = []
+        committed_names: set[bytes] = set()
         for group_plan in plan.group_plans:
             page_indices = self._page_indices_by_ordinal(kv_cache, group_plan.spec.local_group)
-            allocated_ordinals = [
-                ordinal for ordinal in group_plan.ordinals if ordinal < len(page_indices)
-            ]
-            units.extend(
-                self._name_units(group_plan.spec, plan.block_keys, page_indices, allocated_ordinals)
-            )
-        return CacheExtent(
+            to_fetch = []
+            for ordinal in group_plan.ordinals:
+                if ordinal < committed_blocks:
+                    if ordinal < len(plan.block_keys):
+                        committed_names.add(group_plan.spec.tag + plan.block_keys[ordinal])
+                elif ordinal < len(page_indices):
+                    to_fetch.append(ordinal)
+            units.extend(self._name_units(group_plan.spec, plan.block_keys, page_indices, to_fetch))
+        extent = CacheExtent(
             name=f"fetch:{request.py_request_id}".encode(), units=tuple(units), is_last=True
         )
+        return extent, frozenset(committed_names)
 
     def publish_description(self, request) -> tuple[CacheExtent, None]:
         """Every committed full block the request still holds, in the pages it holds right now.

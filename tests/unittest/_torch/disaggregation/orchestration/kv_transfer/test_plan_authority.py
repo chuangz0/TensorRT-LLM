@@ -211,3 +211,32 @@ def test_follower_that_never_launches_resets_both_ranks_and_the_owner_exports_ag
     assert propagate(rigs, req) == [(1, (END, "store"))]
     assert isinstance(rigs[FOLLOWER].coord.plan_fetch(req), FetchPlan)
     assert rigs[FOLLOWER].store.count("probe") == 0
+
+
+# ---- host-first: the follower starts its own landing when it adopts the answer ----
+
+
+def test_follower_starts_its_landing_when_it_adopts_a_host_first_answer(world):
+    rigs = [
+        Rig(sources=("host",), unlaunched_timeout_s=UNLAUNCHED_TIMEOUT_S, **world.rig_kwargs(r))
+        for r in range(world.n)
+    ]
+    req = store_request()
+    advance_all(world, rigs, req, 0.0)
+    assert rigs[OWNER].record(1)["state"] == "STAGING"  # decided here: landing started here
+    assert rigs[FOLLOWER].records() == [] and rigs[FOLLOWER].host.count("fetch_to_host") == 0
+
+    rigs[FOLLOWER].coord.adopt_plan_answers([req], rigs[OWNER].coord.export_plan_answers(), 0.0)
+    assert rigs[FOLLOWER].record(1)["state"] == "STAGING"
+    assert (
+        rigs[FOLLOWER].host.count("fetch_to_host") == 1 and rigs[FOLLOWER].host.count("probe") == 0
+    )
+    assert rigs[FOLLOWER].coord.plan_fetch(req) is DEFER
+
+    for rig in rigs:
+        rig.host.landings[-1].deliver_all()
+    advance_all(world, rigs, req, 1.0)
+    for rig in rigs:
+        assert rig.record(1)["state"] == "STAGED" and isinstance(
+            rig.coord.plan_fetch(req), FetchPlan
+        )
