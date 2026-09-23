@@ -37,6 +37,8 @@ from ..store import BlobStoreError, GetStatus, PutStatus
 
 __all__ = [
     "DEFAULT_METADATA_SERVER",
+    "LEASE_EXPIRED",
+    "OBJECT_NOT_FOUND",
     "MooncakeBlobStore",
     "MooncakeStoreConfig",
     "build_mooncake_backend",
@@ -49,6 +51,11 @@ DEFAULT_METADATA_SERVER = "P2PHANDSHAKE"
 
 OBJECT_NOT_FOUND = -704
 """Status a get answers for a key the store does not hold; nothing is written."""
+
+LEASE_EXPIRED = -707
+"""Status a get answers when the lease its own query took ran out before the transfer ended.
+The bytes have been written all the same; only the check after them failed. A second get takes
+a fresh lease, so the driver asks once more for such keys."""
 
 MEMCPY_BYPASS_ENV = "MC_STORE_MEMCPY"
 """Mooncake client switch that copies with ``memcpy`` instead of the transfer engine whenever the
@@ -223,13 +230,30 @@ class MooncakeBlobStore:
         return [PutStatus.STORED if status == 0 else PutStatus.DECLINED for status in statuses]
 
     def get(self, keys: Sequence[str], buffers: Sequence[Sequence[Segment]]) -> Sequence[GetStatus]:
+        statuses = list(self._batch_get(keys, buffers))
+        expired = [i for i, status in enumerate(statuses) if status == LEASE_EXPIRED]
+        if expired:
+            logger.info(
+                "%s: lease expired during the get of %d of %d keys; asking once more",
+                self.describe(),
+                len(expired),
+                len(keys),
+            )
+            again = self._batch_get([keys[i] for i in expired], [buffers[i] for i in expired])
+            for i, status in zip(expired, again):
+                statuses[i] = status
+        return [
+            self._read_status(key, status, sum(size for _, size in segments))
+            for key, status, segments in zip(keys, statuses, buffers)
+        ]
+
+    def _batch_get(
+        self, keys: Sequence[str], buffers: Sequence[Sequence[Segment]]
+    ) -> Sequence[int]:
         ptrs, sizes = _split(buffers)
         statuses = self._client.batch_get_into_multi_buffers(list(keys), ptrs, sizes)
         self._check_count("batch_get_into_multi_buffers", statuses, keys)
-        return [
-            self._read_status(key, status, sum(key_sizes))
-            for key, status, key_sizes in zip(keys, statuses, sizes)
-        ]
+        return statuses
 
     def _read_status(self, key: str, status: int, expected: int) -> GetStatus:
         if status == expected:
@@ -257,21 +281,47 @@ def _memcpy_bypass_enabled() -> bool:
     return value.lower() not in ("0", "false", "no", "off")
 
 
+def _resolve_landing(entry: BackendEntry) -> BackendEntry:
+    """The entry with its ``landing`` decided: over TCP an unset ``landing`` becomes ``host``,
+    because the transfer engine's TCP path reaches GPU memory only through a synchronous copy
+    per 64 KB chunk, while RDMA writes GPU memory directly and keeps the ``device`` default. An
+    explicit ``device`` over TCP is allowed with a warning."""
+    protocol = entry.options.get("protocol", MooncakeStoreConfig.protocol)
+    landing = entry.options.get("landing")
+    if protocol != "tcp":
+        return entry
+    if landing is None:
+        logger.info(
+            "backend %r: protocol tcp with no landing set; landing on host memory first "
+            "(landing: host)",
+            entry.name,
+        )
+        return dataclasses.replace(entry, options={**entry.options, "landing": "host"})
+    if landing == "device":
+        logger.warning(
+            "backend %r: landing 'device' over tcp registers GPU memory with a transport that "
+            "copies it through host memory in 64 KB steps; 'host' is the intended landing for tcp",
+            entry.name,
+        )
+    return entry
+
+
 def _refuse_memcpy_bypass_over_device_memory(entry: BackendEntry) -> None:
-    """Without ``stage_through_host`` the backend registers the KV pools, which live on the GPU;
-    the bypass would ``memcpy`` them and crash the process. Staging registers pinned host memory
-    only, so the bypass is harmless there."""
-    if entry.options.get("stage_through_host", False) or not _memcpy_bypass_enabled():
+    """With ``landing: device`` the backend registers the KV pools, which live on the GPU; the
+    bypass would ``memcpy`` them and crash the process. ``landing: host`` registers pinned host
+    memory only, so the bypass is harmless there. Reads the resolved ``landing``."""
+    if entry.options.get("landing", "device") != "device" or not _memcpy_bypass_enabled():
         return
     raise ValueError(
         f"backend {entry.name!r}: {MEMCPY_BYPASS_ENV}={os.environ[MEMCPY_BYPASS_ENV]!r} makes the "
         "Mooncake client memcpy local objects, which crashes on the GPU memory this backend "
-        "registers; unset it or set stage_through_host: true"
+        "registers; unset it or set landing: host"
     )
 
 
 def build_mooncake_backend(entry: BackendEntry, context: BackendBuildContext) -> BackendHandle:
     """Factory for ``type: mooncake``."""
+    entry = _resolve_landing(entry)
     _refuse_memcpy_bypass_over_device_memory(entry)
     return build_blob_backend(
         entry,

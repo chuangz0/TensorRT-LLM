@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Callable, Sequence
 
 from tensorrt_llm.logger import logger
 
@@ -42,6 +42,7 @@ from ...disaggregation.orchestration.kv_transfer.build import build_coordinator
 from ...disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority
 from ...disaggregation.resource.kv_extractor import build_page_table_from_manager
 from ...disaggregation.resource.kv_v2_reader import KVv2ResourceReader
+from ...disaggregation.resource.naming import GROUP_TAG_BYTES
 from ...disaggregation.resource.region import (
     KVv2RegionResolver,
     layout_fingerprint,
@@ -211,6 +212,26 @@ def _register_kv_pools(backends: Sequence[BackendHandle], resolver: KVv2RegionRe
         raise
 
 
+def _unit_bytes_by_name(
+    reader: KVv2ResourceReader, resolver: KVv2RegionResolver
+) -> Callable[[bytes], int]:
+    """Size of a unit from its name: the name starts with its layer group's tag, and every unit
+    of a group is one page of that group's pools. For a backend that lands units in its own
+    memory before their pages exist."""
+    bytes_by_tag = {
+        spec.tag: sum(size for _, size in resolver(spec.local_group, 0))
+        for spec in reader.group_specs()
+    }
+
+    def unit_bytes(name: bytes) -> int:
+        try:
+            return bytes_by_tag[name[:GROUP_TAG_BYTES]]
+        except KeyError:
+            raise KeyError(f"unit {name.hex()} belongs to no layer group of this rank") from None
+
+    return unit_bytes
+
+
 def _status_dump_path() -> str | None:
     template = os.environ.get(KV_TRANSFER_STATUS_DUMP_ENV)
     if not template:
@@ -255,6 +276,9 @@ def attach_kv_transfer(
         ),
         max_unit_bytes=resolver.max_unit_bytes(),
         device_index=executor.device_id,
+        unit_bytes=_unit_bytes_by_name(reader, resolver),
+        max_request_blocks=-(-executor.max_seq_len // reader.tokens_per_block),
+        landing_wait_timeout_s=config.landing_wait_timeout_s,
     )
     backends = build_backends(config, build_context)
     _check_followers_can_rebuild_plans(mapping, backends)

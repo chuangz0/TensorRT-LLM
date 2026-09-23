@@ -22,7 +22,11 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Sequence
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.backends.blob.backend import BlobStoreBackend, BlobStoreConfig  # noqa: E402
+from disaggregation.backends.blob.backend import (  # noqa: E402
+    BlobStoreBackend,
+    BlobStoreConfig,
+    HostLandingBlobBackend,
+)
 from disaggregation.backends.blob.drivers.memory import MemoryBlobStore  # noqa: E402
 from disaggregation.backends.blob.staging import HostStagingPool  # noqa: E402
 from disaggregation.backends.blob.store import GetStatus, PutStatus  # noqa: E402
@@ -30,6 +34,8 @@ from disaggregation.base.cache_backend import CacheExtent, Unit  # noqa: E402
 from disaggregation.base.region import Segment  # noqa: E402
 
 FINGERPRINT = b"\x01layout"
+SLOT = 128
+"""Default slot width of the host pools the fakes build; every test unit is smaller."""
 
 
 # ---------------------------------------------------------------------------------------------
@@ -349,6 +355,17 @@ def make_staging(
     return pool, copier, host, trace
 
 
+def fake_open_staging(
+    store, *, slot_bytes: int, num_slots: int, device_index=None
+) -> HostStagingPool:
+    """Stand-in for ``factory.open_default_staging``: a registered host arena over a
+    ``FakeCopier`` instead of a pinned torch buffer over CUDA. Same signature, so a test patches
+    the factory's name with it."""
+    host = MemoryArena(slot_bytes * num_slots)
+    store.register_span(host.address, host.size)
+    return HostStagingPool(host.address, slot_bytes, num_slots, FakeCopier(), keepalive=host)
+
+
 # ---------------------------------------------------------------------------------------------
 # Extents and a wired backend
 # ---------------------------------------------------------------------------------------------
@@ -371,14 +388,25 @@ def config(**overrides) -> BlobStoreConfig:
 @dataclass
 class Rank:
     """One process's view: its arena, resolver, units and a backend over a (possibly shared)
-    store. ``unit(g, l, *sizes)`` carves memory and returns the ``Unit`` naming it."""
+    store. ``unit(g, l, *sizes)`` carves memory and returns the ``Unit`` naming it.
+
+    ``backend`` is the ``BlobStoreBackend`` for the ``device`` landing and the
+    ``HostLandingBlobBackend`` for ``host``; ``inner`` is the ``BlobStoreBackend`` either way.
+    The host shape also carries its two pools and their copiers; the publish pool is traced.
+    """
 
     store: FakeBlobStore
-    backend: BlobStoreBackend
+    backend: BlobStoreBackend | HostLandingBlobBackend
     arena: MemoryArena
     resolver: ArenaResolver
+    inner: BlobStoreBackend | None = None
     registration: object | None = None
     units: dict[tuple[int, int], Unit] = field(default_factory=dict)
+    publish_pool: TracingStagingPool | None = None
+    publish_copier: FakeCopier | None = None
+    trace: Trace | None = None
+    landing_pool: HostStagingPool | None = None
+    landing_copier: FakeCopier | None = None
 
     def unit(self, local_group: int, local: int, *sizes: int, seed: str = "u") -> Unit:
         self.resolver.add(local_group, local, *sizes)
@@ -386,8 +414,34 @@ class Rank:
         self.units[(local_group, local)] = unit
         return unit
 
+    def unit_bytes(self, name: bytes) -> int:
+        """Size of the unit called ``name`` on this rank; what the host shape is built with."""
+        for unit in self.units.values():
+            if unit.name == name:
+                return sum(size for _, size in self.segments(unit))
+        raise KeyError(f"no unit called {name!r} on this rank")
+
     def segments(self, unit: Unit) -> tuple[Segment, ...]:
         return self.resolver.segments(unit.local_group, unit.local)
+
+    def land(self, units: Iterable[Unit], name: bytes = b"ext", timeout: float = 5.0):
+        """Host shape: ``fetch_to_host`` the units and wait for the landing's outcome."""
+        landing = self.backend.fetch_to_host(name, [u.name for u in units])
+        wait_until(lambda: landing.poll() is not None, timeout, what="landing outcome")
+        return landing
+
+    def place(self, landing, units: Iterable[Unit], name: bytes = b"ext"):
+        """Host shape: place the units out of ``landing`` and return the placement's outcome."""
+        return self.finish(landing.place(extent(units, name=name)))
+
+    def free_landing_slots(self) -> int:
+        assert self.landing_pool is not None
+        return len(self.landing_pool._free)
+
+    def inflight_slots_free(self) -> int:
+        """The inner backend's ``max_inflight_ops`` semaphore, as seen from outside."""
+        assert self.inner is not None
+        return self.inner._inflight._value
 
     def write(self, unit: Unit, data: bytes) -> None:
         write(self.segments(unit), data)
@@ -428,15 +482,51 @@ def make_rank(
     fingerprint: bytes = FINGERPRINT,
     **config_overrides,
 ) -> Rank:
-    """A backend over ``store`` (a fresh one when ``None``) with its pool registered."""
+    """A ``landing: device`` backend over ``store`` (a fresh one when ``None``) with its pool
+    registered. ``staging`` builds the inner backend of a host shape; ``make_host_rank`` is the
+    usual way there."""
     store = store if store is not None else FakeBlobStore()
     arena = MemoryArena(arena_bytes)
     resolver = ArenaResolver(arena)
     cfg = config(**config_overrides)
     backend = BlobStoreBackend(store, cfg, resolver, fingerprint, staging=staging)
-    rank = Rank(store, backend, arena, resolver)
-    if register and not cfg.stage_through_host:
+    rank = Rank(store, backend, arena, resolver, inner=backend)
+    if register and not cfg.lands_on_host:
         rank.registration = backend.register_pool(arena.address, arena.size)
+    return rank
+
+
+def make_host_rank(
+    store: FakeBlobStore | None = None,
+    *,
+    publish_slots: int = 4,
+    landing_slots: int = 4,
+    slot_bytes: int = SLOT,
+    landing_wait_timeout_s: float | None = 30.0,
+    arena_bytes: int = 1 << 16,
+    unit_bytes: Callable[[bytes], int] | None = None,
+    **config_overrides,
+) -> Rank:
+    """A ``landing: host`` backend: a traced publish pool, a landing pool over its own
+    ``FakeCopier``, and a ``HostLandingBlobBackend`` over the inner backend. The caller's pool is
+    deliberately not registered, as it would not be on a machine without GPUDirect. Units are
+    sized by ``unit_bytes``, by default from the rank's own table (``Rank.unit``)."""
+    store = store if store is not None else FakeBlobStore()
+    publish_pool, publish_copier, _, trace = make_staging(
+        store, slots=publish_slots, slot_bytes=slot_bytes
+    )
+    landing_pool = fake_open_staging(store, slot_bytes=slot_bytes, num_slots=landing_slots)
+    rank = make_rank(
+        store, arena_bytes=arena_bytes, staging=publish_pool, landing="host", **config_overrides
+    )
+    rank.backend = HostLandingBlobBackend(
+        rank.inner,
+        landing_pool,
+        unit_bytes or rank.unit_bytes,
+        landing_wait_timeout_s=landing_wait_timeout_s,
+    )
+    rank.publish_pool, rank.publish_copier, rank.trace = publish_pool, publish_copier, trace
+    rank.landing_pool, rank.landing_copier = landing_pool, landing_pool._copier
     return rank
 
 

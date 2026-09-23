@@ -260,17 +260,24 @@ class TransferRecord:
 ```mermaid
 stateDiagram-v2
     [*] --> PLANNED: fetch 由 advance 的计划阶段写入,publish 由 publish_committed_blocks 建立
-    PLANNED --> IN_FLIGHT: fetch 或 publish 返回 Attempt
-    PLANNED --> RELEASED: SubmissionRejected(什么都没逃出去)或请求被取消
+    PLANNED --> IN_FLIGHT: fetch 或 publish 返回 Attempt(device-direct)
+    PLANNED --> STAGING: LandsOnHost 来源:_decide 写下计划即 fetch_to_host,不占页
+    PLANNED --> RELEASED: 请求被取消(SubmissionRejected 见 §5:保留计划,下轮再发起)
+    STAGING --> STAGED: 全 rank 落到后端 host 内存(共识 TERMINAL,B = token_end);等调度器给页
+    STAGING --> FAILED: 任一 Failed,或 served 不全,或过期;释放落地区,不 quiesce、不退页
+    STAGED --> IN_FLIGHT: 调度器 reserve 后 launch_fetches 调 Landing.place(extent)
+    STAGED --> FAILED: 等页超过 landing_wait_timeout_s(票 FAILED),或放置被拒 3 次
     IN_FLIGHT --> LANDED: 当前 try 全部 Delivered 且 served 齐全且共识通过
     IN_FLIGHT --> FAILED: 任一 Failed,或 served 不全,或过期,或共识判失败
-    LANDED --> RELEASED: 释放点到达,quiesce 为 True
-    FAILED --> PLANNED: fetch 且 retries_left 大于 0,quiesce 后退页,请求回到 candidates
+    LANDED --> RELEASED: 释放点到达,quiesce 为 True(有落地区的在 unpark 后立即释放它)
+    FAILED --> PLANNED: fetch 且 retries_left 大于 0,quiesce 后退页(有落地区的释放它),请求回到 candidates
     FAILED --> RELEASED: 其余情况,quiesce 后退页或终结
     RELEASED --> [*]
 ```
 
 > 实现注:`RELEASED` 不是可观察状态。实现中"释放"是事件——记录出表(`_release` 直接 pop),`RecordState` 没有 `RELEASED` 值;下文的 "RELEASED" 读作"记录已释放(不在表中)"。
+>
+> `STAGING` / `STAGED` 只属于 `LandsOnHost` 来源的 fetch(`KV_TRANSFER_HOST_FIRST_FETCH_DESIGN.zh.md` §5):内容先落在后端自己的 host 内存(`TransferRecord.landing`),GPU 页在 `STAGED → IN_FLIGHT` 时才被预留,放置阶段就是今天的 `IN_FLIGHT`。这两个状态期间请求仍是 `CONTEXT_INIT`,`plan_fetch` 对 `STAGING` 答 `DEFER`、对 `STAGED` 答 `FetchPlan`;记录没有页,请求结束时不 hold、立即释放。
 
 答 `None` 或 `DEFER` 的候选**不建记录**;`DEFER` 的下一轮仍在 `candidates` 里。
 
@@ -333,7 +340,7 @@ gen-init 落地后到被真正调度之间,引擎还要准备 seq slot、sampler
 | draft 管理器的联合配对只看 prompt_len | 也按 `token_end` |
 | PP:rank 0 的 canonical schedule 带 gen-init 请求 id | 也带每个请求的 `token_end`;跟随者在收到 schedule 与重跑 `schedule_request` 之间由协调层把计划写进记录表。跟随者分配不足今天就没有处理,本设计不改善(`_pp_retry_until_can_schedule` 只查 `scheduled_batch`) |
 
-后端接不下(`SubmissionRejected`)时,`launch_fetches` 用 `give_back_fetch_pages` 把页退回,记录 `RELEASED`,请求回到 `candidates`,**不消耗** `retries_left`。这是唯一的背压机制。
+后端接不下(`SubmissionRejected`)时,`launch_fetches` 用 `give_back_fetch_pages` 把页退回,记录**保留计划、留在 `PLANNED`**(`LandsOnHost` 来源的放置被拒则留在 `STAGED`),请求回到 `candidates`,**不消耗** `retries_left`,计 `consecutive_launch_failures`,连续 3 次后本地算(`KV_TRANSFER_MULTI_RANK_PLAN.zh.md` S0 的修订;早先版本写作"记录 `RELEASED`")。这是 GPU 页方向唯一的背压机制。`LandsOnHost` 后端的容量不足不走这条路:它在后端内部排队等待;排队等待与等页都由 `landing_wait_timeout_s` 封顶(后端排队用同一配置值,经 `BackendBuildContext` 传入;host-first 设计 §4、§7)。
 
 ```mermaid
 stateDiagram-v2
@@ -667,7 +674,9 @@ sequenceDiagram
     ST-->>C: poll 给出 Delivered
 ```
 
-契约已经容得下:两条轴互不蕴含,SPEC 明确写了"对端可以停止碰内存而关于结果的消息仍在路上"。缓冲归后端自己管,协调层、Planner、KV v2 都不知道它存在;这和 C++ NIXL 路径上的 bounce buffer 是同一思路。
+契约已经容得下:两条轴互不蕴含,SPEC 明确写了"对端可以停止碰内存而关于结果的消息仍在路上"。缓冲归后端自己管;**publish 方向**协调层、Planner、KV v2 都不知道它存在,这和 C++ NIXL 路径上的 bounce buffer 是同一思路。
+
+**fetch 方向**经 `LandsOnHost` 以不透明的 `Landing` 可见(`KV_TRANSFER_HOST_FIRST_FETCH_DESIGN.zh.md`):实现了该能力的后端先把 unit 取到自己的 host 内存,协调层此时不预留 GPU 页(记录 `STAGING`),全 rank 落地后才请调度器给页(`STAGED`),再由 `Landing.place(extent)` 把落地区拷进页(`IN_FLIGHT`)。协调层只持有 `Landing` 句柄、只调它的 `poll / place / release`,仍然不见地址。blob 后端由 `landing: device | host` 选形态(TCP 缺省 `host`),KVCR 后端只有 `host` 一种。
 
 要把"早静默"变成"早放页",现在预定两件事,以后不必重做记录模型:(1) 契约加一个**非阻塞的静默查询**(待定 → §11 #4),`advance` 的收阶段顺手问;(2) **记录可以比请求活得久**:`hold_for_transfer` 在静默后就释放页并终结请求,记录留到结局出来只为 ctx 响应。
 
@@ -778,7 +787,9 @@ class StreamsLayers(Protocol):
 | effects | 协调层反向调用引擎的一组回调,§7.3 |
 | EngineQueue | 后端把需要 KV v2 的工作排进来、协调层在引擎线程执行的队列 |
 | worker 后端 / store 后端 | 见 §1.1 |
-| blob 后端 | store 后端在代码里的落点:`backends/blob/backend.py::BlobStoreBackend` 只依赖 `backends/blob/store.py::BlobStore` 协议,同时实现 `Fetches` / `Publishes` / `RegistersPools`;驱动在 `backends/blob/drivers/` 下各一个模块(`mooncake.py`:连接配置、状态码翻译、注册表工厂;`memory.py`:进程内字典存储),经共用的 `blob/factory.py::build_blob_backend` 建后端 |
+| blob 后端 | store 后端在代码里的落点:`backends/blob/backend.py::BlobStoreBackend` 只依赖 `backends/blob/store.py::BlobStore` 协议,同时实现 `Fetches` / `Publishes` / `RegistersPools`;驱动在 `backends/blob/drivers/` 下各一个模块(`mooncake.py`:连接配置、状态码翻译、注册表工厂;`memory.py`:进程内字典存储),经共用的 `blob/factory.py::build_blob_backend` 建后端。选项 `landing: device \| host`(缺省 `device`,mooncake 在 `protocol: tcp` 下缺省 `host`):`host` 形态是 `HostLandingBlobBackend`(`LandsOnHost`,组合一个 `BlobStoreBackend`),publish 经发布池 staged、fetch 先落到落地池再 `place`,KV 池不登记;`BackendHandle.landing` 与状态导出暴露解析后的值 |
+| LandsOnHost / Landing | 后端能力:fetch 先落在后端自己的 host 内存,再由 `Landing.place(extent)` 搬进页;`Landing.poll / place / release` 是协调层见到的全部(`KV_TRANSFER_HOST_FIRST_FETCH_DESIGN.zh.md` §4) |
+| STAGING / STAGED | `LandsOnHost` fetch 的两个记录状态:落地在飞(无页) / 全 rank 落地、等调度器给页(§4.1) |
 | parked | 请求处于 `KV_FETCH_IN_PROGRESS`,不被调度 |
 | canonical schedule | PP 下 rank 0 决定、跟随者照做的调度结果 |
 | ADP | attention data parallel |

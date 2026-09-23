@@ -16,6 +16,7 @@ from fakes import (  # noqa: E402
     FakeDist,
     FakeEngineQueue,
     FakeFetches,
+    FakeLandsOnHost,
     FakePublishes,
     FakeReader,
     FakeRequest,
@@ -72,3 +73,24 @@ def test_answered_probe_plans_from_the_store():
     plan = coordinator.plan_fetch(req)
     assert isinstance(plan, FetchPlan)
     assert plan.token_end == 28 and plan.source == "store"
+
+
+def test_a_host_landing_backend_with_a_hint_key_is_refused_at_assembly():
+    """A ``LandsOnHost`` backend is a store with one destination: it takes no routing hint."""
+    reader = FakeReader(groups=[full_attention(0)], tokens_per_block=TPB)
+    handle = BackendHandle(
+        name="host-store",
+        hint_key="ctx",
+        fetcher=FakeLandsOnHost(name="host-store"),
+        publisher=None,
+        pool_registrar=None,
+        close=lambda: None,
+        landing="host",
+    )
+    config = KVTransferConfig(
+        backends=(BackendEntry.from_dict({"name": "host-store", "type": "fake"}),)
+    )
+    with pytest.raises(ValueError, match="takes no hint_key"):
+        build_coordinator(
+            config, [handle], reader, RecordingEffects(), FakeEngineQueue(), FakeDist()
+        )

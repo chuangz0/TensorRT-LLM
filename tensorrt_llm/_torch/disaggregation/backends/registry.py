@@ -30,6 +30,7 @@ from typing import Callable, Mapping, Optional, Sequence
 
 from ..base.cache_backend import Fetches, Publishes, RegistersPools
 from ..base.region import RegionResolver
+from ..orchestration.kv_transfer.interfaces import LandsOnHost
 from .config import BackendEntry, KVTransferConfig
 
 __all__ = [
@@ -54,12 +55,24 @@ class BackendBuildContext:
         layout_fingerprint: Digest of the local memory layout, for content-addressed names.
         max_unit_bytes: The largest unit any layer group produces; sizes staging buffers.
         device_index: CUDA device of the KV pools, for backends that copy through host memory.
+        unit_bytes: Byte size of the unit called ``name``, for a backend that lands units in its
+            own memory before it knows their pages (``LandsOnHost``). ``None`` when the assembly
+            offers no such backend.
+        max_request_blocks: Blocks the longest request spans (``max_seq_len`` over
+            ``tokens_per_block``), so a backend can warn when its landing memory is short of
+            one fetch. ``None`` when unknown.
+        landing_wait_timeout_s: ``KVTransferConfig.landing_wait_timeout_s``, so a backend that
+            queues landings for its own memory bounds that wait with the same clock the
+            coordinator uses for pages; ``None`` for no bound. Defaults to the config's default.
     """
 
     resolver: RegionResolver
     layout_fingerprint: bytes
     max_unit_bytes: int
     device_index: Optional[int] = None
+    unit_bytes: Optional[Callable[[bytes], int]] = None
+    max_request_blocks: Optional[int] = None
+    landing_wait_timeout_s: Optional[float] = 30.0
 
 
 @dataclass(frozen=True)
@@ -75,15 +88,18 @@ class BackendHandle:
             with its transport; ``None`` when it reaches memory another way.
         close: Stops the backend and releases what it holds. Idempotent.
         counters: The backend's operational counters, for the status dump; empty if it has none.
+        landing: Where a fetch lands first: ``device`` (the caller's pages; a ``Fetches``) or
+            ``host`` (the backend's own memory; a ``LandsOnHost``). Shown in the status dump.
     """
 
     name: str
     hint_key: Optional[str]
-    fetcher: Optional[Fetches]
+    fetcher: Optional[Fetches | LandsOnHost]
     publisher: Optional[Publishes]
     pool_registrar: Optional[RegistersPools]
     close: Callable[[], None]
     counters: Callable[[], Mapping[str, int]] = field(default=dict)
+    landing: str = "device"
 
 
 BackendFactory = Callable[[BackendEntry, BackendBuildContext], BackendHandle]

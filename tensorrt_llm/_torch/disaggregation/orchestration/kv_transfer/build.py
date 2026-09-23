@@ -28,7 +28,7 @@ from ...backends.registry import BackendHandle
 from ...base.views import ResourceReader
 from ...remote_cache import FetchSource, Planner
 from .coordinator import KVTransferCoordinator
-from .interfaces import DistLike, EngineQueue, KVTransferEffects, PlanAuthority
+from .interfaces import DistLike, EngineQueue, KVTransferEffects, LandsOnHost, PlanAuthority
 
 __all__ = ["build_coordinator"]
 
@@ -45,7 +45,13 @@ def build_coordinator(
 ) -> KVTransferCoordinator:
     """One ``FetchSource`` per backend with a fetch role, in config (priority) order; one
     publisher per backend with a publish role; the config's timeouts on the planner and the
-    coordinator."""
+    coordinator. A ``LandsOnHost`` backend is a store with one destination, so it takes no
+    ``hint_key``."""
+    for handle in backends:
+        if isinstance(handle.fetcher, LandsOnHost) and handle.hint_key is not None:
+            raise ValueError(
+                f"backend {handle.name!r} lands fetches on the host and takes no hint_key"
+            )
     fetch_sources = [
         FetchSource(handle.name, handle.fetcher, handle.hint_key)
         for handle in backends

@@ -4,10 +4,11 @@
 
 Engine A computes a prompt of seven full blocks and publishes them to a Mooncake store over
 loopback TCP; engine B, started after A is gone, probes the store, fetches the seven
-blocks into pages the scheduler reserved for it, computes only the tail, and generates the same
-tokens. Counters come from the status dump each engine writes at ``close``. B runs with and
-without the overlap scheduler, which is what proves the overlap-loop publish point offers pages
-whose forward has completed.
+blocks into its own host memory first, places them into pages once the scheduler reserved them,
+computes only the tail, and generates the same tokens (the store runs over TCP, so the YAML's
+unset ``landing`` resolves to ``host``). Counters come from the status dump each engine writes at
+``close``. B runs with and without the overlap scheduler, which is what proves the overlap-loop
+publish point offers pages whose forward has completed.
 """
 
 import os
@@ -22,6 +23,7 @@ from mooncake_cluster import (
     dump_template,
     generate_ids,
     kv_cache_config,
+    landing_of,
     prompt_token_ids,
     read_status_dump,
     timeout_mark,
@@ -50,15 +52,35 @@ def run_engine(
     return tokens, read_status_dump(tmp_path, tag)
 
 
+RDMA_ENV = "KV_TRANSFER_E2E_RDMA"
+"""Set to ``1`` on a machine whose transport writes GPU memory directly: the explicit
+``landing: device`` variant registers the KV pools with Mooncake, which over loopback TCP is the
+unverified path (integration plan §11 #12), so it is skipped by default."""
+
+LANDINGS = [
+    pytest.param(None, id="landing_default_host"),
+    pytest.param(
+        "device",
+        id="landing_device",
+        marks=pytest.mark.skipif(
+            os.environ.get(RDMA_ENV) != "1", reason=f"{RDMA_ENV}=1 only: GPU-direct landing"
+        ),
+    ),
+]
+
+
 @timeout_mark(600)
+@pytest.mark.parametrize("landing", LANDINGS)
 @pytest.mark.parametrize(
     "disable_overlap_scheduler_b", [True, False], ids=["no_overlap", "overlap"]
 )
 def test_store_fetch_two_instances(
-    mooncake_cluster, tinyllama_path, tmp_path, monkeypatch, disable_overlap_scheduler_b
+    mooncake_cluster, tinyllama_path, tmp_path, monkeypatch, disable_overlap_scheduler_b, landing
 ):
-    namespace = f"e1-{os.getpid()}-{int(disable_overlap_scheduler_b)}"
-    config_path = write_kv_transfer_yaml(tmp_path, mooncake_cluster.master_address, namespace)
+    namespace = f"e1-{os.getpid()}-{int(disable_overlap_scheduler_b)}-{landing or 'default'}"
+    config_path = write_kv_transfer_yaml(
+        tmp_path, mooncake_cluster.master_address, namespace, landing=landing
+    )
     monkeypatch.setenv(KV_TRANSFER_CONFIG_ENV, config_path)
     prompt = prompt_token_ids()
 
@@ -79,6 +101,9 @@ def test_store_fetch_two_instances(
 
     assert dump_a["started_at"] < dump_b["started_at"]
     assert dump_a["pid"] != dump_b["pid"]
+    # With no landing in the YAML, the factory lands on host memory first over TCP.
+    expected_landing = landing or "host"
+    assert landing_of(dump_a) == expected_landing and landing_of(dump_b) == expected_landing
 
     counters_a = counters(dump_a)
     assert counters_a["publish_stored"] == NAMEABLE_BLOCKS, counters_a

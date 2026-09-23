@@ -271,8 +271,11 @@ def mooncake_cluster():
 # ---------------------------------------------------------------------------------------------
 
 
-def write_kv_transfer_yaml(directory, master_address: str, namespace: str, **overrides) -> str:
-    """The plan §8 file for a TCP loopback store that stages through host memory."""
+def write_kv_transfer_yaml(
+    directory, master_address: str, namespace: str, *, landing: str | None = None, **overrides
+) -> str:
+    """The plan §8 file for a TCP loopback store. ``landing`` is written only when given: left
+    out, the mooncake factory resolves it to ``host`` for TCP, which is what the tests assert."""
     backend = dict(
         name="shared-store",
         type="mooncake",
@@ -283,9 +286,10 @@ def write_kv_transfer_yaml(directory, master_address: str, namespace: str, **ove
         metadata_server="P2PHANDSHAKE",
         global_segment_size=0,
         local_buffer_size=256 << 20,
-        stage_through_host=True,
         namespace=namespace,
     )
+    if landing is not None:
+        backend["landing"] = landing
     config = dict(fetch_timeout_s=30, publish_timeout_s=60, probe_timeout_s=1.0, backends=[backend])
     config.update(overrides)
     path = os.path.join(str(directory), "kv_transfer.yaml")
@@ -313,6 +317,12 @@ def counters(dump: dict) -> dict:
     (backend,) = dump["backends"]
     assert backend["type"] == "mooncake" and backend["name"] == "shared-store"
     return backend["counters"]
+
+
+def landing_of(dump: dict) -> str:
+    """The landing the factory resolved for the one backend, as the status dump reports it."""
+    (backend,) = dump["backends"]
+    return backend["landing"]
 
 
 def assert_no_leftover_records(dump: dict) -> None:

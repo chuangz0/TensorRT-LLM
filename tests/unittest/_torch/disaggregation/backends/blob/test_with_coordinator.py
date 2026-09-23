@@ -29,6 +29,7 @@ from fakes import (  # noqa: E402
 from store_fakes import (  # noqa: E402
     FakeBlobStore,
     fill,
+    make_host_rank,
     make_rank,
     pattern,
     read,
@@ -258,3 +259,90 @@ def test_probe_outage_defers_within_budget_then_plans_local_without_a_fetch():
         assert gen.backend.counters.probe_hits == 0
     finally:
         gen.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# landing: host
+# ---------------------------------------------------------------------------------------------
+
+
+class HostSide(Side):
+    """A rank whose backend is the ``landing: host`` shape: fetches land in the backend's host
+    memory and are placed into pages once the scheduler has reserved them."""
+
+    def __init__(self, store: FakeBlobStore, *, publishes: bool) -> None:
+        self.rank = make_host_rank(
+            store,
+            arena_bytes=1 << 16,
+            landing_slots=BLOCKS + 2,
+            unit_bytes=lambda name: UNIT_BYTES,  # every unit is one block of one group
+        )
+        for o in range(BLOCKS + 2):
+            self.rank.resolver.add(0, o, UNIT_BYTES // 2, UNIT_BYTES // 2)
+        self.reader = FakeReader(groups=[full_attention(0)], tokens_per_block=TPB)
+        self.effects = RecordingEffects()
+        self.queue = FakeEngineQueue()
+        self.source = FetchSource("store", self.rank.backend, None)
+        self.planner = Planner([self.source], self.reader, TPB, probe_timeout_s=2.0)
+        self.coord = KVTransferCoordinator(
+            [self.source],
+            [self.rank.inner] if publishes else [],
+            self.planner,
+            self.reader,
+            self.effects,
+            self.queue,
+            FakeDist(),
+        )
+
+
+def test_host_landing_rank_lands_first_then_places_after_the_scheduler_reserves():
+    """The host-first flow end to end over a real backend: the plan starts the landing at once
+    (``STAGING``, no pages), ``plan_fetch`` defers until the content is on the host, then answers
+    the plan so the scheduler reserves pages, and ``launch_fetches`` places instead of fetching.
+    The landing is released in the same round the request is unparked."""
+    store = FakeBlobStore()
+    ctx, gen = Side(store, publishes=True), HostSide(store, publishes=False)
+    try:
+        req = FakeRequest(1, prompt_len=PROMPT)
+        _publish(ctx, req)
+
+        # Probe, then plan: the plan is decided and the landing started in the same advance.
+        gen.coord.advance([req], 0.0)
+        assert gen.coord.plan_fetch(req) is DEFER
+        counters = gen.backend.counters
+        wait_until(lambda: counters.probe_hits + counters.probe_misses == BLOCKS, what="probe")
+        gen.coord.advance([req], 1.0)
+        assert gen.coord.plan_fetch(req) is DEFER  # STAGING: no pages yet
+        assert gen.records()[0]["state"] == "STAGING" and gen.records()[0]["has_landing"]
+        assert gen.effects.names() == []  # nothing parked, nothing prepared
+        gen.fill_all(0xEE)
+
+        # Landed on the host: the record is STAGED and the plan is offered to the scheduler.
+        wait_until(lambda: counters.fetch_hits == BLOCKS, what="landing")
+        gen.coord.advance([req], 2.0)
+        plan = gen.coord.plan_fetch(req)
+        assert isinstance(plan, FetchPlan) and plan.token_end == END
+        assert gen.records()[0]["state"] == "STAGED"
+        assert gen.block_bytes(0) == bytes([0xEE]) * UNIT_BYTES  # pages untouched so far
+        assert gen.rank.backend.landings_held() == 1
+
+        # The scheduler reserved: launch places, parks, and the next round unparks + releases.
+        gen.coord.launch_fetches([req], 2.0)
+        assert gen.effects.names() == ["prepare_fetch_resources", "park_for_fetch"]
+        assert gen.records()[0]["state"] == "IN_FLIGHT"
+        gen.advance_until("unpark")
+        assert gen.effects.only("unpark") == [(req, END, False, None)]
+        assert gen.records()[0]["state"] == "LANDED"
+        assert not gen.records()[0]["has_landing"]
+        assert gen.rank.backend.landings_held() == 0
+        for o in range(BLOCKS):
+            assert gen.block_bytes(o) == pattern(o + 1, UNIT_BYTES) == ctx.block_bytes(o)
+        assert gen.block_bytes(BLOCKS) == bytes([0xEE]) * UNIT_BYTES
+        assert counters.fetch_hits == BLOCKS and counters.fetch_misses == 0
+        assert counters.failed_attempts == 0
+
+        gen.coord.notify_request_finished(req)
+        assert gen.records() == [] and gen.effects.count("hold_for_transfer") == 0
+    finally:
+        gen.close()
+        ctx.close()

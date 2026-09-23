@@ -7,12 +7,14 @@ bindings. No backend, no threads, no master."""
 import logging
 import sys
 import types
+from collections import deque
 
 import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.backends.blob.drivers import mooncake as driver_module  # noqa: E402
 from disaggregation.backends.blob.drivers.mooncake import (  # noqa: E402
+    LEASE_EXPIRED,
     OBJECT_NOT_FOUND,
     MooncakeBlobStore,
     MooncakeStoreConfig,
@@ -24,7 +26,8 @@ BUFFERS = [[(0x1000, 64)], [(0x2000, 40), (0x2100, 24)], [(0x3000, 16)]]
 
 
 class _FakeBindings:
-    """Shaped like ``MooncakeDistributedStore``; every method answers what the test set."""
+    """Shaped like ``MooncakeDistributedStore``; every method answers what the test set: a
+    fixed value, or, given a ``deque``, one entry per call."""
 
     def __init__(self, **answers):
         self.answers = answers
@@ -36,7 +39,8 @@ class _FakeBindings:
 
         def method(*args):
             self.calls.append((name, args))
-            return self.answers[name]
+            answer = self.answers[name]
+            return answer.popleft() if isinstance(answer, deque) else answer
 
         return method
 
@@ -78,6 +82,33 @@ def test_get_other_codes_and_short_reads_are_failed_and_a_wrong_count_raises():
     # An answer of the wrong length is a failed call: none of it can be trusted.
     with pytest.raises(BlobStoreError, match="batch_get_into_multi_buffers answered 1 of 3"):
         _store(batch_get_into_multi_buffers=[64]).get(KEYS, BUFFERS)
+
+
+def test_get_asks_once_more_for_the_keys_whose_lease_expired(caplog):
+    """``-707`` means the bytes landed but the lease the get itself took ran out before the check
+    after the transfer; a second get takes a fresh lease. Only the expired keys are asked again,
+    with their own buffers, and the retry's answer stands whatever it is."""
+    store = _store(
+        batch_get_into_multi_buffers=deque(
+            [[LEASE_EXPIRED, 64, LEASE_EXPIRED], [64, OBJECT_NOT_FOUND]]
+        )
+    )
+    with caplog.at_level(logging.INFO, logger=driver_module.__name__):
+        assert store.get(KEYS, BUFFERS) == [GetStatus.HIT, GetStatus.HIT, GetStatus.MISS]
+    first, second = store.raw.calls
+    assert first[1][0] == KEYS
+    assert second == (
+        "batch_get_into_multi_buffers",
+        ([KEYS[0], KEYS[2]], [[0x1000], [0x3000]], [[64], [16]]),
+    )
+    (record,) = [r for r in caplog.records if "lease expired" in r.getMessage()]
+    assert record.levelno == logging.INFO and "2 of 3" in record.getMessage()
+
+
+def test_get_retries_the_lease_once_only():
+    store = _store(batch_get_into_multi_buffers=deque([[LEASE_EXPIRED], [LEASE_EXPIRED]]))
+    assert store.get(KEYS[:1], BUFFERS[:1]) == [GetStatus.FAILED]
+    assert len(store.raw.calls) == 2
 
 
 def test_put_zero_is_stored_and_any_other_status_is_declined_with_the_codes_logged(caplog):

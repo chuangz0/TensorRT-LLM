@@ -5,8 +5,14 @@ the second driver exercises ``factory.py`` and the backend without any knobs in 
 
 import importlib
 
+import pytest
+
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.backends.blob.backend import BlobStoreBackend, BlobStoreConfig  # noqa: E402
+from disaggregation.backends.blob.backend import (  # noqa: E402
+    BlobStoreBackend,
+    BlobStoreConfig,
+    HostLandingBlobBackend,
+)
 from disaggregation.backends.blob.drivers.memory import MemoryBlobStore  # noqa: E402
 from disaggregation.backends.blob.store import GetStatus  # noqa: E402
 from disaggregation.backends.config import BackendEntry, KVTransferConfig  # noqa: E402
@@ -22,6 +28,7 @@ from store_fakes import (  # noqa: E402
     ArenaResolver,
     MemoryArena,
     extent,
+    fake_open_staging,
     pattern,
     read,
     wait_until,
@@ -89,3 +96,66 @@ def test_get_of_an_unknown_key_is_a_miss_that_leaves_the_destination_alone():
     assert store.holds(["nope"]) == [False]
     assert store.get(["nope"], [[dst]]) == [GetStatus.MISS]
     assert read([dst]) == bytes([0xEE]) * 64
+
+
+def test_memory_type_with_host_landing_builds_the_lands_on_host_shape(monkeypatch):
+    """``landing: host`` over the memory driver: the factory opens two host pools (here faked
+    over host arenas, so no torch), the fetcher is a ``HostLandingBlobBackend``, the publisher is
+    the inner backend, no pool is registered, and a unit round-trips publish -> land -> place."""
+    importlib.import_module("disaggregation.backends.blob.drivers.memory")
+    factory = importlib.import_module("disaggregation.backends.blob.factory")
+    monkeypatch.setattr(factory, "open_default_staging", fake_open_staging)
+    arena = MemoryArena(1 << 10)
+    resolver = ArenaResolver(arena)
+    src = resolver.add(0, 0, 64)
+    dst = resolver.add(0, 1, 64)
+    entry = BackendEntry.from_dict(
+        {
+            "name": "local",
+            "type": "memory",
+            "namespace": "t",
+            "landing": "host",
+            "staging_buffer_bytes": 256,
+            "landing_buffer_bytes": 512,
+        }
+    )
+    context = BackendBuildContext(
+        resolver=resolver,
+        layout_fingerprint=FINGERPRINT,
+        max_unit_bytes=64,
+        unit_bytes=lambda name: 64,
+    )
+    handles = build_backends(KVTransferConfig(backends=(entry,)), context)
+    try:
+        (handle,) = handles
+        assert handle.landing == "host" and handle.pool_registrar is None
+        assert isinstance(handle.fetcher, HostLandingBlobBackend)
+        assert isinstance(handle.publisher, BlobStoreBackend)
+        assert handle.counters()["landings_held"] == 0
+        write(src, pattern(3, 64))
+        attempt = handle.publisher.publish(extent([Unit(name=b"u", local_group=0, local=0)]))
+        handle.publisher.settle([attempt])
+        assert attempt.poll() == Delivered(frozenset({b"u"}))
+        landing = handle.fetcher.fetch_to_host(b"n", [b"u"])
+        wait_until(lambda: landing.poll() is not None)
+        assert landing.poll() == Delivered(frozenset({b"u"}))
+        assert handle.counters()["landings_held"] == 1
+        write(dst, bytes([0xEE]) * 64)
+        placed = landing.place(extent([Unit(name=b"u", local_group=0, local=1)]))
+        handle.fetcher.settle([placed])
+        assert placed.poll() == Delivered(frozenset({b"u"}))
+        assert read(dst) == pattern(3, 64)
+        landing.release()
+        assert handle.counters()["landings_held"] == 0
+    finally:
+        close_backends(handles)
+
+
+def test_host_landing_needs_the_assembly_to_size_units(monkeypatch):
+    importlib.import_module("disaggregation.backends.blob.drivers.memory")
+    entry = BackendEntry.from_dict({"name": "local", "type": "memory", "landing": "host"})
+    context = BackendBuildContext(
+        resolver=ArenaResolver(MemoryArena(64)), layout_fingerprint=FINGERPRINT, max_unit_bytes=64
+    )
+    with pytest.raises(ValueError, match="size units by name"):
+        build_backends(KVTransferConfig(backends=(entry,)), context)

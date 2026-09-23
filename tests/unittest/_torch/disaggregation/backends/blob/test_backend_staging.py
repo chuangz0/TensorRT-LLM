@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The host-staging path: ``HostStagingPool`` with a ``FakeCopier``, and the backend driving it.
+"""The host pools: ``plan_slot_geometry``, ``HostStagingPool`` with a ``FakeCopier`` (blocking
+and queued hand-out), and the ``landing: host`` backend driving its publish pool.
 
-The property that distinguishes staging is the design's §10.1 split: a staged publish is *quiet*
-(the caller's memory is no longer read) as soon as its units are gathered into host slots, before
-the store has taken them -- so ``quiesce`` answers ``True`` while ``poll`` still answers ``None``.
+The property that distinguishes a staged publish is the design's §10.1 split: it is *quiet* (the
+caller's memory is no longer read) as soon as its units are gathered into host slots, before the
+store has taken them -- so ``quiesce`` answers ``True`` while ``poll`` still answers ``None``. The
+fetch direction of this shape (landing, then placement) has its own suite,
+``test_host_landing_contract.py``; here it appears only where it shares a pool's mechanics.
 """
 
 import threading
@@ -17,56 +20,48 @@ from disaggregation.backends.blob.staging import HostStagingPool, plan_slot_geom
 from disaggregation.backends.blob.store import PutStatus  # noqa: E402
 from disaggregation.base.cache_backend import Delivered, Failed, SubmissionRejected  # noqa: E402
 from store_fakes import (  # noqa: E402
+    SLOT,
     FakeBlobStore,
     FakeCopier,
     MemoryArena,
     extent,
+    make_host_rank,
     make_rank,
-    make_staging,
     pattern,
     read,
     wait_until,
 )
 
-SLOT = 128
-
 
 def _staged(store=None, *, slots: int = 4, slot_bytes: int = SLOT, **overrides):
-    """A staging backend whose pinned buffer is a registered host arena; the caller's pool is
-    deliberately *not* registered, as it would not be on a machine without GPUDirect."""
-    store = store if store is not None else FakeBlobStore()
-    pool, copier, host, trace = make_staging(store, slots=slots, slot_bytes=slot_bytes)
-    rank = make_rank(store, stage_through_host=True, staging=pool, **overrides)
-    rank.pool, rank.copier, rank.host, rank.trace = pool, copier, host, trace
-    return rank
-
-
-def _slot_of(rank, address: int) -> int:
-    return (address - rank.pool.slot_address(0)) // rank.pool.slot_bytes
+    """A host-landing backend whose publish pool has ``slots`` traced slots."""
+    return make_host_rank(store, publish_slots=slots, slot_bytes=slot_bytes, **overrides)
 
 
 # ---- plan_slot_geometry ----
 
 
 @pytest.mark.parametrize(
-    "unit, batch, budget, expected",
+    "unit, cap, budget, expected",
     [
-        (100, 8, 1000, (100, 8)),  # budget covers the batch
-        (100, 8, 350, (100, 3)),  # budget bounds the batch
+        (100, 8, 1000, (100, 8)),  # budget covers the cap
+        (100, 8, 350, (100, 3)),  # budget bounds the cap
         (100, 8, 50, (100, 1)),  # budget below one unit still yields one slot
         (100, 8, 0, (100, 1)),
         (100, 1, 10**9, (100, 1)),
         (7, 3, 21, (7, 3)),
+        (100, None, 1000, (100, 10)),  # no cap: every slot the budget affords
+        (100, None, 50, (100, 1)),
     ],
 )
-def test_plan_slot_geometry(unit, batch, budget, expected):
-    assert plan_slot_geometry(unit, batch, budget) == expected
+def test_plan_slot_geometry(unit, cap, budget, expected):
+    assert plan_slot_geometry(unit, cap, budget) == expected
 
 
-@pytest.mark.parametrize("unit, batch", [(0, 8), (-1, 8), (100, 0), (100, -3)])
-def test_plan_slot_geometry_rejects_non_positive_inputs(unit, batch):
+@pytest.mark.parametrize("unit, cap", [(0, 8), (-1, 8), (100, 0), (100, -3)])
+def test_plan_slot_geometry_rejects_non_positive_inputs(unit, cap):
     with pytest.raises(ValueError):
-        plan_slot_geometry(unit, batch, 1000)
+        plan_slot_geometry(unit, cap, 1000)
 
 
 # ---- HostStagingPool alone ----
@@ -107,6 +102,60 @@ def test_pool_acquire_is_all_or_nothing_and_release_wakes_waiters():
     assert sorted(got[0]) == [0, 2]
 
 
+class _Waiter:
+    """A ``SlotWaiter`` that records what it was told and on which thread."""
+
+    def __init__(self) -> None:
+        self.granted: list[int] | None = None
+        self.refused: str | None = None
+        self.thread: int | None = None
+
+    def slots_granted(self, slots):
+        self.granted, self.thread = slots, threading.get_ident()
+
+    def slots_refused(self, reason):
+        self.refused, self.thread = reason, threading.get_ident()
+
+
+def test_pool_enqueue_grants_at_once_queues_in_order_and_grants_on_release():
+    host = MemoryArena(3 * 16)
+    pool = HostStagingPool(host.address, 16, 3, FakeCopier())
+    with pytest.raises(ValueError):
+        pool.enqueue(_Waiter(), 4)
+    first, second, third = _Waiter(), _Waiter(), _Waiter()
+    pool.enqueue(first, 2)
+    assert sorted(first.granted) == [0, 1] and first.thread == threading.get_ident()
+    pool.enqueue(second, 2)  # one free is not two: queued
+    pool.enqueue(third, 1)  # would fit, but waits behind ``second``: no overtaking
+    assert second.granted is None and third.granted is None
+    releaser = threading.Thread(target=pool.release, args=(first.granted,))
+    releaser.start()
+    releaser.join(5)
+    # The releasing thread granted both, in order, once the head's ask fit (the free list is
+    # ``[2, 0, 1]`` at that point: the returned slots go to its back).
+    assert sorted(second.granted) == [0, 2] and second.thread == releaser.ident
+    assert third.granted == [1] and third.thread == releaser.ident
+    assert pool.dequeue(second) is False  # already granted
+
+
+def test_pool_dequeue_drops_a_queued_waiter_and_shutdown_refuses_the_rest():
+    host = MemoryArena(16)
+    pool = HostStagingPool(host.address, 16, 1, FakeCopier())
+    holder, leaving, staying, late = _Waiter(), _Waiter(), _Waiter(), _Waiter()
+    pool.enqueue(holder, 1)
+    pool.enqueue(leaving, 1)
+    pool.enqueue(staying, 1)
+    assert pool.dequeue(leaving) is True and pool.dequeue(leaving) is False
+    pool.shutdown()
+    assert staying.refused == "staging pool is shut down" and leaving.refused is None
+    pool.enqueue(late, 1)
+    assert late.refused is not None and late.granted is None
+    pool.release(holder.granted)  # still allowed; nothing is granted to anyone
+    assert staying.granted is None and leaving.granted is None
+    with pytest.raises(RuntimeError):
+        pool.acquire(1)
+
+
 def test_gather_and_scatter_concatenate_in_resolver_order():
     host = MemoryArena(2 * 32)
     copier = FakeCopier()
@@ -131,7 +180,7 @@ def test_gather_and_scatter_concatenate_in_resolver_order():
         pool.gather(0, [s1, s2, (s1[0], 1)])
 
 
-# ---- backend over the pool ----
+# ---- backend over the publish pool ----
 
 
 def test_staged_publish_is_quiet_before_the_store_takes_it_then_delivered():
@@ -141,11 +190,12 @@ def test_staged_publish_is_quiet_before_the_store_takes_it_then_delivered():
         rank.write(b, pattern(2, 64))
         rank.store.block("put")
         attempt = rank.backend.publish(extent([a, b]))
-        rank.store.wait_entered(3)  # register (host), is_exist, put
+        rank.store.wait_entered(4)  # two pool registrations, is_exist, put
         # §10.1: gathered into slots and synced, so the caller's memory is out of the picture.
         assert rank.backend.quiesce([attempt]) is True
         assert attempt.poll() is None
-        assert rank.copier.kinds() == ["d2h", "d2h", "d2h"] and rank.copier.syncs == 1
+        assert rank.publish_copier.kinds() == ["d2h", "d2h", "d2h"]
+        assert rank.publish_copier.syncs == 1
         # Overwriting the source now must not change what the store receives.
         rank.fill(a, 0x00)
         rank.fill(b, 0x00)
@@ -157,31 +207,31 @@ def test_staged_publish_is_quiet_before_the_store_takes_it_then_delivered():
         # The store was handed host memory (the fake refuses unregistered buffers, and the
         # caller's pool is not registered), and every slot is free again afterwards.
         assert rank.store.count("put") == 1
-        assert sorted(rank.pool.acquire(rank.pool.num_slots)) == list(range(rank.pool.num_slots))
+        pool = rank.publish_pool
+        assert sorted(pool.acquire(pool.num_slots)) == list(range(pool.num_slots))
 
 
-def test_staged_fetch_round_trips_bytes_through_slots():
+def test_staged_publish_is_readable_by_a_direct_fetch_and_vice_versa():
+    """Same byte string either way: a unit's segments concatenated in resolver order."""
     store = FakeBlobStore()
     with make_rank(store) as direct, _staged(store) as staged:
-        # Publish directly from registered memory; fetch through host staging.
-        ua = direct.unit(0, 0, 40, 24)
-        direct.write(ua, pattern(7, 64))
-        assert isinstance(direct.finish(direct.backend.publish(extent([ua]))), Delivered)
-        ub, missing = staged.unit(0, 0, 40, 24), staged.unit(0, 1, 16)
-        staged.fill(ub, 0xEE)
-        staged.fill(missing, 0xEE)
-        outcome = staged.finish(staged.backend.fetch(extent([ub, missing])))
-        assert outcome == Delivered(frozenset({ub.name}))
-        assert staged.read(ub) == pattern(7, 64)
-        assert staged.read(missing) == bytes([0xEE]) * 16
-        assert staged.copier.kinds() == ["h2d", "h2d"] and staged.copier.syncs == 1
-        # And a staged publish is readable by a direct fetch: same byte string either way.
         uc = staged.unit(1, 0, 8, 8)
         staged.write(uc, pattern(9, 16))
         assert isinstance(staged.finish(staged.backend.publish(extent([uc]))), Delivered)
         ud = direct.unit(1, 0, 16)
         assert isinstance(direct.finish(direct.backend.fetch(extent([ud]))), Delivered)
         assert direct.read(ud) == pattern(9, 16)
+        # And the other way, through a landing: published directly, landed and placed here.
+        ua = direct.unit(0, 0, 40, 24)
+        direct.write(ua, pattern(7, 64))
+        assert isinstance(direct.finish(direct.backend.publish(extent([ua]))), Delivered)
+        ub = staged.unit(0, 0, 32, 32)
+        staged.fill(ub, 0xEE)
+        landing = staged.land([ub])
+        assert staged.place(landing, [ub]) == Delivered(frozenset({ub.name}))
+        assert staged.read(ub) == pattern(7, 64)
+        assert staged.landing_copier.kinds() == ["h2d", "h2d"]
+        landing.release()
 
 
 def test_slot_exhaustion_waits_then_proceeds():
@@ -189,19 +239,19 @@ def test_slot_exhaustion_waits_then_proceeds():
         a, b = rank.unit(0, 0, 32), rank.unit(0, 1, 32)
         rank.write(a, pattern(1, 32))
         rank.write(b, pattern(2, 32))
-        held = rank.pool.acquire(1)  # someone else has the only slot
+        held = rank.publish_pool.acquire(1)  # someone else has the only slot
         attempt = rank.backend.publish(extent([a, b]))
         # One slot bounds the batch to one unit, so the lookup is two calls; then the worker
         # parks in ``acquire`` until the slot comes back. (``close`` would wake it with a failed
         # delivery instead; see ``test_close_wakes_a_worker_parked_for_a_slot``.)
         wait_until(lambda: rank.store.count("holds") == 2)
         time.sleep(0.05)
-        assert attempt.poll() is None and rank.copier.copies == []
-        rank.pool.release(held)
+        assert attempt.poll() is None and rank.publish_copier.copies == []
+        rank.publish_pool.release(held)
         outcome = rank.finish(attempt)
         assert outcome == Delivered(frozenset({a.name, b.name}))
         # Two rounds of one slot: gather, put, gather, put.
-        assert rank.copier.kinds() == ["d2h", "d2h"]
+        assert rank.publish_copier.kinds() == ["d2h", "d2h"]
         puts = [args[0] for m, args in rank.store.calls if m == "put"]
         assert [len(k) for k in puts] == [1, 1]
         assert rank.store.objects[rank.key(b)] == pattern(2, 32)
@@ -212,7 +262,7 @@ def test_staged_publish_larger_than_the_pool_is_quiet_only_after_its_last_round(
         units = [rank.unit(0, i, 16) for i in range(3)]
         rank.store.block("put")
         attempt = rank.backend.publish(extent(units))
-        rank.store.wait_entered(3)  # first round's put is blocked; a third unit is still unread
+        rank.store.wait_entered(4)  # first round's put is blocked; a third unit is still unread
         quiet = []
         t = threading.Thread(target=lambda: quiet.append(rank.backend.quiesce([attempt])))
         t.start()
@@ -224,23 +274,16 @@ def test_staged_publish_larger_than_the_pool_is_quiet_only_after_its_last_round(
         assert isinstance(rank.finish(attempt), Delivered)
 
 
-def test_copier_exception_fails_the_delivery_and_frees_the_slots():
+def test_copier_exception_fails_the_publish_and_frees_the_slots():
     with _staged(slots=2) as rank:
         a = rank.unit(0, 0, 32)
-        rank.copier.fail_next("copy", RuntimeError("cudaMemcpyAsync failed"))
+        rank.publish_copier.fail_next("copy", RuntimeError("cudaMemcpyAsync failed"))
         outcome = rank.finish(rank.backend.publish(extent([a])))
         assert isinstance(outcome, Failed) and "cudaMemcpyAsync" in outcome.reason
         assert rank.store.count("put") == 0
         assert rank.backend.counters.failed_attempts == 1
-        assert sorted(rank.pool.acquire(2)) == [0, 1]  # nothing leaked
-        rank.pool.release([0, 1])
-        # On the fetch side too: a scatter that fails is Failed, not a short serve.
-        b = rank.unit(0, 1, 32)
-        rank.store.objects[rank.key(b)] = pattern(3, 32)
-        rank.copier.fail_next("copy")
-        outcome = rank.finish(rank.backend.fetch(extent([b])))
-        assert isinstance(outcome, Failed)
-        assert sorted(rank.pool.acquire(2)) == [0, 1]
+        assert sorted(rank.publish_pool.acquire(2)) == [0, 1]  # nothing leaked
+        rank.publish_pool.release([0, 1])
 
 
 def test_unit_larger_than_a_slot_fails_before_anything_moves():
@@ -248,13 +291,13 @@ def test_unit_larger_than_a_slot_fails_before_anything_moves():
         big = rank.unit(0, 0, 33)
         outcome = rank.backend.publish(extent([big])).poll()
         assert isinstance(outcome, Failed) and "exceeds the staging slot" in outcome.reason
-        assert rank.store.count("holds") == 0 and rank.copier.copies == []
+        assert rank.store.count("holds") == 0 and rank.publish_copier.copies == []
 
 
 def test_staging_does_not_require_the_callers_pool_to_be_registered():
     with _staged() as rank:
         assert rank.registration is None
-        assert rank.store.count("register_span") == 1  # the host buffer only
+        assert rank.store.count("register_span") == 2  # the two host pools only
         u = rank.unit(0, 0, 8)
         rank.write(u, pattern(1, 8))
         assert isinstance(rank.finish(rank.backend.publish(extent([u]))), Delivered)
@@ -274,16 +317,12 @@ def _sync_precedes_release(rank, thread: int) -> None:
     assert last_sync < last_release, events
 
 
-@pytest.mark.parametrize("direction", ["publish", "fetch"])
-def test_copier_failing_on_the_second_segment_syncs_before_releasing_the_slot(direction):
+def test_copier_failing_on_the_second_segment_of_a_publish_syncs_before_releasing_the_slot():
     with _staged(slots=2) as rank:
         two_seg = rank.unit(0, 0, 32, 32)
         rank.write(two_seg, pattern(1, 64))
-        if direction == "fetch":
-            rank.store.objects[rank.key(two_seg)] = pattern(1, 64)
-            rank.fill(two_seg, 0xEE)
-        rank.copier.fail_at("copy", 2, RuntimeError("cudaMemcpyAsync failed on segment 2"))
-        attempt = getattr(rank.backend, direction)(extent([two_seg]))
+        rank.publish_copier.fail_at("copy", 2, RuntimeError("cudaMemcpyAsync failed on segment 2"))
+        attempt = rank.backend.publish(extent([two_seg]))
         quiet = []
         t = threading.Thread(target=lambda: quiet.append(rank.backend.quiesce([attempt])))
         t.start()
@@ -297,35 +336,55 @@ def test_copier_failing_on_the_second_segment_syncs_before_releasing_the_slot(di
         assert len(copies) == 2  # the second call is recorded before it raises
         worker = next(t_ for e, t_, _ in rank.trace.events if e == "copy")
         _sync_precedes_release(rank, worker)
-        assert rank.copier.syncs >= 1
-        if direction == "publish":
-            assert rank.store.count("put") == 0
-        else:
-            # SPEC §5.2 inv. 3: after Failed the destination is undefined. Here the first segment
-            # landed and the second never did, which is exactly what the caller must not trust.
-            assert rank.read(two_seg) == pattern(1, 64)[:32] + bytes([0xEE]) * 32
+        assert rank.publish_copier.syncs >= 1
+        assert rank.store.count("put") == 0
         # Another delivery through the same slots afterwards sees nothing of the failed one.
         fresh = rank.unit(0, 1, 64)
         rank.write(fresh, pattern(7, 64))
         assert isinstance(rank.finish(rank.backend.publish(extent([fresh]))), Delivered)
         assert rank.store.objects[rank.key(fresh)] == pattern(7, 64)
-        rank.trace.check_slot_exclusivity(rank.pool)
+        rank.trace.check_slot_exclusivity(rank.publish_pool)
+
+
+def test_copier_failing_on_the_second_segment_of_a_placement_drains_and_leaves_memory_undefined():
+    store = FakeBlobStore()
+    with make_rank(store) as direct, _staged(store, slots=2) as rank:
+        src = direct.unit(0, 0, 64)
+        direct.write(src, pattern(1, 64))
+        assert isinstance(direct.finish(direct.backend.publish(extent([src]))), Delivered)
+        two_seg = rank.unit(0, 0, 32, 32)
+        rank.fill(two_seg, 0xEE)
+        landing = rank.land([two_seg])
+        rank.landing_copier.fail_at("copy", 2, RuntimeError("cudaMemcpyAsync failed on segment 2"))
+        attempt = landing.place(extent([two_seg]))
+        quiet = []
+        t = threading.Thread(target=lambda: quiet.append(rank.backend.quiesce([attempt])))
+        t.start()
+        outcome = rank.finish(attempt)
+        t.join(5)
+        assert isinstance(outcome, Failed) and "segment 2" in outcome.reason
+        assert quiet == [True]
+        assert rank.landing_copier.syncs == 1  # drained before the outcome
+        # SPEC §5.2 inv. 3: after Failed the destination is undefined. Here the first segment
+        # landed and the second never did, which is exactly what the caller must not trust.
+        assert rank.read(two_seg) == pattern(1, 64)[:32] + bytes([0xEE]) * 32
+        landing.release()
 
 
 # ---- interleaved staged traffic ----
 
 
-def test_interleaved_staged_publish_and_fetch_keep_slots_exclusive_and_bytes_exact():
+def test_interleaved_publish_and_landing_use_their_own_pools_and_keep_bytes_exact():
     store = FakeBlobStore()
     with (
         make_rank(store) as direct,
-        _staged(store, slots=2, transfer_batch_size=8, num_workers=2) as staged,
+        _staged(store, slots=2, landing_slots=6, transfer_batch_size=8, num_workers=2) as staged,
     ):
         # Six units to publish through staging (three rounds of two) ...
         outgoing = [staged.unit(0, i, 40, 24) for i in range(6)]
         for i, u in enumerate(outgoing):
             staged.write(u, pattern(10 + i, 64))
-        # ... and six others, published directly, to fetch through staging at the same time.
+        # ... and six others, published directly, to land and place at the same time.
         sources = [direct.unit(1, i, 64) for i in range(6)]
         for i, u in enumerate(sources):
             direct.write(u, pattern(20 + i, 64))
@@ -334,28 +393,23 @@ def test_interleaved_staged_publish_and_fetch_keep_slots_exclusive_and_bytes_exa
         for u in incoming:
             staged.fill(u, 0xEE)
 
-        # Force the overlap: the publish parks at its first put holding both slots, the fetch
-        # is submitted meanwhile and parks in ``acquire``; from the unblock on they interleave.
+        # Force the overlap: the publish parks at its first put holding both publish slots; the
+        # landing, submitted meanwhile, takes its slots from the other pool and completes.
         store.block("put")
         pub = staged.backend.publish(extent(outgoing, name=b"out"))
         wait_until(lambda: store.count("put") == 2, what="first put")
-        lookups = store.count("holds")
-        fetch = staged.backend.fetch(extent(incoming, name=b"in"))
-        wait_until(lambda: store.count("holds") > lookups, what="fetch lookup")
-        time.sleep(0.02)
-        assert fetch.poll() is None and pub.poll() is None
+        landing = staged.land(incoming, name=b"in")
+        assert landing.poll() == Delivered(frozenset(u.name for u in incoming))
+        assert pub.poll() is None
         store.unblock()
         assert staged.finish(pub) == Delivered(frozenset(u.name for u in outgoing))
-        assert staged.finish(fetch) == Delivered(frozenset(u.name for u in incoming))
+        assert staged.place(landing, incoming) == Delivered(frozenset(u.name for u in incoming))
         for i, u in enumerate(outgoing):
             assert store.objects[staged.key(u)] == pattern(10 + i, 64)
         for i, u in enumerate(incoming):
             assert staged.read(u) == pattern(20 + i, 64) == direct.read(sources[i])
-        staged.trace.check_slot_exclusivity(staged.pool)
-        threads = {t for e, t, _ in staged.trace.events if e == "copy"}
-        assert len(threads) == 2  # both workers took part
-        acquires = [a[0] for e, _, a in staged.trace.events if e == "acquire"]
-        assert all(len(s) <= 2 for s in acquires) and len(acquires) >= 6
+        staged.trace.check_slot_exclusivity(staged.publish_pool)
+        landing.release()
 
 
 # ---- close while parked or racing submissions ----
@@ -363,7 +417,7 @@ def test_interleaved_staged_publish_and_fetch_keep_slots_exclusive_and_bytes_exa
 
 def test_close_wakes_a_worker_parked_for_a_slot_and_fails_its_delivery():
     rank = _staged(slots=1)
-    held = rank.pool.acquire(1)
+    held = rank.publish_pool.acquire(1)
     u = rank.unit(0, 0, 32)
     attempt = rank.backend.publish(extent([u]))
     wait_until(lambda: rank.store.count("holds") == 1)
@@ -375,9 +429,9 @@ def test_close_wakes_a_worker_parked_for_a_slot_and_fails_its_delivery():
     assert isinstance(outcome, Failed) and "shut down" in outcome.reason
     assert rank.backend.quiesce([attempt]) is True
     assert rank.store.count("put") == 0
-    rank.pool.release(held)
+    rank.publish_pool.release(held)
     with pytest.raises(RuntimeError):
-        rank.pool.acquire(1)  # the pool stays shut
+        rank.publish_pool.acquire(1)  # the pool stays shut
 
 
 def test_submissions_racing_close_are_rejected_or_reach_an_outcome():
@@ -414,7 +468,7 @@ def test_submissions_racing_close_are_rejected_or_reach_an_outcome():
     for attempt in attempts:
         outcome = attempt.poll()
         assert isinstance(outcome, (Delivered, Failed))
-    rank.trace.check_slot_exclusivity(rank.pool)
+    rank.trace.check_slot_exclusivity(rank.publish_pool)
 
 
 # ---- the store declining or failing a put once the units are already in host slots ----
@@ -450,10 +504,11 @@ def test_staged_declined_put_for_a_unit_another_publisher_made_present_counts_as
         assert store.objects[staged.key(first)] == pattern(1, 32)
         assert store.objects[staged.key(second)] == pattern(2, 32)
         assert staged.backend.quiesce([attempt]) is True
-        every_slot = list(range(staged.pool.num_slots))
-        assert sorted(staged.pool.acquire(staged.pool.num_slots)) == every_slot  # all came back
-        staged.pool.release(every_slot)
-        staged.trace.check_slot_exclusivity(staged.pool)
+        pool = staged.publish_pool
+        every_slot = list(range(pool.num_slots))
+        assert sorted(pool.acquire(pool.num_slots)) == every_slot  # all came back
+        pool.release(every_slot)
+        staged.trace.check_slot_exclusivity(pool)
 
 
 def test_staged_put_raising_after_the_gather_fails_frees_the_slots_and_is_quiet():
@@ -469,10 +524,10 @@ def test_staged_put_raising_after_the_gather_fails_frees_the_slots_and_is_quiet(
         outcome = rank.finish(attempt)
         assert isinstance(outcome, Failed) and "store unreachable" in outcome.reason
         assert rank.store.objects == {}
-        assert rank.copier.kinds() == ["d2h", "d2h"]  # gathered before the put
+        assert rank.publish_copier.kinds() == ["d2h", "d2h"]  # gathered before the put
         assert rank.backend.counters.failed_attempts == 1
         assert rank.backend.counters.publish_stored == 0
         assert rank.backend.quiesce([attempt]) is True
-        assert sorted(rank.pool.acquire(2)) == [0, 1]
-        rank.pool.release([0, 1])
-        rank.trace.check_slot_exclusivity(rank.pool)
+        assert sorted(rank.publish_pool.acquire(2)) == [0, 1]
+        rank.publish_pool.release([0, 1])
+        rank.trace.check_slot_exclusivity(rank.publish_pool)

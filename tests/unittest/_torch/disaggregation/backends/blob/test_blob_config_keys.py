@@ -24,12 +24,14 @@ def test_backend_and_driver_fields_do_not_overlap():
     assert not BlobStoreConfig.fields() & MooncakeStoreConfig.fields()
 
 
-def test_backend_fields_are_the_documented_seven():
+def test_backend_fields_are_the_documented_nine():
     assert BlobStoreConfig.fields() == {
         "namespace",
         "transfer_batch_size",
-        "stage_through_host",
+        "landing",
         "staging_buffer_bytes",
+        "landing_buffer_bytes",
+        "max_landed_units",
         "max_inflight_ops",
         "num_workers",
         "probe_ttl_s",
@@ -41,9 +43,11 @@ def test_backend_fields_are_the_documented_seven():
 
 def test_backend_config_defaults_are_the_documented_ones():
     cfg = BlobStoreConfig()
-    assert cfg.namespace == "trtllm" and cfg.stage_through_host is False
+    assert cfg.namespace == "trtllm" and cfg.landing == "device" and not cfg.lands_on_host
     assert cfg.transfer_batch_size > 0 and cfg.max_inflight_ops > 0 and cfg.num_workers > 0
-    assert cfg.probe_ttl_s > 0 and cfg.staging_buffer_bytes > 0
+    assert cfg.probe_ttl_s > 0
+    assert cfg.staging_buffer_bytes == 512 << 20 and cfg.landing_buffer_bytes == 2 << 30
+    assert cfg.max_landed_units is None  # every slot the landing budget affords
 
 
 def test_configs_are_frozen():
@@ -61,7 +65,11 @@ def test_configs_are_frozen():
         ({"max_inflight_ops": 0}, "max_inflight_ops"),
         ({"num_workers": -2}, "num_workers"),
         ({"probe_ttl_s": 0.0}, "probe_ttl_s"),
-        ({"stage_through_host": True, "staging_buffer_bytes": 0}, "staging_buffer_bytes"),
+        ({"landing": "gpu"}, "landing"),
+        ({"landing": True}, "landing"),
+        ({"landing": "host", "staging_buffer_bytes": 0}, "staging_buffer_bytes"),
+        ({"landing": "host", "landing_buffer_bytes": 0}, "landing_buffer_bytes"),
+        ({"max_landed_units": 0}, "max_landed_units"),
     ],
 )
 def test_backend_config_rejects_bad_values_naming_the_field(overrides, needle):
@@ -69,21 +77,29 @@ def test_backend_config_rejects_bad_values_naming_the_field(overrides, needle):
         BlobStoreConfig(**overrides)
 
 
-def test_backend_config_leaves_staging_bytes_unchecked_when_not_staging():
-    cfg = BlobStoreConfig(staging_buffer_bytes=0)
-    assert cfg.staging_buffer_bytes == 0 and cfg.stage_through_host is False
+def test_backend_config_leaves_pool_budgets_unchecked_when_landing_on_device():
+    cfg = BlobStoreConfig(staging_buffer_bytes=0, landing_buffer_bytes=0)
+    assert cfg.staging_buffer_bytes == 0 and cfg.landing_buffer_bytes == 0
+    assert cfg.landing == "device"
 
 
 def test_backend_from_dict_round_trips_known_keys():
     raw = {
         "namespace": "ns",
         "num_workers": 3,
-        "stage_through_host": True,
+        "landing": "host",
         "staging_buffer_bytes": 4096,
+        "landing_buffer_bytes": 8192,
+        "max_landed_units": 16,
     }
     cfg = BlobStoreConfig.from_dict(raw)
     assert cfg == BlobStoreConfig(**raw)
-    assert cfg.num_workers == 3 and cfg.staging_buffer_bytes == 4096
+    assert cfg.num_workers == 3 and cfg.lands_on_host and cfg.max_landed_units == 16
+
+
+def test_backend_from_dict_refuses_the_old_staging_key():
+    with pytest.raises(ValueError, match="stage_through_host"):
+        BlobStoreConfig.from_dict({"stage_through_host": True})
 
 
 # ---- MooncakeStoreConfig ----

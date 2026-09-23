@@ -193,13 +193,13 @@ backends:                    # 顺序即 fetch 优先级(设计§7.4)
     protocol: tcp
     local_hostname: 127.0.0.1
     global_segment_size: 0   # 引擎不贡献段;对象活在 segment provider 里(§10 #8)
-    stage_through_host: true # TCP 传输走 pinned host 中转;KV pool 不登记
+    # landing 缺省:tcp 下工厂注入 host(fetch 先落后端 host 内存再放置,publish 经 pinned host 中转;KV pool 不登记);rdma 缺省 device
     namespace: tinyllama-e2e
 ```
 
 注册表:`BackendRegistry.factory_for(type)` 先查显式登记,再查内置表 `{"mooncake": ".blob.drivers.mooncake:build_mooncake_backend", "memory": ".blob.drivers.memory:build_memory_backend"}`(相对本包的字符串,import 延后到首次使用);未知类型报错并列出已知类型。加后端 = 新目录 + 内置表一行(或运行期 `register_backend_type`),协调层、hooks、调度器不改(设计§10.3)。
 
-`BackendHandle.pool_registrar`:`stage_through_host=False` 时为后端自身(`RegistersPools`),装配把 `KVv2RegionResolver.pool_memory_spans()` 逐个 `register_pool`;为 True 时 `None`。
+`BackendHandle.pool_registrar`:`landing: device` 时为后端自身(`RegistersPools`),装配把 `KVv2RegionResolver.pool_memory_spans()` 逐个 `register_pool`;`landing: host` 时 `None`。`BackendHandle.landing` 记录解析后的形态,状态导出的每个 backend 条目带 `"landing"`。装配还给 `BackendBuildContext` 两项:`unit_bytes(name)`(按 unit 名前缀的 group tag 查该组一页的字节数,host 落地的 get 需要精确大小)与 `max_request_blocks`(`max_seq_len / tokens_per_block`,落地池偏小时告警)。
 
 **测试用状态导出** `TRTLLM_KV_TRANSFER_STATUS_DUMP=/tmp/kvt-{pid}.json`:设了则 `KVTransferHooks.close()` 末尾写一份 JSON:`{"started_at": <attach 时的 time.time()>, "pid": …, "coordinator": status_dump(), "backends": [{"name", "type", "roles", "counters": {...}}]}`。`{pid}` 由 worker 进程号替换,同一测试里的多个 `LLM()` 各写一份;测试按 `started_at` 排序即得创建顺序。不设则不写;非测试代码不读它。
 
@@ -266,7 +266,7 @@ backends:                    # 顺序即 fetch 优先级(设计§7.4)
 | 9 | 空闲循环阻塞在请求队列 | §5 #6 |
 | 10 | 有 `FetchPlan` 的请求受 `if budget.requests_full: break`(460)影响,gen-init 因在更早阶段(371)不受 | 本轮接受(取回请求少);记录为后续项 |
 | 11 | fetch 落地的请求 `context_current_position` 直接来自游标,`unpark` 后 `py_ctx_pre_resize_cap` 必须清空 | `unpark` 置 `R.py_ctx_pre_resize_cap = None`,否则后续 `_revert_ctx_alloc` 会把已有内容的页缩掉 |
-| 12 | TCP 传输能否直接读 GPU 登记内存未验证 | e2e 用 `stage_through_host: true`;RDMA 路径留待有网卡的环境 |
+| 12 | TCP 传输能否直接读 GPU 登记内存未验证 | e2e 不写 `landing`,tcp 下解析为 `host`(status dump 断言);`landing: device` + RDMA 路径留待有网卡的环境 |
 | 13 | `revert_allocate_context` 3379 在 `py_ctx_pre_resize_cap is None` 时直接返回 True(`reserve_transfer_pages` 只在容量真的增长时才记 pre_cap;cache 被 resume 且容量够时不记)→ `give_back_fetch_pages` 后 cache 仍活着、history 仍声明到 `token_end`,而页里没有数据 | `give_back_fetch_pages` 在 `_revert_ctx_alloc` 之后检查:请求仍在 `kv_cache_map` 则 `kv_cache_manager.free_resources(R)` + `rewind_context_after_cache_drop(R, tpb)`(`llm_request.py` 1666;与 `_try_reserve_fetch_pages` 失败路径同一套),请求作为全新首 chunk 重入。full attention 下 history 偏高本身不致错(无 stale 范围、默认 `all_reusable` 不要求 commit 终点等于 history),但重新走 reuse match 更简单也更省页,统一丢弃 |
 | 14 | `unpark` 之后请求以 `is_first_context_chunk` 重入调度,`reserve_transfer_pages`/`prepare_context_cache` 会按 `num_committed_tokens` 重新落游标;若 `try_commit_blocks` 没提交到 `token_end`,游标会回退到本地 reuse 深度、已取回的页被当作未算 | 范围守卫加 `enable_block_reuse=True`(`try_commit_blocks` 5013 在关闭 reuse 时直接返回);`unpark` 在 commit 后检查 `kv_cache.num_committed_tokens >= token_end`,不满足记 WARNING 并继续(请求退回按本地 reuse 深度重算,慢但正确;不用硬断言,避免一个请求拖垮引擎) |
 | 15 | 时间来源不一致会让 deadline 与 probe 预算各说各话 | hooks 每轮取一次 `now = time.monotonic()` 传 `advance(candidates, now)`;协调层把同一个 `now` 传给 `Planner.decide(..., now=)`,Planner 没有自己的时钟;测试直接给 `advance`/`decide` 传 `now` |
@@ -315,7 +315,7 @@ e2e(`tests/unittest/_torch/disaggregation/e2e/`,GPU,`pytest.importorskip("moonca
 |---|---|---|
 | 环境变量到不了 MPI spawn 的 worker | 低(探索 smoke 已在 shell 设变量跑通;测试内 `monkeypatch.setenv` 早于 spawn) / E1 不装配 | S4 首项验证;备选见 §12 S4 |
 | 同进程两个 `LLM()` 的 worker 各写 dump 互相覆盖 | 低 | 路径含 `{pid}`,按 `started_at` 排序 |
-| TCP 传输 + GPU 直读不可用 | 中 / E1 fetch 失败 | `stage_through_host: true`(缺省即如此写在 e2e YAML) |
+| TCP 传输 + GPU 直读不可用 | 中 / E1 fetch 失败 | tcp 缺省 `landing: host`(e2e YAML 不写 `landing`,由 mooncake 工厂注入) |
 | overlap 下发布读到 forward 未写完的页 | 已消除 | §5 #4 只发布 `previous_batch`;E1 overlap 参数化 |
 | probe 时间预算太短,本地 Mooncake 也答不完 → 全部本地计算,`fetch_hits == 0` | 低 / E1 断言失败 | e2e 用 `probe_timeout_s: 1.0`;生产缺省 0.05 |
 | `hold_for_transfer` 与 disagg `start_transfer` 重复释放 seq slot | 无 | `SlotManager.remove_slot` 对未知 id 是 no-op(2694–2697);U2 五种情形 |

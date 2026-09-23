@@ -203,6 +203,7 @@ class KVTransferHooks:
                     "name": handle.name,
                     "type": entry.type,
                     "roles": sorted(entry.roles),
+                    "landing": handle.landing,
                     "counters": dict(handle.counters()),
                 }
                 for handle, entry in zip(self.backends, self._backend_entries)

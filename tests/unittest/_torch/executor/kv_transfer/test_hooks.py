@@ -1027,6 +1027,7 @@ class TestClose:
                 "name": "store",
                 "type": "fake",
                 "roles": ["fetch", "publish"],
+                "landing": "device",  # the handle's default; a host-first backend says "host"
                 "counters": {"fetch_hits": 1, "publish_stored": 1},  # read at dump time
             }
         ]

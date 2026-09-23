@@ -16,7 +16,6 @@ import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.backends.blob.backend import BlobStoreBackend, StoreCounters  # noqa: E402
-from disaggregation.backends.blob.staging import HostStagingPool  # noqa: E402
 from disaggregation.backends.blob.store import BlobStoreError  # noqa: E402
 from disaggregation.base.cache_backend import (  # noqa: E402
     Attempt,
@@ -30,10 +29,10 @@ from disaggregation.base.cache_backend import (  # noqa: E402
 )
 from store_fakes import (  # noqa: E402
     FakeBlobStore,
-    FakeCopier,
     MemoryArena,
     config,
     extent,
+    make_host_rank,
     make_rank,
     pattern,
     wait_until,
@@ -51,11 +50,9 @@ def test_backend_satisfies_the_three_protocols():
         assert isinstance(rank.backend.publish(extent([])), Attempt)
 
 
-def test_staging_requires_a_pool_when_configured():
+def test_host_landing_requires_a_publish_pool_when_configured():
     with pytest.raises(ValueError, match="HostStagingPool"):
-        BlobStoreBackend(
-            FakeBlobStore(), config(stage_through_host=True), lambda group, local: (), b"\x01"
-        )
+        BlobStoreBackend(FakeBlobStore(), config(landing="host"), lambda group, local: (), b"\x01")
 
 
 # ---- RegistersPools (§6.4) ----
@@ -450,10 +447,6 @@ def test_transfer_batch_size_bounds_one_store_call_not_one_delivery():
         assert [len(keys) for keys in exists] == [2, 2, 1]
 
 
-def test_staged_batch_is_bounded_by_the_slot_count():
-    store = FakeBlobStore()
-    host = MemoryArena(4 * 64)
-    store.register_span(host.address, host.size)
-    pool = HostStagingPool(host.address, 64, 3, FakeCopier())
-    with make_rank(store, stage_through_host=True, transfer_batch_size=64, staging=pool) as rank:
-        assert rank.backend._batch == 3
+def test_staged_batch_is_bounded_by_the_publish_pool_slot_count():
+    with make_host_rank(publish_slots=3, transfer_batch_size=64) as rank:
+        assert rank.inner._batch == 3
