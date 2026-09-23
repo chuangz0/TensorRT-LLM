@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -49,8 +50,12 @@ DEFAULT_METADATA_SERVER = "P2PHANDSHAKE"
 OBJECT_NOT_FOUND = -704
 """Status a get answers for a key the store does not hold; nothing is written."""
 
+MEMCPY_BYPASS_ENV = "MC_STORE_MEMCPY"
+"""Mooncake client switch that copies with ``memcpy`` instead of the transfer engine whenever the
+object lives in this process's own segment. Safe over host memory only: a GPU span crashes it."""
+
 _DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200
-_DEFAULT_LOCAL_BUFFER_SIZE = 1073741824
+_DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -64,7 +69,10 @@ class MooncakeStoreConfig:
         protocol: Transport protocol, ``"rdma"`` or ``"tcp"``.
         device_name: RDMA device filter handed to ``setup``; empty means any.
         global_segment_size: Bytes this process contributes to the pool.
-        local_buffer_size: Bytes of the client's own transfer buffer.
+        local_buffer_size: Bytes of the client's own transfer buffer. Only the bindings' copying
+            APIs (``put`` / ``get`` of Python bytes) stage through it; this driver uses the
+            zero-copy multi-buffer calls over registered memory, so the bindings' own default of
+            16 MiB is plenty.
     """
 
     master_server_address: str
@@ -126,7 +134,12 @@ class MooncakeBlobStore:
     a key the store already holds also answers ``0`` and keeps the first object (observed against
     a real master, see ``test_real_master.py``), so a publish that lost a race reads as ``STORED``
     rather than ``DECLINED``; the backend is correct either way because it asks ``holds`` before
-    every put. An answer of the wrong length from any batch call raises ``BlobStoreError``.
+    every put. One ``DECLINED`` worth knowing: a master started with ``--memory_allocator=cachelib``
+    stores an object as one allocation of at most one slab (16 MiB minus 16 bytes) and answers
+    ``-600`` for a unit whose segments add up to more, however they are cut; the default
+    ``offset`` allocator has no such cap (both observed against a real master, see
+    ``test_real_master.py``). An answer of the wrong length from any batch call raises
+    ``BlobStoreError``.
     """
 
     def __init__(self, client: Any, config: MooncakeStoreConfig) -> None:
@@ -234,8 +247,32 @@ class MooncakeBlobStore:
             logger.warning("%s: close answered status %d", self.describe(), status)
 
 
+def _memcpy_bypass_enabled() -> bool:
+    """Whether ``MC_STORE_MEMCPY`` turns the memcpy bypass on, read the way the Mooncake client
+    reads it: unset and the exact spellings of "off" mean off, any other value (including one
+    with surrounding whitespace) means on."""
+    value = os.environ.get(MEMCPY_BYPASS_ENV)
+    if value is None:
+        return False
+    return value.lower() not in ("0", "false", "no", "off")
+
+
+def _refuse_memcpy_bypass_over_device_memory(entry: BackendEntry) -> None:
+    """Without ``stage_through_host`` the backend registers the KV pools, which live on the GPU;
+    the bypass would ``memcpy`` them and crash the process. Staging registers pinned host memory
+    only, so the bypass is harmless there."""
+    if entry.options.get("stage_through_host", False) or not _memcpy_bypass_enabled():
+        return
+    raise ValueError(
+        f"backend {entry.name!r}: {MEMCPY_BYPASS_ENV}={os.environ[MEMCPY_BYPASS_ENV]!r} makes the "
+        "Mooncake client memcpy local objects, which crashes on the GPU memory this backend "
+        "registers; unset it or set stage_through_host: true"
+    )
+
+
 def build_mooncake_backend(entry: BackendEntry, context: BackendBuildContext) -> BackendHandle:
     """Factory for ``type: mooncake``."""
+    _refuse_memcpy_bypass_over_device_memory(entry)
     return build_blob_backend(
         entry,
         context,

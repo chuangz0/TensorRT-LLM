@@ -470,6 +470,48 @@ def test_mooncake_publish_only_entry_has_no_fetches(mooncake_module):
         close_backends(handles)
 
 
+@pytest.mark.parametrize("value", ["1", "true", " ON ", "surprise", " off "])
+def test_mooncake_refuses_the_memcpy_bypass_when_it_would_register_gpu_memory(
+    mooncake_module, monkeypatch, value
+):
+    """``MC_STORE_MEMCPY`` makes the Mooncake client ``memcpy`` local objects, which crashes on the
+    GPU pools a non-staging backend registers. The client reads any value but the spellings of
+    "off" as on, and so does the guard. Refused before a store is opened."""
+    _, opened = mooncake_module
+    monkeypatch.setenv("MC_STORE_MEMCPY", value)
+    config = KVTransferConfig(backends=(entry("store", "mooncake", **MOONCAKE_OPTIONS),))
+    with pytest.raises(ValueError, match="MC_STORE_MEMCPY.*stage_through_host"):
+        build_backends(config, make_context())
+    assert opened == []
+
+
+@pytest.mark.parametrize("value", [None, "0", "false", "OFF", "no"])
+def test_mooncake_allows_the_memcpy_bypass_when_it_is_off(mooncake_module, monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("MC_STORE_MEMCPY", raising=False)
+    else:
+        monkeypatch.setenv("MC_STORE_MEMCPY", value)
+    config = KVTransferConfig(backends=(entry("store", "mooncake", **MOONCAKE_OPTIONS),))
+    close_backends(build_backends(config, make_context()))
+
+
+def test_mooncake_allows_the_memcpy_bypass_when_staging_through_host(mooncake_module, monkeypatch):
+    """Staging registers pinned host memory only, which the bypass copies correctly."""
+    factory, _ = mooncake_module
+    monkeypatch.setenv("MC_STORE_MEMCPY", "1")
+    monkeypatch.setattr(
+        factory,
+        "open_default_staging",
+        lambda store, *, num_slots, **_: SimpleNamespace(
+            num_slots=num_slots, shutdown=lambda: None
+        ),
+    )
+    config = KVTransferConfig(
+        backends=(entry("store", "mooncake", stage_through_host=True, **MOONCAKE_OPTIONS),)
+    )
+    close_backends(build_backends(config, make_context()))
+
+
 def test_mooncake_refuses_a_hint_key_before_opening_a_store(mooncake_module):
     _, opened = mooncake_module
     config = KVTransferConfig(

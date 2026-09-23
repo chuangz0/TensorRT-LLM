@@ -183,6 +183,25 @@ def test_unregistered_destination_fails_before_the_store_is_asked(store):
         assert isinstance(src_again.poll(), Failed)
 
 
+def test_a_unit_of_one_20_mib_segment_round_trips_whole(store):
+    """A unit far larger than a cachelib slab, as one segment. The master's default ``offset``
+    allocator has no per-object cap, so the driver passes the segment through as one buffer and
+    the object comes back whole; ``drivers/mooncake.py`` documents the cachelib master that would
+    decline it instead."""
+    size = 20 << 20
+    src, dst = MemoryArena(size), MemoryArena(size)
+    store.register_span(src.address, size)
+    store.register_span(dst.address, size)
+    ctypes.memset(src.address, 0x5A, size)
+    ctypes.memset(dst.address, 0xEE, size)
+    key = f"t{os.getpid()}:big"
+    assert store.put([key], [[(src.address, size)]]) == [PutStatus.STORED]
+    assert store.raw.get_size(key) == size
+    assert store.get([key], [[(dst.address, size)]]) == [GetStatus.HIT]
+    assert ctypes.string_at(dst.address, size) == ctypes.string_at(src.address, size)
+    store.close()
+
+
 def test_putting_a_key_the_store_already_holds_keeps_the_first_object(store):
     """A canary for the driver's put translation, for the one case the backend meets in practice:
     a key another publisher stored first. The master answers ``0`` and keeps the first object;
