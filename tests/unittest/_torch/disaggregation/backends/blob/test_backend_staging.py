@@ -14,10 +14,11 @@ import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.backends.blob.staging import HostStagingPool, plan_slot_geometry  # noqa: E402
+from disaggregation.backends.blob.store import PutStatus  # noqa: E402
 from disaggregation.base.cache_backend import Delivered, Failed, SubmissionRejected  # noqa: E402
 from store_fakes import (  # noqa: E402
+    FakeBlobStore,
     FakeCopier,
-    FakeStoreClient,
     MemoryArena,
     extent,
     make_rank,
@@ -30,12 +31,12 @@ from store_fakes import (  # noqa: E402
 SLOT = 128
 
 
-def _staged(client=None, *, slots: int = 4, slot_bytes: int = SLOT, **overrides):
+def _staged(store=None, *, slots: int = 4, slot_bytes: int = SLOT, **overrides):
     """A staging backend whose pinned buffer is a registered host arena; the caller's pool is
     deliberately *not* registered, as it would not be on a machine without GPUDirect."""
-    client = client if client is not None else FakeStoreClient()
-    pool, copier, host, trace = make_staging(client, slots=slots, slot_bytes=slot_bytes)
-    rank = make_rank(client, stage_through_host=True, staging=pool, **overrides)
+    store = store if store is not None else FakeBlobStore()
+    pool, copier, host, trace = make_staging(store, slots=slots, slot_bytes=slot_bytes)
+    rank = make_rank(store, stage_through_host=True, staging=pool, **overrides)
     rank.pool, rank.copier, rank.host, rank.trace = pool, copier, host, trace
     return rank
 
@@ -138,9 +139,9 @@ def test_staged_publish_is_quiet_before_the_store_takes_it_then_delivered():
         a, b = rank.unit(0, 0, 64), rank.unit(0, 1, 40, 24)
         rank.write(a, pattern(1, 64))
         rank.write(b, pattern(2, 64))
-        rank.client.block("batch_put_from_multi_buffers")
+        rank.store.block("put")
         attempt = rank.backend.publish(extent([a, b]))
-        rank.client.wait_entered(3)  # register (host), is_exist, put
+        rank.store.wait_entered(3)  # register (host), is_exist, put
         # §10.1: gathered into slots and synced, so the caller's memory is out of the picture.
         assert rank.backend.quiesce([attempt]) is True
         assert attempt.poll() is None
@@ -148,20 +149,20 @@ def test_staged_publish_is_quiet_before_the_store_takes_it_then_delivered():
         # Overwriting the source now must not change what the store receives.
         rank.fill(a, 0x00)
         rank.fill(b, 0x00)
-        rank.client.unblock()
+        rank.store.unblock()
         outcome = rank.finish(attempt)
         assert outcome == Delivered(frozenset({a.name, b.name}))
-        assert rank.client.objects[rank.key(a)] == pattern(1, 64)
-        assert rank.client.objects[rank.key(b)] == pattern(2, 64)
+        assert rank.store.objects[rank.key(a)] == pattern(1, 64)
+        assert rank.store.objects[rank.key(b)] == pattern(2, 64)
         # The store was handed host memory (the fake refuses unregistered buffers, and the
         # caller's pool is not registered), and every slot is free again afterwards.
-        assert rank.client.count("batch_put_from_multi_buffers") == 1
+        assert rank.store.count("put") == 1
         assert sorted(rank.pool.acquire(rank.pool.num_slots)) == list(range(rank.pool.num_slots))
 
 
 def test_staged_fetch_round_trips_bytes_through_slots():
-    client = FakeStoreClient()
-    with make_rank(client) as direct, _staged(client) as staged:
+    store = FakeBlobStore()
+    with make_rank(store) as direct, _staged(store) as staged:
         # Publish directly from registered memory; fetch through host staging.
         ua = direct.unit(0, 0, 40, 24)
         direct.write(ua, pattern(7, 64))
@@ -193,7 +194,7 @@ def test_slot_exhaustion_waits_then_proceeds():
         # One slot bounds the batch to one unit, so the lookup is two calls; then the worker
         # parks in ``acquire`` until the slot comes back. (``close`` would wake it with a failed
         # delivery instead; see ``test_close_wakes_a_worker_parked_for_a_slot``.)
-        wait_until(lambda: rank.client.count("batch_is_exist") == 2)
+        wait_until(lambda: rank.store.count("holds") == 2)
         time.sleep(0.05)
         assert attempt.poll() is None and rank.copier.copies == []
         rank.pool.release(held)
@@ -201,23 +202,23 @@ def test_slot_exhaustion_waits_then_proceeds():
         assert outcome == Delivered(frozenset({a.name, b.name}))
         # Two rounds of one slot: gather, put, gather, put.
         assert rank.copier.kinds() == ["d2h", "d2h"]
-        puts = [args[0] for m, args in rank.client.calls if m == "batch_put_from_multi_buffers"]
+        puts = [args[0] for m, args in rank.store.calls if m == "put"]
         assert [len(k) for k in puts] == [1, 1]
-        assert rank.client.objects[rank.key(b)] == pattern(2, 32)
+        assert rank.store.objects[rank.key(b)] == pattern(2, 32)
 
 
 def test_staged_publish_larger_than_the_pool_is_quiet_only_after_its_last_round():
     with _staged(slots=2) as rank:
         units = [rank.unit(0, i, 16) for i in range(3)]
-        rank.client.block("batch_put_from_multi_buffers")
+        rank.store.block("put")
         attempt = rank.backend.publish(extent(units))
-        rank.client.wait_entered(3)  # first round's put is blocked; a third unit is still unread
+        rank.store.wait_entered(3)  # first round's put is blocked; a third unit is still unread
         quiet = []
         t = threading.Thread(target=lambda: quiet.append(rank.backend.quiesce([attempt])))
         t.start()
         time.sleep(0.05)
         assert t.is_alive()
-        rank.client.unblock()
+        rank.store.unblock()
         t.join(5)
         assert quiet == [True]
         assert isinstance(rank.finish(attempt), Delivered)
@@ -229,13 +230,13 @@ def test_copier_exception_fails_the_delivery_and_frees_the_slots():
         rank.copier.fail_next("copy", RuntimeError("cudaMemcpyAsync failed"))
         outcome = rank.finish(rank.backend.publish(extent([a])))
         assert isinstance(outcome, Failed) and "cudaMemcpyAsync" in outcome.reason
-        assert rank.client.count("batch_put_from_multi_buffers") == 0
+        assert rank.store.count("put") == 0
         assert rank.backend.counters.failed_attempts == 1
         assert sorted(rank.pool.acquire(2)) == [0, 1]  # nothing leaked
         rank.pool.release([0, 1])
         # On the fetch side too: a scatter that fails is Failed, not a short serve.
         b = rank.unit(0, 1, 32)
-        rank.client.objects[rank.key(b)] = pattern(3, 32)
+        rank.store.objects[rank.key(b)] = pattern(3, 32)
         rank.copier.fail_next("copy")
         outcome = rank.finish(rank.backend.fetch(extent([b])))
         assert isinstance(outcome, Failed)
@@ -247,17 +248,17 @@ def test_unit_larger_than_a_slot_fails_before_anything_moves():
         big = rank.unit(0, 0, 33)
         outcome = rank.backend.publish(extent([big])).poll()
         assert isinstance(outcome, Failed) and "exceeds the staging slot" in outcome.reason
-        assert rank.client.count("batch_is_exist") == 0 and rank.copier.copies == []
+        assert rank.store.count("holds") == 0 and rank.copier.copies == []
 
 
 def test_staging_does_not_require_the_callers_pool_to_be_registered():
     with _staged() as rank:
         assert rank.registration is None
-        assert rank.client.count("register_buffer") == 1  # the host buffer only
+        assert rank.store.count("register_span") == 1  # the host buffer only
         u = rank.unit(0, 0, 8)
         rank.write(u, pattern(1, 8))
         assert isinstance(rank.finish(rank.backend.publish(extent([u]))), Delivered)
-        assert rank.client.objects[rank.key(u)] == pattern(1, 8)
+        assert rank.store.objects[rank.key(u)] == pattern(1, 8)
 
 
 # ---- copier failure part-way through a unit ----
@@ -279,7 +280,7 @@ def test_copier_failing_on_the_second_segment_syncs_before_releasing_the_slot(di
         two_seg = rank.unit(0, 0, 32, 32)
         rank.write(two_seg, pattern(1, 64))
         if direction == "fetch":
-            rank.client.objects[rank.key(two_seg)] = pattern(1, 64)
+            rank.store.objects[rank.key(two_seg)] = pattern(1, 64)
             rank.fill(two_seg, 0xEE)
         rank.copier.fail_at("copy", 2, RuntimeError("cudaMemcpyAsync failed on segment 2"))
         attempt = getattr(rank.backend, direction)(extent([two_seg]))
@@ -298,7 +299,7 @@ def test_copier_failing_on_the_second_segment_syncs_before_releasing_the_slot(di
         _sync_precedes_release(rank, worker)
         assert rank.copier.syncs >= 1
         if direction == "publish":
-            assert rank.client.count("batch_put_from_multi_buffers") == 0
+            assert rank.store.count("put") == 0
         else:
             # SPEC §5.2 inv. 3: after Failed the destination is undefined. Here the first segment
             # landed and the second never did, which is exactly what the caller must not trust.
@@ -307,7 +308,7 @@ def test_copier_failing_on_the_second_segment_syncs_before_releasing_the_slot(di
         fresh = rank.unit(0, 1, 64)
         rank.write(fresh, pattern(7, 64))
         assert isinstance(rank.finish(rank.backend.publish(extent([fresh]))), Delivered)
-        assert rank.client.objects[rank.key(fresh)] == pattern(7, 64)
+        assert rank.store.objects[rank.key(fresh)] == pattern(7, 64)
         rank.trace.check_slot_exclusivity(rank.pool)
 
 
@@ -315,10 +316,10 @@ def test_copier_failing_on_the_second_segment_syncs_before_releasing_the_slot(di
 
 
 def test_interleaved_staged_publish_and_fetch_keep_slots_exclusive_and_bytes_exact():
-    client = FakeStoreClient()
+    store = FakeBlobStore()
     with (
-        make_rank(client) as direct,
-        _staged(client, slots=2, transfer_batch_size=8, num_workers=2) as staged,
+        make_rank(store) as direct,
+        _staged(store, slots=2, transfer_batch_size=8, num_workers=2) as staged,
     ):
         # Six units to publish through staging (three rounds of two) ...
         outgoing = [staged.unit(0, i, 40, 24) for i in range(6)]
@@ -335,19 +336,19 @@ def test_interleaved_staged_publish_and_fetch_keep_slots_exclusive_and_bytes_exa
 
         # Force the overlap: the publish parks at its first put holding both slots, the fetch
         # is submitted meanwhile and parks in ``acquire``; from the unblock on they interleave.
-        client.block("batch_put_from_multi_buffers")
+        store.block("put")
         pub = staged.backend.publish(extent(outgoing, name=b"out"))
-        wait_until(lambda: client.count("batch_put_from_multi_buffers") == 2, what="first put")
-        lookups = client.count("batch_is_exist")
+        wait_until(lambda: store.count("put") == 2, what="first put")
+        lookups = store.count("holds")
         fetch = staged.backend.fetch(extent(incoming, name=b"in"))
-        wait_until(lambda: client.count("batch_is_exist") > lookups, what="fetch lookup")
+        wait_until(lambda: store.count("holds") > lookups, what="fetch lookup")
         time.sleep(0.02)
         assert fetch.poll() is None and pub.poll() is None
-        client.unblock()
+        store.unblock()
         assert staged.finish(pub) == Delivered(frozenset(u.name for u in outgoing))
         assert staged.finish(fetch) == Delivered(frozenset(u.name for u in incoming))
         for i, u in enumerate(outgoing):
-            assert client.objects[staged.key(u)] == pattern(10 + i, 64)
+            assert store.objects[staged.key(u)] == pattern(10 + i, 64)
         for i, u in enumerate(incoming):
             assert staged.read(u) == pattern(20 + i, 64) == direct.read(sources[i])
         staged.trace.check_slot_exclusivity(staged.pool)
@@ -365,7 +366,7 @@ def test_close_wakes_a_worker_parked_for_a_slot_and_fails_its_delivery():
     held = rank.pool.acquire(1)
     u = rank.unit(0, 0, 32)
     attempt = rank.backend.publish(extent([u]))
-    wait_until(lambda: rank.client.count("batch_is_exist") == 1)
+    wait_until(lambda: rank.store.count("holds") == 1)
     time.sleep(0.02)  # let the worker reach acquire
     start = time.monotonic()
     rank.backend.close()
@@ -373,7 +374,7 @@ def test_close_wakes_a_worker_parked_for_a_slot_and_fails_its_delivery():
     outcome = attempt.poll()
     assert isinstance(outcome, Failed) and "shut down" in outcome.reason
     assert rank.backend.quiesce([attempt]) is True
-    assert rank.client.count("batch_put_from_multi_buffers") == 0
+    assert rank.store.count("put") == 0
     rank.pool.release(held)
     with pytest.raises(RuntimeError):
         rank.pool.acquire(1)  # the pool stays shut
@@ -423,31 +424,31 @@ def test_staged_declined_put_for_a_unit_another_publisher_made_present_counts_as
     """Staged variant of the publish race: between our lookup and our put another publisher
     stores ``first``; the store declines our write of it. The unit is held under its name, so it
     is served, the slots go back, and the attempt is quiet."""
-    client = FakeStoreClient()
-    with make_rank(client) as other, _staged(client, slots=4) as staged:
+    store = FakeBlobStore()
+    with make_rank(store) as other, _staged(store, slots=4) as staged:
         first, second = staged.unit(0, 0, 32), staged.unit(0, 1, 32)
         staged.write(first, pattern(1, 32))
         staged.write(second, pattern(2, 32))
         theirs = other.unit(0, 0, 32)  # the same name from another rank's memory
         other.write(theirs, pattern(1, 32))
-        orig = client.batch_put_from_multi_buffers
+        orig = store.put
 
-        def raced_put(keys, ptrs, sizes):
-            client.batch_put_from_multi_buffers = orig  # one-shot: ``other`` needs the real one
+        def raced_put(keys, buffers):
+            store.put = orig  # one-shot: ``other`` needs the real one
             assert isinstance(other.finish(other.backend.publish(extent([theirs]))), Delivered)
-            results = list(orig(keys, ptrs, sizes))
-            results[keys.index(staged.key(first))] = -1
+            results = list(orig(keys, buffers))
+            results[keys.index(staged.key(first))] = PutStatus.DECLINED
             return results
 
-        client.batch_put_from_multi_buffers = raced_put
+        store.put = raced_put
         attempt = staged.backend.publish(extent([first, second]))
         outcome = staged.finish(attempt)
         assert outcome == Delivered(frozenset({first.name, second.name}))
         assert staged.backend.counters.publish_stored == 1
         assert staged.backend.counters.publish_raced == 1
         assert staged.backend.counters.failed_attempts == 0
-        assert client.objects[staged.key(first)] == pattern(1, 32)
-        assert client.objects[staged.key(second)] == pattern(2, 32)
+        assert store.objects[staged.key(first)] == pattern(1, 32)
+        assert store.objects[staged.key(second)] == pattern(2, 32)
         assert staged.backend.quiesce([attempt]) is True
         every_slot = list(range(staged.pool.num_slots))
         assert sorted(staged.pool.acquire(staged.pool.num_slots)) == every_slot  # all came back
@@ -463,11 +464,11 @@ def test_staged_put_raising_after_the_gather_fails_frees_the_slots_and_is_quiet(
         a, b = rank.unit(0, 0, 32), rank.unit(0, 1, 32)
         rank.write(a, pattern(1, 32))
         rank.write(b, pattern(2, 32))
-        rank.client.fail_next("batch_put_from_multi_buffers", RuntimeError("store unreachable"))
+        rank.store.fail_next("put", RuntimeError("store unreachable"))
         attempt = rank.backend.publish(extent([a, b]))
         outcome = rank.finish(attempt)
         assert isinstance(outcome, Failed) and "store unreachable" in outcome.reason
-        assert rank.client.objects == {}
+        assert rank.store.objects == {}
         assert rank.copier.kinds() == ["d2h", "d2h"]  # gathered before the put
         assert rank.backend.counters.failed_attempts == 1
         assert rank.backend.counters.publish_stored == 0

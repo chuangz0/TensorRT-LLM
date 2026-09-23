@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""``BlobStoreBackend`` over the real ``MooncakeDistributedStore`` and a ``mooncake_master``
-started for the test (TCP transport, P2P handshake, loopback). Skipped when the bindings or the
-master binary are missing.
+"""``BlobStoreBackend`` over ``MooncakeBlobStore`` on a real ``MooncakeDistributedStore`` and a
+``mooncake_master`` started for the test (TCP transport, P2P handshake, loopback). Skipped when
+the bindings or the master binary are missing.
 
 One backend stands for both ranks: a unit's coordinates are local, its name is not, so the same
 name is published from layer group 0 and fetched into layer group 1 of one process. That keeps
-one client per test, whose ``close`` the backend owns.
+one store per test, whose ``close`` the backend owns. Assertions about what the store itself
+holds go through ``store.raw``, the wrapped bindings object.
 """
 
 import ctypes
@@ -20,6 +21,11 @@ import time
 import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
+from disaggregation.backends.blob.drivers.mooncake import (  # noqa: E402
+    MooncakeBlobStore,
+    MooncakeStoreConfig,
+)
+from disaggregation.backends.blob.store import GetStatus, PutStatus  # noqa: E402
 from disaggregation.base.cache_backend import Delivered, Failed, Unit  # noqa: E402
 from store_fakes import MemoryArena, extent, make_rank, pattern, wait_until  # noqa: E402
 
@@ -89,18 +95,18 @@ def master_port():
 
 @pytest.fixture
 def store(master_port):
-    from mooncake.store import MooncakeDistributedStore
-
-    client = MooncakeDistributedStore()
-    status = client.setup(
-        "127.0.0.1", "P2PHANDSHAKE", 64 << 20, 16 << 20, "tcp", "", f"127.0.0.1:{master_port}"
+    config = MooncakeStoreConfig(
+        master_server_address=f"127.0.0.1:{master_port}",
+        local_hostname="127.0.0.1",
+        protocol="tcp",
+        global_segment_size=64 << 20,
+        local_buffer_size=16 << 20,
     )
-    assert status == 0, f"setup failed with {status}"
-    return client  # closed by the backend that owns it
+    return MooncakeBlobStore.open(config)  # closed by the backend that owns it
 
 
 def _rank(store, **overrides):
-    """A backend over the real client; source units in group 0, destinations in group 1."""
+    """A backend over the real store; source units in group 0, destinations in group 1."""
     rank = make_rank(store, arena_bytes=1 << 16, namespace=f"t{os.getpid()}", **overrides)
     return rank
 
@@ -112,7 +118,7 @@ def test_publish_then_fetch_round_trips_two_segment_units(store):
             rank.write(u, pattern(i + 1, 128))
         published = rank.finish(rank.backend.publish(extent(src, name=b"ctx")))
         assert published == Delivered(frozenset(u.name for u in src))
-        assert all(store.get_size(rank.key(u)) == 128 for u in src)
+        assert all(store.raw.get_size(rank.key(u)) == 128 for u in src)
 
         dst = []
         for i, u in enumerate(src):
@@ -142,7 +148,7 @@ def test_missing_unit_is_not_served_and_left_untouched(store):
         assert rank.read(dst_held) == pattern(5, 64)
         assert rank.read(dst_missing) == bytes([0xEE]) * 64
         assert rank.backend.counters.fetch_misses == 1
-        assert store.batch_is_exist([rank.key(dst_missing)]) == [0]
+        assert store.raw.batch_is_exist([rank.key(dst_missing)]) == [0]
 
 
 def test_probe_answers_what_the_store_holds(store):
@@ -175,3 +181,29 @@ def test_unregistered_destination_fails_before_the_store_is_asked(store):
         rank.registration.close()
         src_again = rank.backend.fetch(extent([Unit(name=held.name, local_group=0, local=0)]))
         assert isinstance(src_again.poll(), Failed)
+
+
+def test_putting_a_key_the_store_already_holds_keeps_the_first_object(store):
+    """A canary for the driver's put translation, for the one case the backend meets in practice:
+    a key another publisher stored first. The master answers ``0`` and keeps the first object;
+    ``drivers/mooncake.py`` documents that and translates ``0`` as ``STORED``. A master that
+    starts answering otherwise fails here, which is the cue to revisit that translation."""
+    with _rank(store) as rank:
+        first, second = rank.unit(0, 0, 64), rank.unit(0, 1, 64)
+        rank.write(first, pattern(3, 64))
+        rank.write(second, pattern(4, 64))
+        key = rank.key(first)
+        assert store.put([key], [rank.segments(first)]) == [PutStatus.STORED]
+        assert store.holds([key]) == [True]
+        ((address, size),) = rank.segments(second)
+        (status,) = store.raw.batch_put_from_multi_buffers([key], [[address]], [[size]])
+        assert status == 0, (
+            f"duplicate put answered {status}; revisit the DECLINED translation in "
+            "drivers/mooncake.py"
+        )
+        assert store.raw.get_size(key) == 64
+        rank.resolver.add(1, 0, 64)
+        dst = Unit(name=first.name, local_group=1, local=0)
+        rank.fill(dst, 0xEE)
+        assert store.get([key], [rank.segments(dst)]) == [GetStatus.HIT]
+        assert rank.read(dst) == pattern(3, 64)  # the first object, not the second put's bytes

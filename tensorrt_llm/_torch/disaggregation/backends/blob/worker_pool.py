@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A fixed pool of daemon worker threads for the store backend's blocking client calls.
+"""A fixed pool of daemon worker threads for the store backend's blocking store calls.
 
 The standard ``ThreadPoolExecutor`` joins its threads at interpreter exit, so a worker stuck in a
 store call that never returns would keep the process alive after the engine gave the backend up.

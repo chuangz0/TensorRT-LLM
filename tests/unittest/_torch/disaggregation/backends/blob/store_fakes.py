@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Fakes for the Mooncake store backend: an in-memory ``StoreClient``, host memory standing in
-for KV pages, and a ``Copier`` that moves bytes with ``memmove``.
+"""Fakes for the blob store backend: an in-process ``BlobStore`` with blocking and failing knobs,
+host memory standing in for KV pages, and a ``Copier`` that moves bytes with ``memmove``.
 
-``FakeStoreClient`` follows the return conventions of ``mooncake.store.MooncakeDistributedStore``
-as ``client.StoreClient`` documents them: statuses, not exceptions; ``-704`` for a key that is not
-there; one key is one object assembled from a buffer list. Every buffer handed to a put or a get
-must lie inside a span ``register_buffer`` accepted, otherwise that key answers a negative status
-and nothing is written (see ``UNREGISTERED`` for how this compares with the real client).
+``FakeBlobStore`` is the knobs (``block`` / ``fail_next`` / ``fail_at``, a call log) in front of
+a ``MemoryBlobStore``, the in-process driver, so the store logic lives in one place. That store
+answers ``FAILED`` for a buffer outside every registered span; the real store over TCP is laxer,
+but the backend refuses unregistered destinations itself, before the store is called, so neither
+behaviour is relied on.
 
 This module is named ``store_fakes`` rather than ``fakes`` because pytest's default import mode
 puts each test directory on ``sys.path``, and ``orchestration/kv_transfer/fakes.py`` already owns the name
@@ -22,26 +22,12 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Sequence
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.backends.blob.backend import BlobStoreBackend  # noqa: E402
-from disaggregation.backends.blob.mooncake import MooncakeStoreConfig  # noqa: E402
+from disaggregation.backends.blob.backend import BlobStoreBackend, BlobStoreConfig  # noqa: E402
+from disaggregation.backends.blob.drivers.memory import MemoryBlobStore  # noqa: E402
 from disaggregation.backends.blob.staging import HostStagingPool  # noqa: E402
+from disaggregation.backends.blob.store import GetStatus, PutStatus  # noqa: E402
 from disaggregation.base.cache_backend import CacheExtent, Unit  # noqa: E402
 from disaggregation.base.region import Segment  # noqa: E402
-
-MISSING = -704
-"""The status Mooncake answers for a key that is not in the store."""
-
-UNREGISTERED = -1
-"""The status this fake answers for a buffer outside every registered span.
-
-Stricter than the real client over TCP, which accepts unregistered buffers for both put and get
-(it goes through its own local buffer); over RDMA they cannot be reached. The backend does not
-rely on either: it refuses unregistered destinations itself, before the client is called.
-"""
-
-TOO_SMALL = -600
-TOO_LARGE = -800
-"""What the real client answers when the buffers of a get do not add up to the object's size."""
 
 FINGERPRINT = b"\x01layout"
 
@@ -125,7 +111,7 @@ class ArenaResolver:
 
 
 # ---------------------------------------------------------------------------------------------
-# Blocking / failing knobs shared by the client and the copier
+# Blocking / failing knobs shared by the store and the copier
 # ---------------------------------------------------------------------------------------------
 
 
@@ -198,121 +184,66 @@ class _Knobs:
 
 
 # ---------------------------------------------------------------------------------------------
-# Store client
+# Blob store
 # ---------------------------------------------------------------------------------------------
 
 
-class FakeStoreClient(_Knobs):
-    """An in-memory ``StoreClient``; see the module docstring for the conventions it follows."""
+class FakeBlobStore(_Knobs):
+    """The knobs in front of an in-memory ``BlobStore``: every protocol method passes the gate
+    (``block`` / ``fail_next`` / ``fail_at``, recorded in ``calls``) and then forwards to
+    ``inner``. ``objects`` / ``registered`` read through to it."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.objects: dict[str, bytes] = {}
-        self.registered: dict[int, int] = {}
-        """address -> size of every live registration."""
-        self.setup_args: tuple | None = None
+        self.inner = MemoryBlobStore()
         self.closed = 0
 
-    # -- StoreClient --
+    @property
+    def objects(self) -> dict[str, bytes]:
+        return self.inner.objects
 
-    def setup(self, *args) -> int:
-        self._enter("setup", *args)
-        self.setup_args = args
-        return 0
+    @property
+    def registered(self) -> dict[int, int]:
+        return self.inner.registered
 
-    def register_buffer(self, buffer_ptr: int, size: int) -> int:
-        self._enter("register_buffer", buffer_ptr, size)
-        with self._lock:
-            self.registered[buffer_ptr] = size
-        return 0
+    # -- BlobStore --
 
-    def unregister_buffer(self, buffer_ptr: int) -> int:
-        self._enter("unregister_buffer", buffer_ptr)
-        with self._lock:
-            return 0 if self.registered.pop(buffer_ptr, None) is not None else UNREGISTERED
+    def register_span(self, address: int, size: int) -> None:
+        self._enter("register_span", address, size)
+        self.inner.register_span(address, size)
 
-    def batch_is_exist(self, keys: Sequence[str]) -> list[int]:
-        self._enter("batch_is_exist", tuple(keys))
-        with self._lock:
-            return [1 if key in self.objects else 0 for key in keys]
+    def unregister_span(self, address: int, size: int) -> None:
+        self._enter("unregister_span", address, size)
+        self.inner.unregister_span(address, size)
 
-    def batch_put_from_multi_buffers(
-        self,
-        keys: Sequence[str],
-        all_buffer_ptrs: Sequence[Sequence[int]],
-        all_sizes: Sequence[Sequence[int]],
-    ) -> list[int]:
-        self._enter("batch_put_from_multi_buffers", tuple(keys))
-        results = []
-        for key, ptrs, sizes in zip(keys, all_buffer_ptrs, all_sizes):
-            if not self._all_registered(ptrs, sizes):
-                results.append(UNREGISTERED)
-                continue
-            data = b"".join(ctypes.string_at(p, s) for p, s in zip(ptrs, sizes))
-            with self._lock:
-                self.objects[key] = data
-            results.append(0)
-        return results
+    def holds(self, keys: Sequence[str]) -> list[bool]:
+        self._enter("holds", tuple(keys))
+        return self.inner.holds(keys)
 
-    def batch_get_into_multi_buffers(
-        self,
-        keys: Sequence[str],
-        all_buffer_ptrs: Sequence[Sequence[int]],
-        all_sizes: Sequence[Sequence[int]],
-    ) -> list[int]:
-        self._enter("batch_get_into_multi_buffers", tuple(keys))
-        results = []
-        for key, ptrs, sizes in zip(keys, all_buffer_ptrs, all_sizes):
-            with self._lock:
-                data = self.objects.get(key)
-            if data is None:
-                results.append(MISSING)
-                continue
-            if not self._all_registered(ptrs, sizes):
-                results.append(UNREGISTERED)
-                continue
-            total = sum(sizes)
-            if total != len(data):
-                # As the real client: the buffers must add up to the object exactly; nothing is
-                # written otherwise (-600 when they are too small, -800 when too large).
-                results.append(TOO_SMALL if total < len(data) else TOO_LARGE)
-                continue
-            offset = 0
-            for p, s in zip(ptrs, sizes):
-                ctypes.memmove(p, data[offset : offset + s], s)
-                offset += s
-            results.append(len(data))
-        return results
+    def put(self, keys: Sequence[str], buffers: Sequence[Sequence[Segment]]) -> list[PutStatus]:
+        self._enter("put", tuple(keys))
+        return self.inner.put(keys, buffers)
 
-    def get_size(self, key: str) -> int:
-        self._enter("get_size", key)
-        with self._lock:
-            data = self.objects.get(key)
-        return MISSING if data is None else len(data)
+    def get(self, keys: Sequence[str], buffers: Sequence[Sequence[Segment]]) -> list[GetStatus]:
+        self._enter("get", tuple(keys))
+        return self.inner.get(keys, buffers)
 
-    def close(self) -> int:
+    def close(self) -> None:
         self._enter("close")
         self.closed += 1
-        return 0
+        self.inner.close()
+
+    def describe(self) -> str:
+        return "fake"
 
     # -- knobs --
 
     def evict(self, *keys: str) -> None:
-        with self._lock:
-            for key in keys:
-                self.objects.pop(key, None)
+        for key in keys:
+            self.objects.pop(key, None)
 
     def evict_all(self) -> None:
-        with self._lock:
-            self.objects.clear()
-
-    def _all_registered(self, ptrs: Sequence[int], sizes: Sequence[int]) -> bool:
-        with self._lock:
-            spans = tuple(self.registered.items())
-        return all(
-            any(base <= p and p + s <= base + size for base, size in spans)
-            for p, s in zip(ptrs, sizes)
-        )
+        self.objects.clear()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -406,11 +337,11 @@ class TracingStagingPool(HostStagingPool):
 
 
 def make_staging(
-    client: FakeStoreClient, *, slots: int, slot_bytes: int
+    store: FakeBlobStore, *, slots: int, slot_bytes: int
 ) -> tuple[TracingStagingPool, FakeCopier, MemoryArena, Trace]:
     """A registered host arena cut into ``slots`` traced slots over a traced ``FakeCopier``."""
     host = MemoryArena(slot_bytes * slots)
-    assert client.register_buffer(host.address, host.size) == 0
+    store.register_span(host.address, host.size)
     trace = Trace()
     copier = FakeCopier()
     copier.trace = trace
@@ -431,18 +362,18 @@ def extent(units: Iterable[Unit], name: bytes = b"ext", is_last: bool = True) ->
     return CacheExtent(name=name, units=tuple(units), is_last=is_last)
 
 
-def config(**overrides) -> MooncakeStoreConfig:
-    base = dict(master_server_address="fake:0", num_workers=2, probe_ttl_s=30.0)
+def config(**overrides) -> BlobStoreConfig:
+    base = dict(num_workers=2, probe_ttl_s=30.0)
     base.update(overrides)
-    return MooncakeStoreConfig(**base)
+    return BlobStoreConfig(**base)
 
 
 @dataclass
 class Rank:
     """One process's view: its arena, resolver, units and a backend over a (possibly shared)
-    client. ``unit(g, l, *sizes)`` carves memory and returns the ``Unit`` naming it."""
+    store. ``unit(g, l, *sizes)`` carves memory and returns the ``Unit`` naming it."""
 
-    client: FakeStoreClient
+    store: FakeBlobStore
     backend: BlobStoreBackend
     arena: MemoryArena
     resolver: ArenaResolver
@@ -477,19 +408,19 @@ class Rank:
 
     # ``with make_rank() as rank:`` closes the backend inside the test body. The repository's
     # ``threadleak`` check runs before fixture teardown, so a backend closed there would count
-    # its ``mooncake-store_N`` workers as leaked; closing here also asserts ``close`` joins them.
+    # its ``blob-store-{i}`` workers as leaked; closing here also asserts ``close`` joins them.
     def __enter__(self) -> Rank:
         return self
 
     def __exit__(self, *exc) -> None:
-        unblock = getattr(self.client, "unblock", None)  # a real client has no gate
+        unblock = getattr(self.store, "unblock", None)  # a real store has no gate
         if unblock is not None:
             unblock()
         self.backend.close()
 
 
 def make_rank(
-    client: FakeStoreClient | None = None,
+    store: FakeBlobStore | None = None,
     *,
     arena_bytes: int = 1 << 16,
     register: bool = True,
@@ -497,13 +428,13 @@ def make_rank(
     fingerprint: bytes = FINGERPRINT,
     **config_overrides,
 ) -> Rank:
-    """A backend over ``client`` (a fresh one when ``None``) with its pool registered."""
-    client = client if client is not None else FakeStoreClient()
+    """A backend over ``store`` (a fresh one when ``None``) with its pool registered."""
+    store = store if store is not None else FakeBlobStore()
     arena = MemoryArena(arena_bytes)
     resolver = ArenaResolver(arena)
     cfg = config(**config_overrides)
-    backend = BlobStoreBackend(client, cfg, resolver, fingerprint, staging=staging)
-    rank = Rank(client, backend, arena, resolver)
+    backend = BlobStoreBackend(store, cfg, resolver, fingerprint, staging=staging)
+    rank = Rank(store, backend, arena, resolver)
     if register and not cfg.stage_through_host:
         rank.registration = backend.register_pool(arena.address, arena.size)
     return rank

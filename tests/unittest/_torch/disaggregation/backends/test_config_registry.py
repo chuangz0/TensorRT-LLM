@@ -4,7 +4,7 @@
 
 YAML -> ``KVTransferConfig`` validation, ``build_backends`` over a fake type, rollback on a failed
 build, ``close_backends`` tolerance, and the built-in ``mooncake`` entry: imported lazily, refusing
-a ``hint_key``, and built over a fake store client. Import-light like the ``kv_transfer`` suite:
+a ``hint_key``, and built over a fake blob store. Import-light like the ``kv_transfer`` suite:
 nothing here needs ``tensorrt_llm``.
 """
 
@@ -34,7 +34,7 @@ from disaggregation.backends.registry import (  # noqa: E402
     build_backends,
     close_backends,
 )
-from store_fakes import FINGERPRINT, ArenaResolver, FakeStoreClient, MemoryArena  # noqa: E402
+from store_fakes import FINGERPRINT, ArenaResolver, FakeBlobStore, MemoryArena  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 
@@ -334,7 +334,7 @@ def test_unknown_type_names_the_known_types():
     registry = BackendRegistry()
     registry.register_backend_type("fake", fake_factory)
     with pytest.raises(
-        ValueError, match=r"unknown kv transfer backend type 'nope'.*'fake'.*'mooncake'"
+        ValueError, match=r"unknown kv transfer backend type 'nope'.*'fake'.*'memory'.*'mooncake'"
     ):
         registry.factory_for("nope")
 
@@ -388,12 +388,12 @@ def test_importing_the_registry_does_not_import_the_mooncake_driver():
         """
         import sys
         import disaggregation.backends.registry as registry
-        assert "disaggregation.backends.blob.mooncake" not in sys.modules, "eager import"
+        assert "disaggregation.backends.blob.drivers.mooncake" not in sys.modules, "eager import"
         assert "disaggregation.backends.blob.backend" not in sys.modules, "eager import"
         factory = registry.BackendRegistry().factory_for("mooncake")
-        assert factory.__module__ == "disaggregation.backends.blob.mooncake"
+        assert factory.__module__ == "disaggregation.backends.blob.drivers.mooncake"
         assert factory.__name__ == "build_mooncake_backend"
-        assert "disaggregation.backends.blob.mooncake" in sys.modules
+        assert "disaggregation.backends.blob.drivers.mooncake" in sys.modules
         """
     )
     subprocess.run(
@@ -406,18 +406,21 @@ def test_importing_the_registry_does_not_import_the_mooncake_driver():
 
 @pytest.fixture
 def mooncake_module(monkeypatch):
-    """The driver module with its client opener replaced by a fake; yields (module, opened)."""
-    module = importlib.import_module("disaggregation.backends.blob.mooncake")
-    opened: list[FakeStoreClient] = []
+    """The driver module with ``MooncakeBlobStore.open`` replaced by a fake; yields
+    ``(factory_module, opened)``: the shared factory module, whose ``open_default_staging`` the
+    staging tests replace, and the fake stores opened so far."""
+    driver = importlib.import_module("disaggregation.backends.blob.drivers.mooncake")
+    factory = importlib.import_module("disaggregation.backends.blob.factory")
+    opened: list[FakeBlobStore] = []
 
     def open_fake(config):
-        client = FakeStoreClient()
-        client.opened_with = config
-        opened.append(client)
-        return client
+        store = FakeBlobStore()
+        store.opened_with = config
+        opened.append(store)
+        return store
 
-    monkeypatch.setattr(module, "open_mooncake_client", open_fake)
-    return module, opened
+    monkeypatch.setattr(driver.MooncakeBlobStore, "open", open_fake)
+    return factory, opened
 
 
 MOONCAKE_OPTIONS = dict(
@@ -429,7 +432,7 @@ MOONCAKE_OPTIONS = dict(
 )
 
 
-def test_mooncake_factory_builds_a_blob_store_backend_over_the_opened_client(mooncake_module):
+def test_mooncake_factory_builds_a_blob_store_backend_over_the_opened_store(mooncake_module):
     _, opened = mooncake_module
     config = KVTransferConfig(backends=(entry("store", "mooncake", **MOONCAKE_OPTIONS),))
     handles = build_backends(config, make_context())
@@ -437,7 +440,6 @@ def test_mooncake_factory_builds_a_blob_store_backend_over_the_opened_client(moo
         assert len(opened) == 1
         assert opened[0].opened_with.master_server_address == "127.0.0.1:50051"
         assert opened[0].opened_with.protocol == "tcp"
-        assert opened[0].opened_with.stage_through_host is False
         handle = handles[0]
         assert handle.name == "store" and handle.hint_key is None
         assert isinstance(handle.fetcher, BlobStoreBackend)
@@ -464,7 +466,7 @@ def test_mooncake_publish_only_entry_has_no_fetches(mooncake_module):
         close_backends(handles)
 
 
-def test_mooncake_refuses_a_hint_key_before_opening_a_client(mooncake_module):
+def test_mooncake_refuses_a_hint_key_before_opening_a_store(mooncake_module):
     _, opened = mooncake_module
     config = KVTransferConfig(
         backends=(entry("store", "mooncake", hint_key="ctx", **MOONCAKE_OPTIONS),)
@@ -474,17 +476,32 @@ def test_mooncake_refuses_a_hint_key_before_opening_a_client(mooncake_module):
     assert opened == []
 
 
-def test_mooncake_refuses_unknown_options_before_opening_a_client(mooncake_module):
+def test_mooncake_refuses_unknown_options_before_opening_a_store(mooncake_module):
     _, opened = mooncake_module
     config = KVTransferConfig(
         backends=(entry("store", "mooncake", bogus_option=1, **MOONCAKE_OPTIONS),)
     )
-    with pytest.raises(ValueError, match="unknown MooncakeStoreConfig keys.*bogus_option"):
+    with pytest.raises(
+        ValueError, match=r"backend 'store' \(type mooncake\): unknown keys.*bogus_option"
+    ):
         build_backends(config, make_context())
     assert opened == []
 
 
-def test_mooncake_staging_failure_closes_the_client(mooncake_module, monkeypatch):
+def test_mooncake_reports_a_misspelt_backend_key_against_the_entry_not_the_driver(mooncake_module):
+    # ``namespce`` is neither side's key. The error names the entry and its type, not
+    # ``MooncakeStoreConfig``: the user wrote one flat entry and need not know the split.
+    _, opened = mooncake_module
+    config = KVTransferConfig(
+        backends=(entry("store", "mooncake", namespce="typo", **MOONCAKE_OPTIONS),)
+    )
+    with pytest.raises(ValueError, match=r"\(type mooncake\): unknown keys \['namespce'\]") as info:
+        build_backends(config, make_context())
+    assert "MooncakeStoreConfig" not in str(info.value)
+    assert opened == []
+
+
+def test_mooncake_staging_failure_closes_the_store(mooncake_module, monkeypatch):
     module, opened = mooncake_module
 
     def fail_staging(*args, **kwargs):
@@ -503,7 +520,7 @@ def test_mooncake_with_host_staging_registers_no_pools(mooncake_module, monkeypa
     module, opened = mooncake_module
     geometry = []
 
-    def fake_staging(client, *, slot_bytes, num_slots, device_index=None):
+    def fake_staging(store, *, slot_bytes, num_slots, device_index=None):
         geometry.append((slot_bytes, num_slots, device_index))
         return SimpleNamespace(num_slots=num_slots, shutdown=lambda: None)
 

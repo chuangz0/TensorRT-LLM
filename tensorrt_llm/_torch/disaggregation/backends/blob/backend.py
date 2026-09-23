@@ -14,16 +14,16 @@
 # limitations under the License.
 """A cache backend over a blob store: ``Fetches``, ``Publishes``, ``RegistersPools``.
 
-The class depends only on the ``StoreClient`` protocol; a driver such as ``mooncake.py`` opens
-the client and builds it. One store object per unit. A unit's segments go in as that object's
-buffer list, so it is stored whole or not at all, which is what per-unit atomic visibility needs
-(contract §6.3). Every
-delivery runs on the backend's own threads; they call the store client and, when staging, the
-copier, and nothing else. ``probe`` is answered the same way on a thread of its own: the first
-call queues the lookup and answers ``None``, a later call returns the answer once.
+The class depends only on the ``BlobStore`` protocol (``store.py``); a driver under ``drivers/``
+opens the store and ``factory.py`` builds the backend over it. One store object per unit. A
+unit's segments go in as that object's buffer list, so it is stored whole or not at all, which is
+what per-unit atomic visibility needs (contract §6.3). Every delivery runs on the backend's own
+threads; they call the store and, when staging, the copier, and nothing else. ``probe`` is
+answered the same way on a thread of its own: the first call queues the lookup and answers
+``None``, a later call returns the answer once.
 
-Reading a unit is two round trips: ``batch_is_exist`` then ``batch_get_into_multi_buffers``. The
-first tells a miss from a failure, which one negative get status could not; the contract forbids
+Reading a unit is two round trips: ``holds`` then ``get``. The first tells a miss from a failure
+(a lookup that cannot be answered raises, it never answers "absent"); the contract forbids
 reporting either as the other (§5.2). A unit that was present at the lookup and gone by the get is
 a miss (the store wrote nothing); any other trouble reading a present unit fails the whole
 attempt, because earlier batches of the same attempt may already have written their destinations
@@ -32,11 +32,12 @@ and the contract says that content is then undefined (§5.2 invariant 3).
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Mapping, Optional, Sequence, TypeVar
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Sequence, TypeVar
 
 from ...base.cache_backend import (
     Attempt,
@@ -49,15 +50,12 @@ from ...base.cache_backend import (
     SubmissionRejected,
 )
 from ...base.region import RegionResolver, Segment
-from .client import OBJECT_NOT_FOUND, StoreClient
 from .keys import KeyScheme
 from .staging import HostStagingPool
+from .store import BlobStore, BlobStoreError, GetStatus, PutStatus
 from .worker_pool import DaemonWorkerPool
 
-if TYPE_CHECKING:
-    from .mooncake import MooncakeStoreConfig
-
-__all__ = ["MAX_PROBES", "BlobStoreBackend", "StoreCounters"]
+__all__ = ["MAX_PROBES", "BlobStoreBackend", "BlobStoreConfig", "StoreCounters"]
 
 MAX_PROBES = 1024
 """Bound on remembered lookups, pending or answered. A lookup thread that stopped answering must
@@ -69,6 +67,57 @@ without the store."""
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+_DEFAULT_STAGING_BUFFER_BYTES = 536870912
+
+
+@dataclass(frozen=True)
+class BlobStoreConfig:
+    """What the backend reads from a backend entry; the driver's connection options are separate.
+
+    Attributes:
+        namespace: Leading component of every key; two deployments share cache only when they agree.
+        transfer_batch_size: Units per store call. Bounds one call, not one delivery.
+        stage_through_host: Pass units through a pinned host buffer instead of registering the
+            caller's pools. Costs a copy each way; works without GPUDirect RDMA.
+        staging_buffer_bytes: Ceiling on the pinned staging allocation when staging.
+        max_inflight_ops: Deliveries that may be queued or running at once. A submission past
+            this bound is refused with ``SubmissionRejected``.
+        num_workers: Threads that drive store calls.
+        probe_ttl_s: Seconds an unconsumed probe answer is kept before it is dropped.
+    """
+
+    namespace: str = "trtllm"
+    transfer_batch_size: int = 64
+    stage_through_host: bool = False
+    staging_buffer_bytes: int = _DEFAULT_STAGING_BUFFER_BYTES
+    max_inflight_ops: int = 256
+    num_workers: int = 2
+    probe_ttl_s: float = 30.0
+
+    def __post_init__(self) -> None:
+        if not self.namespace:
+            raise ValueError("namespace must not be empty")
+        for name in ("transfer_batch_size", "max_inflight_ops", "num_workers"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be > 0")
+        if self.stage_through_host and self.staging_buffer_bytes <= 0:
+            raise ValueError("staging_buffer_bytes must be > 0 when stage_through_host is set")
+        if self.probe_ttl_s <= 0:
+            raise ValueError("probe_ttl_s must be > 0")
+
+    @classmethod
+    def fields(cls) -> frozenset[str]:
+        """The option keys this class reads; a driver's keys must not overlap them."""
+        return frozenset(f.name for f in dataclasses.fields(cls))
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> BlobStoreConfig:
+        """Build from a plain mapping, refusing keys this class does not know."""
+        unknown = sorted(set(raw) - cls.fields())
+        if unknown:
+            raise ValueError(f"unknown BlobStoreConfig keys: {unknown}")
+        return cls(**raw)
 
 
 @dataclass
@@ -118,12 +167,6 @@ class _Task:
     def __post_init__(self) -> None:
         self.total = sum(size for _, size in self.segments)
 
-    def ptrs(self) -> list[int]:
-        return [address for address, _ in self.segments]
-
-    def sizes(self) -> list[int]:
-        return [size for _, size in self.segments]
-
 
 @dataclass
 class _Probe:
@@ -141,9 +184,6 @@ class _Registration:
         self.closing = False
         self._backend = backend
 
-    def overlaps(self, address: int, size: int) -> bool:
-        return address < self.address + self.size and self.address < address + size
-
     def covers(self, address: int, size: int) -> bool:
         return self.address <= address and address + size <= self.address + self.size
 
@@ -160,10 +200,8 @@ class BlobStoreBackend:
     """Fetch from and publish to one blob store.
 
     Args:
-        client: An opened store client. Owned from here on; ``close`` closes it.
-        config: Batch sizes, bounds and whether to stage through host memory. Only the fields
-            shared by every driver are read: ``namespace``, ``transfer_batch_size``,
-            ``stage_through_host``, ``max_inflight_ops``, ``num_workers``, ``probe_ttl_s``.
+        store: An opened blob store. Owned from here on; ``close`` closes it.
+        config: Batch sizes, bounds and whether to stage through host memory.
         resolver: Maps a unit's local coordinates to its memory segments.
         layout_fingerprint: Folded into every key; see ``KeyScheme``.
         staging: Required when ``config.stage_through_host``; ignored otherwise. Owned from here
@@ -172,8 +210,8 @@ class BlobStoreBackend:
 
     def __init__(
         self,
-        client: StoreClient,
-        config: MooncakeStoreConfig,
+        store: BlobStore,
+        config: BlobStoreConfig,
         resolver: RegionResolver,
         layout_fingerprint: bytes,
         *,
@@ -181,7 +219,7 @@ class BlobStoreBackend:
     ) -> None:
         if config.stage_through_host and staging is None:
             raise ValueError("stage_through_host needs a HostStagingPool")
-        self._client = client
+        self._store = store
         self._config = config
         self._resolve = resolver
         self._keys = KeyScheme(config.namespace, layout_fingerprint)
@@ -192,14 +230,14 @@ class BlobStoreBackend:
         self._lock = threading.Lock()
         self._registrations: list[_Registration] = []
         self._pending: set[tuple[int, int]] = set()
-        """Spans whose ``register_buffer`` call is in progress; they refuse overlaps like live ones."""
+        """Spans whose ``register_span`` call is in progress; they refuse overlaps like live ones."""
         self._probes: dict[tuple[bytes, tuple[bytes, ...]], _Probe] = {}
         self._inflight = threading.BoundedSemaphore(config.max_inflight_ops)
         # Daemon workers: a store call that never returns must not keep the process alive once
         # the engine has given the backend up.
-        self._pool = DaemonWorkerPool(config.num_workers, thread_name_prefix="mooncake-store")
+        self._pool = DaemonWorkerPool(config.num_workers, thread_name_prefix="blob-store")
         # Lookups have their own thread so a probe is not queued behind every delivery in flight.
-        self._lookups = DaemonWorkerPool(1, thread_name_prefix="mooncake-store-probe")
+        self._lookups = DaemonWorkerPool(1, thread_name_prefix="blob-store-probe")
         self._closed = False
         self.counters = StoreCounters()
 
@@ -214,15 +252,13 @@ class BlobStoreBackend:
             raise ValueError(f"size must be > 0, got {size}")
         span = (address, size)
         with self._lock:
-            # Reserved across the client call, which runs outside the lock: Mooncake unregisters
-            # by address, so a concurrent duplicate must be refused before it can make a call
-            # whose cleanup would tear down the winner's registration.
+            # The store call runs outside the lock, so the span is reserved across it: a
+            # concurrent duplicate must be refused before it reaches the store, where its own
+            # registration or cleanup could tear down the winner's.
             self._check_overlap(address, size)
             self._pending.add(span)
         try:
-            status = self._client.register_buffer(address, size)
-            if status != 0:
-                raise RuntimeError(f"register_buffer failed with status {status}")
+            self._store.register_span(address, size)
             reg = _Registration(self, address, size)
             with self._lock:
                 self._registrations.append(reg)
@@ -247,12 +283,10 @@ class BlobStoreBackend:
                 return
             reg.closing = True
         try:
-            status = self._client.unregister_buffer(reg.address)
+            self._store.unregister_span(reg.address, reg.size)
         finally:
             # A close that raised has not closed: the handle stays live and may be retried.
             reg.closing = False
-        if status != 0:
-            raise RuntimeError(f"unregister_buffer failed with status {status}")
         with self._lock:
             reg.live = False
             self._registrations.remove(reg)
@@ -322,7 +356,7 @@ class BlobStoreBackend:
             self._own(attempt).done.wait()
 
     def close(self) -> None:
-        """Finish the work in flight, release registrations, then close the client. Idempotent.
+        """Finish the work in flight, release registrations, then close the store. Idempotent.
 
         A worker parked for a staging slot is woken and its delivery fails, so this returns.
         """
@@ -338,12 +372,17 @@ class BlobStoreBackend:
             live, self._registrations = self._registrations, []
         for reg in live:
             reg.live = False
-            status = self._client.unregister_buffer(reg.address)
-            if status != 0:
+            try:
+                self._store.unregister_span(reg.address, reg.size)
+            except BlobStoreError as exc:
                 logger.warning(
-                    "unregister_buffer(%#x) failed with status %d during close", reg.address, status
+                    "blob store [%s]: unregistering [%#x, %#x) failed during close: %s",
+                    self._store.describe(),
+                    reg.address,
+                    reg.address + reg.size,
+                    exc,
                 )
-        self._client.close()
+        self._store.close()
 
     # ---- submission ----
 
@@ -428,13 +467,14 @@ class BlobStoreBackend:
     def _fail(self, attempt: _StoreAttempt, reason: str) -> None:
         with self._lock:
             self.counters.failed_attempts += 1
-        logger.warning("mooncake store delivery failed: %s", reason)
+        logger.warning("blob store [%s]: delivery failed: %s", self._store.describe(), reason)
         attempt.finish(Failed(reason))
 
-    def _exists(self, tasks: Sequence[_Task]) -> Sequence[int]:
-        present = self._client.batch_is_exist([task.key for task in tasks])
-        if len(present) != len(tasks):
-            raise RuntimeError(f"batch_is_exist answered {len(present)} of {len(tasks)} keys")
+    def _holds(self, keys: Sequence[str]) -> Sequence[bool]:
+        """Ask the store for ``keys``; an answer of the wrong length is a failed lookup too."""
+        present = self._store.holds(keys)
+        if len(present) != len(keys):
+            raise BlobStoreError(f"holds answered {len(present)} of {len(keys)} keys")
         return present
 
     def _staged(self, count: int, body: Callable[[list[int]], _T]) -> _T:
@@ -462,16 +502,15 @@ class BlobStoreBackend:
     def _do_fetch(self, attempt: _StoreAttempt, tasks: Sequence[_Task]) -> Outcome:
         served: set[bytes] = set()
         for batch in _batched(tasks, self._batch):
-            present = self._exists(batch)
-            if any(status < 0 for status in present):
-                return Failed("store lookup failed")
-            hits = [task for task, status in zip(batch, present) if status == 1]
+            try:
+                present = self._holds([task.key for task in batch])
+            except BlobStoreError as exc:
+                return Failed(f"store lookup failed: {exc}")
+            hits = [task for task, held in zip(batch, present) if held]
             misses = len(batch) - len(hits)
             if hits:
                 if self._staging is None:
-                    results = self._client.batch_get_into_multi_buffers(
-                        [t.key for t in hits], [t.ptrs() for t in hits], [t.sizes() for t in hits]
-                    )
+                    results = self._store.get([t.key for t in hits], [t.segments for t in hits])
                     got, bad = _reads(hits, results)
                 else:
                     got, bad = self._staged(
@@ -488,10 +527,9 @@ class BlobStoreBackend:
 
     def _staged_get(self, hits: Sequence[_Task], slots: Sequence[int]) -> tuple[list[_Task], int]:
         assert self._staging is not None
-        results = self._client.batch_get_into_multi_buffers(
+        results = self._store.get(
             [t.key for t in hits],
-            [[self._staging.slot_address(slot)] for slot in slots],
-            [[t.total] for t in hits],
+            [[(self._staging.slot_address(slot), t.total)] for slot, t in zip(slots, hits)],
         )
         got, bad = _reads(hits, results)
         if not bad:
@@ -505,22 +543,21 @@ class BlobStoreBackend:
         served: set[bytes] = set()
         pending: list[_Task] = []
         for batch in _batched(tasks, self._batch):
-            present = self._exists(batch)
-            if any(status < 0 for status in present):
+            try:
+                present = self._holds([task.key for task in batch])
+            except BlobStoreError as exc:
                 # A store that cannot answer whether it holds a unit is out of reach; treating the
                 # answer as "absent" would turn an outage into writes against it (and a fetch on
                 # the same answer fails, so the two directions agree).
-                return Failed("store lookup failed")
+                return Failed(f"store lookup failed: {exc}")
             # Present units are merged, not rewritten (§6.3 requirement 2).
-            pending.extend(task for task, status in zip(batch, present) if status != 1)
-            served.update(task.name for task, status in zip(batch, present) if status == 1)
+            pending.extend(task for task, held in zip(batch, present) if not held)
+            served.update(task.name for task, held in zip(batch, present) if held)
         with self._lock:
             self.counters.publish_present += len(tasks) - len(pending)
         if self._staging is None:
             for batch in _batched(pending, self._batch):
-                taken, problem = self._put(
-                    batch, [t.ptrs() for t in batch], [t.sizes() for t in batch]
-                )
+                taken, problem = self._put(batch, [t.segments for t in batch])
                 if problem is not None:
                     return Failed(problem)
                 served.update(task.name for task in taken)
@@ -558,8 +595,10 @@ class BlobStoreBackend:
         for batch, batch_slots in zip(_batched(group, self._batch), _batched(slots, self._batch)):
             taken, problem = self._put(
                 batch,
-                [[self._staging.slot_address(slot)] for slot in batch_slots],
-                [[task.total] for task in batch],
+                [
+                    [(self._staging.slot_address(slot), task.total)]
+                    for slot, task in zip(batch_slots, batch)
+                ],
             )
             if problem is not None:
                 return problem
@@ -567,59 +606,62 @@ class BlobStoreBackend:
         return None
 
     def _put(
-        self, tasks: Sequence[_Task], ptrs: Sequence[Sequence[int]], sizes: Sequence[Sequence[int]]
+        self, tasks: Sequence[_Task], buffers: Sequence[Sequence[Segment]]
     ) -> tuple[list[_Task], Optional[str]]:
         """Write one batch. Returns the units the store now holds, and a reason if the call failed.
 
         A unit the store declined but holds anyway lost a race with another publisher and counts
-        as taken; one it declined and does not hold is simply not served. Only a call that itself
-        misbehaves (exception, wrong count, failed lookup) is a failure. Units written before such
-        a failure are still returned and counted in ``publish_stored`` (they are in the store),
-        but the caller's attempt ends ``Failed`` and reports no served set.
-
-        TODO: the Python bindings expose no error-code table, so every non-zero put status is
-        treated as "declined" here. Once the codes for already-exists and no-space are known,
-        only those should be not-served and any other negative status should fail the attempt.
+        as taken; one it declined and does not hold is simply not served. A call that misbehaves
+        (exception, wrong count, a unit that failed to write, a failed lookup afterwards) is a
+        failure. Units stored before such a failure are still returned and counted in
+        ``publish_stored`` (they are in the store), but the caller's attempt ends ``Failed`` and
+        reports no served set.
         """
-        results = self._client.batch_put_from_multi_buffers([t.key for t in tasks], ptrs, sizes)
+        results = self._store.put([t.key for t in tasks], buffers)
         if len(results) != len(tasks):
-            return [], f"batch_put answered {len(results)} of {len(tasks)} keys"
-        taken = [task for task, status in zip(tasks, results) if status == 0]
-        declined = [task for task, status in zip(tasks, results) if status != 0]
+            return [], f"put answered {len(results)} of {len(tasks)} keys"
+        stored = [task for task, status in zip(tasks, results) if status is PutStatus.STORED]
         with self._lock:
-            self.counters.publish_stored += len(taken)
+            self.counters.publish_stored += len(stored)
+        failed = sum(1 for status in results if status is PutStatus.FAILED)
+        if failed:
+            return stored, f"{failed} of {len(tasks)} units could not be written"
+        declined = [task for task, status in zip(tasks, results) if status is PutStatus.DECLINED]
         raced: list[_Task] = []
         if declined:
-            present = self._exists(declined)
-            if any(status < 0 for status in present):
-                return taken, "store lookup failed after a declined put"
-            raced = [task for task, status in zip(declined, present) if status == 1]
+            try:
+                present = self._holds([task.key for task in declined])
+            except BlobStoreError as exc:
+                return stored, f"store lookup failed after a declined put: {exc}"
+            raced = [task for task, held in zip(declined, present) if held]
             if len(raced) < len(declined):
-                codes = sorted({status for status in results if status != 0})
                 logger.warning(
-                    "mooncake store did not take %d of %d units (put statuses %s)",
+                    "blob store [%s]: did not take %d of %d units",
+                    self._store.describe(),
                     len(declined) - len(raced),
                     len(tasks),
-                    codes,
                 )
         with self._lock:
             self.counters.publish_raced += len(raced)
-        return taken + raced, None
+        return stored + raced, None
 
     def _lookup(self, entry: _Probe, units: Sequence[bytes]) -> None:
         held: set[bytes] = set()
         try:
             for batch in _batched(units, self._batch):
-                present = self._client.batch_is_exist([self._keys.key(u) for u in batch])
-                if len(present) != len(batch) or any(status < 0 for status in present):
-                    raise RuntimeError("batch_is_exist failed")
-                held.update(u for u, status in zip(batch, present) if status == 1)
+                present = self._holds([self._keys.key(u) for u in batch])
+                held.update(u for u, is_held in zip(batch, present) if is_held)
             with self._lock:
                 self.counters.probe_hits += len(held)
                 self.counters.probe_misses += len(units) - len(held)
                 entry.answer = frozenset(held)
         except BaseException as exc:  # noqa: BLE001 - thread boundary; re-raised from probe
-            logger.warning("mooncake store lookup failed: %s: %s", type(exc).__name__, exc)
+            logger.warning(
+                "blob store [%s]: lookup failed: %s: %s",
+                self._store.describe(),
+                type(exc).__name__,
+                exc,
+            )
             with self._lock:
                 entry.error = exc
             if not isinstance(exc, Exception):
@@ -641,16 +683,14 @@ class BlobStoreBackend:
             del self._probes[key]
 
 
-def _reads(tasks: Sequence[_Task], results: Sequence[int]) -> tuple[list[_Task], int]:
+def _reads(tasks: Sequence[_Task], results: Sequence[GetStatus]) -> tuple[list[_Task], int]:
     """Split the answer of one get into the units fully delivered and how many went wrong.
 
     A unit the store no longer holds (gone since the lookup) is neither: nothing was written and
-    it is simply not served. A short read or any other negative status is wrong.
+    it is simply not served. An answer of the wrong length counts every unit as wrong.
     """
     if len(results) != len(tasks):
         return [], len(tasks)
-    got = [task for task, status in zip(tasks, results) if status == task.total]
-    bad = sum(
-        1 for task, status in zip(tasks, results) if status not in (task.total, OBJECT_NOT_FOUND)
-    )
+    got = [task for task, status in zip(tasks, results) if status is GetStatus.HIT]
+    bad = sum(1 for status in results if status is GetStatus.FAILED)
     return got, bad

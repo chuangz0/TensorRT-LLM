@@ -759,7 +759,7 @@ class StreamsLayers(Protocol):
 | effects | 协调层反向调用引擎的一组回调,§7.3 |
 | EngineQueue | 后端把需要 KV v2 的工作排进来、协调层在引擎线程执行的队列 |
 | worker 后端 / store 后端 | 见 §1.1 |
-| blob 后端 | store 后端在代码里的落点:`backends/blob/backend.py::BlobStoreBackend` 只依赖 `StoreClient` Protocol,同时实现 `Fetches` / `Publishes` / `RegistersPools`;驱动 `backends/blob/mooncake.py`(配置、开客户端、注册表工厂)是第一个,后续驱动与其并列 |
+| blob 后端 | store 后端在代码里的落点:`backends/blob/backend.py::BlobStoreBackend` 只依赖 `backends/blob/store.py::BlobStore` 协议,同时实现 `Fetches` / `Publishes` / `RegistersPools`;驱动在 `backends/blob/drivers/` 下各一个模块(`mooncake.py`:连接配置、状态码翻译、注册表工厂;`memory.py`:进程内字典存储),经共用的 `blob/factory.py::build_blob_backend` 建后端 |
 | parked | 请求处于 `KV_FETCH_IN_PROGRESS`,不被调度 |
 | canonical schedule | PP 下 rank 0 决定、跟随者照做的调度结果 |
 | ADP | attention data parallel |

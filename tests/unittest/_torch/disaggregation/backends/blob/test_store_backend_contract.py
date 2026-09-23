@@ -17,6 +17,7 @@ import pytest
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.backends.blob.backend import BlobStoreBackend, StoreCounters  # noqa: E402
 from disaggregation.backends.blob.staging import HostStagingPool  # noqa: E402
+from disaggregation.backends.blob.store import BlobStoreError  # noqa: E402
 from disaggregation.base.cache_backend import (  # noqa: E402
     Attempt,
     Delivered,
@@ -28,8 +29,8 @@ from disaggregation.base.cache_backend import (  # noqa: E402
     Unit,
 )
 from store_fakes import (  # noqa: E402
+    FakeBlobStore,
     FakeCopier,
-    FakeStoreClient,
     MemoryArena,
     config,
     extent,
@@ -53,17 +54,17 @@ def test_backend_satisfies_the_three_protocols():
 def test_staging_requires_a_pool_when_configured():
     with pytest.raises(ValueError, match="HostStagingPool"):
         BlobStoreBackend(
-            FakeStoreClient(), config(stage_through_host=True), lambda group, local: (), b"\x01"
+            FakeBlobStore(), config(stage_through_host=True), lambda group, local: (), b"\x01"
         )
 
 
 # ---- RegistersPools (§6.4) ----
 
 
-def test_register_pool_forwards_to_client_and_refuses_overlap():
+def test_register_pool_forwards_to_store_and_refuses_overlap():
     with make_rank() as rank:
         a = rank.arena.address
-        assert rank.client.calls[0] == ("register_buffer", (a, rank.arena.size))
+        assert rank.store.calls[0] == ("register_span", (a, rank.arena.size))
         other = MemoryArena(64)
         reg = rank.backend.register_pool(other.address, other.size)
         for start, size in [(a, 1), (a + 10, 5), (a - 1, 2), (a + rank.arena.size - 1, 100)]:
@@ -72,28 +73,28 @@ def test_register_pool_forwards_to_client_and_refuses_overlap():
         reg.close()
         with pytest.raises(ValueError, match="size must be > 0"):
             rank.backend.register_pool(other.address, 0)
-        assert rank.client.count("register_buffer") == 2  # a refused registration reaches nothing
+        assert rank.store.count("register_span") == 2  # a refused registration reaches nothing
 
 
-def test_concurrent_duplicate_register_pool_is_refused_before_it_reaches_the_client():
-    # The winner is parked inside the client's register RPC; the loser, asking for the same span
-    # meanwhile, must be refused without a call of its own (Mooncake unregisters by address, so a
-    # loser's cleanup would otherwise tear the winner down).
+def test_concurrent_duplicate_register_pool_is_refused_before_it_reaches_the_store():
+    # The winner is parked inside the store's register call; the loser, asking for the same span
+    # meanwhile, must be refused without a call of its own (a store that keys registrations by
+    # address would otherwise have the loser's cleanup tear the winner down).
     with make_rank() as rank:
         other = MemoryArena(64)
-        rank.client.block("register_buffer")
+        rank.store.block("register_span")
         winner = []
         t = threading.Thread(
             target=lambda: winner.append(rank.backend.register_pool(other.address, other.size))
         )
         t.start()
-        rank.client.wait_entered(2)  # the pool's own registration, then the winner's, parked
+        rank.store.wait_entered(2)  # the pool's own registration, then the winner's, parked
         with pytest.raises(ValueError, match="overlaps"):
             rank.backend.register_pool(other.address, other.size)
         with pytest.raises(ValueError, match="overlaps"):
             rank.backend.register_pool(other.address + 8, 8)  # partial overlap, same answer
-        assert rank.client.count("register_buffer") == 2  # nothing from the losers
-        rank.client.unblock()
+        assert rank.store.count("register_span") == 2  # nothing from the losers
+        rank.store.unblock()
         t.join(5)
         assert not t.is_alive() and len(winner) == 1
         # The winner's registration is live and untouched by the refusals.
@@ -101,19 +102,18 @@ def test_concurrent_duplicate_register_pool_is_refused_before_it_reaches_the_cli
         u = Unit(name=b"x", local_group=5, local=5)
         assert isinstance(rank.finish(rank.backend.publish(extent([u]))), Delivered)
         winner[0].close()
-        assert rank.client.count("unregister_buffer") == 1
+        assert rank.store.count("unregister_span") == 1
 
 
-def test_register_pool_raises_and_registers_nothing_when_client_refuses():
+def test_register_pool_raises_and_registers_nothing_when_store_refuses():
     with make_rank() as rank:
         other = MemoryArena(64)
-        # The RPC answers a bad status ...
-        rank.client.register_buffer = lambda ptr, size: -5
+        # The store refuses ...
+        rank.store.fail_next("register_span", BlobStoreError("registration refused with status -5"))
         with pytest.raises(RuntimeError, match="status -5"):
             rank.backend.register_pool(other.address, other.size)
-        # ... or raises outright.
-        del rank.client.register_buffer
-        rank.client.fail_next("register_buffer", OSError("rdma device gone"))
+        # ... or its transport raises outright.
+        rank.store.fail_next("register_span", OSError("rdma device gone"))
         with pytest.raises(OSError):
             rank.backend.register_pool(other.address, other.size)
         # Nothing was kept from either failure: the span is free, and a unit there is refused.
@@ -127,7 +127,7 @@ def test_unregister_rpc_raising_keeps_the_handle_live_and_retry_works():
     with make_rank() as rank:
         other = MemoryArena(64)
         reg = rank.backend.register_pool(other.address, other.size)
-        rank.client.fail_next("unregister_buffer", OSError("transport hiccup"))
+        rank.store.fail_next("unregister_span", OSError("transport hiccup"))
         with pytest.raises(OSError):
             reg.close()
         # Still registered: overlap is refused and deliveries into the span still run.
@@ -137,10 +137,10 @@ def test_unregister_rpc_raising_keeps_the_handle_live_and_retry_works():
         u = Unit(name=b"x", local_group=5, local=5)
         assert isinstance(rank.finish(rank.backend.publish(extent([u]))), Delivered)
         reg.close()  # the retry succeeds
-        assert rank.client.count("unregister_buffer") == 2
+        assert rank.store.count("unregister_span") == 2
         assert isinstance(rank.backend.publish(extent([u])).poll(), Failed)
         reg.close()  # idempotent once it has succeeded
-        assert rank.client.count("unregister_buffer") == 2
+        assert rank.store.count("unregister_span") == 2
 
 
 def test_registration_close_is_idempotent_and_by_handle():
@@ -149,23 +149,23 @@ def test_registration_close_is_idempotent_and_by_handle():
         stale = rank.backend.register_pool(other.address, other.size)
         stale.close()
         stale.close()
-        assert rank.client.count("unregister_buffer") == 1
+        assert rank.store.count("unregister_span") == 1
         # Pool rebuild: register the same span again, then close the stale handle once more
         # (§6.4 3c): the live registration must not be taken down.
         live = rank.backend.register_pool(other.address, other.size)
         stale.close()
-        assert rank.client.count("unregister_buffer") == 1
+        assert rank.store.count("unregister_span") == 1
         with pytest.raises(ValueError, match="overlaps"):
             rank.backend.register_pool(other.address, other.size)
         live.close()
-        assert rank.client.count("unregister_buffer") == 2
+        assert rank.store.count("unregister_span") == 2
 
 
 def test_registration_close_that_raises_has_not_closed():
     with make_rank() as rank:
         other = MemoryArena(64)
         reg = rank.backend.register_pool(other.address, other.size)
-        rank.client.fail_next("unregister_buffer")
+        rank.store.fail_next("unregister_span")
         with pytest.raises(RuntimeError):
             reg.close()
         with pytest.raises(ValueError, match="overlaps"):  # still registered
@@ -181,7 +181,7 @@ def test_delivery_into_unregistered_memory_fails_and_is_not_a_miss(direction):
         attempt = getattr(rank.backend, direction)(extent([u]))
         outcome = attempt.poll()  # decided at submission: nothing was queued
         assert isinstance(outcome, Failed) and "not registered" in outcome.reason
-        assert rank.client.count("batch_is_exist") == 0
+        assert rank.store.count("holds") == 0
         assert rank.backend.counters.failed_attempts == 1
         assert rank.backend.counters.fetch_misses == 0
         assert rank.backend.quiesce([attempt]) is True
@@ -196,7 +196,7 @@ def test_delivery_into_closed_registration_fails():
         assert isinstance(outcome, Failed) and "not registered" in outcome.reason
 
 
-def test_segment_running_past_its_registration_is_refused_before_the_client():
+def test_segment_running_past_its_registration_is_refused_before_the_store():
     # Coverage is per segment and per registration: a segment that starts inside the pool but
     # runs past its end is not registered memory, whatever else is registered.
     with make_rank() as rank:
@@ -205,7 +205,7 @@ def test_segment_running_past_its_registration_is_refused_before_the_client():
         bad = Unit(name=b"straddle", local_group=0, local=9)
         outcome = rank.backend.publish(extent([bad])).poll()
         assert isinstance(outcome, Failed) and "not registered" in outcome.reason
-        assert rank.client.count("batch_put_from_multi_buffers") == 0
+        assert rank.store.count("put") == 0
 
 
 def test_one_bad_unit_fails_the_whole_delivery_and_nothing_is_moved():
@@ -214,8 +214,8 @@ def test_one_bad_unit_fails_the_whole_delivery_and_nothing_is_moved():
         unknown = Unit(name=b"?", local_group=7, local=7)
         outcome = rank.backend.publish(extent([good, unknown])).poll()
         assert isinstance(outcome, Failed) and "does not resolve" in outcome.reason
-        assert rank.client.count("batch_is_exist") == 0
-        assert rank.key(good) not in rank.client.objects
+        assert rank.store.count("holds") == 0
+        assert rank.key(good) not in rank.store.objects
 
 
 def test_unit_resolving_to_no_memory_fails():
@@ -231,13 +231,13 @@ def test_unit_resolving_to_no_memory_fails():
 
 def test_empty_extent_is_delivered_empty_immediately():
     with make_rank() as rank:
-        calls = len(rank.client.calls)
+        calls = len(rank.store.calls)
         for submit in (rank.backend.fetch, rank.backend.publish):
             attempt = submit(extent([]))
             assert attempt.poll() == Delivered(frozenset())
             assert rank.backend.quiesce([attempt]) is True
             rank.backend.settle([attempt])
-        assert len(rank.client.calls) == calls
+        assert len(rank.store.calls) == calls
 
 
 def test_fetch_with_any_route_is_rejected():
@@ -248,7 +248,7 @@ def test_fetch_with_any_route_is_rejected():
     with make_rank() as rank:
         with pytest.raises(SubmissionRejected):
             rank.backend.fetch(extent([rank.unit(0, 0, 8)]), route=SomeRoute())
-        assert rank.client.count("batch_is_exist") == 0
+        assert rank.store.count("holds") == 0
 
 
 def test_open_route_is_not_implemented():
@@ -262,7 +262,7 @@ def test_submit_after_close_is_rejected_and_close_is_idempotent():
         u = rank.unit(0, 0, 8)
         rank.backend.close()
         rank.backend.close()
-        assert rank.client.closed == 1
+        assert rank.store.closed == 1
         with pytest.raises(SubmissionRejected):
             rank.backend.fetch(extent([u]))
         with pytest.raises(SubmissionRejected):
@@ -271,22 +271,22 @@ def test_submit_after_close_is_rejected_and_close_is_idempotent():
             rank.backend.probe(b"n", [u.name])
         # An empty extent needs no worker and is still answered.
         assert rank.backend.publish(extent([])).poll() == Delivered(frozenset())
-    assert rank.client.closed == 1
+    assert rank.store.closed == 1
 
 
-def test_close_finishes_work_in_flight_before_closing_the_client():
+def test_close_finishes_work_in_flight_before_closing_the_store():
     with make_rank() as rank:
         u = rank.unit(0, 0, 8)
-        rank.client.block("batch_put_from_multi_buffers")
+        rank.store.block("put")
         attempt = rank.backend.publish(extent([u]))
-        rank.client.wait_entered(3)  # register, is_exist, put
+        rank.store.wait_entered(3)  # register, is_exist, put
         closer = threading.Thread(target=rank.backend.close)
         closer.start()
         time.sleep(0.05)
-        assert closer.is_alive() and rank.client.closed == 0
-        rank.client.unblock()
+        assert closer.is_alive() and rank.store.closed == 0
+        rank.store.unblock()
         closer.join(5)
-        assert not closer.is_alive() and rank.client.closed == 1
+        assert not closer.is_alive() and rank.store.closed == 1
         assert isinstance(attempt.poll(), Delivered)
 
 
@@ -296,23 +296,23 @@ def test_close_finishes_work_in_flight_before_closing_the_client():
 def test_poll_is_non_blocking_while_workers_are_blocked():
     with make_rank() as rank:
         u = rank.unit(0, 0, 8)
-        rank.client.block("batch_is_exist")
+        rank.store.block("holds")
         attempt = rank.backend.publish(extent([u]))
-        rank.client.wait_entered(2)
+        rank.store.wait_entered(2)
         start = time.monotonic()
         for _ in range(50):
             assert attempt.poll() is None
         assert time.monotonic() - start < 0.5
-        rank.client.unblock()
+        rank.store.unblock()
         assert isinstance(rank.finish(attempt), Delivered)
 
 
 def test_settle_blocks_until_an_outcome_then_poll_is_set():
     with make_rank() as rank:
         u = rank.unit(0, 0, 8)
-        rank.client.block("batch_is_exist")
+        rank.store.block("holds")
         attempt = rank.backend.fetch(extent([u]))
-        rank.client.wait_entered(2)
+        rank.store.wait_entered(2)
         settled = threading.Event()
 
         def settle():
@@ -323,7 +323,7 @@ def test_settle_blocks_until_an_outcome_then_poll_is_set():
         t.start()
         assert not settled.wait(0.1)
         assert attempt.poll() is None
-        rank.client.unblock()
+        rank.store.unblock()
         assert settled.wait(5)
         t.join(5)
         assert attempt.poll() is not None
@@ -344,15 +344,15 @@ def test_outcome_is_immutable_once_set():
 def test_quiesce_is_true_once_done_and_blocks_while_running():
     with make_rank() as rank:
         u = rank.unit(0, 0, 8)
-        rank.client.block("batch_put_from_multi_buffers")
+        rank.store.block("put")
         attempt = rank.backend.publish(extent([u]))
-        rank.client.wait_entered(3)
+        rank.store.wait_entered(3)
         answered = []
         t = threading.Thread(target=lambda: answered.append(rank.backend.quiesce([attempt])))
         t.start()
         time.sleep(0.05)
         assert t.is_alive()  # direct path: the put reads the caller's memory, so not quiet yet
-        rank.client.unblock()
+        rank.store.unblock()
         t.join(5)
         assert answered == [True]
         assert rank.backend.quiesce([attempt, attempt]) is True
@@ -365,45 +365,45 @@ def test_max_inflight_ops_rejects_the_excess_and_nothing_escapes():
     with make_rank(max_inflight_ops=1, num_workers=2) as rank:
         a, b = rank.unit(0, 0, 8), rank.unit(0, 1, 8)
         rank.write(b, pattern(2, 8))
-        rank.client.block("batch_is_exist")
+        rank.store.block("holds")
         first = rank.backend.publish(extent([a], name=b"a"))
-        rank.client.wait_entered(2)
+        rank.store.wait_entered(2)
         with pytest.raises(SubmissionRejected, match="1 deliveries already in flight"):
             rank.backend.publish(extent([b], name=b"b"))
-        assert rank.client.count("batch_is_exist") == 1  # only the first delivery reached it
-        rank.client.unblock()
+        assert rank.store.count("holds") == 1  # only the first delivery reached it
+        rank.store.unblock()
         assert isinstance(rank.finish(first), Delivered)
-        assert rank.key(b) not in rank.client.objects  # nothing of the rejected one escaped
+        assert rank.key(b) not in rank.store.objects  # nothing of the rejected one escaped
         assert rank.backend.counters.failed_attempts == 0
         # The slot is free again once the first is done.
         second = rank.backend.publish(extent([b], name=b"b"))
         assert isinstance(rank.finish(second), Delivered)
-        assert rank.client.objects[rank.key(b)] == pattern(2, 8)
+        assert rank.store.objects[rank.key(b)] == pattern(2, 8)
 
 
 def test_rejected_submission_succeeds_once_an_in_flight_delivery_finishes():
     # The semaphore is restored by the finishing delivery, whatever its outcome.
     with make_rank(max_inflight_ops=2, num_workers=2) as rank:
         units = [rank.unit(0, i, 8) for i in range(3)]
-        rank.client.block("batch_is_exist")
+        rank.store.block("holds")
         first = rank.backend.publish(extent([units[0]]))
         second = rank.backend.publish(extent([units[1]]))
-        rank.client.wait_entered(3)  # register, then both lookups parked at the gate
+        rank.store.wait_entered(3)  # register, then both lookups parked at the gate
         with pytest.raises(SubmissionRejected):
             rank.backend.publish(extent([units[2]]))
-        rank.client.fail_next("batch_put_from_multi_buffers")  # one of the two fails, not both
-        rank.client.unblock()
+        rank.store.fail_next("put")  # one of the two fails, not both
+        rank.store.unblock()
         outcomes = [rank.finish(first), rank.finish(second)]
         assert sorted(type(o).__name__ for o in outcomes) == ["Delivered", "Failed"]
         third = rank.backend.publish(extent([units[2]]))
         assert isinstance(rank.finish(third), Delivered)
-        assert rank.key(units[2]) in rank.client.objects
+        assert rank.key(units[2]) in rank.store.objects
 
 
 def test_failed_delivery_releases_its_inflight_slot():
     with make_rank(max_inflight_ops=1) as rank:
         u = rank.unit(0, 0, 8)
-        rank.client.fail_next("batch_is_exist")
+        rank.store.fail_next("holds")
         assert isinstance(rank.finish(rank.backend.fetch(extent([u]))), Failed)
         assert isinstance(rank.finish(rank.backend.fetch(extent([u]))), Delivered)
 
@@ -444,16 +444,16 @@ def test_transfer_batch_size_bounds_one_store_call_not_one_delivery():
         units = [rank.unit(0, i, 4) for i in range(5)]
         outcome = rank.finish(rank.backend.publish(extent(units)))
         assert outcome == Delivered(frozenset(u.name for u in units))
-        puts = [args[0] for m, args in rank.client.calls if m == "batch_put_from_multi_buffers"]
+        puts = [args[0] for m, args in rank.store.calls if m == "put"]
         assert [len(keys) for keys in puts] == [2, 2, 1]
-        exists = [args[0] for m, args in rank.client.calls if m == "batch_is_exist"]
+        exists = [args[0] for m, args in rank.store.calls if m == "holds"]
         assert [len(keys) for keys in exists] == [2, 2, 1]
 
 
 def test_staged_batch_is_bounded_by_the_slot_count():
-    client = FakeStoreClient()
+    store = FakeBlobStore()
     host = MemoryArena(4 * 64)
-    client.register_buffer(host.address, host.size)
+    store.register_span(host.address, host.size)
     pool = HostStagingPool(host.address, 64, 3, FakeCopier())
-    with make_rank(client, stage_through_host=True, transfer_batch_size=64, staging=pool) as rank:
+    with make_rank(store, stage_through_host=True, transfer_batch_size=64, staging=pool) as rank:
         assert rank.backend._batch == 3

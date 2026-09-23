@@ -30,7 +30,7 @@ import threading
 from typing import Literal, Protocol, Sequence
 
 from ...base.region import Segment
-from .client import StoreClient
+from .store import BlobStore, BlobStoreError
 
 __all__ = ["Copier", "HostStagingPool", "open_default_staging", "plan_slot_geometry"]
 
@@ -218,13 +218,13 @@ class _CudaCopier:
 
 
 def open_default_staging(
-    client: StoreClient,
+    store: BlobStore,
     *,
     slot_bytes: int,
     num_slots: int,
     device_index: int | None = None,
 ) -> HostStagingPool:
-    """Allocate a pinned buffer with torch, register it with ``client`` and wrap it in a pool.
+    """Allocate a pinned buffer with torch, register it with ``store`` and wrap it in a pool.
 
     Imports torch here and nowhere else in the package.
     """
@@ -233,10 +233,10 @@ def open_default_staging(
     pinned = torch.cuda.is_available()
     buffer = torch.empty(slot_bytes * num_slots, dtype=torch.uint8, pin_memory=pinned)
     base = int(buffer.data_ptr())
-    status = client.register_buffer(base, buffer.numel())
-    if status != 0:
-        raise RuntimeError(
-            f"register_buffer failed with status {status} for the staging buffer at "
-            f"[{base:#x}, {base + buffer.numel():#x})"
-        )
+    try:
+        store.register_span(base, buffer.numel())
+    except BlobStoreError as exc:
+        raise BlobStoreError(
+            f"{exc} for the staging buffer at [{base:#x}, {base + buffer.numel():#x})"
+        ) from exc
     return HostStagingPool(base, slot_bytes, num_slots, _CudaCopier(device_index), keepalive=buffer)

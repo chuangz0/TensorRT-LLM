@@ -18,9 +18,10 @@ README §5 给 `remote_cache.py` 的职责是"远端缓存的取用策略"。本
 
 **A5. `blob/fetch.py` + `blob/publish.py` → `blob/backend.py`。**
 README §5 把 blob 后端拆成 `fetch.py` 与 `publish.py`。本分支的 `BlobStoreBackend` 是一个类同时实现 `Fetches` / `Publishes` / `RegistersPools`:
-三者共用同一个 `StoreClient`、同一个 staging pool、同一张 registration 表(登记的 pool 跨度既被 fetch 的目的地检查用,也被 publish 的来源检查用),
-拆成两个文件只会让共享状态变成第三个模块。提议:README §5 的 `blob/` 条目改为 `backend.py`(三个契约面)+ `client.py`(`StoreClient` Protocol)+
-`keys.py` / `staging.py` / `worker_pool.py`(实现细节)+ `mooncake.py`(驱动:配置、开客户端、注册表工厂;后续驱动与其并列)。
+三者共用同一个 `BlobStore`、同一个 staging pool、同一张 registration 表(登记的 pool 跨度既被 fetch 的目的地检查用,也被 publish 的来源检查用),
+拆成两个文件只会让共享状态变成第三个模块。提议:README §5 的 `blob/` 条目改为 `store.py`(`BlobStore` 协议 + `PutStatus`/`GetStatus`/`BlobStoreError`:驱动实现的面)+
+`backend.py`(三个契约面 + `BlobStoreConfig`)+ `factory.py`(所有驱动共用的工厂骨架)+ `keys.py` / `staging.py` / `worker_pool.py`(实现细节)+
+`drivers/`(每个存储一个模块:`mooncake.py`、`memory.py`;新存储只加一个模块与注册表一行)。README 的 "复用适配层的产品作为其驱动置于该后端之下……后续驱动与其并列" 仍成立,只多 `drivers/` 一层,让读者一眼分出通用件与驱动。
 若作者坚持拆分,`fetch.py` / `publish.py` 可以是对 `backend.py` 的纯搬家,不改行为。
 
 ## B 类:现状注记,进 README 文末"当前落点与上图的出入"段

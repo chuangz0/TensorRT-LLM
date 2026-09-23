@@ -89,7 +89,10 @@ class BackendHandle:
 BackendFactory = Callable[[BackendEntry, BackendBuildContext], BackendHandle]
 """Builds one backend from its config entry. Raises ``ValueError`` for an entry it cannot serve."""
 
-_BUILTIN_FACTORIES: Mapping[str, str] = {"mooncake": ".blob.mooncake:build_mooncake_backend"}
+_BUILTIN_FACTORIES: Mapping[str, str] = {
+    "mooncake": ".blob.drivers.mooncake:build_mooncake_backend",
+    "memory": ".blob.drivers.memory:build_memory_backend",
+}
 """Type name -> ``<module relative to this package>:<factory name>``; imported on first use."""
 
 
