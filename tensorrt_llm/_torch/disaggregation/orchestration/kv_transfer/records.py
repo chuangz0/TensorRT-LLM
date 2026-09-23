@@ -95,9 +95,16 @@ class TransferRecord:
         rejected: Publish only; some submission of this record raised ``SubmissionRejected``.
             The units it carried were never offered, so the publish as a whole has failed even if
             the other pieces land.
-        consecutive_rejections: Fetch only; ``SubmissionRejected`` answers in a row since the
-            last launch that went through. Past ``MAX_CONSECUTIVE_REJECTIONS`` the source counts
-            as unavailable for this record.
+        consecutive_launch_failures: Fetch only; launches in a row that never started, whether
+            the backend refused the submission or the route could not be opened, since the last
+            launch that went through. At ``MAX_CONSECUTIVE_LAUNCH_FAILURES`` the record gives up.
+        launch_gave_up: Fetch only; this rank will not launch the current plan. The record votes
+            ``FAILED`` every round until the ranks agree, and the scheduler is answered ``DEFER``
+            meanwhile. Cleared when the plan is dropped for a retry.
+        peer_launched_at: Fetch only; when this rank, still unlaunched, first saw a vote other
+            than ``UNLAUNCHED`` for the same record. Bounds how long an unlaunched rank may hold
+            the others up (``unlaunched_timeout_s``). Cleared when this rank launches or the plan
+            is dropped.
     """
 
     request_id: int
@@ -111,7 +118,9 @@ class TransferRecord:
     abandoned: bool = False
     retry_hint: int | None = None
     rejected: bool = False
-    consecutive_rejections: int = 0
+    consecutive_launch_failures: int = 0
+    launch_gave_up: bool = False
+    peer_launched_at: float | None = None
 
     @property
     def key(self) -> RecordKey:

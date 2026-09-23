@@ -28,6 +28,7 @@ from engine_fakes import (
     HangingClose,
     extent_names,
     finish_prefill,
+    make_executor,
     make_request,
 )
 
@@ -54,36 +55,10 @@ from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 
 pytestmark = pytest.mark.cpu_only
 
 CONTEXT_INIT = LlmRequestState.CONTEXT_INIT
-
-
-def make_executor(kv: FakeKVCacheManager, slots: FakeSlotManager) -> PyExecutor:
-    """A ``PyExecutor`` with only what the effects, the binding and the two real methods under
-    test (``_terminate_request``, ``_try_cancel_request``) read."""
-    executor = object.__new__(PyExecutor)
-    executor.kv_cache_manager = kv
-    executor.resource_manager = SimpleNamespace(
-        resource_managers={
-            ResourceManagerType.KV_CACHE_MANAGER: kv,
-            ResourceManagerType.SEQ_SLOT_MANAGER: slots,
-        }
-    )
-    executor._revert_ctx_alloc = Mock()
-    executor._prepare_disagg_gen_resources = Mock()
-    executor._do_terminate_request = Mock()
-    executor._free_request_resources = Mock()
-    executor._handle_errors = Mock()
-    executor._disagg_pp_termination_handler = None
-    executor.kv_cache_transceiver = None
-    executor._fatal_error = None
-    executor.is_shutdown = False
-    executor.active_requests = []
-    executor.canceled_req_ids = []
-    return executor
 
 
 class Rig:
@@ -455,7 +430,8 @@ class TestGiveBackFetchPages:
         rig.executor._revert_ctx_alloc.assert_called_once_with([req])
         assert rig.store.count("quiesce") == 0
         assert req.state == CONTEXT_INIT and not rig.binding.is_tracking(req)
-        assert rig.binding.plan_fetch(req) is DEFER  # back to the candidates, no retry consumed
+        # The plan stands: the scheduler reserves for the same fetch next round, no retry spent.
+        assert rig.binding.plan_fetch(req) is plan
 
     def test_second_failure_lands_the_request_on_the_local_path(self, rig):
         req = make_request(1, 100)
@@ -1147,21 +1123,23 @@ class TestFetchExpiry:
 class TestRejectedSubmissions:
     def test_consecutive_rejections_are_capped_then_the_request_computes_locally(self, rig):
         """Back-pressure is a reason to try again, not forever: after a bounded run of
-        ``SubmissionRejected`` the request is planned as local compute."""
+        ``SubmissionRejected`` the rank gives the plan up and answers the scheduler DEFER; the
+        next round's agreement spends the retry on a fresh plan, a second run gives that up
+        too, and the agreement after it settles on local compute."""
         rig.store.reject_next = 100
         req = make_request(1, 100)
-        rounds = 0
-        while rounds < 10:
+        for _ in range(12):
             rig.advance(req)
             plan = rig.binding.plan_fetch(req)
             if plan is None:
                 break
+            if plan is DEFER:
+                continue  # given up: waiting for the agreement, nothing reserved this round
             assert isinstance(plan, FetchPlan)
             rig.reserve(req, plan.token_end)
             rig.binding.launch_reserved_fetches([req])
-            rounds += 1
         assert rig.binding.plan_fetch(req) is None, "rejections were never capped"
-        assert rig.store.count("fetch") <= 3
+        assert rig.store.count("fetch") == 6  # 3 per plan, two plans
         assert rig.store.attempts == []  # nothing escaped
         assert rig.executor._revert_ctx_alloc.call_count == rig.store.count("fetch")
         assert req.state == CONTEXT_INIT and not rig.binding.is_tracking(req)

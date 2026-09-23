@@ -27,6 +27,65 @@ def test_tp_collectives_stay_in_the_tp_group_while_allreduce_spans_the_world() -
     assert [total for _, total in results] == [6, 6, 6, 6]
 
 
+def test_pp_allgather_stays_in_the_pp_group_while_allgather_spans_the_world() -> None:
+    """Ranks 0..3 with tp_size 2: TP groups {0, 1}, {2, 3}; PP groups {0, 2}, {1, 3}."""
+    group = FakeDistGroup(world_size=4, tp_size=2, pp_size=2)
+    assert [group.rank(r).pp_rank for r in range(4)] == [0, 0, 1, 1]
+
+    def step(rank):
+        dist = group.rank(rank)
+        return dist.pp_allgather(("pp", rank)), dist.allgather(("world", rank))
+
+    results = group.run(step)
+
+    assert [pp for pp, _ in results] == [
+        [("pp", 0), ("pp", 2)],
+        [("pp", 1), ("pp", 3)],
+        [("pp", 0), ("pp", 2)],
+        [("pp", 1), ("pp", 3)],
+    ]
+    assert all(world == [("world", r) for r in range(4)] for _, world in results)
+
+
+def test_pp_size_defaults_to_the_mapping_layout_and_must_match_it() -> None:
+    assert FakeDistGroup(world_size=4, tp_size=2).pp_size == 2
+    with pytest.raises(ValueError, match="must equal world_size"):
+        FakeDistGroup(world_size=4, tp_size=2, pp_size=1)
+
+
+def test_object_collectives_round_trip_through_pickle() -> None:
+    """``allgather`` and ``pp_allgather`` carry objects the way the real ones do: pickled, so
+    tuples stay tuples and receivers hold their own copies."""
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    payload = ([((1, "fetch"), "TERMINAL", 28, 28)], [], [(1, (28, "worker"))])
+
+    results = group.run(lambda rank: group.rank(rank).allgather(payload))
+
+    assert results[0] == [payload, payload]
+    assert results[0][1] is not results[1][1]
+    assert isinstance(results[0][0][0][0][0], tuple)
+    with pytest.raises(Exception):  # a payload that cannot be pickled is caught here too
+        group.run(lambda rank: group.rank(rank).allgather(lambda: None))
+
+
+def test_a_rank_in_a_pp_group_of_one_answers_pp_allgather_locally() -> None:
+    dist = FakeDistGroup(world_size=2, tp_size=2, pp_size=1).rank(1)
+    assert dist.pp_allgather({"x": 1}) == [{"x": 1}]
+    assert dist.calls == [("pp_allgather", {"x": 1})]
+
+
+def test_ranks_mixing_pp_allgather_and_allgather_are_reported() -> None:
+    """Different groups, so the peer never arrives: a timeout rather than a mismatch."""
+    group = FakeDistGroup(world_size=2, tp_size=1, pp_size=2, timeout_s=0.2)
+
+    def step(rank):
+        dist = group.rank(rank)
+        return dist.pp_allgather(rank) if rank == 0 else dist.allgather(rank)
+
+    with pytest.raises(FakeDistTimeout):
+        group.run(step)
+
+
 def test_world_allreduce_reaches_ranks_in_other_tp_groups() -> None:
     """The shape the poison consensus relies on: TP groups of one, MAX over the world."""
     group = FakeDistGroup(world_size=2, tp_size=1)

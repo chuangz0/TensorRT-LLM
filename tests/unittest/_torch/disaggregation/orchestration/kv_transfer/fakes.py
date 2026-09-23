@@ -32,6 +32,7 @@ from disaggregation.orchestration.kv_transfer.interfaces import (  # noqa: E402
     GroupKind,
     GroupSpec,
 )
+from disaggregation.orchestration.kv_transfer.records import TransferRecord  # noqa: E402
 from disaggregation.remote_cache import (  # noqa: E402
     FetchPlan,
     GroupPlan,
@@ -689,6 +690,10 @@ class Rig:
             if rec["request_id"] == rid and rec["direction"] == direction:
                 return rec
         return None
+
+    def fetch_record(self, rid: int) -> TransferRecord | None:
+        """The fetch ``TransferRecord`` itself, for the launch bookkeeping the dump leaves out."""
+        return self.coord._records.get((rid, "fetch"))
 
     def payloads(self) -> list:
         """Every payload this rank handed to its collective, in order."""

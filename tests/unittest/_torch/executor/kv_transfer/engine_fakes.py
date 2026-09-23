@@ -14,7 +14,9 @@ from __future__ import annotations
 import hashlib
 import threading
 from collections import deque
+from types import SimpleNamespace
 from typing import Iterable, Sequence
+from unittest.mock import Mock
 
 from tensorrt_llm._torch.disaggregation.base.cache_backend import (
     CacheExtent,
@@ -29,6 +31,8 @@ from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces imp
 )
 from tensorrt_llm._torch.disaggregation.resource.naming import group_tag
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.bindings import SamplingConfig
 
 TPB = 32
@@ -189,6 +193,9 @@ class FakeKVCacheManager:
 
     ``commit_to[rid]`` overrides what ``try_commit_blocks`` commits (default: the cursor).
     ``release_index_slot`` is idempotent, as the real wrapper's is (plan §7 #3).
+    ``reserve_transfer_pages`` answers ``reserve_answer`` (default ``True``) and, when it does
+    reserve, leaves behind a cache declaring history to ``token_end``, as the scheduler's call
+    on the real wrapper does.
     """
 
     def __init__(self, tokens_per_block: int = TPB) -> None:
@@ -196,9 +203,17 @@ class FakeKVCacheManager:
         self.enable_block_reuse = True
         self.kv_cache_map: dict[int, FakeKVCache] = {}
         self.commit_to: dict[int, int] = {}
+        self.reserve_answer = True
         self.calls: list[tuple[str, int]] = []
         self.index_slots_released: list[int] = []
         self._early_freed: set[int] = set()
+
+    def reserve_transfer_pages(self, request, token_end: int) -> bool:
+        self.calls.append(("reserve_transfer_pages", request.py_request_id))
+        if not self.reserve_answer:
+            return False
+        self.kv_cache_map[request.py_request_id] = FakeKVCache(history_length=token_end)
+        return True
 
     def get_history_length(self, request) -> int | None:
         kv_cache = self.kv_cache_map.get(request.py_request_id)
@@ -251,6 +266,31 @@ class FakeSlotManager:
     def free_resources(self, request) -> None:
         self.freed.append(request.py_request_id)
         self.slots.discard(request.py_request_id)
+
+
+def make_executor(kv: FakeKVCacheManager, slots: FakeSlotManager) -> PyExecutor:
+    """A ``PyExecutor`` with only what the effects, the binding and the two real methods under
+    test (``_terminate_request``, ``_try_cancel_request``) read."""
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_manager = kv
+    executor.resource_manager = SimpleNamespace(
+        resource_managers={
+            ResourceManagerType.KV_CACHE_MANAGER: kv,
+            ResourceManagerType.SEQ_SLOT_MANAGER: slots,
+        }
+    )
+    executor._revert_ctx_alloc = Mock()
+    executor._prepare_disagg_gen_resources = Mock()
+    executor._do_terminate_request = Mock()
+    executor._free_request_resources = Mock()
+    executor._handle_errors = Mock()
+    executor._disagg_pp_termination_handler = None
+    executor.kv_cache_transceiver = None
+    executor._fatal_error = None
+    executor.is_shutdown = False
+    executor.active_requests = []
+    executor.canceled_req_ids = []
+    return executor
 
 
 class FakeReader:

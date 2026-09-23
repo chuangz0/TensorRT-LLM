@@ -37,6 +37,29 @@ def effect_indices(trace, name):
     return [i for i, (n, _) in enumerate(trace) if n == name]
 
 
+def gen_init_request() -> FakeRequest:
+    return FakeRequest(7, prompt_len=30, is_gen_init=True, route_hints={"ctx": {"peer": "c"}})
+
+
+def loop_advance(rig: Rig, req: FakeRequest, now: float) -> None:
+    """One round's ``advance`` as the engine binding issues it: the request is a candidate only
+    while its answer is ``DEFER``."""
+    rig.coord.advance([req] if rig.coord.plan_fetch(req) is DEFER else [], now)
+
+
+def drive_rounds(rig: Rig, req: FakeRequest, rounds: int) -> int:
+    """The engine loop for one request: ``advance``, then launch when planned, round after round,
+    until the answer is ``None`` (compute locally). Returns how many rounds it took."""
+    for round_index in range(rounds):
+        loop_advance(rig, req, float(round_index))
+        plan = rig.coord.plan_fetch(req)
+        if plan is None:
+            return round_index
+        if isinstance(plan, FetchPlan):
+            rig.coord.launch_fetches([req], float(round_index))
+    raise AssertionError(f"request {req.py_request_id} still undecided after {rounds} rounds")
+
+
 # ---- PLANNED -> IN_FLIGHT -> LANDED -> RELEASED ----
 
 
@@ -238,7 +261,7 @@ def test_cancelled_by_peer_counts_as_failed():
     rig.coord.advance([], 1.0)
     assert rig.effects.count("give_back_fetch_pages") == 1
     assert rig.record(1)["state"] == "PLANNED"
-    assert rig.payloads()[-1][0] == [((1, "fetch"), 0, 0, True)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0, 0)]
 
 
 def test_local_cancel_is_delivered_nothing_not_a_failure():
@@ -246,8 +269,8 @@ def test_local_cancel_is_delivered_nothing_not_a_failure():
     req = worker_request()
     rig.plan_and_launch(req).finish(Cancelled(by_peer=False))
     rig.coord.advance([], 1.0)
-    # On the wire it is a short serve (B = 0, not failed), so the retry path applies.
-    assert rig.payloads()[-1][0] == [((1, "fetch"), 0, 0, False)]
+    # On the wire it is a short serve (TERMINAL with B = 0), so the retry path applies.
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", 0, 0)]
     assert rig.effects.count("give_back_fetch_pages") == 1
     assert rig.effects.count("fail_requests") == 0
     assert rig.record(1)["state"] == "PLANNED"
@@ -283,34 +306,41 @@ def test_second_short_serve_quiesces_only_the_second_try():
 
 @pytest.mark.parametrize("gen_init", [False, True])
 def test_transport_error_and_rejection_alternation_is_bounded(gen_init):
+    """A failed route and a refused submission are the same thing to the record: a launch that
+    never started. Neither re-plans the request on this rank alone; together they count towards
+    ``MAX_CONSECUTIVE_LAUNCH_FAILURES``, and the failure lands through the ranks' agreement."""
     rig = Rig()
-    if gen_init:
-        req = FakeRequest(7, prompt_len=30, is_gen_init=True, route_hints={"ctx": {"peer": "c"}})
-    else:
-        req = worker_request()
+    req = gen_init_request() if gen_init else worker_request()
     rid = req.py_request_id
 
-    # 1. transport error: costs the one retry, record kept.
-    rig.worker.open_route_errors.append(RuntimeError("t1"))
-    rig.coord.advance([req], 0.0)
-    rig.coord.launch_fetches([req], 0.0)
-    assert rig.record(rid)["state"] == "PLANNED" and rig.coord.plan_fetch(req) is DEFER
-    # 2. rejection: free, record kept.
-    rig.worker.reject_next = 1
-    rig.coord.advance([req], 1.0)
-    rig.coord.launch_fetches([req], 1.0)
-    assert rig.record(rid)["state"] == "PLANNED" and rig.coord.plan_fetch(req) is DEFER
+    # 1. transport error, 2. rejection, 3. transport error: the plan survives each of them.
+    for index, failure in enumerate(("route", "reject", "route")):
+        if failure == "route":
+            rig.worker.open_route_errors.append(RuntimeError(f"t{index}"))
+        else:
+            rig.worker.reject_next = 1
+        loop_advance(rig, req, float(index))
+        assert isinstance(rig.coord.plan_fetch(req), FetchPlan)
+        rig.coord.launch_fetches([req], float(index))
+        rec = rig.fetch_record(rid)
+        assert rig.record(rid)["state"] == "PLANNED" and rec.plan is not None
+        assert rec.consecutive_launch_failures == index + 1 and rec.retries_left == 1
+    assert rig.effects.count("give_back_fetch_pages") == 3 and rig.worker.count("quiesce") == 0
+    # At the cap the rank gives up: DEFER to the scheduler, nothing failed yet.
+    assert rig.fetch_record(rid).launch_gave_up and rig.coord.plan_fetch(req) is DEFER
     assert rig.effects.count("fail_requests") == 0
-    # 3. transport error again: budget exhausted.
-    rig.worker.open_route_errors.append(RuntimeError("t2"))
-    rig.coord.advance([req], 2.0)
-    rig.coord.launch_fetches([req], 2.0)
-    assert rig.effects.count("give_back_fetch_pages") == 3
-    assert rig.records() == [] and rig.coord.plan_fetch(req) is None
-    assert rig.worker.count("quiesce") == 0
+
+    # 4. Its FAILED vote lands on the next advance.
+    loop_advance(rig, req, 3.0)
+    assert rig.payloads()[-1][0] == [((rid, "fetch"), "FAILED", 0, 0)]
     if gen_init:
-        assert rig.effects.only("fail_requests") == [((req,), "kv route failed: t2")]
+        assert rig.effects.only("fail_requests") == [((req,), "kv fetch launch given up")]
+        assert rig.records() == [] and rig.coord.plan_fetch(req) is None
     else:
+        rec = rig.fetch_record(rid)
+        assert rec.retries_left == 0 and rec.plan is None
+        assert not rec.launch_gave_up and rec.consecutive_launch_failures == 0
+        assert rig.coord.plan_fetch(req) is DEFER  # planned afresh next round
         assert rig.effects.count("fail_requests") == 0
 
 
@@ -335,7 +365,7 @@ def test_quiesce_false_at_request_end_is_fatal_and_keeps_the_record():
 @pytest.mark.parametrize(
     "error", [NotImplementedError("single destination"), ValueError("bad hint")]
 )
-def test_route_refused_gives_back_and_settles_on_local_compute(error):
+def test_route_refused_gives_up_and_settles_on_local_compute_after_two_agreements(error):
     rig = Rig()
     req = worker_request()
     rig.worker.open_route_errors.append(error)
@@ -343,30 +373,42 @@ def test_route_refused_gives_back_and_settles_on_local_compute(error):
     rig.coord.launch_fetches([req], 0.0)
     assert rig.effects.names() == ["prepare_fetch_resources", "give_back_fetch_pages"]
     assert rig.worker.count("fetch") == 0 and rig.worker.count("quiesce") == 0
-    assert rig.records() == []
-    # This plan can never work: decided as "compute locally", not re-planned.
-    assert rig.coord.plan_fetch(req) is None
-    assert rig.coord.status_dump()["decided_plans"] == 1
+    # This plan can never work here: the rank gives up at once and answers the scheduler DEFER
+    # until the ranks agree, rather than deciding "compute locally" on its own.
+    assert rig.fetch_record(1).launch_gave_up and rig.coord.plan_fetch(req) is DEFER
+
+    # First agreement: the retry is spent and the request is planned again, on the same route
+    # (the planner knows nothing of the refusal) ...
+    loop_advance(rig, req, 1.0)
+    assert rig.fetch_record(1).retries_left == 0 and rig.coord.plan_fetch(req) is DEFER
+    rig.worker.open_route_errors.append(error)
+    loop_advance(rig, req, 2.0)
+    rig.coord.launch_fetches([req], 2.0)
+    assert rig.fetch_record(1).launch_gave_up
+    # ... which is refused again; the second agreement settles on local compute.
+    loop_advance(rig, req, 3.0)
+    assert rig.records() == [] and rig.coord.plan_fetch(req) is None
+    assert rig.effects.count("give_back_fetch_pages") == 2
+    assert rig.effects.count("fail_requests") == 0
 
 
-def test_gen_init_route_refused_fails_the_request():
+def test_gen_init_route_refused_fails_the_request_at_the_next_agreement():
     rig = Rig()
-    req = FakeRequest(7, prompt_len=30, is_gen_init=True, route_hints={"ctx": {"peer": "c"}})
+    req = gen_init_request()
     rig.worker.open_route_errors.append(ValueError("unknown peer"))
     rig.coord.advance([req], 0.0)
     rig.coord.launch_fetches([req], 0.0)
-    # NB-5: pages first, then the verdict.
-    assert rig.effects.names() == [
-        "prepare_fetch_resources",
-        "give_back_fetch_pages",
-        "fail_requests",
-    ]
+    # NB-5: pages first; the verdict waits for the ranks' agreement on the next advance.
+    assert rig.effects.names() == ["prepare_fetch_resources", "give_back_fetch_pages"]
+    assert rig.coord.plan_fetch(req) is DEFER and rig.record(7)["state"] == "PLANNED"
+    loop_advance(rig, req, 1.0)
+    assert rig.effects.names()[-1:] == ["fail_requests"]
     ((reqs, reason),) = rig.effects.only("fail_requests")
-    assert reqs == (req,) and reason == "kv route refused: unknown peer"
+    assert reqs == (req,) and reason == "kv fetch launch given up"
     assert rig.coord.plan_fetch(req) is None and rig.records() == []
 
 
-def test_route_transport_error_costs_the_retry_and_replans_once():
+def test_route_transport_error_keeps_the_plan_and_the_retry():
     rig = Rig()
     req = worker_request()
     rig.worker.open_route_errors.append(RuntimeError("peer metadata fetch failed"))
@@ -374,41 +416,42 @@ def test_route_transport_error_costs_the_retry_and_replans_once():
     rig.coord.launch_fetches([req], 0.0)
     assert rig.effects.names() == ["prepare_fetch_resources", "give_back_fetch_pages"]
     assert rig.worker.count("fetch") == 0 and rig.worker.count("quiesce") == 0
-    # The record stays, PLANNED without a plan, so the consumed retry is remembered.
+    # The record keeps its plan: the scheduler reserves for the same fetch again next round.
     rec = rig.record(1)
-    assert rec["state"] == "PLANNED" and rec["attempts"] == 0 and rec["token_end"] is None
-    assert rig.coord.plan_fetch(req) is DEFER
+    assert rec["state"] == "PLANNED" and rec["attempts"] == 0 and rec["token_end"] == END
+    assert rig.coord.plan_fetch(req) is rig.fetch_record(1).plan
+    assert rig.fetch_record(1).retries_left == 1
 
-    # Planned again next round; the one retry is spent, so a real failure now gives up.
+    # The route works next round; a real failure afterwards still has its retry.
     rig.plan_and_launch(req, now=1.0).finish(Failed("later"))
     rig.coord.advance([], 2.0)
-    assert rig.records() == [] and rig.coord.plan_fetch(req) is None
+    assert rig.record(1)["state"] == "PLANNED" and rig.fetch_record(1).retries_left == 0
 
 
-def test_second_route_transport_error_settles_on_local_compute():
+def test_repeated_route_transport_errors_give_up_then_settle_on_local_compute():
     rig = Rig()
     req = worker_request()
-    rig.worker.open_route_errors.extend([RuntimeError("first"), RuntimeError("second")])
-    rig.coord.advance([req], 0.0)
-    rig.coord.launch_fetches([req], 0.0)
-    rig.coord.advance([req], 1.0)
-    rig.coord.launch_fetches([req], 1.0)
-    assert rig.effects.count("give_back_fetch_pages") == 2
+    rig.worker.open_route_errors.extend(RuntimeError(f"e{i}") for i in range(6))
+    drive_rounds(rig, req, rounds=12)
+    # Three errors give the plan up; the agreement spends the retry on a fresh plan; three more
+    # give that up too; the next agreement settles on local compute.
+    assert rig.worker.count("open_route") == 6 and rig.worker.count("fetch") == 0
+    assert rig.effects.count("give_back_fetch_pages") == 6
     assert rig.effects.count("fail_requests") == 0
     assert rig.records() == [] and rig.coord.plan_fetch(req) is None
 
 
-def test_second_route_transport_error_fails_gen_init():
+def test_repeated_route_transport_errors_fail_gen_init():
     rig = Rig()
-    req = FakeRequest(7, prompt_len=30, is_gen_init=True, route_hints={"ctx": {"peer": "c"}})
-    rig.worker.open_route_errors.extend([RuntimeError("first"), RuntimeError("second")])
-    rig.coord.advance([req], 0.0)
-    rig.coord.launch_fetches([req], 0.0)
+    req = gen_init_request()
+    rig.worker.open_route_errors.extend(RuntimeError(f"e{i}") for i in range(3))
+    for round_index in range(3):
+        loop_advance(rig, req, float(round_index))
+        rig.coord.launch_fetches([req], float(round_index))
     assert rig.effects.count("fail_requests") == 0 and rig.coord.plan_fetch(req) is DEFER
-    rig.coord.advance([req], 1.0)
-    rig.coord.launch_fetches([req], 1.0)
+    loop_advance(rig, req, 3.0)  # the FAILED vote lands: a gen-init fetch has no retry
     ((reqs, reason),) = rig.effects.only("fail_requests")
-    assert reqs == (req,) and reason == "kv route failed: second"
+    assert reqs == (req,) and reason == "kv fetch launch given up"
     assert rig.effects.names()[-2:] == ["give_back_fetch_pages", "fail_requests"]
     assert rig.records() == [] and rig.coord.plan_fetch(req) is None
 
@@ -505,16 +548,19 @@ def test_submission_rejected_gives_back_without_quiesce_or_retry_cost():
     req = worker_request()
     rig.worker.reject_next = 1
     rig.coord.advance([req], 0.0)
+    plan = rig.coord.plan_fetch(req)
     rig.coord.launch_fetches([req], 0.0)
     # NB-5: the resources were prepared for the launch, so they are given back, in that order.
     assert rig.effects.names() == ["prepare_fetch_resources", "give_back_fetch_pages"]
     assert rig.worker.count("quiesce") == 0
     assert rig.worker.routes[0].closed == 1
-    # The record persists, PLANNED without a plan, so the retry budget is one budget for the
-    # request rather than one per rejection.
+    # The record keeps its plan: the same fetch is reserved for and launched again next round,
+    # the retry budget untouched; only the run of failed launches is counted.
     rec = rig.record(1)
-    assert rec["state"] == "PLANNED" and rec["token_end"] is None and rec["attempts"] == 0
-    assert rig.coord.plan_fetch(req) is DEFER  # back to undecided, planned again next round
+    assert rec["state"] == "PLANNED" and rec["token_end"] == END and rec["attempts"] == 0
+    assert rig.coord.plan_fetch(req) is plan
+    assert rig.fetch_record(1).consecutive_launch_failures == 1
+    assert rig.fetch_record(1).retries_left == 1
 
     # The retry budget is intact: a real failure afterwards still gets its one retry.
     rig.plan_and_launch(req, now=1.0).finish(Failed("later"))
@@ -953,7 +999,7 @@ def test_allgather_payload_carries_plan_answers_and_arrivals():
     rig.worker.attempts[0].deliver_all()
     rig.coord.advance([], 1.0)
     arrivals, expired, plans = rig.payloads()[1]
-    assert arrivals == [((1, "fetch"), END, END, False)] and plans == []
+    assert arrivals == [((1, "fetch"), "TERMINAL", END, END)] and plans == []
 
 
 def test_allgather_payload_wires_none_and_defer():
@@ -971,7 +1017,7 @@ def test_peer_reporting_short_b_fails_the_local_landed_fetch():
     def peer(local):
         arrivals, expired, plans = local
         return (
-            [(key, b - 4, hint - 4, failed) for key, b, hint, failed in arrivals],
+            [(key, kind, b - 4, hint - 4) for key, kind, b, hint in arrivals],
             expired,
             plans,
         )
@@ -1139,23 +1185,17 @@ def test_two_requests_progress_independently(candidates_twice):
 # ---- back-pressure that never lets up ----
 
 
-def test_three_consecutive_rejections_send_a_normal_fetch_to_local_compute():
+def test_consecutive_rejections_give_up_then_the_request_computes_locally():
     rig = Rig()
     req = worker_request()
     rig.worker.reject_next = 10
-    for round_index in range(6):
-        if rig.coord.plan_fetch(req) is DEFER:  # undecided: a candidate for this round
-            rig.coord.advance([req], float(round_index))
-        plan = rig.coord.plan_fetch(req)
-        if plan is None:
-            break
-        assert isinstance(plan, FetchPlan)
-        rig.coord.launch_fetches([req], float(round_index))
-    assert rig.coord.plan_fetch(req) is None
-    assert rig.worker.count("fetch") == 3
-    assert rig.effects.count("give_back_fetch_pages") == 3
+    drive_rounds(rig, req, rounds=12)
+    # Three rejections give the plan up; the agreement spends the retry on a fresh plan; three
+    # more give that up too; the next agreement settles on local compute.
+    assert rig.worker.count("fetch") == 6
+    assert rig.effects.count("give_back_fetch_pages") == 6
     assert rig.effects.count("fail_requests") == 0
-    assert rig.records() == []
+    assert rig.records() == [] and rig.coord.plan_fetch(req) is None
 
 
 def test_three_consecutive_rejections_fail_a_gen_init_fetch():
@@ -1163,12 +1203,12 @@ def test_three_consecutive_rejections_fail_a_gen_init_fetch():
     req = FakeRequest(1, prompt_len=29, is_gen_init=True, route_hints={"ctx": {"peer": "peer1"}})
     rig.worker.reject_next = 10
     for round_index in range(3):
-        rig.coord.advance([req], float(round_index))
+        loop_advance(rig, req, float(round_index))
         assert isinstance(rig.coord.plan_fetch(req), FetchPlan)
         rig.coord.launch_fetches([req], float(round_index))
     assert rig.worker.count("fetch") == 3
     assert rig.effects.count("give_back_fetch_pages") == 3
-    (failed,) = rig.effects.only("fail_requests")
-    assert failed[0] == (req,) and failed[1].startswith("kv fetch rejected")
-    assert rig.coord.plan_fetch(req) is None
-    assert rig.records() == []
+    assert rig.effects.count("fail_requests") == 0 and rig.coord.plan_fetch(req) is DEFER
+    loop_advance(rig, req, 3.0)  # the FAILED vote lands: a gen-init fetch has no retry
+    assert rig.effects.only("fail_requests") == [((req,), "kv fetch launch given up")]
+    assert rig.coord.plan_fetch(req) is None and rig.records() == []

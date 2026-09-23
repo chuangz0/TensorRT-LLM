@@ -132,6 +132,8 @@ class StoreCounters:
     publish_present: int = 0
     probe_hits: int = 0
     probe_misses: int = 0
+    probe_failed: int = 0
+    """Lookups the store could not answer; the planner then decides as if the probe were unanswered."""
     failed_attempts: int = 0
 
 
@@ -664,6 +666,7 @@ class BlobStoreBackend:
             )
             with self._lock:
                 entry.error = exc
+                self.counters.probe_failed += 1
             if not isinstance(exc, Exception):
                 raise
         finally:

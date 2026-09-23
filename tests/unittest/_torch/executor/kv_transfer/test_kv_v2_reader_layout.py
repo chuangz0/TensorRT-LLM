@@ -28,6 +28,7 @@ from tensorrt_llm._torch.disaggregation.resource.kv_v2_reader import KVv2Resourc
 from tensorrt_llm._torch.disaggregation.resource.region import (
     KVv2RegionResolver,
     layout_fingerprint,
+    parallel_shard_tag,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import EngineRequestView
@@ -398,6 +399,32 @@ class TestLayout:
             assert layout_fingerprint(other) != layout_fingerprint(manager)
         finally:
             other.shutdown()
+
+    def test_parallel_shard_tag_names_the_tp_slice_and_is_shared_by_full_head_holders(self):
+        # A TP=1 worker and an attention-DP replica both hold every head: one tag, shared entries.
+        assert parallel_shard_tag(Mapping(world_size=1, tp_size=1, rank=0)) == "heads=all"
+        tp_ranks = [Mapping(world_size=2, tp_size=2, rank=r) for r in range(2)]
+        assert [parallel_shard_tag(m) for m in tp_ranks] == ["heads=0/2", "heads=1/2"]
+        adp_ranks = [
+            Mapping(world_size=2, tp_size=2, rank=r, enable_attention_dp=True) for r in range(2)
+        ]
+        assert [parallel_shard_tag(m) for m in adp_ranks] == ["heads=all", "heads=all"]
+
+    def test_fingerprint_separates_tp_shards_and_shares_attention_dp_replicas(self, manager):
+        """Two TP ranks hold byte-identical layouts of different heads: their fingerprints must
+        differ. Two attention-DP replicas hold the same heads: theirs must agree. The default
+        (no shard tag) is stable."""
+        page_table = build_page_table_from_manager(manager)
+        by_tag = {
+            tag: layout_fingerprint(manager, page_table, parallel_shard=tag)
+            for tag in ("heads=0/2", "heads=1/2", "heads=all", "")
+        }
+        assert by_tag["heads=0/2"] != by_tag["heads=1/2"]
+        assert by_tag["heads=all"] == layout_fingerprint(
+            manager, page_table, parallel_shard="heads=all"
+        )
+        assert by_tag[""] == layout_fingerprint(manager, page_table) == layout_fingerprint(manager)
+        assert len(set(by_tag.values())) == 4
 
     def test_resolver_spans_and_segments(self, manager):
         page_table = build_page_table_from_manager(manager)

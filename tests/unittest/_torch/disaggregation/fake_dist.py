@@ -2,20 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """In-process fake of the executor's ``dist`` object for multi-rank coordinator tests.
 
-A ``FakeDistGroup`` is a world of ``world_size`` ranks split into TP groups of
-``tp_size`` consecutive ranks, one thread per rank. Each collective is a
-``threading.Barrier`` rendezvous over its group: the call blocks until every
-rank of the group has entered a collective, checks that all of them entered
-the same one, then returns the gathered or reduced payloads. The fake
-verifies the protocol -- which collectives each rank enters, how often, in
-what order and with what payload -- not the blocking semantics of a real
+A ``FakeDistGroup`` is a world of ``world_size`` ranks, one thread per rank, laid out as the
+``Mapping`` lays out ranks: TP groups of ``tp_size`` consecutive ranks, and PP groups of the
+``pp_size`` ranks that share a TP rank (rank ``pp_rank * tp_size + tp_rank``). Each collective
+is a ``threading.Barrier`` rendezvous over its group: the call blocks until every rank of the
+group has entered a collective, checks that all of them entered the same one, then returns the
+gathered or reduced payloads. The fake verifies the protocol -- which collectives each rank
+enters, how often, in what order and with what payload -- not the blocking semantics of a real
 communication backend.
+
+The TP collectives hand out deep copies; the object collectives (``allgather``,
+``pp_allgather``) send the payload through ``pickle`` as the real ones do, so a payload that
+does not survive pickling fails here too.
 
 Barrier timeouts are wall-clock inside ``threading`` and unaffected by tests
 that patch ``time.monotonic``.
 """
 
 import copy
+import pickle
 import threading
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -37,6 +42,10 @@ class _PeerFailed(Exception):
 
 
 _REDUCERS = {ReduceOp.SUM: sum, ReduceOp.MAX: max, ReduceOp.MIN: min}
+
+
+def _pickle_round_trip(payload: Any) -> Any:
+    return pickle.loads(pickle.dumps(payload))
 
 
 class _Rendezvous:
@@ -112,14 +121,12 @@ class _Rendezvous:
 class FakeDistRank:
     """The ``dist`` object one rank hands to its coordinator.
 
-    Models only what the coordinator uses: a single pipeline / context-parallel
-    stage, TP collectives over the rank's TP group and ``allreduce`` over the
-    world. Every call is appended to ``calls`` as ``(collective, payload)``
-    with the payload as the caller passed it, including calls a single-rank
-    group answers locally.
+    Models only what the coordinators use: a single context-parallel stage, TP collectives over
+    the rank's TP group, ``pp_allgather`` over its PP group, ``allgather`` and ``allreduce``
+    over the world. Every call is appended to ``calls`` as ``(collective, payload)`` with the
+    payload as the caller passed it, including calls a single-rank group answers locally.
     """
 
-    pp_size = 1
     cp_size = 1
 
     def __init__(self, group: "FakeDistGroup", rank: int) -> None:
@@ -128,7 +135,19 @@ class FakeDistRank:
         self.world_size = group.world_size
         self.tp_size = group.tp_size
         self.tp_rank = rank % group.tp_size
+        self.pp_size = group.pp_size
+        self.pp_rank = rank // group.tp_size
         self.calls: List[Tuple[str, Any]] = []
+
+    def allgather(self, obj) -> list:
+        return self._gather(
+            self._group.world_rendezvous(), "allgather", obj, copier=_pickle_round_trip
+        )
+
+    def pp_allgather(self, obj) -> list:
+        return self._gather(
+            self._group.pp_rendezvous(self.rank), "pp_allgather", obj, copier=_pickle_round_trip
+        )
 
     def tp_allgather(self, obj, *, small_payload: bool = False) -> list:
         return self._gather(self._group.tp_rendezvous(self.rank), "tp_allgather", obj)
@@ -150,21 +169,27 @@ class FakeDistRank:
         return self._reduce(self._group.world_rendezvous(), "allreduce", obj, op)
 
     def _gather(
-        self, rendezvous: _Rendezvous, collective: str, payload: Any, label: Optional[str] = None
+        self,
+        rendezvous: _Rendezvous,
+        collective: str,
+        payload: Any,
+        label: Optional[str] = None,
+        copier: Callable[[Any], Any] = copy.deepcopy,
     ) -> list:
         """Record the call and exchange a snapshot of ``payload``; return one copy per rank.
 
         The snapshot is taken before waiting: a sender may mutate its input as
         soon as the call returns, while a peer may not have read the slot yet.
-        Receivers get their own copies, as they would after unpickling.
-        ``label`` is what peers must agree on; it defaults to ``collective``.
+        Receivers get their own copies, as they would after unpickling;
+        ``copier`` makes them. ``label`` is what peers must agree on; it
+        defaults to ``collective``.
         """
-        snapshot = copy.deepcopy(payload)
+        snapshot = copier(payload)
         self.calls.append((collective, snapshot))
         if len(rendezvous.ranks) == 1:
-            return [copy.deepcopy(snapshot)]
+            return [copier(snapshot)]
         gathered = rendezvous.exchange(self.rank, label or collective, snapshot)
-        return [copy.deepcopy(item) for item in gathered]
+        return [copier(item) for item in gathered]
 
     def _reduce(self, rendezvous: _Rendezvous, collective: str, payload: Any, op: ReduceOp):
         # Peers must agree on the operation, not just on entering a reduce.
@@ -179,13 +204,27 @@ class FakeDistRank:
 
 
 class FakeDistGroup:
-    """``world_size`` fake ranks in TP groups of ``tp_size`` consecutive ranks."""
+    """``world_size`` fake ranks in TP groups of ``tp_size`` consecutive ranks and PP groups of
+    the ``pp_size`` ranks sharing a TP rank; ``world_size == tp_size * pp_size``."""
 
-    def __init__(self, world_size: int, tp_size: int, timeout_s: float = 5.0) -> None:
+    def __init__(
+        self,
+        world_size: int,
+        tp_size: int,
+        pp_size: Optional[int] = None,
+        timeout_s: float = 5.0,
+    ) -> None:
         if world_size % tp_size:
             raise ValueError(f"tp_size {tp_size} must divide world_size {world_size}")
+        if pp_size is None:
+            pp_size = world_size // tp_size
+        if tp_size * pp_size != world_size:
+            raise ValueError(
+                f"tp_size {tp_size} * pp_size {pp_size} must equal world_size {world_size}"
+            )
         self.world_size = world_size
         self.tp_size = tp_size
+        self.pp_size = pp_size
         self._ranks = [FakeDistRank(self, rank) for rank in range(world_size)]
         self._world = _Rendezvous("world", range(world_size), timeout_s, self._last_call)
         self._tp_groups = [
@@ -195,7 +234,16 @@ class FakeDistGroup:
                 timeout_s,
                 self._last_call,
             )
-            for index in range(world_size // tp_size)
+            for index in range(pp_size)
+        ]
+        self._pp_groups = [
+            _Rendezvous(
+                f"PP group {tp_rank}",
+                range(tp_rank, world_size, tp_size),
+                timeout_s,
+                self._last_call,
+            )
+            for tp_rank in range(tp_size)
         ]
 
     def rank(self, rank: int) -> FakeDistRank:
@@ -203,6 +251,9 @@ class FakeDistGroup:
 
     def tp_rendezvous(self, rank: int) -> _Rendezvous:
         return self._tp_groups[rank // self.tp_size]
+
+    def pp_rendezvous(self, rank: int) -> _Rendezvous:
+        return self._pp_groups[rank % self.tp_size]
 
     def world_rendezvous(self) -> _Rendezvous:
         return self._world
@@ -223,7 +274,7 @@ class FakeDistGroup:
             except Exception as error:  # re-raised on the caller's thread below
                 with lock:
                     failures.append((rank, error))
-                for rendezvous in (self._world, *self._tp_groups):
+                for rendezvous in (self._world, *self._tp_groups, *self._pp_groups):
                     rendezvous.abort(f"rank {rank} raised {type(error).__name__}")
 
         threads = [

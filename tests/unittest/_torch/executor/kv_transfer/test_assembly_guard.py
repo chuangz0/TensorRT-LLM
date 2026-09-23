@@ -33,6 +33,7 @@ from tensorrt_llm._torch.pyexecutor.kv_transfer.assembly import (
 from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import (
     EngineRequestView,
     PyExecutorKVTransferEffects,
+    SingleRankDist,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -66,8 +67,17 @@ def guard(executor, mapping=None, **overrides):
     )
 
 
-def test_in_scope_engine_passes():
-    guard(in_scope_executor())
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        in_scope_mapping(),
+        in_scope_mapping(tp_size=2),
+        in_scope_mapping(tp_size=4, enable_attention_dp=True),
+    ],
+    ids=["single_rank", "tp", "adp"],
+)
+def test_in_scope_engine_passes(mapping):
+    guard(in_scope_executor(), mapping)
 
 
 def _v1_manager():
@@ -106,14 +116,13 @@ def _pool_rebalance():
     [
         (_v1_manager, None, {}, "kv_cache_config.use_kv_cache_manager_v2=True is required"),
         (_no_reuse, None, {}, "kv_cache_config.enable_block_reuse=True is required"),
-        (in_scope_executor, in_scope_mapping(tp_size=2), {}, "TP=PP=CP=1 is required, got tp=2"),
-        (in_scope_executor, in_scope_mapping(pp_size=2), {}, "TP=PP=CP=1 is required.*pp=2"),
-        (in_scope_executor, in_scope_mapping(cp_size=2), {}, "TP=PP=CP=1 is required.*cp=2"),
+        (in_scope_executor, in_scope_mapping(pp_size=2), {}, "PP=1 is required, got pp=2"),
+        (in_scope_executor, in_scope_mapping(cp_size=2), {}, "CP=1 is required, got cp=2"),
         (
             in_scope_executor,
-            in_scope_mapping(enable_attention_dp=True),
+            in_scope_mapping(tp_size=2, pp_size=2, cp_size=2),
             {},
-            "attention data parallelism is not supported",
+            "CP=1 is required",  # CP is the condition that will not lift: named first
         ),
         (in_scope_executor, None, {"spec_config": object()}, "speculative decoding"),
         (in_scope_executor, None, {"kv_connector_manager": object()}, "a KV connector is attached"),
@@ -130,10 +139,9 @@ def _pool_rebalance():
     ids=[
         "v1_manager",
         "no_reuse",
-        "tp",
         "pp",
         "cp",
-        "adp",
+        "cp_before_pp",
         "spec",
         "connector",
         "draft",
@@ -211,8 +219,11 @@ class TestAssembledCoordinator:
             backends=(BackendEntry.from_dict({"name": "store", "type": "fake"}),),
             probe_timeout_s=probe_timeout_s,
             fetch_timeout_s=12.5,
+            unlaunched_timeout_s=7.5,
         )
-        coordinator = assembly._build_coordinator(config, [handle], reader, effects)
+        coordinator = assembly._build_coordinator(
+            config, [handle], reader, effects, SingleRankDist(), attention_dp=False
+        )
         return coordinator, reader
 
     def test_planner_budget_is_the_wall_clock_alone(self):
@@ -222,6 +233,7 @@ class TestAssembledCoordinator:
         assert planner._probe_timeout_s == 0.05
         assert planner._clock is time.monotonic  # plan §10 #15: one clock with ``advance``
         assert coordinator._fetch_timeout_s == 12.5 and coordinator._publish_timeout_s is None
+        assert coordinator._unlaunched_timeout_s == 7.5
 
     def test_answered_probe_plans_within_the_budget(self):
         coordinator, _ = self._build(probe_timeout_s=0.05, store=FakeFetches(probe_answer="all"))

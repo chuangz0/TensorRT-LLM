@@ -40,10 +40,14 @@ from ...disaggregation.orchestration.kv_transfer.interfaces import FetchSource, 
 from ...disaggregation.remote_cache import Planner
 from ...disaggregation.resource.kv_extractor import build_page_table_from_manager
 from ...disaggregation.resource.kv_v2_reader import KVv2ResourceReader
-from ...disaggregation.resource.region import KVv2RegionResolver, layout_fingerprint
+from ...disaggregation.resource.region import (
+    KVv2RegionResolver,
+    layout_fingerprint,
+    parallel_shard_tag,
+)
 from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .binding import KVTransferEngineBinding
-from .effects import EngineWorkQueue, PyExecutorKVTransferEffects, SingleRankDist
+from .effects import EngineDist, EngineWorkQueue, PyExecutorKVTransferEffects
 
 if TYPE_CHECKING:
     from ..py_executor import PyExecutor
@@ -76,13 +80,13 @@ def check_engine_supports_kv_transfer(
         _refuse("kv_cache_config.use_kv_cache_manager_v2=True is required")
     if not kv_cache_manager.enable_block_reuse:
         _refuse("kv_cache_config.enable_block_reuse=True is required")
-    if mapping.tp_size != 1 or mapping.pp_size != 1 or mapping.cp_size != 1:
+    if mapping.cp_size != 1:
         _refuse(
-            f"TP=PP=CP=1 is required, got tp={mapping.tp_size} pp={mapping.pp_size} "
-            f"cp={mapping.cp_size}"
+            f"CP=1 is required, got cp={mapping.cp_size}: context parallelism splits the "
+            "sequence, so block ordinals do not name the same content on every rank"
         )
-    if mapping.enable_attention_dp:
-        _refuse("attention data parallelism is not supported")
+    if mapping.pp_size != 1:
+        _refuse(f"PP=1 is required, got pp={mapping.pp_size}")
     if spec_config is not None:
         _refuse("speculative decoding is not supported")
     if kv_connector_manager is not None:
@@ -126,6 +130,9 @@ def _build_coordinator(
     backends: Sequence[BackendHandle],
     reader: KVv2ResourceReader,
     effects: PyExecutorKVTransferEffects,
+    dist,
+    *,
+    attention_dp: bool,
 ) -> KVTransferCoordinator:
     fetch_sources = [
         FetchSource(handle.name, handle.fetcher, handle.hint_key)
@@ -149,9 +156,11 @@ def _build_coordinator(
         reader,
         effects,
         EngineWorkQueue(),
-        SingleRankDist(),
+        dist,
         fetch_timeout_s=config.fetch_timeout_s,
         publish_timeout_s=config.publish_timeout_s,
+        unlaunched_timeout_s=config.unlaunched_timeout_s,
+        attention_dp=attention_dp,
     )
 
 
@@ -194,7 +203,9 @@ def attach_kv_transfer(
     resolver = KVv2RegionResolver(page_table)
     build_context = BackendBuildContext(
         resolver=resolver,
-        layout_fingerprint=layout_fingerprint(kv_cache_manager, page_table),
+        layout_fingerprint=layout_fingerprint(
+            kv_cache_manager, page_table, parallel_shard=parallel_shard_tag(mapping)
+        ),
         max_unit_bytes=resolver.max_unit_bytes(),
         device_index=executor.device_id,
     )
@@ -202,7 +213,14 @@ def attach_kv_transfer(
     _register_kv_pools(backends, resolver)
 
     effects = PyExecutorKVTransferEffects(executor)
-    coordinator = _build_coordinator(config, backends, reader, effects)
+    coordinator = _build_coordinator(
+        config,
+        backends,
+        reader,
+        effects,
+        EngineDist(executor.dist, mapping),
+        attention_dp=mapping.enable_attention_dp,
+    )
     binding = KVTransferEngineBinding(
         executor,
         coordinator,

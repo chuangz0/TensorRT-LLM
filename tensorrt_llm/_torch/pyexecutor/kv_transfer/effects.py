@@ -16,8 +16,9 @@
 
 ``EngineRequestView`` is the ``RequestView`` over one ``LlmRequest``; ``PyExecutorKVTransferEffects``
 is the ``KVTransferEffects`` over one ``PyExecutor`` and the only place that writes a request's
-transfer state; ``EngineWorkQueue`` and ``SingleRankDist`` complete the contract. The two state
-constants spell the coordination layer's states with the alias table of design §12.2.
+transfer state; ``EngineWorkQueue`` and ``EngineDist`` (``SingleRankDist`` for tests) complete the
+contract. The two state constants spell the coordination layer's states with the alias table of
+design §12.2.
 """
 
 from __future__ import annotations
@@ -28,20 +29,25 @@ from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
 from tensorrt_llm.logger import logger
 
+from ...disaggregation.orchestration.kv_transfer.interfaces import Scope
 from ..kv_cache.kv_cache_manager_v2 import _settle_context_cursor
 from ..llm_request import LlmRequest, LlmRequestState, rewind_context_after_cache_drop
 from ..resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
+    from tensorrt_llm.mapping import Mapping as ParallelMapping
+
     from ..py_executor import PyExecutor
 
 __all__ = [
     "KV_FETCH_IN_PROGRESS",
     "KV_PUBLISH_IN_PROGRESS",
+    "EngineDist",
     "EngineRequestView",
     "EngineWorkQueue",
     "PyExecutorKVTransferEffects",
     "SingleRankDist",
+    "collective_group_size",
 ]
 
 # Both aliases lie outside the V2 scheduler's schedulable range. The disagg transceiver writes
@@ -116,6 +122,28 @@ class SingleRankDist:
 
     def allgather(self, payload: object, scope: str) -> list:
         return [payload]
+
+
+def collective_group_size(mapping: ParallelMapping, scope: Scope) -> int:
+    """How many ranks take part in a collective of ``scope``: the world, or this rank's PP group."""
+    return mapping.pp_size if scope == "pp" else mapping.world_size
+
+
+class EngineDist:
+    """``DistLike`` over the executor's ``dist``: the whole world through ``allgather``, this rank's
+    pipeline group through ``pp_allgather``. A group of one rank answers with its own payload and
+    enters no collective, as the disagg transceiver's sync policy does for a world of one."""
+
+    def __init__(self, dist, mapping: ParallelMapping) -> None:
+        self._dist = dist
+        self._mapping = mapping
+
+    def allgather(self, payload: object, scope: Scope) -> list:
+        if collective_group_size(self._mapping, scope) == 1:
+            return [payload]
+        if scope == "pp":
+            return self._dist.pp_allgather(payload)
+        return self._dist.allgather(payload)
 
 
 class PyExecutorKVTransferEffects:
