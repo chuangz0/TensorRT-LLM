@@ -77,13 +77,15 @@ def prompt_token_ids(seed: int = 1, prompt_len: int = PROMPT_LEN) -> list[int]:
     return [1] + [(seed * 7919 + i * 13 + 1) % 31000 + 100 for i in range(prompt_len - 1)]
 
 
-def kv_cache_config():
+def kv_cache_config(free_gpu_memory_fraction: float = 0.2):
+    """``free_gpu_memory_fraction`` is of the memory free when the engine starts, so a test that
+    keeps several engines up at once lowers it to leave room for the next one."""
     from tensorrt_llm.llmapi import KvCacheConfig
 
     return KvCacheConfig(
         use_kv_cache_manager_v2=True,
         enable_block_reuse=True,
-        free_gpu_memory_fraction=0.2,
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
         tokens_per_block=TOKENS_PER_BLOCK,
     )
 
