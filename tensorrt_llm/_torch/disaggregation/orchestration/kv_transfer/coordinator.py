@@ -41,13 +41,20 @@ from .interfaces import (
     FetchSource,
     KVTransferEffects,
     PlacesPieces,
+    PlanAuthority,
     RequestView,
     ResourceReader,
     Scope,
 )
 from .records import AttemptRecord, RecordKey, RecordState, TransferRecord
 
-__all__ = ["MAX_CONSECUTIVE_LAUNCH_FAILURES", "KVTransferCoordinator", "Vote", "VoteKind"]
+__all__ = [
+    "MAX_CONSECUTIVE_LAUNCH_FAILURES",
+    "KVTransferCoordinator",
+    "PlanAnswers",
+    "Vote",
+    "VoteKind",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +68,9 @@ _DEFER_WIRE = "DEFER"
 _PlanAnswer = FetchPlan | None | Defer
 _PlanWire = tuple[int, str] | str | None
 """A plan answer on the wire: ``(token_end, source)``, ``"DEFER"``, or ``None``."""
+PlanAnswers = list[tuple[int, _PlanWire]]
+"""Decided answers as the owner hands them to the followers: ``[(request_id, plan wire)]``, never
+``"DEFER"``. Built-in types only, so it rides in the pickled schedule."""
 
 
 class VoteKind(Enum):
@@ -171,6 +181,11 @@ class KVTransferCoordinator:
             already launched before it votes the fetch failed. ``None`` disables. Never starts
             counting on a single rank.
         attention_dp: Under attention DP the collective spans this rank's PP group only.
+        plan_authority: Who decides plan answers on this rank. ``VOTED``: planned here and
+            reduced in the collective. ``OWNER``: planned here alone, not carried in the
+            payload, handed out with ``export_plan_answers``. ``FOLLOWER``: never planned or
+            probed here; taken with ``adopt_plan_answers``. Votes and expiries travel through
+            the collective in every mode.
         queue_budget: How many posted callables one ``advance`` runs.
         gather: Replaces ``dist.allgather(payload, scope)`` for the one collective per
             ``advance``; a test seam so the four phases can be driven on one thread with
@@ -194,6 +209,7 @@ class KVTransferCoordinator:
         publish_timeout_s: float | None = None,
         unlaunched_timeout_s: float | None = 30.0,
         attention_dp: bool = False,
+        plan_authority: PlanAuthority = PlanAuthority.VOTED,
         queue_budget: int = 64,
         gather: Callable[[_Payload], list] | None = None,
     ) -> None:
@@ -212,6 +228,7 @@ class KVTransferCoordinator:
         self._fetch_timeout_s = fetch_timeout_s
         self._publish_timeout_s = publish_timeout_s
         self._unlaunched_timeout_s = unlaunched_timeout_s
+        self._plan_authority = plan_authority
         self._queue_budget = queue_budget
         scope: Scope = "pp" if attention_dp else "world"
         self._gather: Callable[[_Payload], list] = gather or (
@@ -222,6 +239,10 @@ class KVTransferCoordinator:
         self._requests: dict[int, RequestView] = {}
         self._plans: dict[int, FetchPlan | None] = {}
         """Decided answers ``plan_fetch`` reads. A request with no entry is undecided (DEFER)."""
+        self._answers_to_export: dict[int, FetchPlan | None] = {}
+        """OWNER only: the answers the last ``advance`` decided, for ``export_plan_answers``."""
+        self._pending_answers: dict[int, _PlanWire] = {}
+        """FOLLOWER only: adopted answers whose request is not a candidate here yet."""
         self._probe_answers: dict[int, dict[str, frozenset[bytes] | None]] = {}
         self._finished: set[int] = set()
         self._held: set[int] = set()
@@ -272,6 +293,37 @@ class KVTransferCoordinator:
             req = self._requests.get(rid)
             if req is not None:
                 self.notify_request_finished(req)
+
+    # ---- plan authority: owner hands out, follower takes ----
+
+    @property
+    def plan_authority(self) -> PlanAuthority:
+        return self._plan_authority
+
+    def export_plan_answers(self) -> PlanAnswers:
+        """OWNER, after ``advance``: the answers it decided this round, on the wire, for the
+        followers' ``adopt_plan_answers``. Empty in any other mode."""
+        return [(rid, _wire(ans)) for rid, ans in sorted(self._answers_to_export.items())]
+
+    def adopt_plan_answers(self, views: Sequence[RequestView], answers: PlanAnswers) -> None:
+        """FOLLOWER: take the owner's answers. ``None`` decides a request local; ``(token_end,
+        source)`` becomes this rank's own plan over its own layer groups. An answer for a request
+        not yet among ``views`` (the undecided candidates here) is held until its request appears
+        as a candidate, or is dropped when the request ends: the owner decides a request once and
+        does not export it again."""
+        by_rid = {view.py_request_id: view for view in views}
+        self._pending_answers.update(answers)
+        for rid, wire in list(self._pending_answers.items()):
+            view = by_rid.get(rid)
+            if view is None:
+                continue
+            del self._pending_answers[rid]
+            self._requests[rid] = view
+            if wire is None:
+                self._decide(rid, None)
+            else:
+                token_end, source = wire
+                self._decide(rid, self._planner.materialize(view, token_end, source))
 
     # ---- scheduler hook (read-only, non-blocking) ----
 
@@ -353,6 +405,7 @@ class KVTransferCoordinator:
 
     def status_dump(self) -> dict:
         return {
+            "plan_authority": self._plan_authority.value,
             "records": [
                 {
                     "request_id": rec.request_id,
@@ -364,6 +417,9 @@ class KVTransferCoordinator:
                     "deadline": rec.deadline,
                     "abandoned": rec.abandoned,
                     "token_end": rec.plan.token_end if rec.plan else None,
+                    "launch_gave_up": rec.launch_gave_up,
+                    "peer_launched_at": rec.peer_launched_at,
+                    "last_vote": rec.last_vote,
                 }
                 for rec in self._records.values()
             ],
@@ -392,6 +448,7 @@ class KVTransferCoordinator:
                 vote = self._unlaunched_vote(rec, now)
             else:
                 continue
+            rec.last_vote = vote.kind.value
             if self._is_voting(rec):
                 votes[key] = vote
             elif rec.state is RecordState.IN_FLIGHT and vote.kind is not VoteKind.INFLIGHT:
@@ -475,6 +532,9 @@ class KVTransferCoordinator:
 
     def _plan(self, candidates: Sequence[RequestView]) -> dict[int, _PlanAnswer]:
         answers: dict[int, _PlanAnswer] = {}
+        if self._plan_authority is PlanAuthority.FOLLOWER:
+            # The owner plans; its answers arrive with the schedule (``adopt_plan_answers``).
+            return answers
         for req in candidates:
             rid = req.py_request_id
             rec = self._records.get((rid, "fetch"))
@@ -525,17 +585,19 @@ class KVTransferCoordinator:
         answers: Mapping[int, _PlanAnswer],
         now: float,
     ) -> tuple[dict[RecordKey, _Verdict], list[RecordKey], dict[int, _PlanAnswer]]:
+        voted = self._plan_authority is PlanAuthority.VOTED
         payload: _Payload = (
             [(key, vote.kind.value, vote.b, vote.hint) for key, vote in sorted(votes.items())],
             sorted(expired),
-            [(rid, _wire(ans)) for rid, ans in sorted(answers.items())],
+            [(rid, _wire(ans)) for rid, ans in sorted(answers.items())] if voted else [],
         )
         gathered = self._gather(payload)
         ballots = _ballots_by_key(gathered)
         self._note_peer_launches(votes, ballots, now)
         verdicts = _reduce_votes(ballots, len(gathered))
         expired_all = {tuple(key) for _, exp, _ in gathered for key in exp}
-        consensus = _reduce_plans(gathered, answers)
+        # An owner's answers are its own word; they reach the followers with the schedule.
+        consensus = _reduce_plans(gathered, answers) if voted else dict(answers)
         return verdicts, sorted(expired_all), consensus
 
     def _note_peer_launches(
@@ -584,21 +646,29 @@ class KVTransferCoordinator:
                 # unlaunched record is a failure: drop the plan without touching pages.
                 self._reset_for_replan(rec)
 
+        self._answers_to_export = {}
         for rid, ans in answers.items():
             if ans is DEFER:
                 continue
-            self._plans[rid] = ans
-            key = (rid, "fetch")
-            rec = self._records.get(key)
-            if ans is None:
-                if rec is not None and rec.state is RecordState.PLANNED:
-                    self._release(rec)
-                continue
-            if rec is None:
-                rec = TransferRecord(rid, "fetch", RecordState.PLANNED)
-                self._records[key] = rec
-            rec.plan = ans
-            rec.retry_hint = None
+            self._decide(rid, ans)
+            if self._plan_authority is PlanAuthority.OWNER:
+                self._answers_to_export[rid] = ans
+
+    def _decide(self, rid: int, ans: FetchPlan | None) -> None:
+        """Write a decided answer: ``None`` releases a planned record, a plan goes on the record
+        (created if needed) and ``plan_fetch`` reads it from now on."""
+        self._plans[rid] = ans
+        key = (rid, "fetch")
+        rec = self._records.get(key)
+        if ans is None:
+            if rec is not None and rec.state is RecordState.PLANNED:
+                self._release(rec)
+            return
+        if rec is None:
+            rec = TransferRecord(rid, "fetch", RecordState.PLANNED)
+            self._records[key] = rec
+        rec.plan = ans
+        rec.retry_hint = None
 
     def _expire_inflight(self, rec: TransferRecord) -> None:
         if rec.direction == "fetch" and rec.request_id in self._finished:
@@ -888,6 +958,7 @@ class KVTransferCoordinator:
     def _forget_request(self, rid: int) -> None:
         self._requests.pop(rid, None)
         self._plans.pop(rid, None)
+        self._pending_answers.pop(rid, None)
         self._probe_answers.pop(rid, None)
         self._finished.discard(rid)
         self._held.discard(rid)

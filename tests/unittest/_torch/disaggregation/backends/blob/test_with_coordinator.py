@@ -150,6 +150,7 @@ def test_publish_on_one_rank_then_probe_plan_launch_and_land_on_another():
         gen.coord.notify_request_finished(req)
         assert gen.records() == [] and gen.effects.count("hold_for_transfer") == 0
         assert gen.coord.status_dump() == {
+            "plan_authority": "VOTED",
             "records": [],
             "decided_plans": 0,
             "finished_pending": [],

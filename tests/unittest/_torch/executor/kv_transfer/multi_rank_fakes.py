@@ -27,7 +27,10 @@ from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
 from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.coordinator import (
     KVTransferCoordinator,
 )
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import FetchSource
+from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import (
+    FetchSource,
+    PlanAuthority,
+)
 from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.records import TransferRecord
 from tensorrt_llm._torch.disaggregation.remote_cache import FetchPlan, Planner
 from tensorrt_llm._torch.disaggregation.resource.region import parallel_shard_tag
@@ -85,8 +88,8 @@ class RankRig:
     """One rank of a world: real coordinator, planner, effects and binding over the fakes, with
     ``schedule_round`` standing in for what the engine loop and the V2 scheduler do per round.
 
-    ``unlaunched_timeout_s`` and ``fetch_timeout_s`` go to the coordinator; the store answers
-    every probe and every fetch stays in flight until ``deliver_all``.
+    ``unlaunched_timeout_s``, ``fetch_timeout_s`` and ``plan_authority`` go to the coordinator;
+    the store answers every probe and every fetch stays in flight until ``deliver_all``.
     """
 
     def __init__(
@@ -97,6 +100,7 @@ class RankRig:
         enable_attention_dp: bool = False,
         unlaunched_timeout_s: float | None = 10.0,
         fetch_timeout_s: float | None = None,
+        plan_authority: PlanAuthority = PlanAuthority.VOTED,
     ) -> None:
         self.rank = rank
         self.dist = group.rank(rank)
@@ -124,6 +128,7 @@ class RankRig:
             fetch_timeout_s=fetch_timeout_s,
             unlaunched_timeout_s=unlaunched_timeout_s,
             attention_dp=enable_attention_dp,
+            plan_authority=plan_authority,
         )
         handle = BackendHandle(
             name="store",
@@ -147,10 +152,17 @@ class RankRig:
 
     # -- one round of the loop on this rank --
 
-    def schedule_round(self, active: Sequence[LlmRequest]) -> None:
+    def schedule_round(self, active: Sequence[LlmRequest], *, adopt=None) -> None:
         """``advance_round``, then, for every request the coordinator planned, reserve its pages
-        the way the scheduler's ``reserve_transfer_pages`` does and launch the fetch."""
+        the way the scheduler's ``reserve_transfer_pages`` does and launch the fetch.
+
+        ``adopt`` plays Stage 0 for a follower: called after ``advance_round`` with the active
+        requests, it must return the owner's exported answers, which are adopted before the
+        local scheduling below.
+        """
         self.binding.advance_round(list(active))
+        if adopt is not None:
+            self.binding.adopt_plan_answers(list(active), adopt(list(active)))
         launch_queue = []
         for request in active:
             plan = self.binding.plan_fetch(request)

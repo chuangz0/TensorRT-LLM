@@ -42,8 +42,11 @@ from tensorrt_llm.logger import logger
 
 from ...disaggregation.backends.config import BackendEntry
 from ...disaggregation.backends.registry import BackendHandle, close_backends
-from ...disaggregation.orchestration.kv_transfer.coordinator import KVTransferCoordinator
-from ...disaggregation.orchestration.kv_transfer.interfaces import DEFER
+from ...disaggregation.orchestration.kv_transfer.coordinator import (
+    KVTransferCoordinator,
+    PlanAnswers,
+)
+from ...disaggregation.orchestration.kv_transfer.interfaces import DEFER, PlanAuthority
 from ...disaggregation.resource.kv_v2_reader import KVv2ResourceReader
 from ..llm_request import LlmRequest, LlmRequestState
 from .effects import EngineRequestView, PyExecutorKVTransferEffects
@@ -73,6 +76,7 @@ class KVTransferEngineBinding:
         status_dump_path: Where ``close`` writes the JSON status dump; ``None`` writes nothing.
         started_at: ``time.time()`` at assembly; recorded in the dump so a test can order
             several engines by creation.
+        rank: This rank's index in the world, recorded in the dump; ``None`` when unknown.
     """
 
     DEFER = DEFER
@@ -90,6 +94,7 @@ class KVTransferEngineBinding:
         close_timeout_s: float,
         status_dump_path: str | None = None,
         started_at: float | None = None,
+        rank: int | None = None,
     ) -> None:
         self._executor = executor
         self.coordinator = coordinator
@@ -100,19 +105,40 @@ class KVTransferEngineBinding:
         self._close_timeout_s = close_timeout_s
         self._status_dump_path = status_dump_path
         self._started_at = time.time() if started_at is None else started_at
+        self._rank = rank
         self._is_closed = False
         self._num_deferred_requests = 0
-        """Requests still undecided after the last advance; each is waiting on a store lookup."""
+        """Requests still undecided after the last advance (or, on a follower, after the last
+        adoption); each is waiting on a store lookup."""
 
     # ---- loop entry points ----
 
     def advance_round(self, active_requests: Sequence[LlmRequest]) -> None:
         """Loop head (design §3.2 step 1), once per round: pick the undecided candidates, then
-        ``coordinator.advance`` reaps landed transfers and plans them."""
+        ``coordinator.advance`` reaps landed transfers and plans them. A follower plans nothing
+        here; its undecided count is set when it adopts the owner's answers."""
         candidates = self._undecided_candidates(active_requests)
         self.coordinator.advance(candidates, time.monotonic())
+        if self.coordinator.plan_authority is not PlanAuthority.FOLLOWER:
+            self._num_deferred_requests = sum(
+                1 for candidate in candidates if self.coordinator.plan_fetch(candidate) is DEFER
+            )
+
+    def export_plan_answers(self) -> PlanAnswers:
+        """Owner of the pipeline-parallel loop, after ``advance_round``: this round's decided plan
+        answers, to travel with the schedule to the other ranks."""
+        return self.coordinator.export_plan_answers()
+
+    def adopt_plan_answers(
+        self, active_requests: Sequence[LlmRequest], answers: PlanAnswers
+    ) -> None:
+        """Follower of the pipeline-parallel loop, before it runs its local scheduler: take the
+        owner's answers; every undecided candidate without one stays deferred."""
+        candidates = self._undecided_candidates(active_requests)
+        self.coordinator.adopt_plan_answers(candidates, answers)
+        answered = {request_id for request_id, _ in answers}
         self._num_deferred_requests = sum(
-            1 for candidate in candidates if self.coordinator.plan_fetch(candidate) is DEFER
+            1 for candidate in candidates if candidate.py_request_id not in answered
         )
 
     def plan_fetch(self, request: LlmRequest):
@@ -178,6 +204,7 @@ class KVTransferEngineBinding:
         return {
             "started_at": self._started_at,
             "pid": os.getpid(),
+            "rank": self._rank,
             "coordinator": self.coordinator.status_dump(),
             "backends": [
                 {

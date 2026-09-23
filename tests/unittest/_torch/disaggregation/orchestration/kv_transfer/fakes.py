@@ -31,6 +31,7 @@ from disaggregation.orchestration.kv_transfer.interfaces import (  # noqa: E402
     FetchSource,
     GroupKind,
     GroupSpec,
+    PlanAuthority,
 )
 from disaggregation.orchestration.kv_transfer.records import TransferRecord  # noqa: E402
 from disaggregation.remote_cache import (  # noqa: E402
@@ -454,14 +455,22 @@ class LockstepWorld:
     nested (and so on up to rank ``n-1``), so every rank's payload exists before any gather
     returns. Each rank then applies the same gathered list. ``fn`` must call ``advance`` exactly
     once per rank. Between ``run`` calls the test scripts each rank's fakes freely.
+
+    ``authority_of(rank)`` names each rank's ``PlanAuthority`` (default: every rank ``VOTED``);
+    ``Rig`` construction reads it through ``authority_kwargs``.
     """
 
-    def __init__(self, n: int) -> None:
+    def __init__(self, n: int, authority_of: Callable[[int], PlanAuthority] | None = None) -> None:
         self.n = n
+        self.authority_of = authority_of or (lambda rank: PlanAuthority.VOTED)
         self.gathers = [LockstepGather(self, r) for r in range(n)]
         self._fn: Callable[[int], object] | None = None
         self._payloads: dict[int, object] = {}
         self._results: list = []
+
+    def rig_kwargs(self, rank: int) -> dict:
+        """The keyword arguments that place a ``Rig`` at ``rank`` of this world."""
+        return {"gather": self.gathers[rank], "plan_authority": self.authority_of(rank)}
 
     def run(self, fn: Callable[[int], object]) -> list:
         assert self._fn is None, "LockstepWorld.run is not reentrant"

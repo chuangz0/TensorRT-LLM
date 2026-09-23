@@ -25,7 +25,9 @@ GUARD = "self.kv_transfer is not None"
 
 
 def source_of(method) -> str:
-    return inspect.getsource(method)
+    """The method's source with every whitespace run collapsed to one space, so a marker keeps
+    matching however the formatter wraps a call."""
+    return re.sub(r"\s+", " ", inspect.getsource(method))
 
 
 def ordered(text: str, *needles: str) -> None:
@@ -118,11 +120,79 @@ def test_overlap_loop_publishes_only_the_previous_batch():
     assert len(hook_calls(text, "publish_committed_blocks")) == 1
 
 
+# ---- the pipeline-parallel loop (multi-rank plan S4 ①-⑥) ----
+
+
+def test_pp_loop_advances_at_the_head_launches_after_stage_0_and_paces_idle():
+    text = source_of(PyExecutor._executor_loop_pp)
+    ordered(
+        text,
+        "if self.should_stop_processing:",
+        "break",
+        "self.disagg.poll_gen_transfers()",
+        GUARD,
+        "self.kv_transfer.advance_round(self.active_requests)",
+        "self._pad_attention_dp_dummy_request()",
+        "self._pp_schedule_and_propagate(microbatch_id)",
+        "if self.dist.rank != 0:",
+        GUARD,
+        "protected_from_eviction_request_ids=self.",
+        "kv_transfer.inflight_request_ids()",
+        "self.disagg.revert_deferred_gen_init(",
+        GUARD,
+        "self.kv_transfer.launch_reserved_fetches( self._kv_fetch_launch_queue if self.dist.rank "
+        "== 0 else local_scheduler_output.fetch_launch_queue)",
+        "self.disagg.pace_idle()",
+        GUARD,
+        "self.kv_transfer.pace_idle()",
+    )
+    assert len(hook_calls(text, "advance_round")) == 1
+    assert len(hook_calls(text, "launch_reserved_fetches")) == 1
+    assert len(hook_calls(text, "pace_idle")) == 1
+    # The one advance sits before any ``continue``/``break`` other than the stop check's.
+    head, _, _ = inspect.getsource(PyExecutor._executor_loop_pp).partition(
+        "self.kv_transfer.advance_round("
+    )
+    assert re.findall(r"^\s*(break|continue)\b", head, re.M) == ["break"]
+
+
+def test_pp_schedule_propagation_exports_on_the_owner_and_adopts_on_the_followers():
+    text = source_of(PyExecutor._pp_schedule_and_propagate)
+    ordered(
+        text,
+        "self._schedule(",
+        "self.disagg.admit(",
+        GUARD,
+        "kv_fetch_answers = self.kv_transfer.export_plan_answers()",
+        "SerializableSchedulerOutput.from_scheduler_result(",
+        "kv_fetch_answers=kv_fetch_answers",
+        "if scheduled_batch is None:",
+        GUARD,
+        "self.kv_transfer.adopt_plan_answers(",
+        "self.active_requests, serializable_schedule.kv_fetch_answers",
+        "serializable_schedule.to_scheduler_result(",
+    )
+
+
+def test_pp_executed_batch_publishes_after_the_context_commit_and_before_the_disagg_send():
+    text = source_of(PyExecutor._handle_executed_batch)
+    ordered(
+        text,
+        "self._update_requests(executed_batch.sample_state)",
+        "self._update_v2_context_resources(scheduled_requests)",
+        GUARD,
+        "self.kv_transfer.publish_committed_blocks(",
+        "scheduled_requests.context_requests)",
+        "self._send_kv_async(finished_ctx_reqs)",
+    )
+    assert len(hook_calls(text, "publish_committed_blocks")) == 1
+
+
 # ---- release gate, cancel, idle, shutdown ----
 
 
 def test_release_gate_is_the_first_statement_of_terminate_request():
-    tree = ast.parse(source_of(PyExecutor._terminate_request).strip())
+    tree = ast.parse(inspect.getsource(PyExecutor._terminate_request).strip())
     body = tree.body[0].body
     first = body[0]
     text = ast.unparse(first)
@@ -148,7 +218,7 @@ def test_cancel_asks_is_tracking_before_the_transceiver():
 
 
 def test_idle_detection_counts_a_transfer_in_flight_as_live():
-    text = source_of(PyExecutor._fetch_and_enqueue_requests)
+    text = inspect.getsource(PyExecutor._fetch_and_enqueue_requests)
     idle = re.search(r"idle = \((.*?)\)\n", text, re.S)
     assert idle is not None
     ordered(

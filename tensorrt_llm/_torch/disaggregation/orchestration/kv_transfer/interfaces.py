@@ -26,7 +26,7 @@ satisfies it structurally), the ``KVTransferEffects``, the ``EngineQueue`` and t
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Callable, Literal, Mapping, Protocol, Sequence, runtime_checkable
 
 from ...base.cache_backend import Attempt, CacheExtent, Fetches
@@ -45,6 +45,7 @@ __all__ = [
     "GroupSpec",
     "KVTransferEffects",
     "PlacesPieces",
+    "PlanAuthority",
     "RequestView",
     "ResourceReader",
     "Scope",
@@ -69,6 +70,24 @@ class Defer:
 
 DEFER = Defer()
 """The single ``Defer`` instance. Compare with ``is``."""
+
+
+class PlanAuthority(Enum):
+    """Who decides a request's plan answer on this rank (design §7.1 "齐").
+
+    VOTED: every rank plans and the collective reduces the answers; the loop where every rank
+        runs the scheduler.
+    OWNER: this rank plans alone and hands its answers to the other ranks with the schedule
+        (``export_plan_answers``); the rank that schedules in the pipeline-parallel loop.
+    FOLLOWER: this rank never plans or probes; it takes the owner's answers
+        (``adopt_plan_answers``) and builds its own plans from them.
+
+    Arrivals and expiries travel through the collective in every mode.
+    """
+
+    VOTED = "VOTED"
+    OWNER = "OWNER"
+    FOLLOWER = "FOLLOWER"
 
 
 class RequestView(Protocol):

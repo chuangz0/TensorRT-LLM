@@ -323,6 +323,22 @@ class Planner:
             return None
         return self._build(token_end, chosen, hint, False, reuse_end, keys)
 
+    def materialize(self, req: RequestView, token_end: int, source: str) -> FetchPlan:
+        """The plan another rank decided, built over this rank's own layer groups and reuse depth:
+        what ``decide`` would have built here for ``(token_end, source)``.
+
+        Only a store source: a routed source's hint is per request and is not on the wire, so a
+        plan for one cannot be rebuilt from ``(token_end, source)`` alone (``ValueError``).
+        """
+        chosen = next((s for s in self._sources if s.name == source), None)
+        if chosen is None:
+            raise ValueError(f"no fetch source named {source!r} on this rank")
+        if chosen.hint_key is not None:
+            raise ValueError(f"cannot rebuild a plan for the routed source {source!r}")
+        reuse_end = self._reader.local_reuse_tokens(req) // self._tpb
+        keys = tuple(self._reader.block_keys(req))
+        return self._build(token_end, chosen, None, False, reuse_end, keys)
+
     def _gen_init_source(self, req: RequestView) -> FetchSource | None:
         """The first routed source whose hint the request carries. A gen-init fetch has one
         possible origin, the context worker named by its hint; without a matching hint there is

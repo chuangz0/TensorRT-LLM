@@ -417,7 +417,8 @@ class KVTransferCoordinator:
                  planner: Planner, reader: ResourceReader, effects: KVTransferEffects,
                  queue: EngineQueue, dist: DistLike, *,
                  fetch_timeout_s: float | None = None, publish_timeout_s: float | None = None,
-                 attention_dp: bool = False, queue_budget: int = 64,
+                 unlaunched_timeout_s: float | None = 30.0, attention_dp: bool = False,
+                 plan_authority: PlanAuthority = PlanAuthority.VOTED, queue_budget: int = 64,
                  gather: Callable[[Payload], list] | None = None): ...
 
     # ---- 循环入口(每个 rank 每轮调用次数必须一致)----
@@ -428,6 +429,10 @@ class KVTransferCoordinator:
 
     # ---- 调度器钩子(只读、非阻塞)----
     def plan_fetch(self, req: RequestView) -> FetchPlan | None | Defer: ...
+
+    # ---- PP 的计划下发(OWNER 导出,FOLLOWER 采纳;见下文"齐")----
+    def export_plan_answers(self) -> list[tuple[int, tuple[int, str] | None]]: ...
+    def adopt_plan_answers(self, views: Sequence[RequestView], answers) -> None: ...
 
     # ---- 控制(不是入口)----
     def notify_request_finished(self, req: RequestView) -> None: ...  # 释放门:未在飞的 fetch 到释放点;在飞的记录 hold 请求
@@ -448,10 +453,16 @@ class KVTransferCoordinator:
 - 对 `candidates` 算本 rank 的计划答案(§7.2)。
 - 按 `now` 判定过期,置 `abandoned`。
 
-**齐**(一次集合通信)
-- payload:`[(record_id, B, failed)]`、过期的记录 id、`[(request_id, token_end | None | DEFER)]`。
-- 范围:`world`;ADP 下改为本 PP 组(今天 `_gen_consensus` 的规则)。PP > 1 时计划答案不走 allgather,由 rank 0 决定并随 canonical schedule 下发。
-- 归约:到达取 `MIN(B)`、`MAX(failed)`,因为各 rank 持有的层组不同,`served` 不同。计划答案:**任一 rank 答 `DEFER` 则 `DEFER`**(store 的 probe 异步到达,各 rank 先后不一);否则不一致取 `None`。
+**齐**(一次集合通信;三种 `PlanAuthority` 下每轮都发生,空闲轮也发生)
+- payload:`[(record_id, 票型, B, hint)]`、过期的记录 id、`[(request_id, (token_end, source) | None | DEFER)]`;计划段只在 `VOTED` 下携带,其余模式为空列表。
+- 票型四种,fetch 与 publish 同一形状、同一归约:`UNLAUNCHED`(fetch 有计划、本 rank 未发起:页未预留或发起没成功)、`INFLIGHT`(本 rank 还有 attempt 在跑)、`FAILED`(本 rank 的 attempt 失败,或放弃发起 `launch_gave_up`,或同伴已发起而本 rank 未发起超过 `unlaunched_timeout_s`)、`TERMINAL(B, hint)`(本 rank 全部 attempt 无失败结束;publish 的 `B=hint=0`)。请求已结束的记录不投票:结局无跨 rank 效果,本 rank 一到 terminal 就本地落地。
+- 范围:`world`;ADP 下改为本 PP 组(今天 `_gen_consensus` 的规则)。
+- 到达归约(仍要求每条记录 `seen==n`),按序:任一 `INFLIGHT` → 本轮不落地(失败落地要 `quiesce`,不能压在活 attempt 上);否则任一 `FAILED` → 决定性失败,已 Delivered 的 rank 一样丢弃、退页、耗一次重试;否则任一 `UNLAUNCHED` → 本轮不落地(落地要每个 rank 的页都在);否则全 `TERMINAL`,取 `MIN(B)`、`MIN(hint)`,因为各 rank 持有的层组不同,`served` 不同。
+- 计划答案按 `PlanAuthority` 分三种:
+  - `VOTED`(每个 rank 都跑调度器的循环):随 payload 走,**任一 rank 答 `DEFER` 则 `DEFER`**(store 的 probe 异步到达,各 rank 先后不一);否则 `(token_end, source)` 不一致取 `None`。
+  - `OWNER`(PP > 1 下调 `_schedule()` 的 rank:rank 0,或 ADP 下每个首 PP rank):本地算、本地答案直接生效、不进 payload;`export_plan_answers()` 把本轮决定的答案以 `[(request_id, (token_end, source) | None)]` 随 canonical schedule(`SerializableSchedulerOutput.kv_fetch_answers`)下发。
+  - `FOLLOWER`(PP > 1 下的其余 rank,含 owner 的 TP 同伴):不算、不 probe;`adopt_plan_answers(views, answers)` 在 `to_scheduler_result` 之前采纳:`None` → 本地计算并释放 PLANNED 记录;`(token_end, source)` → `Planner.materialize(req, token_end, source)` 按**本 rank** 的层组与本地 reuse 深度重建计划写进记录(只接受 store 来源:路由来源的 hint 不在线上)。
+  - 没有固有滞后:owner 第 R 轮 Stage 0 发起,follower 第 R 轮采纳、本地调度、同轮发起。只有 follower 预留失败才推到 R+1,中间那轮 owner `TERMINAL`、follower `UNLAUNCHED`,不落地。follower 尚未把请求当候选时收到的答案挂起到请求出现;请求结束即丢弃。失败共识在 owner 上同轮重置,下一轮重新导出。
 
 **用**
 - `LANDED` 的 fetch:`effects.unpark(...)`,attempt 的 `route.close()`。

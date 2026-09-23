@@ -148,7 +148,12 @@ def test_request_end_releases_landed_fetch_with_exactly_one_quiesce():
     assert quiesces == [((attempt,), True)]
     assert rig.records() == []
     assert rig.worker.routes[0].closed == 1  # idempotent close, not closed twice
-    assert rig.coord.status_dump() == {"records": [], "decided_plans": 0, "finished_pending": []}
+    assert rig.coord.status_dump() == {
+        "plan_authority": "VOTED",
+        "records": [],
+        "decided_plans": 0,
+        "finished_pending": [],
+    }
     # Nothing else happened at the release point of a landed fetch.
     assert rig.effects.names() == ["prepare_fetch_resources", "park_for_fetch", "unpark"]
 
@@ -196,7 +201,12 @@ def test_request_end_while_in_flight_abandons_then_releases_on_outcome(late):
     ]
     assert rig.effects.only("terminate_request") == [(req,)]
     assert quiesce_indices(rig.trace)[0] < effect_indices(rig.trace, "terminate_request")[0]
-    assert rig.coord.status_dump() == {"records": [], "decided_plans": 0, "finished_pending": []}
+    assert rig.coord.status_dump() == {
+        "plan_authority": "VOTED",
+        "records": [],
+        "decided_plans": 0,
+        "finished_pending": [],
+    }
 
 
 def test_request_end_while_in_flight_survives_its_deadline():
@@ -833,7 +843,12 @@ def test_publish_rejected_while_fetch_in_flight_terminates_once_the_fetch_releas
     assert rig.effects.count("fail_requests") == 0
     assert rig.effects.count("stage_transfer_response") == 0
     assert rig.effects.count("unpark") == 0
-    assert rig.coord.status_dump() == {"records": [], "decided_plans": 0, "finished_pending": []}
+    assert rig.coord.status_dump() == {
+        "plan_authority": "VOTED",
+        "records": [],
+        "decided_plans": 0,
+        "finished_pending": [],
+    }
 
 
 def test_publish_landed_first_waits_for_the_in_flight_fetch_before_terminating():
@@ -852,7 +867,12 @@ def test_publish_landed_first_waits_for_the_in_flight_fetch_before_terminating()
     rig.coord.advance([], 3.0)
     assert rig.effects.names()[-2:] == ["stage_transfer_response", "terminate_request"]
     assert rig.effects.count("unpark") == 0
-    assert rig.coord.status_dump() == {"records": [], "decided_plans": 0, "finished_pending": []}
+    assert rig.coord.status_dump() == {
+        "plan_authority": "VOTED",
+        "records": [],
+        "decided_plans": 0,
+        "finished_pending": [],
+    }
 
 
 def test_abandoned_publish_of_held_request_still_times_out_and_terminates():
@@ -894,7 +914,12 @@ def test_both_records_in_flight_fetch_releases_first_then_publish_lands():
     assert rig.effects.count("terminate_request") == 1
     assert rig.effects.names()[-2:] == ["stage_transfer_response", "terminate_request"]
     assert rig.worker.count("quiesce") == 1 and pub.count("quiesce") == 1
-    assert rig.coord.status_dump() == {"records": [], "decided_plans": 0, "finished_pending": []}
+    assert rig.coord.status_dump() == {
+        "plan_authority": "VOTED",
+        "records": [],
+        "decided_plans": 0,
+        "finished_pending": [],
+    }
 
 
 def test_no_publishers_means_no_publish_records():
@@ -1068,6 +1093,9 @@ def test_status_dump_shape():
             "deadline": 11.0,
             "abandoned": False,
             "token_end": END,
+            "launch_gave_up": False,
+            "peer_launched_at": None,
+            "last_vote": None,
         }
     ]
 

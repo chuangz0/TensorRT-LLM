@@ -36,7 +36,11 @@ from ...disaggregation.backends.registry import (
     close_backends,
 )
 from ...disaggregation.orchestration.kv_transfer.coordinator import KVTransferCoordinator
-from ...disaggregation.orchestration.kv_transfer.interfaces import FetchSource, GroupKind
+from ...disaggregation.orchestration.kv_transfer.interfaces import (
+    FetchSource,
+    GroupKind,
+    PlanAuthority,
+)
 from ...disaggregation.remote_cache import Planner
 from ...disaggregation.resource.kv_extractor import build_page_table_from_manager
 from ...disaggregation.resource.kv_v2_reader import KVv2ResourceReader
@@ -52,7 +56,12 @@ from .effects import EngineDist, EngineWorkQueue, PyExecutorKVTransferEffects
 if TYPE_CHECKING:
     from ..py_executor import PyExecutor
 
-__all__ = ["KV_TRANSFER_STATUS_DUMP_ENV", "attach_kv_transfer", "check_engine_supports_kv_transfer"]
+__all__ = [
+    "KV_TRANSFER_STATUS_DUMP_ENV",
+    "attach_kv_transfer",
+    "check_engine_supports_kv_transfer",
+    "plan_authority_for",
+]
 
 KV_TRANSFER_STATUS_DUMP_ENV = "TRTLLM_KV_TRANSFER_STATUS_DUMP"
 """Test seam: a path (``{pid}`` replaced by the worker's pid) where ``close`` writes a JSON dump."""
@@ -85,8 +94,6 @@ def check_engine_supports_kv_transfer(
             f"CP=1 is required, got cp={mapping.cp_size}: context parallelism splits the "
             "sequence, so block ordinals do not name the same content on every rank"
         )
-    if mapping.pp_size != 1:
-        _refuse(f"PP=1 is required, got pp={mapping.pp_size}")
     if spec_config is not None:
         _refuse("speculative decoding is not supported")
     if kv_connector_manager is not None:
@@ -106,10 +113,38 @@ def check_engine_supports_kv_transfer(
         )
 
 
+def plan_authority_for(mapping) -> PlanAuthority:
+    """Who plans on this rank, from the loop the engine runs (multi-rank plan S4).
+
+    Without pipeline parallelism every rank runs the scheduler and the answers are voted. With
+    it, the rank that calls ``_schedule`` in ``_pp_schedule_and_propagate`` owns the answers:
+    rank 0, or under attention DP every first pipeline rank (one per replica, whose collective
+    is its own pipeline group). Every other rank, the owner's tensor-parallel peers included,
+    receives the schedule and follows.
+    """
+    if mapping.pp_size == 1:
+        return PlanAuthority.VOTED
+    schedules_for_its_replica = mapping.enable_attention_dp and mapping.tp_size > 1
+    if mapping.rank == 0 or (mapping.pp_rank == 0 and schedules_for_its_replica):
+        return PlanAuthority.OWNER
+    return PlanAuthority.FOLLOWER
+
+
 def _check_layer_groups_are_full_attention(reader: KVv2ResourceReader) -> None:
     for group_spec in reader.group_specs():
         if group_spec.kind is not GroupKind.PAGED or group_spec.window_size is not None:
             _refuse("only full-attention models are supported (no sliding window, no SSM)")
+
+
+def _check_followers_can_rebuild_plans(mapping, backends: Sequence[BackendHandle]) -> None:
+    """Under PP the followers rebuild every plan from ``(token_end, source)`` alone; a routed
+    backend's plan also needs the request's hint, which is not on the wire."""
+    if mapping.pp_size > 1 and any(handle.hint_key is not None for handle in backends):
+        close_backends(backends)
+        _refuse(
+            "PP>1 with a routed (hint) backend: a follower cannot rebuild a routed plan from "
+            "(token_end, source)"
+        )
 
 
 def _register_kv_pools(backends: Sequence[BackendHandle], resolver: KVv2RegionResolver) -> None:
@@ -133,6 +168,7 @@ def _build_coordinator(
     dist,
     *,
     attention_dp: bool,
+    plan_authority: PlanAuthority = PlanAuthority.VOTED,
 ) -> KVTransferCoordinator:
     fetch_sources = [
         FetchSource(handle.name, handle.fetcher, handle.hint_key)
@@ -161,6 +197,7 @@ def _build_coordinator(
         publish_timeout_s=config.publish_timeout_s,
         unlaunched_timeout_s=config.unlaunched_timeout_s,
         attention_dp=attention_dp,
+        plan_authority=plan_authority,
     )
 
 
@@ -210,6 +247,7 @@ def attach_kv_transfer(
         device_index=executor.device_id,
     )
     backends = build_backends(config, build_context)
+    _check_followers_can_rebuild_plans(mapping, backends)
     _register_kv_pools(backends, resolver)
 
     effects = PyExecutorKVTransferEffects(executor)
@@ -220,6 +258,7 @@ def attach_kv_transfer(
         effects,
         EngineDist(executor.dist, mapping),
         attention_dp=mapping.enable_attention_dp,
+        plan_authority=plan_authority_for(mapping),
     )
     binding = KVTransferEngineBinding(
         executor,
@@ -231,13 +270,15 @@ def attach_kv_transfer(
         close_timeout_s=config.close_timeout_s,
         status_dump_path=_status_dump_path(),
         started_at=started_at,
+        rank=mapping.rank,
     )
     executor.scheduler.kv_transfer_planner = binding
     executor.kv_transfer = binding
     logger.info(
-        "KV transfer attached: backends=%s pools=%d layout=%s",
+        "KV transfer attached: backends=%s pools=%d layout=%s plan_authority=%s",
         [(entry.name, entry.type, sorted(entry.roles)) for entry in config.backends],
         len(resolver.pool_memory_spans()),
         build_context.layout_fingerprint.hex(),
+        coordinator.plan_authority.value,
     )
     return binding

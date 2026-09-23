@@ -105,6 +105,8 @@ class TransferRecord:
             than ``UNLAUNCHED`` for the same record. Bounds how long an unlaunched rank may hold
             the others up (``unlaunched_timeout_s``). Cleared when this rank launches or the plan
             is dropped.
+        last_vote: The kind of the vote this rank last cast for the record, as its wire string;
+            ``None`` before the first. Diagnostic only, read by the status dump.
     """
 
     request_id: int
@@ -121,6 +123,7 @@ class TransferRecord:
     consecutive_launch_failures: int = 0
     launch_gave_up: bool = False
     peer_launched_at: float | None = None
+    last_vote: str | None = None
 
     @property
     def key(self) -> RecordKey:

@@ -970,13 +970,20 @@ class TestClose:
 
         with open(dump_path, encoding="utf-8") as f:
             dump = json.load(f)
-        assert set(dump) == {"started_at", "pid", "coordinator", "backends"}
+        assert set(dump) == {"started_at", "pid", "rank", "coordinator", "backends"}
         assert dump["started_at"] == 123.5
         import os
 
         assert dump["pid"] == os.getpid()
+        assert dump["rank"] is None  # the rig does not name a rank; the assembly does
         coordinator = dump["coordinator"]
-        assert set(coordinator) == {"records", "decided_plans", "finished_pending"}
+        assert set(coordinator) == {
+            "plan_authority",
+            "records",
+            "decided_plans",
+            "finished_pending",
+        }
+        assert coordinator["plan_authority"] == "VOTED"
         assert coordinator["finished_pending"] == [1]
         assert isinstance(coordinator["decided_plans"], int)
         records = {(r["request_id"], r["direction"]): r for r in coordinator["records"]}
@@ -992,6 +999,9 @@ class TestClose:
                 "deadline",
                 "abandoned",
                 "token_end",
+                "launch_gave_up",
+                "peer_launched_at",
+                "last_vote",
             }
         assert records[(1, "publish")]["state"] == "IN_FLIGHT"
         assert records[(2, "fetch")]["state"] == "IN_FLIGHT"
@@ -1013,7 +1023,12 @@ class TestClose:
 
     def test_status_dump_is_readable_before_close(self, rig):
         dump = rig.binding.status_dump()
-        assert dump["coordinator"] == {"records": [], "decided_plans": 0, "finished_pending": []}
+        assert dump["coordinator"] == {
+            "plan_authority": "VOTED",
+            "records": [],
+            "decided_plans": 0,
+            "finished_pending": [],
+        }
         assert dump["backends"][0]["name"] == "store"
 
 

@@ -23,12 +23,16 @@ from engine_fakes import (
 
 from tensorrt_llm._torch.disaggregation.backends.config import BackendEntry, KVTransferConfig
 from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import DEFER
+from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import (
+    DEFER,
+    PlanAuthority,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_transfer import assembly
 from tensorrt_llm._torch.pyexecutor.kv_transfer.assembly import (
     attach_kv_transfer,
     check_engine_supports_kv_transfer,
+    plan_authority_for,
 )
 from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import (
     EngineRequestView,
@@ -53,7 +57,9 @@ def in_scope_executor() -> PyExecutor:
 
 
 def in_scope_mapping(**overrides) -> SimpleNamespace:
-    mapping = SimpleNamespace(tp_size=1, pp_size=1, cp_size=1, enable_attention_dp=False)
+    mapping = SimpleNamespace(
+        rank=0, tp_size=1, pp_size=1, pp_rank=0, cp_size=1, enable_attention_dp=False
+    )
     for key, value in overrides.items():
         setattr(mapping, key, value)
     return mapping
@@ -73,11 +79,48 @@ def guard(executor, mapping=None, **overrides):
         in_scope_mapping(),
         in_scope_mapping(tp_size=2),
         in_scope_mapping(tp_size=4, enable_attention_dp=True),
+        in_scope_mapping(pp_size=2),
+        in_scope_mapping(tp_size=2, pp_size=2, enable_attention_dp=True),
     ],
-    ids=["single_rank", "tp", "adp"],
+    ids=["single_rank", "tp", "adp", "pp", "adp_pp"],
 )
 def test_in_scope_engine_passes(mapping):
     guard(in_scope_executor(), mapping)
+
+
+@pytest.mark.parametrize(
+    "mapping, authority",
+    [
+        (in_scope_mapping(), PlanAuthority.VOTED),
+        (in_scope_mapping(rank=1, tp_size=2), PlanAuthority.VOTED),
+        (in_scope_mapping(pp_size=2), PlanAuthority.OWNER),
+        (in_scope_mapping(rank=1, pp_size=2, pp_rank=1), PlanAuthority.FOLLOWER),
+        # The owner's TP peer receives the schedule by tp_broadcast: a follower.
+        (in_scope_mapping(rank=1, tp_size=2, pp_size=2), PlanAuthority.FOLLOWER),
+        # Under attention DP every first PP rank schedules for its own replica.
+        (
+            in_scope_mapping(rank=1, tp_size=2, pp_size=2, enable_attention_dp=True),
+            PlanAuthority.OWNER,
+        ),
+        (
+            in_scope_mapping(rank=3, tp_size=2, pp_size=2, pp_rank=1, enable_attention_dp=True),
+            PlanAuthority.FOLLOWER,
+        ),
+    ],
+    ids=[
+        "single_rank",
+        "tp_peer_votes",
+        "pp_rank0_owns",
+        "pp_rank1_follows",
+        "tp_peer_of_owner_follows",
+        "adp_first_pp_rank_owns",
+        "adp_second_pp_rank_follows",
+    ],
+)
+def test_plan_authority_follows_the_rank_that_schedules(mapping, authority):
+    """Mirrors the owner rule of ``_pp_schedule_and_propagate``: rank 0, or under attention DP
+    with TP>1 every first pipeline rank, runs ``_schedule``; everyone else follows."""
+    assert plan_authority_for(mapping) is authority
 
 
 def _v1_manager():
@@ -116,13 +159,12 @@ def _pool_rebalance():
     [
         (_v1_manager, None, {}, "kv_cache_config.use_kv_cache_manager_v2=True is required"),
         (_no_reuse, None, {}, "kv_cache_config.enable_block_reuse=True is required"),
-        (in_scope_executor, in_scope_mapping(pp_size=2), {}, "PP=1 is required, got pp=2"),
         (in_scope_executor, in_scope_mapping(cp_size=2), {}, "CP=1 is required, got cp=2"),
         (
             in_scope_executor,
             in_scope_mapping(tp_size=2, pp_size=2, cp_size=2),
             {},
-            "CP=1 is required",  # CP is the condition that will not lift: named first
+            "CP=1 is required",  # TP and PP are hosted; CP alone is refused
         ),
         (in_scope_executor, None, {"spec_config": object()}, "speculative decoding"),
         (in_scope_executor, None, {"kv_connector_manager": object()}, "a KV connector is attached"),
@@ -139,9 +181,8 @@ def _pool_rebalance():
     ids=[
         "v1_manager",
         "no_reuse",
-        "pp",
         "cp",
-        "cp_before_pp",
+        "cp_with_tp_pp",
         "spec",
         "connector",
         "draft",
@@ -155,6 +196,31 @@ def test_every_out_of_scope_condition_is_refused_with_its_reason(
 ):
     with pytest.raises(ValueError, match="cannot host them: " + reason):
         guard(make_executor(), mapping, **overrides)
+
+
+def _handle(name: str, hint_key, closed: list) -> BackendHandle:
+    return BackendHandle(
+        name=name,
+        hint_key=hint_key,
+        fetcher=FakeFetches(),
+        publisher=None,
+        pool_registrar=None,
+        close=lambda: closed.append(name),
+    )
+
+
+def test_pp_refuses_a_routed_backend_and_closes_what_was_built():
+    """A follower rebuilds plans from ``(token_end, source)``; a routed backend's plan also
+    needs the request's hint, which the schedule does not carry."""
+    closed = []
+    handles = [_handle("store", None, closed), _handle("worker", "ctx", closed)]
+    with pytest.raises(ValueError, match="PP>1 with a routed \\(hint\\) backend"):
+        assembly._check_followers_can_rebuild_plans(in_scope_mapping(pp_size=2), handles)
+    assert closed == ["store", "worker"]
+
+    assembly._check_followers_can_rebuild_plans(in_scope_mapping(pp_size=1), handles)
+    assembly._check_followers_can_rebuild_plans(in_scope_mapping(pp_size=2), handles[:1])
+    assert closed == ["store", "worker"]  # accepted configurations close nothing
 
 
 def test_attach_refuses_a_malformed_config_before_building_anything(tmp_path):
@@ -200,7 +266,13 @@ class TestAssembledCoordinator:
     ``probe_timeout_s``; a request whose probe is never answered is deferred until the wall-clock
     budget runs out, then computed locally."""
 
-    def _build(self, *, probe_timeout_s: float, store: FakeFetches):
+    def _build(
+        self,
+        *,
+        probe_timeout_s: float,
+        store: FakeFetches,
+        plan_authority: PlanAuthority = PlanAuthority.VOTED,
+    ):
         kv = FakeKVCacheManager(TPB)
         executor = object.__new__(PyExecutor)
         executor.kv_cache_manager = kv
@@ -222,9 +294,24 @@ class TestAssembledCoordinator:
             unlaunched_timeout_s=7.5,
         )
         coordinator = assembly._build_coordinator(
-            config, [handle], reader, effects, SingleRankDist(), attention_dp=False
+            config,
+            [handle],
+            reader,
+            effects,
+            SingleRankDist(),
+            attention_dp=False,
+            plan_authority=plan_authority,
         )
         return coordinator, reader
+
+    def test_plan_authority_reaches_the_coordinator(self):
+        coordinator, _ = self._build(
+            probe_timeout_s=0.05,
+            store=FakeFetches(probe_answer="all"),
+            plan_authority=PlanAuthority.FOLLOWER,
+        )
+        assert coordinator.plan_authority is PlanAuthority.FOLLOWER
+        assert coordinator.status_dump()["plan_authority"] == "FOLLOWER"
 
     def test_planner_budget_is_the_wall_clock_alone(self):
         coordinator, _ = self._build(probe_timeout_s=0.05, store=FakeFetches(probe_answer=None))

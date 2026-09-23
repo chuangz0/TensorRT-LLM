@@ -17,7 +17,7 @@ SPDX-License-Identifier: Apache-2.0
 4. 与现有 disagg 协调器共存:gen-init 请求仍全归 `DisaggTransferCoordinator`;disagg ctx-only 请求对 fetch 路径是普通 context 请求,context 结束后**既发给 gen worker 又发布到 store**。终止由**释放门**把关(§9):门只问本层的记录表,**不问 disagg 发送**——disagg 已有自己的释放点,且在 partial-reuse 早终止模式下发送方根本不会来终止请求。
 5. 请求状态用设计§12.2 的别名表:`KV_FETCH_IN_PROGRESS ≡ DISAGG_GENERATION_TRANS_IN_PROGRESS(9)`、`KV_PUBLISH_IN_PROGRESS ≡ DISAGG_CONTEXT_TRANS_IN_PROGRESS(21)`,两者都在调度器可调度区间之外,调度器排除逻辑**零改动**。
 6. KV v2 wrapper 只改三处(§7);调度器只多问一个只读钩子 `plan_fetch`,多回一个 `fetch_launch_queue`。
-7. 范围守卫:KV v2 + `enable_block_reuse` + full attention + TP=PP=CP=1 + 无 ADP + 无 spec-decode + 无 KV connector + 无 draft 管理器 + beam 1;其余装配期拒绝并说明原因。
+7. 范围守卫:KV v2 + `enable_block_reuse` + full attention + CP=1(TP、PP、ADP 均接受,见 `KV_TRANSFER_MULTI_RANK_PLAN.zh.md`;PP>1 下不接受带路由提示的后端)+ 无 spec-decode + 无 KV connector + 无 draft 管理器 + beam 1;其余装配期拒绝并说明原因。
 8. 测试三层:GPU 上对真 `KVCacheManagerV2` 的 reader/resolver/fingerprint 单测;假执行器的 effects 单测;e2e 两个(双实例同 prompt、disagg 共存),按 `test_llm_pytorch.py::test_llm_disagg_gen_cancelled` 的单进程双 `LLM()` 模式写,自起 `mooncake_master` 与长寿命 segment provider,计数经 `TRTLLM_KV_TRANSFER_STATUS_DUMP` 写 JSON 读取。
 9. 实施分 6 步,每步独立可测;既有 339 + 345 + 513 个测试全程保持绿色。
 
@@ -29,7 +29,7 @@ SPDX-License-Identifier: Apache-2.0
 | 与现有 disagg 共存,ctx-only 请求双发 + 只问本层的释放门 | 删除 KV connector / admission / transfer_manager(设计§12.1) |
 | 别名状态常量 | C++ 枚举收敛(设计§11 #1) |
 | KV v2 wrapper 三个小改动 | 设计§8.1 #3、#4(`match_keys`、`create_kv_cache(reuse_keys)`)与 `pin_by_keys`:只有 worker 后端应答 demand 才需要 |
-| full attention(TinyLlama) | VSWA、SSM、spec-decode、TP/PP/CP>1、ADP、beam>1、KV v1、C++ transceiver |
+| full attention(TinyLlama);TP/PP>1 与 ADP(多 rank 计划) | VSWA、SSM、spec-decode、CP>1、beam>1、KV v1、C++ transceiver |
 | 已改名 `BlobStoreBackend`(`backends/blob/backend.py`),只认 `blob/store.py::BlobStore` 协议;Mooncake 特有部分收进 `blob/drivers/mooncake.py`;见§6 末「改名决定」 | 第三个 blob 驱动(`drivers/memory.py` 已作为可插拔性的证明存在) |
 | 配置走环境变量 + YAML | `LlmArgs` schema 改动(不改 → 不触发 golden manifest) |
 
@@ -270,6 +270,7 @@ backends:                    # 顺序即 fetch 优先级(设计§7.4)
 | 13 | `revert_allocate_context` 3379 在 `py_ctx_pre_resize_cap is None` 时直接返回 True(`reserve_transfer_pages` 只在容量真的增长时才记 pre_cap;cache 被 resume 且容量够时不记)→ `give_back_fetch_pages` 后 cache 仍活着、history 仍声明到 `token_end`,而页里没有数据 | `give_back_fetch_pages` 在 `_revert_ctx_alloc` 之后检查:请求仍在 `kv_cache_map` 则 `kv_cache_manager.free_resources(R)` + `rewind_context_after_cache_drop(R, tpb)`(`llm_request.py` 1666;与 `_try_reserve_fetch_pages` 失败路径同一套),请求作为全新首 chunk 重入。full attention 下 history 偏高本身不致错(无 stale 范围、默认 `all_reusable` 不要求 commit 终点等于 history),但重新走 reuse match 更简单也更省页,统一丢弃 |
 | 14 | `unpark` 之后请求以 `is_first_context_chunk` 重入调度,`reserve_transfer_pages`/`prepare_context_cache` 会按 `num_committed_tokens` 重新落游标;若 `try_commit_blocks` 没提交到 `token_end`,游标会回退到本地 reuse 深度、已取回的页被当作未算 | 范围守卫加 `enable_block_reuse=True`(`try_commit_blocks` 5013 在关闭 reuse 时直接返回);`unpark` 在 commit 后检查 `kv_cache.num_committed_tokens >= token_end`,不满足记 WARNING 并继续(请求退回按本地 reuse 深度重算,慢但正确;不用硬断言,避免一个请求拖垮引擎) |
 | 15 | 时间来源不一致会让 deadline 与 probe 预算各说各话 | binding 每轮取一次 `now = time.monotonic()` 传 `advance(candidates, now)`;Planner 的 `clock` 缺省即 `time.monotonic`,装配不另注入;测试用 `orchestration/kv_transfer/fakes.py` 的假时钟同时替换两处 |
+| 16 | 多 rank 下 `_handle_errors` 可由单 rank 本地触发(`_respond_if_invalid`)→ 该 rank 走释放门、记录释放,同伴对同一记录永远 `seen<n` | **既有隐患**。已结束一侧不受影响(设计 §7.1"齐":已结束请求的记录不投票、本地落地);未结束一侧的记录等到 `fetch_timeout_s` / `publish_timeout_s` 过期才落地,期间 `has_transfer_in_flight()` 为真挡住空闲判定。`status_dump` 的 `last_vote` / `peer_launched_at` 可诊断;修法(释放前先把结局作为票多投一轮)留为后续项 |
 
 ## 11. 测试计划
 
@@ -306,6 +307,7 @@ e2e(`tests/unittest/_torch/disaggregation/e2e/`,GPU,`pytest.importorskip("moonca
 | S4 | e2e 夹具 + E1;**先验证**环境变量能否到达 MPI spawn 的 worker(不能则改为在 YAML 路径上用固定约定,如 `~/.trtllm/kv_transfer.yaml`,并记录) | E1 两个参数化用例绿;探索分支的 20 块结果复现 |
 | S5 | E2 + 释放门情形 C/D/E 补强 | E2 绿;`usedNumBlocks` 回到基线 |
 | S6 | 收尾:三个新模块的模块 docstring 即目录说明(`tensorrt_llm/_torch/disaggregation/` 下无 README,不新建);PR 描述写 rationale 与 grep 结论 | pre-commit 通过 |
+| S7 | 多 rank(`KV_TRANSFER_MULTI_RANK_PLAN.zh.md` S0–S5):票型归约与发起投票、`EngineDist`、分片进指纹、放开 TP/ADP;PP 的 `PlanAuthority`(owner 导出 / follower 采纳,`SerializableSchedulerOutput.kv_fetch_answers`)与 `_executor_loop_pp` 六处接线;守卫只剩 `cp_size>1` | T1 + T3 绿(`status_dump` 顶层加 `rank`/`plan_authority`,记录加 `launch_gave_up`/`peer_launched_at`/`last_vote`);`test_disagg_loop_transcript.py` PP 首/非首 rank 空闲轮集合调用序列一致且各含 1 次 `kv_transfer.advance_round`;`test_hook_points.py` 三处 PP 顺序断言;`test_multi_rank_binding_threads.py` `pp_size=2` follower 晚一轮落地;E1/E2 TP=1 不变 |
 
 ## 13. 风险与回滚
 

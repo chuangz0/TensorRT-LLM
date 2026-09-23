@@ -62,7 +62,14 @@ _COLLECTIVE_COORDINATOR_CALLS = {
 _COLLECTIVE_EXECUTOR_EVENTS = {
     "flush_pending_transfer_responses",  # tp_gather in _enqueue_responses
 }
-_COLLECTIVE_SENSITIVE = _COLLECTIVE_COORDINATOR_CALLS | _COLLECTIVE_EXECUTOR_EVENTS
+# KV transfer binding entry points that run a rank-consensus collective (the
+# PP loop is the only loop whose ranks take different paths around them).
+_COLLECTIVE_KV_TRANSFER_CALLS = {
+    "kv_transfer.advance_round",  # allgather / pp_allgather of votes
+}
+_COLLECTIVE_SENSITIVE = (
+    _COLLECTIVE_COORDINATOR_CALLS | _COLLECTIVE_EXECUTOR_EVENTS | _COLLECTIVE_KV_TRANSFER_CALLS
+)
 
 
 def _entry_points() -> list:
@@ -90,6 +97,29 @@ def _recording_coordinator(calls: list) -> DisaggTransferCoordinator:
 
     coordinator.admit = admit
     return coordinator
+
+
+def _recording_kv_transfer(calls: list) -> SimpleNamespace:
+    """The ``KVTransferEngineBinding`` hooks the PP loop calls, recorded as
+    ``("kv_transfer.<hook>", ...)``; answers are the empty ones of an idle
+    round."""
+
+    def record(name: str, result=None):
+        def hook(*args):
+            calls.append((f"kv_transfer.{name}", *args))
+            return result
+
+        return hook
+
+    return SimpleNamespace(
+        advance_round=record("advance_round"),
+        export_plan_answers=record("export_plan_answers", []),
+        adopt_plan_answers=record("adopt_plan_answers"),
+        inflight_request_ids=record("inflight_request_ids", frozenset()),
+        launch_reserved_fetches=record("launch_reserved_fetches"),
+        publish_committed_blocks=record("publish_committed_blocks"),
+        pace_idle=record("pace_idle"),
+    )
 
 
 def _collective_calls(calls: list) -> list:
@@ -166,8 +196,12 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
 
 def _pp_executor(monkeypatch, calls: list, *, rank: int) -> PyExecutor:
     """Idle executor on a two-stage pipeline; rank 0 schedules, rank 1 receives
-    the schedule from its predecessor and re-runs the scheduler locally."""
+    the schedule from its predecessor and re-runs the scheduler locally. A
+    recording KV transfer binding is attached, so the transcript also pins the
+    six KV transfer hooks of the PP loop (multi-rank plan S4)."""
     executor = _idle_executor(monkeypatch, calls)
+    executor.kv_transfer = _recording_kv_transfer(calls)
+    executor._kv_fetch_launch_queue = []
     executor.dist = Mock(
         rank=rank,
         pp_rank=rank,
@@ -200,7 +234,7 @@ def _pp_executor(monkeypatch, calls: list, *, rank: int) -> PyExecutor:
         executor.scheduler = Mock()
         executor.scheduler.can_schedule.return_value = True
         executor.scheduler.schedule_request.return_value = SimpleNamespace(
-            fitting_disagg_gen_init_requests=[]
+            fitting_disagg_gen_init_requests=[], fetch_launch_queue=[]
         )
         executor.kv_cache_manager = Mock(spec=[])
     return executor
@@ -288,7 +322,9 @@ def test_insufficient_kv_fail_fast_ends_the_loop_before_the_benchmark_gate(
 def test_executor_loop_pp_transcript_on_first_rank(monkeypatch) -> None:
     """The PP loop admits inside schedule propagation, checks transfer timeouts
     only on the retry and executed-batch paths, and flushes responses only from
-    executed-batch handling, so an idle iteration has none of those."""
+    executed-batch handling, so an idle iteration has none of those. The KV
+    transfer owner advances at the loop head, exports its plan answers with the
+    schedule, launches after Stage 0 and paces the idle round."""
     calls = []
     PyExecutor._executor_loop_pp(_pp_executor(monkeypatch, calls, rank=0))
 
@@ -298,10 +334,14 @@ def test_executor_loop_pp_transcript_on_first_rank(monkeypatch) -> None:
             ("handle_errors_synced",),
             ("prepare_context_schedulable", []),
             ("poll_gen_transfers",),
+            ("kv_transfer.advance_round", []),
             ("admit", []),
+            ("kv_transfer.export_plan_answers",),
+            ("kv_transfer.launch_reserved_fetches", []),
             ("receive_gen_init", []),
             ("poll_progress_when_idle",),
             ("pace_idle",),
+            ("kv_transfer.pace_idle",),
         ]
         + _PP_SHUTDOWN_PASS
     )
@@ -309,7 +349,9 @@ def test_executor_loop_pp_transcript_on_first_rank(monkeypatch) -> None:
 
 def test_executor_loop_pp_transcript_on_non_first_rank(monkeypatch) -> None:
     """A non-first rank does not admit; it reverts KV for candidates its local
-    scheduler picked but the first rank did not admit."""
+    scheduler picked but the first rank did not admit. The KV transfer follower
+    adopts the owner's answers before its local scheduler runs, protects its
+    in-flight requests from eviction, and launches from its local queue."""
     calls = []
     PyExecutor._executor_loop_pp(_pp_executor(monkeypatch, calls, rank=1))
 
@@ -319,10 +361,15 @@ def test_executor_loop_pp_transcript_on_non_first_rank(monkeypatch) -> None:
             ("handle_errors_synced",),
             ("prepare_context_schedulable", []),
             ("poll_gen_transfers",),
+            ("kv_transfer.advance_round", []),
+            ("kv_transfer.adopt_plan_answers", [], []),
+            ("kv_transfer.inflight_request_ids",),
             ("revert_deferred_gen_init", [], []),
+            ("kv_transfer.launch_reserved_fetches", []),
             ("receive_gen_init", []),
             ("poll_progress_when_idle",),
             ("pace_idle",),
+            ("kv_transfer.pace_idle",),
         ]
         + _PP_SHUTDOWN_PASS
     )
@@ -339,6 +386,9 @@ def test_pp_ranks_issue_the_same_collective_sensitive_calls(monkeypatch) -> None
 
     assert _collective_calls(first) == _collective_calls(other)
     assert _collective_calls(first)  # the comparison is not vacuous
+    assert [call for call in first if call[0] == "kv_transfer.advance_round"] == [
+        ("kv_transfer.advance_round", [])
+    ]
 
 
 # -- timeout-consensus collective under attention DP -------------------------

@@ -2799,9 +2799,17 @@ class PyExecutor:
             )
             fitting_disagg_gen_init_requests, wait_for_disagg_gen_transfer_progress = (
                 self.disagg.admit(fitting_disagg_gen_init_requests))
+            kv_fetch_answers = ()
+            if self.kv_transfer is not None:
+                # Multi-rank plan S4 ②: the scheduling rank owns the KV fetch plans; they ride
+                # with the schedule to the ranks that follow it.
+                kv_fetch_answers = self.kv_transfer.export_plan_answers()
             serializable_schedule = SerializableSchedulerOutput.from_scheduler_result(
-                scheduled_batch, fitting_disagg_gen_init_requests,
-                num_fitting_reqs, wait_for_disagg_gen_transfer_progress)
+                scheduled_batch,
+                fitting_disagg_gen_init_requests,
+                num_fitting_reqs,
+                wait_for_disagg_gen_transfer_progress,
+                kv_fetch_answers=kv_fetch_answers)
 
         # Broadcast within first tp+cp group before send/recv chain to other tp+cp groups
         if self.dist.is_first_pp_rank:
@@ -2831,6 +2839,12 @@ class PyExecutor:
                         PPCommTag.SCHEDULE_RESULT)
 
         if scheduled_batch is None:
+            if self.kv_transfer is not None:
+                # Multi-rank plan S4 ②: a following rank takes the owner's KV fetch plans before
+                # its local scheduler reserves pages for them.
+                self.kv_transfer.adopt_plan_answers(
+                    self.active_requests,
+                    serializable_schedule.kv_fetch_answers)
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = serializable_schedule.to_scheduler_result(
                 self.active_requests)
             wait_for_disagg_gen_transfer_progress = (
@@ -2917,6 +2931,10 @@ class PyExecutor:
 
                 self.disagg.prepare_context_schedulable(new_requests)
                 self.disagg.poll_gen_transfers()
+                if self.kv_transfer is not None:
+                    # Multi-rank plan S4 ①, design §3.2 ①: loop head, before Stage 0 and before
+                    # any continue/break; every PP rank enters this collective once per round.
+                    self.kv_transfer.advance_round(self.active_requests)
 
                 iter_stats = self._init_iter_stats_if_sampled(len(new_requests))
 
@@ -2933,14 +2951,29 @@ class PyExecutor:
                                "prepare_expect_snapshot_points"):
                         self.kv_cache_manager.prepare_expect_snapshot_points(
                             self.active_requests)
-                    local_scheduler_output = self.scheduler.schedule_request(
-                        self.active_requests, self.inflight_req_ids)
+                    if self.kv_transfer is not None:
+                        # Multi-rank plan S4 ③: as in _schedule, a request with a KV transfer in
+                        # flight must not be evicted or recompute-paused under the backend.
+                        local_scheduler_output = self.scheduler.schedule_request(
+                            self.active_requests,
+                            self.inflight_req_ids,
+                            protected_from_eviction_request_ids=self.
+                            kv_transfer.inflight_request_ids())
+                    else:
+                        local_scheduler_output = self.scheduler.schedule_request(
+                            self.active_requests, self.inflight_req_ids)
                     local_disagg_candidates = getattr(
                         local_scheduler_output,
                         "fitting_disagg_gen_init_requests", [])
                     self.disagg.revert_deferred_gen_init(
                         local_disagg_candidates,
                         fitting_disagg_gen_init_requests)
+                if self.kv_transfer is not None:
+                    # Multi-rank plan S4 ④: rank 0 is the only rank that does not rerun the
+                    # scheduler; every other rank launches from its local pass.
+                    self.kv_transfer.launch_reserved_fetches(
+                        self._kv_fetch_launch_queue if self.dist.rank ==
+                        0 else local_scheduler_output.fetch_launch_queue)
 
                 if (self._mm_encoder_item_scheduling_enabled
                         and scheduled_batch.scheduled_mm_encoder_items):
@@ -3226,6 +3259,9 @@ class PyExecutor:
 
                 if not can_queue and self._pp_ring_is_drained():
                     self.disagg.pace_idle()
+                    if self.kv_transfer is not None:
+                        # Multi-rank plan S4 ⑥: yield while only a backend can make progress.
+                        self.kv_transfer.pace_idle()
 
                 # Stage 4: March forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
@@ -3617,6 +3653,11 @@ class PyExecutor:
                     # Finalize V2 context KV before disagg transfer/response
                     # handling can terminate the request.
                     self._update_v2_context_resources(scheduled_requests)
+                if self.kv_transfer is not None:
+                    # Multi-rank plan S4 ⑤, design §3.2 ④: the batch's forward is complete and
+                    # its context KV committed; offer the blocks before disagg may terminate.
+                    self.kv_transfer.publish_committed_blocks(
+                        scheduled_requests.context_requests)
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
