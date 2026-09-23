@@ -227,16 +227,24 @@ def start_segment_provider(
 
 
 @pytest.fixture
+def tinyllama_path() -> str:
+    """The TinyLlama weights, or a skip; only the tests that run TinyLlama ask for it, so a test
+    on a model it builds itself (the tiny Gemma3) runs without any weights on the machine."""
+    if not os.path.isdir(MODEL_PATH):
+        pytest.skip(f"TinyLlama weights not found at {MODEL_PATH}")
+    return MODEL_PATH
+
+
+@pytest.fixture
 def mooncake_cluster():
-    """A master and one segment provider, killed at teardown whatever happened."""
+    """A master and one segment provider, killed at teardown whatever happened. Needs a GPU,
+    the Mooncake bindings and ``mooncake_master``; no model weights."""
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("the engines need a GPU")
     pytest.importorskip("mooncake.store")
     if not os.access(MASTER, os.X_OK):
         pytest.skip("mooncake_master binary not found")
-    if not os.path.isdir(MODEL_PATH):
-        pytest.skip(f"TinyLlama weights not found at {MODEL_PATH}")
     master_address, master = start_master()
     provider = None
     try:

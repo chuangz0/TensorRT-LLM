@@ -17,7 +17,7 @@ SPDX-License-Identifier: Apache-2.0
 4. 与现有 disagg 协调器共存:gen-init 请求仍全归 `DisaggTransferCoordinator`;disagg ctx-only 请求对 fetch 路径是普通 context 请求,context 结束后**既发给 gen worker 又发布到 store**。终止由**释放门**把关(§9):门只问本层的记录表,**不问 disagg 发送**——disagg 已有自己的释放点,且在 partial-reuse 早终止模式下发送方根本不会来终止请求。
 5. 请求状态用设计§12.2 的别名表:`KV_FETCH_IN_PROGRESS ≡ DISAGG_GENERATION_TRANS_IN_PROGRESS(9)`、`KV_PUBLISH_IN_PROGRESS ≡ DISAGG_CONTEXT_TRANS_IN_PROGRESS(21)`,两者都在调度器可调度区间之外,调度器排除逻辑**零改动**。
 6. KV v2 wrapper 只改三处(§7);调度器只多问一个只读钩子 `plan_fetch`,多回一个 `fetch_launch_queue`。
-7. 范围守卫:KV v2 + `enable_block_reuse` + full attention + CP=1(TP、PP、ADP 均接受,见 `KV_TRANSFER_MULTI_RANK_PLAN.zh.md`;PP>1 下不接受带路由提示的后端)+ 无 spec-decode + 无 KV connector + 无 draft 管理器 + beam 1;其余装配期拒绝并说明原因。
+7. 范围守卫:KV v2 + `enable_block_reuse` + 分页层组(full attention 与滑窗,含 sink;拒绝 SSM/recurrent,见 `KV_TRANSFER_VSWA_PLAN.zh.md`)+ CP=1(TP、PP、ADP 均接受,见 `KV_TRANSFER_MULTI_RANK_PLAN.zh.md`;PP>1 下不接受带路由提示的后端)+ 无 spec-decode + 无 KV connector + 无 draft 管理器 + beam 1;其余装配期拒绝并说明原因。
 8. 测试三层:GPU 上对真 `KVCacheManagerV2` 的 reader/resolver/fingerprint 单测;假执行器的 effects 单测;e2e 两个(双实例同 prompt、disagg 共存),按 `test_llm_pytorch.py::test_llm_disagg_gen_cancelled` 的单进程双 `LLM()` 模式写,自起 `mooncake_master` 与长寿命 segment provider,计数经 `TRTLLM_KV_TRANSFER_STATUS_DUMP` 写 JSON 读取。
 9. 实施分 6 步,每步独立可测;既有 339 + 345 + 513 个测试全程保持绿色。
 
@@ -29,7 +29,7 @@ SPDX-License-Identifier: Apache-2.0
 | 与现有 disagg 共存,ctx-only 请求双发 + 只问本层的释放门 | 删除 KV connector / admission / transfer_manager(设计§12.1) |
 | 别名状态常量 | C++ 枚举收敛(设计§11 #1) |
 | KV v2 wrapper 三个小改动 | 设计§8.1 #3、#4(`match_keys`、`create_kv_cache(reuse_keys)`)与 `pin_by_keys`:只有 worker 后端应答 demand 才需要 |
-| full attention(TinyLlama);TP/PP>1 与 ADP(多 rank 计划) | VSWA、SSM、spec-decode、CP>1、beam>1、KV v1、C++ transceiver |
+| full attention(TinyLlama)与 VSWA(Gemma3,`KV_TRANSFER_VSWA_PLAN.zh.md`);TP/PP>1 与 ADP(多 rank 计划) | SSM、spec-decode、CP>1、beam>1、KV v1、C++ transceiver |
 | 已改名 `BlobStoreBackend`(`backends/blob/backend.py`),只认 `blob/store.py::BlobStore` 协议;Mooncake 特有部分收进 `blob/drivers/mooncake.py`;见§6 末「改名决定」 | 第三个 blob 驱动(`drivers/memory.py` 已作为可插拔性的证明存在) |
 | 配置走环境变量 + YAML | `LlmArgs` schema 改动(不改 → 不触发 golden manifest) |
 

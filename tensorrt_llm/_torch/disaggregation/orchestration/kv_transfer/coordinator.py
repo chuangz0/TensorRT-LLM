@@ -32,7 +32,7 @@ from typing import Callable, Mapping, NamedTuple, Sequence, TypeVar
 
 from ...base.cache_backend import Attempt, Fetches, Publishes, SubmissionRejected
 from ...base.views import RequestView, ResourceReader
-from ...remote_cache import DEFER, Defer, FetchPlan, FetchSource, Planner, merge, retry_hint_from
+from ...remote_cache import DEFER, Defer, FetchPlan, FetchSource, Planner, merge
 from .interfaces import (
     CarriesAux,
     DistLike,
@@ -77,7 +77,8 @@ class VoteKind(Enum):
     UNLAUNCHED: fetch planned but not launched here (no pages yet); holds up a landing, not a failure.
     INFLIGHT: an attempt is still running here; nothing may be decided this round.
     FAILED: decisive: this rank's attempt failed, or it gave up launching.
-    TERMINAL: every attempt here ended without failure; carries ``(B, retry_hint)`` for a fetch.
+    TERMINAL: every attempt here ended without failure; carries ``(B, retry_hint)`` for a fetch,
+        with ``retry_hint == B`` by construction (the wire keeps both fields).
     """
 
     UNLAUNCHED = "UNLAUNCHED"
@@ -95,7 +96,8 @@ class Vote(NamedTuple):
 
 
 _Verdict = tuple[int, int, bool]
-"""``(MIN(B), MIN(retry_hint), failed)``: what the ranks agreed on for one record."""
+"""``(MIN(B), MIN(retry_hint), failed)``: what the ranks agreed on for one record. Every rank votes
+``retry_hint == B``, so the two minima agree; both are kept for the wire shape."""
 _Payload = tuple[list, list, list]
 """``([(key, kind, B, hint)], [expired key], [(rid, plan wire)])``: one rank's word per round."""
 
@@ -480,8 +482,10 @@ class KVTransferCoordinator:
             return Vote(VoteKind.INFLIGHT)
         if rec.any_failed():
             return Vote(VoteKind.FAILED)
-        served = rec.merged_served()
-        return Vote(VoteKind.TERMINAL, merge(rec.plan, served), retry_hint_from(rec.plan, served))
+        # The retry aims no higher than what arrived: the probe answer is cached on the record,
+        # so a retry above B would ask again for the very units that just came up short.
+        b = merge(rec.plan, rec.merged_served())
+        return Vote(VoteKind.TERMINAL, b, b)
 
     def _unlaunched_vote(self, rec: TransferRecord, now: float) -> Vote:
         if rec.launch_gave_up or self._unlaunched_too_long(rec, now):

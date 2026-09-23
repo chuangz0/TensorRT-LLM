@@ -92,8 +92,8 @@ class TransferRecord:
         abandoned: Expired or cancelled. The transfer itself cannot be stopped; the record is
             still polled to its outcome and then released. Fetch: suppresses further expiry;
             publish: informational only, the deadline still fires.
-        retry_hint: Fetch only; the block boundary the next try should aim for, from
-            ``planner.retry_hint_from`` after a short ``served``.
+        retry_hint: Fetch only; the block boundary the next try may aim for at most: the merged
+            B (``remote_cache.merge``) of the try whose ``served`` came up short.
         rejected: Publish only; some submission of this record raised ``SubmissionRejected``.
             The units it carried were never offered, so the publish as a whole has failed even if
             the other pieces land.

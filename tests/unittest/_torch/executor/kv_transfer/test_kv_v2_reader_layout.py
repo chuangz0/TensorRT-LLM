@@ -8,6 +8,11 @@ declaring history to the fetch target; the fetch extent naming exactly the namea
 local radix tree does not serve; two identical committed requests publishing under identical
 names; ``layout_fingerprint`` stable per layout and different across layouts; the region
 resolver's spans; and the idempotent ``release_index_slot``. Allocates device pools.
+
+``TestVariableSlidingWindow`` repeats the fetch and publish walk on a two-group manager (window
+64 on layers 0 and 2, full attention on 1 and 3): the planner's stale-range mirror against the
+cache's own, the reserved pages of the windowed group, the published ordinals, and a second
+request served by local reuse alone.
 """
 
 import gc
@@ -19,7 +24,14 @@ from engine_fakes import FakeFetches
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.disaggregation.base.backend import CacheKind
-from tensorrt_llm._torch.disaggregation.remote_cache import FetchPlan, FetchSource, Planner
+from tensorrt_llm._torch.disaggregation.remote_cache import (
+    FetchPlan,
+    FetchSource,
+    Planner,
+    _stale_range,
+    required_ordinals,
+    servable_end,
+)
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.kv_v2_reader import KVv2ResourceReader
 from tensorrt_llm._torch.disaggregation.resource.region import (
@@ -28,6 +40,7 @@ from tensorrt_llm._torch.disaggregation.resource.region import (
     parallel_shard_tag,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_transfer.assembly import _check_layer_groups_are_paged
 from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import EngineRequestView
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -521,3 +534,160 @@ class TestReleaseIndexSlot:
         again = make_request(2, prompt_tokens(2))
         compute_and_commit(manager, again)
         assert 2 in manager.kv_cache_map
+
+
+# ---------------------------------------------------------------------------------------------
+# Variable sliding window: a windowed group next to a full-attention group
+# ---------------------------------------------------------------------------------------------
+
+WINDOW = 64
+"""Layers 0 and 2 read the last 64 tokens; ``max_attention_window=[64, 512]`` with
+``max_seq_len=512`` makes the 512 entry the full-attention default (``None``)."""
+B = NAMEABLE * TPB  # 224, the largest fetch target for PROMPT_LEN 230
+
+
+def stale_end(history: int) -> int:
+    return (history + 1 - WINDOW) // TPB
+
+
+@pytest.fixture
+def vswa_manager():
+    torch.cuda.init()
+    gc.collect()
+    torch.cuda.empty_cache()
+    mgr = make_manager(
+        num_layers=4,
+        kv_cache_config=KvCacheConfig(
+            max_tokens=2048, enable_block_reuse=True, max_attention_window=[WINDOW, 512]
+        ),
+    )
+    yield mgr
+    mgr.shutdown()
+    del mgr
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.fixture
+def vswa_reader(vswa_manager):
+    return KVv2ResourceReader(vswa_manager, build_page_table_from_manager(vswa_manager))
+
+
+def groups_of(reader):
+    """``(windowed, full)`` specs of the two-group reader."""
+    (windowed,) = [s for s in reader.group_specs() if s.window_size is not None]
+    (full,) = [s for s in reader.group_specs() if s.window_size is None]
+    return windowed, full
+
+
+def store_planner(reader) -> Planner:
+    store = FakeFetches(name="store", probe_answer="all")
+    return Planner([FetchSource("store", store, None)], reader, TPB)
+
+
+class TestVariableSlidingWindow:
+    def test_group_specs_describe_a_windowed_and_a_full_attention_group(self, vswa_reader):
+        windowed, full = groups_of(vswa_reader)
+        assert {s.kind for s in vswa_reader.group_specs()} == {CacheKind.PAGED}
+        assert windowed.window_size == WINDOW and windowed.sink_blocks == 0
+        assert full.window_size is None and full.sink_blocks == 0
+        assert windowed.tag != full.tag
+        _check_layer_groups_are_paged(vswa_reader)  # the assembly guard admits this manager
+
+    @pytest.mark.parametrize("history", [B, PROMPT_LEN, 256, 300])
+    def test_planner_stale_range_mirrors_the_cache_life_cycle(
+        self, vswa_manager, vswa_reader, history
+    ):
+        for spec in vswa_reader.group_specs():
+            assert _stale_range(spec, history, TPB) == tuple(
+                vswa_manager.stale_block_range(spec.local_group, history)
+            )
+        windowed, _ = groups_of(vswa_reader)
+        assert _stale_range(windowed, history, TPB) == (0, stale_end(history))
+
+    def test_fetch_extent_names_the_reserved_pages_of_every_group(self, vswa_manager, vswa_reader):
+        request = make_request(1, prompt_tokens(1))
+        view = EngineRequestView(request)
+        windowed, full = groups_of(vswa_reader)
+        keys = vswa_reader.block_keys(view)
+        planner = store_planner(vswa_reader)
+        _, units = planner.probe_query(view)
+        assert len(units) == 2 * NAMEABLE  # both groups, every nameable block
+        plan = planner.decide(view, {"store": frozenset(units)}, now=0.0)
+        assert isinstance(plan, FetchPlan) and plan.token_end == B and plan.reuse_end == 0
+        expected = {
+            windowed.local_group: tuple(sorted(required_ordinals(windowed, B, 0, TPB))),
+            full.local_group: tuple(range(NAMEABLE)),
+        }
+        assert {g.spec.local_group: g.ordinals for g in plan.group_plans} == expected
+        assert expected[windowed.local_group] == (5, 6) == tuple(range(stale_end(B), NAMEABLE))
+
+        assert vswa_manager.reserve_transfer_pages(request, plan.token_end)
+        assert vswa_manager.get_history_length(request) == B
+        extent = vswa_reader.fetch_extent(view, plan)
+        # Every required ordinal has a page: the reservation skipped exactly the stale range.
+        assert len(extent.units) == sum(len(g.ordinals) for g in plan.group_plans) == 9
+        kv_cache = vswa_manager.kv_cache_map[1]
+        for group_plan in plan.group_plans:
+            pages = list(
+                kv_cache.get_aggregated_page_indices(group_plan.spec.local_group, valid_only=False)
+            )
+            for ordinal in group_plan.ordinals:
+                assert pages[ordinal] != BAD_PAGE_INDEX
+        window_pages = list(
+            kv_cache.get_aggregated_page_indices(windowed.local_group, valid_only=False)
+        )
+        assert all(p == BAD_PAGE_INDEX for p in window_pages[: stale_end(B)])
+        by_group = {}
+        for unit in extent.units:
+            by_group.setdefault(unit.local_group, []).append(unit)
+        assert [u.name for u in by_group[windowed.local_group]] == [
+            windowed.tag + keys[o] for o in (5, 6)
+        ]
+        assert [u.local for u in by_group[windowed.local_group]] == window_pages[5:7]
+        assert [u.name for u in by_group[full.local_group]] == [
+            full.tag + keys[o] for o in range(NAMEABLE)
+        ]
+        full_pages = list(kv_cache.get_aggregated_page_indices(full.local_group, valid_only=False))
+        assert [u.local for u in by_group[full.local_group]] == full_pages[:NAMEABLE]
+        resolver = KVv2RegionResolver(build_page_table_from_manager(vswa_manager))
+        spans = resolver.pool_memory_spans()
+        for unit in extent.units:
+            for address, size in resolver(unit.local_group, unit.local):
+                assert any(a <= address and address + size <= a + s for a, s in spans)
+
+    def test_publish_names_the_sink_and_live_window_of_the_windowed_group(
+        self, vswa_manager, vswa_reader
+    ):
+        request = make_request(1, prompt_tokens(1))
+        compute_and_commit(vswa_manager, request)
+        windowed, full = groups_of(vswa_reader)
+        keys = vswa_reader.block_keys(EngineRequestView(request))
+        extent, chunk = vswa_reader.publish_description(EngineRequestView(request))
+        assert chunk is None and extent.is_last
+        names = {u.name for u in extent.units}
+        # History is the whole prompt: (230 + 1 - 64) // 32 == 5, so window blocks 5 and 6 live.
+        assert stale_end(PROMPT_LEN) == 5
+        assert names == {windowed.tag + keys[o] for o in (5, 6)} | {
+            full.tag + keys[o] for o in range(NAMEABLE)
+        }
+        assert len(extent.units) == 9
+        assert all(u.local != BAD_PAGE_INDEX for u in extent.units)
+
+    def test_second_request_is_served_by_local_reuse_and_asks_for_nothing(
+        self, vswa_manager, vswa_reader
+    ):
+        earlier = make_request(1, prompt_tokens(1))
+        compute_and_commit(vswa_manager, earlier)
+        request = make_request(2, prompt_tokens(1))
+        view = EngineRequestView(request)
+        # Partial reuse matches the prompt short of its last token; the windowed group has pages
+        # for the blocks live at 229 (5 and 6), so the match is not cut short.
+        assert vswa_reader.local_reuse_tokens(view) == PROMPT_LEN - 1 == 229
+        planner = store_planner(vswa_reader)
+        _, units = planner.probe_query(view)
+        keys = vswa_reader.block_keys(view)
+        assert servable_end(frozenset(units), keys, vswa_reader.group_specs(), NAMEABLE, TPB) == 7
+        plan = planner.decide(view, {"store": frozenset(units)}, now=0.0)
+        assert plan.token_end == B and plan.reuse_end == 7
+        assert all(g.ordinals == () for g in plan.group_plans)

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Pure-function tests of the merge rule (design §6.3) and its inputs.
+"""Pure-function tests of the merge rule (design §6.3), ``servable_end`` (the store decision
+over every paged group) and their shared input ``required_ordinals``.
 
 Synthetic model: tpb = 4, a windowed group of W = 3 blocks (12 tokens) with 1 sink block, and
 7 full blocks (``token_end = 28``). Expected stale ranges are computed by hand from
@@ -25,13 +26,18 @@ __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.base.backend import CacheKind  # noqa: E402
 from disaggregation.base.views import GroupSpec  # noqa: E402
 from disaggregation.remote_cache import (  # noqa: E402
+    FetchSource,
+    Planner,
     _stale_range,
     merge,
     required_ordinals,
-    retry_hint_from,
+    servable_end,
 )
 from fakes import (  # noqa: E402
     TPB,
+    FakeFetches,
+    FakeReader,
+    FakeRequest,
     full_attention,
     keys_for,
     make_plan,
@@ -47,6 +53,16 @@ FULL = full_attention(0)
 WINDOW = windowed(1, window_blocks=3, sink_blocks=1)
 STATE = state_group(2)
 END = 7 * TPB  # 28
+NAMEABLE = 7
+
+
+def held(*per_group: tuple) -> frozenset[bytes]:
+    """A probe answer: ``(spec, ordinals)`` pairs, each naming the blocks the store holds."""
+    return frozenset().union(*(names(spec, KEYS, ordinals) for spec, ordinals in per_group))
+
+
+def store_planner(reader: FakeReader) -> Planner:
+    return Planner([FetchSource("store", FakeFetches(name="store"), None)], reader, TPB)
 
 
 # ---- required_ordinals mirrors get_stale_range ----
@@ -107,14 +123,12 @@ def test_plan_units_by_group_match_design_example():
 def test_full_attention_all_served_lands_at_token_end():
     plan = make_plan([FULL], token_end=END, keys=KEYS, reuse_end=2)
     assert merge(plan, plan_unit_names(plan)) == END
-    assert retry_hint_from(plan, plan_unit_names(plan)) == END
 
 
 def test_full_attention_missing_last_block_steps_down_one_boundary():
     plan = make_plan([FULL], token_end=END, keys=KEYS, reuse_end=2)
     served = plan_unit_names(plan) - names(FULL, KEYS, [6])
     assert merge(plan, served) == 24
-    assert retry_hint_from(plan, served) == 24
 
 
 def test_full_attention_gap_in_the_middle_stops_below_the_gap():
@@ -135,7 +149,6 @@ def test_extra_served_names_are_ignored():
 def test_empty_served_is_the_local_prefix_end():
     plan = make_plan([FULL, WINDOW, STATE], token_end=END, keys=KEYS, reuse_end=2)
     assert merge(plan, frozenset()) == 2 * TPB
-    assert retry_hint_from(plan, frozenset()) == 2 * TPB
 
 
 def test_empty_served_with_no_local_prefix_is_zero():
@@ -158,8 +171,6 @@ def test_window_missing_a_window_block_falls_to_where_only_the_sink_is_needed():
     plan = make_plan([WINDOW], token_end=END, keys=KEYS, reuse_end=0)
     served = plan_unit_names(plan) - names(WINDOW, KEYS, [5])
     assert merge(plan, served) == 4
-    # No full-attention group: the hint falls back to all groups.
-    assert retry_hint_from(plan, served) == 4
 
 
 def test_window_missing_sink_block_lands_nowhere_above_zero():
@@ -173,16 +184,13 @@ def test_window_with_local_sink_short_window_falls_to_local_prefix():
     served = plan_unit_names(plan) - names(WINDOW, KEYS, [4])
     # Full attention alone would allow 28; the window group drags B to the local prefix.
     assert merge(plan, served) == 2 * TPB
-    # The retry hint ignores the window group and is what full attention allows.
-    assert retry_hint_from(plan, served) == END
 
 
-def test_combined_model_missing_full_block_bounds_both_rules():
+def test_combined_model_missing_full_block_drops_to_the_local_prefix():
     plan = make_plan([FULL, WINDOW, STATE], token_end=END, keys=KEYS, reuse_end=2)
     served = plan_unit_names(plan) - names(FULL, KEYS, [3])
-    # Full attention allows 12 (blocks 2 present, 3 missing); at 12 the window needs block 2,
-    # which was never asked for, so B drops to the local prefix.
-    assert retry_hint_from(plan, served) == 12
+    # Full attention alone would allow 12 (block 2 present, 3 missing); at 12 the window needs
+    # block 2, which was never asked for, so B drops to the local prefix.
     assert merge(plan, served) == 2 * TPB
 
 
@@ -195,27 +203,124 @@ def test_state_requires_exact_snapshot():
     served = plan_unit_names(plan) - names(STATE, KEYS, [6])
     # Every lower boundary needs a different snapshot that was never asked for.
     assert merge(plan, served) == 2 * TPB
-    assert retry_hint_from(plan, served) == END
 
 
 def test_state_snapshot_alone_does_not_rescue_a_short_full_group():
     plan = make_plan([FULL, STATE], token_end=END, keys=KEYS, reuse_end=2)
     served = plan_unit_names(plan) - names(FULL, KEYS, [6])
     assert merge(plan, served) == 2 * TPB
-    assert retry_hint_from(plan, served) == 24
 
 
-def test_state_only_model_hint_falls_back_to_state_rule():
+def test_state_only_model_lands_only_on_its_exact_snapshot():
     plan = make_plan([STATE], token_end=END, keys=KEYS, reuse_end=0)
     assert ordinals_by_group(plan) == {2: (6,)}
     assert merge(plan, plan_unit_names(plan)) == END
-    assert retry_hint_from(plan, frozenset()) == 0
+    assert merge(plan, frozenset()) == 0
 
 
 def test_merge_never_exceeds_token_end():
     plan = make_plan([FULL], token_end=24, keys=KEYS, reuse_end=0)
     served = names(FULL, KEYS, range(7))
     assert merge(plan, served) == 24
+
+
+# ---- servable_end: the store decision over every paged group ----
+
+ALL = range(7)
+
+
+def test_servable_end_lands_at_nameable_when_every_group_is_whole():
+    assert servable_end(held((FULL, ALL), (WINDOW, ALL)), KEYS, [FULL, WINDOW], NAMEABLE, TPB) == 7
+
+
+def test_servable_end_steps_down_to_where_the_missing_window_block_is_stale():
+    # Window block 5 missing: e=7 needs {0,4,5,6}, e=6 needs {0,3,4,5}, e=5 needs {0,2,3,4}.
+    answer = held((FULL, ALL), (WINDOW, [0, 1, 2, 3, 4, 6]))
+    assert servable_end(answer, KEYS, [FULL, WINDOW], NAMEABLE, TPB) == 5
+    # The same missing block after a fetch to 28: blocks 2 and 3 were stale at 28 and never
+    # asked for, so merge cannot stop at 20 and falls to where only the sink block is live.
+    plan = make_plan([FULL, WINDOW], token_end=END, keys=KEYS, reuse_end=0)
+    assert merge(plan, plan_unit_names(plan) - names(WINDOW, KEYS, [5])) == 4
+
+
+def test_servable_end_counts_a_block_below_the_local_prefix_as_missing():
+    # Full block 0 is not in the store (the local tree has it): the decision is computed with
+    # reuse_end = 0 for rank agreement, so no target is servable ...
+    answer = held((FULL, range(1, 7)), (WINDOW, ALL))
+    assert servable_end(answer, KEYS, [FULL, WINDOW], NAMEABLE, TPB) == 0
+    # ... while a plan already built above that prefix never asked for block 0 and merges whole.
+    plan = make_plan([FULL, WINDOW], token_end=END, keys=KEYS, reuse_end=2)
+    assert merge(plan, plan_unit_names(plan)) == END
+
+
+@pytest.mark.parametrize(
+    "specs, answer, expected",
+    [
+        ([FULL, WINDOW], held((FULL, ALL), (WINDOW, range(1, 7))), 0),  # sink block missing
+        ([FULL, WINDOW], held((FULL, range(6)), (WINDOW, ALL)), 6),  # full block 6 missing
+        ([WINDOW], held((WINDOW, range(3))), 3),  # no full-attention group: the window decides
+        ([FULL, WINDOW, STATE], held((FULL, ALL), (WINDOW, ALL)), 7),  # state is not consulted
+        ([STATE], held((FULL, ALL)), 0),  # no paged group
+    ],
+    ids=["sink_missing", "full_tail_missing", "window_only", "state_ignored", "no_paged_group"],
+)
+def test_servable_end_table(specs, answer, expected):
+    assert servable_end(answer, KEYS, specs, NAMEABLE, TPB) == expected
+
+
+def test_servable_end_with_nothing_nameable_is_zero():
+    assert servable_end(held((FULL, ALL)), KEYS, [FULL], 0, TPB) == 0
+
+
+def test_publisher_window_one_block_ahead_of_the_fetch_target_serves_nothing():
+    # F6: a publisher with prompt_len L = 28 (L % tpb == 0) named the window from
+    # stale_end(28) = 4 on, a fetcher's largest target is B = 24 and needs from stale_end(24) = 3.
+    # Every smaller target needs an even earlier block, so without sink blocks nothing serves.
+    window = windowed(1, window_blocks=3, sink_blocks=0)
+    keys = KEYS[:6]  # nameable = (28 - 1) // 4 = 6
+    answer = held((FULL, range(6)), (window, [4, 5]))
+    assert servable_end(answer, keys, [FULL, window], 6, TPB) == 0
+    assert servable_end(answer, keys, [FULL], 6, TPB) == 6  # the full group alone would allow B
+
+
+# ---- retry: the hint is merge's B, and the store answer is judged again below it ----
+
+
+def test_retry_at_merged_b_asks_only_for_units_that_arrived():
+    reader = FakeReader(groups=[FULL, WINDOW])
+    req = FakeRequest(1, prompt_len=29)
+    keys = reader.block_keys(req)
+    plan = make_plan([FULL, WINDOW], token_end=END, keys=keys, reuse_end=0)
+    served = plan_unit_names(plan) - names(WINDOW, keys, [5])
+    b = merge(plan, served)
+    assert b == 4
+    answer = plan_unit_names(plan) - names(WINDOW, keys, [5])  # what the store told us before
+    retry = store_planner(reader).decide(req, {"store": answer}, now=0.0, retry_hint=b)
+    assert retry.token_end == b
+    assert plan_unit_names(retry) <= served
+    assert ordinals_by_group(retry) == {0: (0,), 1: (0,)}
+
+
+def test_retry_can_fall_below_the_merged_b_to_a_plan_with_empty_asks():
+    # Local prefix of 2 blocks; the store holds every full block and the window blocks live at 28.
+    reader = FakeReader(groups=[FULL, WINDOW])
+    req = FakeRequest(1, prompt_len=29)
+    reader.reuse_tokens[1] = 2 * TPB
+    keys = reader.block_keys(req)
+    answer = names(FULL, keys, ALL) | names(WINDOW, keys, [0, 4, 5, 6])
+    plan = store_planner(reader).decide(req, {"store": answer}, now=0.0)
+    assert plan.token_end == END and plan.reuse_end == 2
+    # Full block 6 never arrives. merge trims below reuse_end 2 and walks down from 28: at 24
+    # the window needs block 3, never asked for; ... down to the reuse floor 8.
+    served = plan_unit_names(plan) - names(FULL, keys, [6])
+    b = merge(plan, served)
+    assert b == 8
+    # The retry judges the cached answer with reuse_end = 0 up to cap 8 // 4 = 2: e=2 needs window
+    # block 1, which the store never held, so e=1 wins; reuse then trims every ask to nothing.
+    retry = store_planner(reader).decide(req, {"store": answer}, now=0.0, retry_hint=b)
+    assert retry.token_end == TPB < b
+    assert retry.reuse_end == 1
+    assert plan_unit_names(retry) == frozenset()
 
 
 # ---- property check against a literal mirror of AttnLifeCycle.get_stale_range ----

@@ -162,14 +162,42 @@ def test_store_uses_contiguous_prefix_of_full_attention_units(reader):
     assert plan.source == "store" and plan.token_end == 8
 
 
-def test_store_prefix_ignores_window_group_gaps(reader):
+def test_store_prefix_requires_window_units_too(reader):
     planner = make_planner(reader, sources=("store",))
     req = FakeRequest(1, prompt_len=29)
     full = reader.groups[0]
     keys = reader.block_keys(req)
     held = frozenset(full.tag + keys[o] for o in range(7))  # no window units at all
+    # Every target needs at least the window's sink block, which the store does not hold.
+    assert planner.decide(req, {"store": held}, now=0.0) is None
+
+
+def test_store_prefix_steps_down_when_a_window_block_is_missing(reader):
+    planner = make_planner(reader, sources=("store",))
+    req = FakeRequest(1, prompt_len=29)
+    full, window = reader.groups[0], reader.groups[1]
+    keys = reader.block_keys(req)
+    # Window block 5 missing: at 28 the window needs {0,4,5,6}, at 24 {0,3,4,5}, at 20 {0,2,3,4}.
+    held = frozenset(full.tag + keys[o] for o in range(7)) | frozenset(
+        window.tag + keys[o] for o in (0, 1, 2, 3, 4, 6)
+    )
     plan = planner.decide(req, {"store": held}, now=0.0)
-    assert plan.token_end == 28
+    assert plan.source == "store" and plan.token_end == 20
+    assert ordinals_by_group(plan) == {0: (0, 1, 2, 3, 4), 1: (0, 2, 3, 4), 2: (4,)}
+
+
+def test_retry_hint_caps_the_candidates_before_the_store_answer_is_judged(reader):
+    planner = make_planner(reader, sources=("store",))
+    req = FakeRequest(1, prompt_len=29)
+    full, window = reader.groups[0], reader.groups[1]
+    keys = reader.block_keys(req)
+    held = frozenset(full.tag + keys[o] for o in range(7)) | frozenset(
+        window.tag + keys[o] for o in (0, 1, 2, 3, 4, 6)
+    )
+    # A hint of 24 is not the answer: at 24 the window needs block 5; the first whole target
+    # below the cap is 20.
+    plan = planner.decide(req, {"store": held}, now=0.0, retry_hint=24)
+    assert plan.token_end == 20
 
 
 def test_store_prefix_uses_every_paged_group_when_no_full_attention():

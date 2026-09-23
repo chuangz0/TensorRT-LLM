@@ -110,7 +110,16 @@ class KVv2ResourceReader:
         )
 
     def publish_description(self, request) -> tuple[CacheExtent, None]:
-        """Every committed full block of the request, in the pages it holds right now.
+        """Every committed full block the request still holds, in the pages it holds right now.
+
+        A windowed group holds ``[0, sink) | [stale_end(history), committed)``, with ``history``
+        read at publish time: after an unchunked prefill that is ``prompt_len``, one block past a
+        fetcher's largest target ``B = (prompt_len - 1) // tpb * tpb``. With ``window % tpb == 0``
+        the two stale ends differ exactly when ``prompt_len % tpb`` is ``0`` or ``tpb - 1``; the
+        window's first block at ``B`` is then already dropped here, and since the stale end grows
+        with the target no larger target does without it either. A fetcher's ``servable_end``
+        falls to what the sink blocks alone serve (nothing, without sinks) and the request
+        computes locally.
 
         Read after the step was committed: committing may swap a block's pages for a concurrent
         committer's (``allow_seq_rebasing``). The positional chunk is ``None``: the store path

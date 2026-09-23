@@ -15,8 +15,9 @@
 """Source policy and the merge rule (design §6.3, §7.2).
 
 The planner is the only place that reads request content in order to *decide*; building extents
-and chunks belongs to ``resource/``. ``merge`` and ``retry_hint_from`` are pure functions of a plan
-and a served set, so the rule that says what "arrived" means can be tested with no engine at all.
+and chunks belongs to ``resource/``. ``servable_end`` (how far a store answer can take a request)
+and ``merge`` (how far a delivery did take it) are pure functions of names and sets, so both rules
+can be tested with no engine at all.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ __all__ = [
     "Planner",
     "merge",
     "required_ordinals",
-    "retry_hint_from",
+    "servable_end",
 ]
 
 
@@ -125,6 +126,20 @@ def _stale_range(spec: GroupSpec, history: int, tpb: int) -> tuple[int, int]:
     return start, max(start, (history + 1 - spec.window_size) // tpb)
 
 
+def _required_ranges(spec: GroupSpec, history: int, reuse_end: int, tpb: int) -> tuple[range, ...]:
+    """``required_ordinals`` as at most two non-empty ranges: the sink blocks above the local
+    prefix, then the live window above it (full attention: one range, ``[reuse_end, full)``).
+    ``servable_end`` checks each range with one prefix-sum lookup instead of a set walk."""
+    full = history // tpb
+    if spec.kind is CacheKind.STATE:
+        if history % tpb != 0 or full <= reuse_end:
+            return ()
+        return (range(full - 1, full),)
+    beg, end = _stale_range(spec, history, tpb)
+    ranges = (range(reuse_end, min(beg, full)), range(max(end, reuse_end), full))
+    return tuple(r for r in ranges if len(r) > 0)
+
+
 def required_ordinals(spec: GroupSpec, history: int, reuse_end: int, tpb: int) -> frozenset[int]:
     """Block ordinals ``spec`` must have fetched for the request to stand at ``history``.
 
@@ -133,14 +148,7 @@ def required_ordinals(spec: GroupSpec, history: int, reuse_end: int, tpb: int) -
     the local prefix; otherwise nothing, because a partial tail's state has no name and moves by
     position.
     """
-    full = history // tpb
-    if spec.kind is CacheKind.STATE:
-        if history % tpb != 0 or full <= reuse_end:
-            return frozenset()
-        return frozenset({full - 1})
-    beg, end = _stale_range(spec, history, tpb)
-    live = chain(range(min(beg, full)), range(end, full))
-    return frozenset(o for o in live if o >= reuse_end)
+    return frozenset(chain.from_iterable(_required_ranges(spec, history, reuse_end, tpb)))
 
 
 def _required_names(plan: FetchPlan, group: GroupPlan, history: int) -> frozenset[bytes]:
@@ -179,18 +187,59 @@ def _merge(plan: FetchPlan, served: frozenset[bytes], groups: Sequence[GroupPlan
 
 def merge(plan: FetchPlan, served: frozenset[bytes]) -> int:
     """The largest B such that, with B as the sequence length, every group's still-needed units
-    are in ``served`` (design §6.3). Never below the local prefix end."""
+    are in ``served`` (design §6.3). Never below the local prefix end.
+
+    ``merge`` asks which of the units the plan *asked for* arrived: it trims below
+    ``plan.reuse_end`` and walks down from ``plan.token_end``. ``servable_end`` asks the other
+    question, which target a probe answer over every nameable block can serve. Under a windowed
+    group any block missing at or above ``stale_end(token_end)`` drags B down to the reuse floor:
+    the window blocks a lower boundary needs were stale at ``token_end``, so they were never
+    asked for and cannot be in ``served``.
+    """
     return _merge(plan, served, plan.group_plans)
 
 
-def retry_hint_from(plan: FetchPlan, served: frozenset[bytes]) -> int:
-    """B computed over full-attention groups only: windowed and state groups need different
-    units at a smaller target and are re-planned on retry. Falls back to all groups when the
-    model has no full-attention group."""
-    full_attention = tuple(
-        g for g in plan.group_plans if g.spec.kind is CacheKind.PAGED and g.spec.window_size is None
-    )
-    return _merge(plan, served, full_attention or plan.group_plans)
+def servable_end(
+    answer: frozenset[bytes],
+    keys: Sequence[bytes],
+    specs: Sequence[GroupSpec],
+    nameable: int,
+    tpb: int,
+) -> int:
+    """The largest ``e`` in ``[1, nameable]`` such that every paged group has each block it needs
+    at ``e * tpb`` in ``answer``; 0 when there is none (or no paged group).
+
+    Computed with ``reuse_end = 0``: the decision must read only inputs every rank shares, and the
+    local reuse depth is per rank. A block the store lacks but the local tree holds therefore
+    still counts as missing, which is conservative (everything in the store implies everything
+    above any local prefix is in the store). State groups are ignored: the assembly guard refuses
+    them, and their snapshots are never published. ``merge`` answers the complementary question
+    about a plan that was fetched; see its docstring for how the two differ on one missing block.
+
+    ``O(groups * nameable)``: one prefix sum of held blocks per group, then each candidate ``e``
+    checks its ranges by subtraction instead of rebuilding an ordinal set per ``e``.
+
+    A block past the last key has no name and cannot be held, so ``nameable`` is clamped to
+    ``len(keys)`` rather than indexing past it.
+    """
+    paged = [s for s in specs if s.kind is CacheKind.PAGED]
+    nameable = min(nameable, len(keys))
+    if not paged or nameable <= 0:
+        return 0
+    held_below = []
+    for spec in paged:
+        counts = [0] * (nameable + 1)
+        for o in range(nameable):
+            counts[o + 1] = counts[o] + (spec.tag + keys[o] in answer)
+        held_below.append(counts)
+    for e in range(nameable, 0, -1):
+        if all(
+            counts[r.stop] - counts[r.start] == len(r)
+            for spec, counts in zip(paged, held_below)
+            for r in _required_ranges(spec, e * tpb, 0, tpb)
+        ):
+            return e
+    return 0
 
 
 class Planner:
@@ -223,7 +272,12 @@ class Planner:
 
     def probe_query(self, req: RequestView) -> tuple[bytes, tuple[bytes, ...]] | None:
         """``(name, unit names)`` to ask a store about, or ``None`` if the request has nothing
-        nameable to fetch. Rank-independent: it starts at block 0, not at the local prefix."""
+        nameable to fetch. Rank-independent: it starts at block 0, not at the local prefix.
+
+        Every group is asked about every nameable block, not only the blocks live at the largest
+        target: ``servable_end`` may settle on a smaller target whose window needs blocks that
+        are stale at the largest one, and one probe is one RPC however many names it carries.
+        """
         if req.is_gen_init:
             return None
         nameable = (req.prompt_len - 1) // self._tpb
@@ -264,7 +318,9 @@ class Planner:
             req: The candidate.
             probe_answers: Per store source, what it holds; ``None`` or missing means unanswered.
             now: The loop clock this round; the probe wait is measured on it.
-            retry_hint: Upper bound on ``token_end`` after a short ``served`` (fetch retry).
+            retry_hint: Upper bound on ``token_end`` after a short ``served`` (fetch retry): the
+                merged B of the failed try. It caps the candidate targets before the store's
+                answer is judged, so a retry may land below it, never above.
         """
         tpb = self._tpb
         reuse_end = self._reader.local_reuse_tokens(req) // tpb
@@ -287,6 +343,11 @@ class Planner:
         if nameable <= 0:
             self.forget(req.py_request_id)
             return None
+        cap = nameable if retry_hint is None else min(nameable, retry_hint // tpb)
+        if cap <= 0:
+            # A retry with nothing to aim for computes locally; no probe is worth waiting on.
+            self.forget(req.py_request_id)
+            return None
 
         chosen: FetchSource | None = None
         hint = None
@@ -295,18 +356,14 @@ class Planner:
         for source in self._sources:
             if source.hint_key is not None:
                 if source.hint_key in req.route_hints:
-                    chosen, hint, token_end = (
-                        source,
-                        req.route_hints[source.hint_key],
-                        nameable * tpb,
-                    )
+                    chosen, hint, token_end = source, req.route_hints[source.hint_key], cap * tpb
                     break
                 continue
             answer = probe_answers.get(source.name)
             if answer is None:
                 pending = True
                 continue
-            end = self._contiguous_prefix_end(answer, keys, nameable)
+            end = servable_end(answer, keys, self._reader.group_specs(), cap, tpb)
             if end > 0:
                 chosen, token_end = source, end * tpb
                 break
@@ -318,8 +375,6 @@ class Planner:
             return None
 
         self.forget(req.py_request_id)
-        if retry_hint is not None:
-            token_end = min(token_end, retry_hint)
         if token_end <= 0:
             return None
         return self._build(token_end, chosen, hint, False, reuse_end, keys)
@@ -348,21 +403,6 @@ class Planner:
             if source.hint_key is not None and source.hint_key in req.route_hints:
                 return source
         return None
-
-    def _contiguous_prefix_end(
-        self, answer: frozenset[bytes], keys: Sequence[bytes], nameable: int
-    ) -> int:
-        """Blocks from 0 that the store holds for every full-attention group (or every paged
-        group when there is none), stopping at the first gap."""
-        specs = [s for s in self._reader.group_specs() if s.kind is CacheKind.PAGED]
-        full_attention = [s for s in specs if s.window_size is None]
-        check = full_attention or specs
-        if not check:
-            return 0
-        o = 0
-        while o < nameable and all(s.tag + keys[o] in answer for s in check):
-            o += 1
-        return o
 
     def _build(
         self,

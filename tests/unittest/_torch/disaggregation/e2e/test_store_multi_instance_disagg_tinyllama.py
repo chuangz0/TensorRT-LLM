@@ -31,7 +31,6 @@ import pytest
 from mooncake_cluster import (
     KV_TRANSFER_CONFIG_ENV,
     KV_TRANSFER_STATUS_DUMP_ENV,
-    MODEL_PATH,
     NAMEABLE_BLOCKS,
     assert_no_leftover_records,
     counters,
@@ -75,7 +74,7 @@ def used_num_blocks_settled(llm) -> int:
     return last
 
 
-def start_engine(tmp_path, monkeypatch, tag: str):
+def start_engine(tmp_path, monkeypatch, tag: str, model_path: str):
     """One ``LLM()`` with the shared store config and the transceiver, dumping its status as
     ``tag`` at shutdown."""
     from tensorrt_llm import LLM
@@ -83,7 +82,7 @@ def start_engine(tmp_path, monkeypatch, tag: str):
 
     monkeypatch.setenv(KV_TRANSFER_STATUS_DUMP_ENV, dump_template(tmp_path, tag))
     return LLM(
-        model=MODEL_PATH,
+        model=model_path,
         kv_cache_config=kv_cache_config(FREE_GPU_MEMORY_FRACTION),
         disable_overlap_scheduler=True,
         enable_iter_perf_stats=True,
@@ -111,7 +110,7 @@ def context_then_generate(llm_ctx, llm_gen, prompt, expected) -> None:
 
 
 @timeout_mark(900)
-def test_store_multi_instance_disagg(mooncake_cluster, tmp_path, monkeypatch):
+def test_store_multi_instance_disagg(mooncake_cluster, tinyllama_path, tmp_path, monkeypatch):
     from tensorrt_llm import LLM
 
     prompts = {"P1": prompt_token_ids(seed=1), "P2": prompt_token_ids(seed=2)}
@@ -119,7 +118,9 @@ def test_store_multi_instance_disagg(mooncake_cluster, tmp_path, monkeypatch):
     # O0: one plain engine, no store, no transceiver; created and gone before the four.
     monkeypatch.delenv(KV_TRANSFER_CONFIG_ENV, raising=False)
     monkeypatch.delenv(KV_TRANSFER_STATUS_DUMP_ENV, raising=False)
-    plain = LLM(model=MODEL_PATH, kv_cache_config=kv_cache_config(), disable_overlap_scheduler=True)
+    plain = LLM(
+        model=tinyllama_path, kv_cache_config=kv_cache_config(), disable_overlap_scheduler=True
+    )
     try:
         expected = {name: generate_ids(plain, prompt) for name, prompt in prompts.items()}
     finally:
@@ -135,7 +136,7 @@ def test_store_multi_instance_disagg(mooncake_cluster, tmp_path, monkeypatch):
     dumps = {}
     try:
         for tag in CTX_ENGINES + GEN_ENGINES:
-            engines[tag] = start_engine(tmp_path, monkeypatch, tag)
+            engines[tag] = start_engine(tmp_path, monkeypatch, tag, tinyllama_path)
         ctx_a, ctx_b = (engines[tag] for tag in CTX_ENGINES)
         gen_a, gen_b = (engines[tag] for tag in GEN_ENGINES)
 

@@ -155,6 +155,12 @@ def plan_authority_for(mapping) -> PlanAuthority:
     rank 0, or under attention DP every first pipeline rank (one per replica, whose collective
     is its own pipeline group). Every other rank, the owner's tensor-parallel peers included,
     receives the schedule and follows.
+
+    The owner judges a store answer over its own layer groups; a follower on a pipeline stage
+    whose groups differ (one holding only windowed layers, say) rebuilds the ask over its own and
+    may name units the store never held. That fetch comes up short and, after one retry, the
+    request computes locally; no stage hangs. Gathering every stage's group set at attach time
+    to refuse such a model would trade an occasional local compute for a refused engine.
     """
     if mapping.pp_size == 1:
         return PlanAuthority.VOTED
@@ -164,10 +170,21 @@ def plan_authority_for(mapping) -> PlanAuthority:
     return PlanAuthority.FOLLOWER
 
 
-def _check_layer_groups_are_full_attention(reader: KVv2ResourceReader) -> None:
+def _check_layer_groups_are_paged(reader: KVv2ResourceReader) -> None:
+    """Every layer group must be paged: full attention or sliding window (with or without sink
+    blocks), whose blocks the store path names and fetches per group. A recurrent group is
+    refused because nothing publishes its state snapshots.
+
+    A model without sliding attention given windows through ``kv_cache_config.max_attention_window``
+    (a Llama, say) passes too: KV v2 drops pages by that window while attention masks nothing,
+    and the store path follows the cache's own life cycle exactly as the local path does.
+    """
     for group_spec in reader.group_specs():
-        if group_spec.kind is not CacheKind.PAGED or group_spec.window_size is not None:
-            _refuse("only full-attention models are supported (no sliding window, no SSM)")
+        if group_spec.kind is not CacheKind.PAGED:
+            _refuse(
+                "SSM/recurrent layer groups are not supported: the store path names no state "
+                "snapshots"
+            )
 
 
 def _check_followers_can_rebuild_plans(mapping, backends: Sequence[BackendHandle]) -> None:
@@ -229,7 +246,7 @@ def attach_kv_transfer(
     kv_cache_manager = executor.kv_cache_manager
     page_table = build_page_table_from_manager(kv_cache_manager)
     reader = KVv2ResourceReader(kv_cache_manager, page_table)
-    _check_layer_groups_are_full_attention(reader)
+    _check_layer_groups_are_paged(reader)
     resolver = KVv2RegionResolver(page_table)
     build_context = BackendBuildContext(
         resolver=resolver,

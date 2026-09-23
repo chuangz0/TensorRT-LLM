@@ -11,7 +11,7 @@ SPDX-License-Identifier: Apache-2.0
 ## A 类:改终态设计,需要作者批准
 
 **A1. `disaggregation/remote_cache.py` 承载 `Planner`。**
-README §5 给 `remote_cache.py` 的职责是"远端缓存的取用策略"。本分支落地的 `Planner` 正是它:决定取不取、问谁、取到哪并归并(`merge`、`retry_hint_from`),
+README §5 给 `remote_cache.py` 的职责是"远端缓存的取用策略"。本分支落地的 `Planner` 正是它:决定取不取、问谁、按所有分页层组决定取到哪(`servable_end`)并归并(`merge`,其 B 也是重试提示),
 也决定 gen-init 的短路与 gen-first 的 `DEFER`。它**不**持有目的区域——调度器经 `reserve_transfer_pages(req, token_end)` 预留页;**不**构造 extent——
 `KVv2ResourceReader.fetch_extent` 做。README 中与路由提示相关的 `hint.py` 尚不存在,随 worker 后端一并拆出(见 B2)。
 提议:README §5 的 `remote_cache.py` 一行加注"实现为 `Planner`;决策输入只用所有 rank 相同的量"。

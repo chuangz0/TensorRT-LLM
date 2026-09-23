@@ -19,7 +19,6 @@ import pytest
 from mooncake_cluster import (
     KV_TRANSFER_CONFIG_ENV,
     KV_TRANSFER_STATUS_DUMP_ENV,
-    MODEL_PATH,
     assert_no_leftover_records,
     counters,
     dump_template,
@@ -59,7 +58,7 @@ def used_num_blocks_settled(llm) -> int:
 
 
 @timeout_mark(600)
-def test_store_with_disagg_ctx_gen(mooncake_cluster, tmp_path, monkeypatch):
+def test_store_with_disagg_ctx_gen(mooncake_cluster, tinyllama_path, tmp_path, monkeypatch):
     from tensorrt_llm import LLM
     from tensorrt_llm.disaggregated_params import DisaggregatedParams
     from tensorrt_llm.llmapi import CacheTransceiverConfig
@@ -69,7 +68,9 @@ def test_store_with_disagg_ctx_gen(mooncake_cluster, tmp_path, monkeypatch):
     # O0: one plain engine, no store, no transceiver; created and gone before the pair.
     monkeypatch.delenv(KV_TRANSFER_CONFIG_ENV, raising=False)
     monkeypatch.delenv(KV_TRANSFER_STATUS_DUMP_ENV, raising=False)
-    plain = LLM(model=MODEL_PATH, kv_cache_config=kv_cache_config(), disable_overlap_scheduler=True)
+    plain = LLM(
+        model=tinyllama_path, kv_cache_config=kv_cache_config(), disable_overlap_scheduler=True
+    )
     try:
         expected = generate_ids(plain, prompt)
     finally:
@@ -87,7 +88,7 @@ def test_store_with_disagg_ctx_gen(mooncake_cluster, tmp_path, monkeypatch):
 
     monkeypatch.setenv(KV_TRANSFER_STATUS_DUMP_ENV, dump_template(tmp_path, "ctx"))
     llm_ctx = LLM(
-        model=MODEL_PATH,
+        model=tinyllama_path,
         kv_cache_config=kv_cache_config(),
         disable_overlap_scheduler=True,
         enable_iter_perf_stats=True,
@@ -98,7 +99,7 @@ def test_store_with_disagg_ctx_gen(mooncake_cluster, tmp_path, monkeypatch):
     try:
         monkeypatch.setenv(KV_TRANSFER_STATUS_DUMP_ENV, dump_template(tmp_path, "gen"))
         llm_gen = LLM(
-            model=MODEL_PATH,
+            model=tinyllama_path,
             kv_cache_config=kv_cache_config(),
             disable_overlap_scheduler=True,
             enable_iter_perf_stats=True,

@@ -385,6 +385,7 @@ partial                                             not named
 | full attention | 分页,终点是**上界** | `[reuse_end, token_end)` 每块一个 | 页 |
 | 窗口(含 sink) | 分页 | sink 块加窗口块 `[stale_end(token_end), token_end)`,减去本地已有的;由 `_stale_block_range(group, token_end)` 给出 | 页 |
 | SSM/state | 状态,终点是**精确检查点** | 一个:`token_end` 所在块末尾的快照 | 请求自己的 SSM slot |
+| 窗口(发布侧) | 分页 | `publish_description` 按 `stale_block_range(group, history)` 命名 `[0, sink) ∪ [stale_end(history), committed)`,history 取发布时刻(非分块 prefill 时 = `prompt_len` = L)。取回方最大目标 B = ⌊(L−1)/tpb⌋·tpb 需 `[stale_end(B), B)`;W ≡ 0 (mod tpb) 时二者恰在 `L mod tpb ∈ {0, tpb−1}` 时相差一块——窗口首块已被发布方丢弃,且 `stale_end` 随目标单调,往下走也救不回:`servable_end` 退到 sink 块独自能服务的边界(无 sink 时为 0),该请求本地算,正确性不受影响 | 页 |
 
 `reuse_end` 是本地命中的块边界;`stale_end` 是窗口组在给定 history 下不再读取的最后一块之后;**history** 是 KV v2 里"已算到哪"的水位,只能增不能减。SSM 之所以能命名:KV v2 提交时把快照挂到 radix tree 的某个 block 上,那个 block 有 key。
 
@@ -399,7 +400,7 @@ partial                                             not named
 1. 预留目的页时必须把 history 一次声明到 `token_end`(今天 gen-init 就是这么做的;否则窗口组要为整段区间持有页,长 prompt 撑爆 SWA pool),而 history 只增不减,且窗口组在 `stale(token_end)` 范围内的块**根本没有页**。所以 B < token_end 时,`[B, token_end)` 既没数据也没页可算。
 2. 非 `ALL_REUSABLE` 策略和所有 SSM 模型上,提交终点还必须等于 history。
 
-第 1 条对所有配置成立,是主要理由。重试提示 = 按 full attention 组算出的 B(窗口组和 SSM 组在更小的目标下需要不同的 unit,重试时重新规划)。一个请求最多重试一次,再不成就当普通请求算。store 的 `probe` 让少到罕见。
+第 1 条对所有配置成立,是主要理由。重试提示 = `merge` 的 B:重试目标不高于已到达的边界,且 probe 答案在记录里缓存、重试不重查,更高的目标只会再次索要刚缺的 unit。重试时 `servable_end` 以该提示为候选上限重新判答案,可能落到更低(甚至 ask 为空的最小计划)。一个请求最多重试一次,再不成就当普通请求算。store 的 `probe` 让少到罕见。
 
 ---
 
@@ -503,8 +504,9 @@ class Planner:
     def decide(self, req, probe_answers, *, now: float, retry_hint=None) -> FetchPlan | None | Defer: ...
     def forget(self, req_id: int) -> None: ...  # 请求结束,丢掉它的 probe 计时
 
-def merge(plan: FetchPlan, served: frozenset[bytes]) -> int: ...            # §6.3:归并后的 B
-def retry_hint_from(plan: FetchPlan, served: frozenset[bytes]) -> int: ...  # 重试时的 token_end 上界
+def merge(plan: FetchPlan, served: frozenset[bytes]) -> int: ...            # §6.3:归并后的 B,也是重试提示
+def servable_end(answer: frozenset[bytes], keys: Sequence[bytes], specs: Sequence[GroupSpec],
+                 nameable: int, tpb: int) -> int: ...                       # store 答案能服务的最大块边界(块数)
 ```
 
 > 实现注:`units_by_group` 与 `unit_names` 已从 `FetchPlan` 删去——二者都由 `group_plans`(各组的 `(GroupSpec, ordinals)`)与 `block_keys` 推出,归并与重试直接读 `group_plans`;`mode` 随 STREAMED 第一版(§10.2)加回。
@@ -519,8 +521,10 @@ probe 的等待只有一个预算:`probe_timeout_s`,按传给 `decide` 的 `now`
 | 2 | gen-first 的 context 请求,generation 侧还没就绪? | `DEFER`(今天 `prepare_context_schedulable` 的逻辑) |
 | 3 | 可命名整块数 > 本地命中块数? | `probe_context_reuse(req)` + `context_block_keys(req)` |
 | 4 | 有哪个后端值得问? | 按装配表顺序:请求带 `hint_key` 对应提示的 worker 后端;或 `probe` 答案非空的 store 后端。`probe` 答 `None`(后端还没查完,或答不了)则 `DEFER`,超过一个小预算后当 `None` |
-| 5 | token_end | worker:prompt 的整块末端;store:probe 答案的**连续**前缀末端;重试时用重试提示 |
-| 6 | 一致性 | 计划只用所有 rank 相同的输入(prompt、路由提示、probe 答案);本地命中深度各 rank 可能不同,只用它裁各组的询问(`group_plans`),裁到空仍是合法计划(契约允许 units 为空) |
+| 5 | token_end | worker:prompt 的整块末端;store:`servable_end`——**每个分页层组**在该边界所需的 unit(full attention 组 `[0, e)`,窗口组 sink 块加 `[stale_end(e·tpb), e)`)全在答案里的最大边界,以 `reuse_end = 0` 计(第 6 步);重试时重试提示先作候选上限,再判答案 |
+| 6 | 一致性 | 计划只用所有 rank 相同的输入(prompt、路由提示、probe 答案);本地命中深度各 rank 可能不同,只用它裁各组的询问(`group_plans`),裁到空仍是合法计划(契约允许 units 为空)。`servable_end` 因此不减本地前缀:store 缺、本地有的块也算缺(保守;store 全在 ⇒ 裁掉本地部分后仍全在) |
+
+**PP 已知限制**:OWNER 用自己的层组判 `servable_end`,FOLLOWER `materialize` 用自己的层组重建 ask;PP 各 stage 层组可能不同(某 stage 只有窗口层),follower 可能索要答案里没有的 unit → 一次少到 + 重试 → 本地算,不挂起。不在 attach 时 allgather 各 stage 的层组集合来拒绝:代价是多一个集合与一条拒绝路径,换来的只是把"偶发退化为本地算"变成"整机拒绝启动"。
 
 ### 7.3 引擎 effects(`orchestration/kv_transfer/interfaces.py`)
 
@@ -625,7 +629,7 @@ Coordinator 通过 effects 反向触达引擎,这是它对引擎的全部依赖�
 
 ### 9.4 从 store 取
 
-同 9.3,差别:§7.2 决策第 4 步用 `probe(name, units)` 问 store 持有哪些;blob 后端(Mooncake 驱动)自己在后台查,查完之前 `probe` 答 `None`,请求 `DEFER` 一两轮;token_end 取答案的**连续**前缀末端;没有路由。`probe` 的答案只是建议(SPEC §6.2 不变式 8),取时少了就走 9.3 第 4 步的重试。
+同 9.3,差别:§7.2 决策第 4 步用 `probe(name, units)` 问 store 持有哪些(每组 × 每个可命名块,一次 RPC);blob 后端(Mooncake 驱动)自己在后台查,查完之前 `probe` 答 `None`,请求 `DEFER` 一两轮;token_end 取 `servable_end`——每个分页层组所需 unit 全在答案里的最大边界(窗口组在更小的边界需要更早的块,所以全问而不只问最大目标的活块);没有路由。`probe` 的答案只是建议(SPEC §6.2 不变式 8),取时少了就走 9.3 第 4 步的重试,重试提示为 `merge` 的 B。
 
 ### 9.5 发布到 store
 

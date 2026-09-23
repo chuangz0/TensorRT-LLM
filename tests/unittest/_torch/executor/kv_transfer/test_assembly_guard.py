@@ -14,6 +14,8 @@ import pytest
 from engine_fakes import FakeFetches
 
 from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
+from tensorrt_llm._torch.disaggregation.base.backend import CacheKind
+from tensorrt_llm._torch.disaggregation.base.views import GroupSpec
 from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_transfer import assembly
@@ -179,6 +181,21 @@ def test_every_out_of_scope_condition_is_refused_with_its_reason(
 ):
     with pytest.raises(ValueError, match="cannot host them: " + reason):
         guard(make_executor(), mapping, **overrides)
+
+
+def _reader_with(*specs: GroupSpec) -> SimpleNamespace:
+    return SimpleNamespace(group_specs=lambda: specs)
+
+
+def test_layer_group_guard_admits_paged_groups_and_refuses_state_groups():
+    """Full attention and sliding windows (with or without sink blocks) are fetched and published
+    per group; a recurrent group has no published snapshot to fetch."""
+    full = GroupSpec(0, CacheKind.PAGED, b"\0" * 8)
+    windowed = GroupSpec(1, CacheKind.PAGED, b"\1" * 8, window_size=128, sink_blocks=1)
+    state = GroupSpec(2, CacheKind.STATE, b"\2" * 8)
+    assembly._check_layer_groups_are_paged(_reader_with(full, windowed))
+    with pytest.raises(ValueError, match="SSM/recurrent layer groups are not supported"):
+        assembly._check_layer_groups_are_paged(_reader_with(full, state))
 
 
 def _handle(name: str, hint_key, closed: list) -> BackendHandle:
