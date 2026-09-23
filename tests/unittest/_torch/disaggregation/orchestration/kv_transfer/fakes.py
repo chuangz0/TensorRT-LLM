@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Mapping, Sequence
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
+from disaggregation.base.backend import CacheKind  # noqa: E402
 from disaggregation.base.cache_backend import (  # noqa: E402
     CacheExtent,
     Delivered,
@@ -26,16 +27,13 @@ from disaggregation.base.cache_backend import (  # noqa: E402
     SubmissionRejected,
     Unit,
 )
+from disaggregation.base.views import GroupSpec  # noqa: E402
 from disaggregation.orchestration.kv_transfer.coordinator import KVTransferCoordinator  # noqa: E402
-from disaggregation.orchestration.kv_transfer.interfaces import (  # noqa: E402
-    FetchSource,
-    GroupKind,
-    GroupSpec,
-    PlanAuthority,
-)
+from disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority  # noqa: E402
 from disaggregation.orchestration.kv_transfer.records import TransferRecord  # noqa: E402
 from disaggregation.remote_cache import (  # noqa: E402
     FetchPlan,
+    FetchSource,
     GroupPlan,
     Planner,
     required_ordinals,
@@ -52,7 +50,7 @@ TPB = 4
 
 
 def full_attention(local_group: int = 0) -> GroupSpec:
-    return GroupSpec(local_group, GroupKind.PAGED, group_tag(frozenset({"full"}), None))
+    return GroupSpec(local_group, CacheKind.PAGED, group_tag(frozenset({"full"}), None))
 
 
 def windowed(
@@ -61,7 +59,7 @@ def windowed(
     window = window_blocks * tpb
     return GroupSpec(
         local_group,
-        GroupKind.PAGED,
+        CacheKind.PAGED,
         group_tag(frozenset({"swa"}), window),
         window_size=window,
         sink_blocks=sink_blocks,
@@ -69,7 +67,7 @@ def windowed(
 
 
 def state_group(local_group: int = 2) -> GroupSpec:
-    return GroupSpec(local_group, GroupKind.STATE, group_tag(frozenset({"ssm"}), None))
+    return GroupSpec(local_group, CacheKind.STATE, group_tag(frozenset({"ssm"}), None))
 
 
 def block_key(seed: str, ordinal: int) -> bytes:
@@ -95,21 +93,28 @@ def make_plan(
     group_plans = tuple(
         GroupPlan(s, tuple(sorted(required_ordinals(s, token_end, reuse_end, tpb)))) for s in groups
     )
-    keys = tuple(keys)
-    unit_names = frozenset(
-        g.spec.tag + keys[o] for g in group_plans for o in g.ordinals if o < len(keys)
-    )
     return FetchPlan(
         token_end=token_end,
         source=source,
         hint=None,
         no_local_fallback=no_local_fallback,
-        units_by_group={g.spec.local_group: g.ordinals for g in group_plans},
-        unit_names=unit_names,
         group_plans=group_plans,
-        block_keys=keys,
+        block_keys=tuple(keys),
         reuse_end=reuse_end,
         tokens_per_block=tpb,
+    )
+
+
+def ordinals_by_group(plan: FetchPlan) -> dict[int, tuple[int, ...]]:
+    """The block ordinals each local layer group asks for, keyed by ``local_group``."""
+    return {g.spec.local_group: g.ordinals for g in plan.group_plans}
+
+
+def plan_unit_names(plan: FetchPlan) -> frozenset[bytes]:
+    """Every unit name the plan asks for, across groups; what a full delivery serves."""
+    keys = plan.block_keys
+    return frozenset(
+        g.spec.tag + keys[o] for g in plan.group_plans for o in g.ordinals if o < len(keys)
     )
 
 
@@ -395,9 +400,6 @@ class RecordingEffects:
     def terminate_request(self, request) -> None:
         self._record("terminate_request", request)
 
-    def stage_transfer_response(self, request) -> None:
-        self._record("stage_transfer_response", request)
-
     def fail_requests(self, requests, reason) -> None:
         self._record("fail_requests", tuple(requests), reason)
 
@@ -434,22 +436,24 @@ class FakeEngineQueue:
 
 
 class FakeDist:
-    """Single rank: ``allgather`` answers with the caller's own payload."""
+    """Single rank: ``allgather`` answers with the caller's own payload; ``calls`` keeps a copy
+    of every payload gathered."""
 
     rank = 0
     world_size = 1
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, object]] = []
+        self.calls: list[object] = []
 
-    def allgather(self, obj, scope) -> list:
+    def allgather(self, obj) -> list:
         snapshot = copy.deepcopy(obj)
-        self.calls.append((scope, snapshot))
+        self.calls.append(snapshot)
         return [copy.deepcopy(snapshot)]
 
 
 class LockstepWorld:
-    """``n`` real coordinators stepped in lockstep on one thread, through the ``gather`` seam.
+    """``n`` real coordinators stepped in lockstep on one thread, each over a ``LockstepGather``
+    as its ``DistLike``.
 
     ``run(fn)`` calls ``fn(0)``; when rank 0 reaches its one collective, its gather runs ``fn(1)``
     nested (and so on up to rank ``n-1``), so every rank's payload exists before any gather
@@ -457,7 +461,7 @@ class LockstepWorld:
     once per rank. Between ``run`` calls the test scripts each rank's fakes freely.
 
     ``authority_of(rank)`` names each rank's ``PlanAuthority`` (default: every rank ``VOTED``);
-    ``Rig`` construction reads it through ``authority_kwargs``.
+    ``Rig`` construction reads it through ``rig_kwargs``.
     """
 
     def __init__(self, n: int, authority_of: Callable[[int], PlanAuthority] | None = None) -> None:
@@ -470,7 +474,7 @@ class LockstepWorld:
 
     def rig_kwargs(self, rank: int) -> dict:
         """The keyword arguments that place a ``Rig`` at ``rank`` of this world."""
-        return {"gather": self.gathers[rank], "plan_authority": self.authority_of(rank)}
+        return {"dist": self.gathers[rank], "plan_authority": self.authority_of(rank)}
 
     def run(self, fn: Callable[[int], object]) -> list:
         assert self._fn is None, "LockstepWorld.run is not reentrant"
@@ -494,27 +498,27 @@ class LockstepWorld:
 
 
 class LockstepGather:
-    """The ``gather`` callable one rank hands to its coordinator; records every payload."""
+    """The ``DistLike`` of one rank of a ``LockstepWorld``; records every payload."""
 
     def __init__(self, world: LockstepWorld, rank: int) -> None:
         self._world = world
         self.rank = rank
         self.calls: list = []
 
-    def __call__(self, payload) -> list:
+    def allgather(self, payload) -> list:
         self.calls.append(copy.deepcopy(payload))
         return self._world._exchange(self.rank, payload)
 
 
 class PeerGather:
-    """A single real rank plus hand-written peers: ``peer(local_payload) -> peer_payload`` for
-    each peer function; the gathered list is ``[local, *peers]``."""
+    """``DistLike`` of a single real rank plus hand-written peers: ``peer(local_payload) ->
+    peer_payload`` for each peer function; the gathered list is ``[local, *peers]``."""
 
     def __init__(self, *peers: Callable[[object], object]) -> None:
         self._peers = peers
         self.calls: list = []
 
-    def __call__(self, payload) -> list:
+    def allgather(self, payload) -> list:
         local = copy.deepcopy(payload)
         self.calls.append(local)
         return [local, *(copy.deepcopy(peer(local)) for peer in self._peers)]
@@ -596,6 +600,9 @@ class FakeReader:
             name=f"publish:{request.seed}".encode(), units=tuple(units), is_last=True
         ), None
 
+    def forget_request(self, request_id: int) -> None:
+        """Nothing to forget: this reader keeps no per-request state."""
+
     # -- scripting helpers --
 
     def script_publish(
@@ -620,7 +627,7 @@ class FakeReader:
         return extents
 
     def unit_names(
-        self, request, ordinals: Iterable[int], *, kinds=(GroupKind.PAGED,)
+        self, request, ordinals: Iterable[int], *, kinds=(CacheKind.PAGED,)
     ) -> frozenset[bytes]:
         """Names of the given blocks for every group of the given kinds (default: paged)."""
         keys = self.block_keys(request)
@@ -638,8 +645,10 @@ class Rig:
 
     Sources are ``worker`` (hint key ``"ctx"``) followed by ``store`` (no hint key) unless
     ``sources`` is given. ``trace`` interleaves backend ``quiesce`` calls with effects. The
-    collective is ``FakeDist`` unless a ``gather`` callable (``LockstepGather``, ``PeerGather``)
-    is given; ``payloads()`` lists what this rank sent either way.
+    collective is ``FakeDist`` unless a ``dist`` (``LockstepGather``, ``PeerGather``) is given;
+    ``payloads()`` lists what this rank sent either way. ``probe_timeout_s`` is measured on the
+    ``now`` tests pass to ``advance``: with the default, a request deferred at 0.0 and 1.0 is
+    planned without the store at 2.0.
     """
 
     def __init__(
@@ -649,14 +658,10 @@ class Rig:
         sources: Sequence[str] = ("worker", "store"),
         publishers: Sequence[FakePublishes] | None = None,
         dist=None,
-        gather=None,
         tpb: int = TPB,
-        probe_budget_rounds: int = 2,
+        probe_timeout_s: float | None = 2.0,
         **coordinator_kwargs,
     ) -> None:
-        self.gather = gather
-        if gather is not None:
-            coordinator_kwargs["gather"] = gather
         self.plans: dict[int, FetchPlan] = {}
         """Plans as read by ``plan_and_launch`` before launching (unreadable afterwards)."""
         self.trace: list = []
@@ -675,9 +680,7 @@ class Rig:
         self.effects = RecordingEffects(trace=self.trace)
         self.queue = FakeEngineQueue()
         self.dist = dist if dist is not None else FakeDist()
-        self.planner = Planner(
-            self.sources, self.reader, tpb, probe_budget_rounds=probe_budget_rounds
-        )
+        self.planner = Planner(self.sources, self.reader, tpb, probe_timeout_s=probe_timeout_s)
         self.coord = KVTransferCoordinator(
             self.sources,
             self.publishers,
@@ -706,9 +709,7 @@ class Rig:
 
     def payloads(self) -> list:
         """Every payload this rank handed to its collective, in order."""
-        if self.gather is not None:
-            return list(self.gather.calls)
-        return [payload for _, payload in self.dist.calls]
+        return list(self.dist.calls)
 
     def plan_and_launch(self, req: FakeRequest, now: float = 0.0) -> FakeAttempt:
         """``advance`` with ``req`` as the only candidate, read its plan into ``plans``, then

@@ -14,10 +14,11 @@
 # limitations under the License.
 """The KV transfer layer as the executor loop and the scheduler see it (design §3.2, plan §4).
 
-``KVTransferEngineBinding`` is the one object the loop calls: it selects the requests each hook
-concerns, wraps them in ``EngineRequestView``, forwards to ``KVTransferCoordinator``, answers the
-release gate and the cancel path from this layer's own tables, and owns the shutdown order. All
-logic lives here or below; the shared engine files hold one guarded call per hook.
+``KVTransferHooks`` is the one object the loop calls, one method per engine loop hook point: each
+selects the requests the hook concerns, wraps them in ``EngineRequestView``, forwards to
+``KVTransferCoordinator``, answers the release gate and the cancel path from the coordinator's
+record table, and owns the shutdown order. All logic lives here or below; the shared engine files
+hold one guarded call per hook.
 
 Known follow-ups:
 
@@ -33,7 +34,6 @@ Known follow-ups:
 from __future__ import annotations
 
 import json
-import logging
 import os
 import threading
 import time
@@ -44,75 +44,33 @@ from tensorrt_llm.logger import logger
 from ...disaggregation.backends.config import BackendEntry
 from ...disaggregation.backends.registry import BackendHandle, close_backends
 from ...disaggregation.orchestration.kv_transfer.coordinator import (
+    DEFER,
     KVTransferCoordinator,
     PlanAnswers,
 )
-from ...disaggregation.orchestration.kv_transfer.interfaces import DEFER, PlanAuthority
-from ...disaggregation.resource.kv_v2_reader import KVv2ResourceReader
+from ...disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority
 from ..llm_request import LlmRequest, LlmRequestState
 from .effects import EngineRequestView, PyExecutorKVTransferEffects
 
 if TYPE_CHECKING:
     from ..py_executor import PyExecutor
 
-__all__ = ["KVTransferEngineBinding"]
+__all__ = ["KVTransferHooks"]
 
 _IDLE_BACKEND_WAIT_S = 0.001
 """How long an idle loop pass sleeps while only a backend can make progress."""
 
 _CONTEXT_INIT_STATE_VALUE = LlmRequestState.CONTEXT_INIT.value
 
-_DISAGGREGATION_LOGGER_NAME = "tensorrt_llm._torch.disaggregation"
-"""The stdlib logger namespace of the import-light layers below this one (coordinator, backends).
-They log through ``logging`` because they do not import ``tensorrt_llm``; the engine forwards
-their WARNING+ records to the TRT-LLM logger so a store outage shows up in the engine's log."""
 
-
-class _ForwardToTrtllmLogger(logging.Handler):
-    """Re-emits each stdlib record it receives through ``tensorrt_llm.logger.logger`` at the
-    matching severity. Installed once per namespace by ``install_log_forwarding``."""
-
-    def __init__(self) -> None:
-        super().__init__(level=logging.WARNING)
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            message = record.getMessage()
-        except Exception:  # noqa: BLE001 - a malformed record must not break the caller's log
-            self.handleError(record)
-            return
-        if record.levelno >= logging.CRITICAL:
-            logger.critical(message)
-        elif record.levelno >= logging.ERROR:
-            logger.error(message)
-        else:
-            logger.warning(message)
-
-
-def install_log_forwarding() -> _ForwardToTrtllmLogger:
-    """Attach the forwarding handler to the disaggregation logger namespace, unless one is there
-    already, and return the attached one."""
-    target = logging.getLogger(_DISAGGREGATION_LOGGER_NAME)
-    for handler in target.handlers:
-        if isinstance(handler, _ForwardToTrtllmLogger):
-            return handler
-    handler = _ForwardToTrtllmLogger()
-    target.addHandler(handler)
-    return handler
-
-
-def remove_log_forwarding(handler: _ForwardToTrtllmLogger) -> None:
-    logging.getLogger(_DISAGGREGATION_LOGGER_NAME).removeHandler(handler)
-
-
-class KVTransferEngineBinding:
+class KVTransferHooks:
     """One call per hook point of plan §5; see the naming table of plan §4.
 
     Args:
         executor: The engine; read for its request lists and its resource release.
-        coordinator: The record table and its four phases.
-        effects: The engine-side effects; also the parked / held tables the gate reads.
-        reader: The resource view, told to forget finished requests.
+        coordinator: The record table and its four phases; also what the release gate and the
+            cancel path read.
+        effects: The engine-side effects.
         backends: The built backends, in config order; closed by ``close``.
         backend_entries: Their config entries, for the status dump.
         close_timeout_s: How long ``close`` waits for the backends before giving them up.
@@ -130,7 +88,6 @@ class KVTransferEngineBinding:
         executor: PyExecutor,
         coordinator: KVTransferCoordinator,
         effects: PyExecutorKVTransferEffects,
-        reader: KVv2ResourceReader,
         backends: Sequence[BackendHandle],
         backend_entries: Sequence[BackendEntry],
         *,
@@ -142,7 +99,6 @@ class KVTransferEngineBinding:
         self._executor = executor
         self.coordinator = coordinator
         self.effects = effects
-        self.reader = reader
         self.backends = tuple(backends)
         self._backend_entries = tuple(backend_entries)
         self._close_timeout_s = close_timeout_s
@@ -153,7 +109,6 @@ class KVTransferEngineBinding:
         self._num_deferred_requests = 0
         """Requests still undecided after the last advance (or, on a follower, after the last
         adoption); each is waiting on a store lookup."""
-        self._log_forwarding = install_log_forwarding()
 
     # ---- loop entry points ----
 
@@ -162,11 +117,9 @@ class KVTransferEngineBinding:
         ``coordinator.advance`` reaps landed transfers and plans them. A follower plans nothing
         here; its undecided count is set when it adopts the owner's answers."""
         candidates = self._undecided_candidates(active_requests)
-        self.coordinator.advance(candidates, time.monotonic())
+        num_deferred = self.coordinator.advance(candidates, time.monotonic())
         if self.coordinator.plan_authority is not PlanAuthority.FOLLOWER:
-            self._num_deferred_requests = sum(
-                1 for candidate in candidates if self.coordinator.plan_fetch(candidate) is DEFER
-            )
+            self._num_deferred_requests = num_deferred
 
     def export_plan_answers(self) -> PlanAnswers:
         """Owner of the pipeline-parallel loop, after ``advance_round``: this round's decided plan
@@ -179,11 +132,7 @@ class KVTransferEngineBinding:
         """Follower of the pipeline-parallel loop, before it runs its local scheduler: take the
         owner's answers; every undecided candidate without one stays deferred."""
         candidates = self._undecided_candidates(active_requests)
-        self.coordinator.adopt_plan_answers(candidates, answers)
-        answered = {request_id for request_id, _ in answers}
-        self._num_deferred_requests = sum(
-            1 for candidate in candidates if candidate.py_request_id not in answered
-        )
+        self._num_deferred_requests = self.coordinator.adopt_plan_answers(candidates, answers)
 
     def plan_fetch(self, request: LlmRequest):
         """Scheduler hook (design §5): ``FetchPlan``, ``None`` or ``DEFER`` for ``request``.
@@ -205,25 +154,24 @@ class KVTransferEngineBinding:
         (design §3.2 step 4, plan §5 #3-#4): offer the blocks of requests whose prefill ended."""
         completed = self._publishable_completed_contexts(context_requests)
         if completed:
-            self.coordinator.publish_committed_blocks(completed, finished=(), now=time.monotonic())
+            self.coordinator.publish_committed_blocks(completed, now=time.monotonic())
 
     # ---- release gate, cancel path, idle pacing ----
 
     def on_request_finished(self, request: LlmRequest) -> bool:
         """The release gate (design §4.3, plan §9): ``True`` when the engine may terminate the
         request now, ``False`` when this layer holds it and will terminate it later."""
-        request_id = request.py_request_id
         self.coordinator.notify_request_finished(EngineRequestView(request))
-        self.reader.forget_request(request_id)
-        return request_id not in self.effects.held_request_ids
+        return request.py_request_id not in self.coordinator.held_request_ids()
 
     def is_tracking(self, request: LlmRequest) -> bool:
-        """Whether this layer has a live record of the request: parked for a fetch, or held for a
-        publish. Ownership is read from the tables, never from the request state."""
+        """Whether this layer owns the request right now: parked for a fetch, or held after it
+        finished. Read from the coordinator's record table, never from the request state. A
+        running request with a publish in flight is not owned: it stays cancellable."""
         request_id = request.py_request_id
         return (
-            request_id in self.effects.parked_request_ids
-            or request_id in self.effects.held_request_ids
+            request_id in self.coordinator.parked_request_ids()
+            or request_id in self.coordinator.held_request_ids()
         )
 
     def has_transfer_in_flight(self) -> bool:
@@ -262,9 +210,8 @@ class KVTransferEngineBinding:
         }
 
     def close(self) -> None:
-        """Stop the backends within ``close_timeout_s``, stop forwarding the layers' logs, free
-        every request this layer still holds or has parked, then write the status dump (plan §5
-        #9, §9).
+        """Stop the backends within ``close_timeout_s``, free every request this layer still holds
+        or has parked, then write the status dump (plan §5 #9, §9).
 
         When the backends do not stop in time, a request whose transfer record is still in flight
         keeps its pages: a backend that may still be writing them must not see them freed. Its
@@ -274,11 +221,11 @@ class KVTransferEngineBinding:
             return
         self._is_closed = True
         backends_closed = self._close_backends_within_timeout()
-        remove_log_forwarding(self._log_forwarding)
         still_in_flight = (
             frozenset() if backends_closed else self.coordinator.inflight_request_ids()
         )
-        for request in self.effects.requests_to_release_on_close():
+        for view in self.coordinator.tracked_requests():
+            request = view.request
             if request.py_request_id in still_in_flight:
                 logger.warning(
                     "kv transfer: request %d keeps its pages, its transfer is still in flight",

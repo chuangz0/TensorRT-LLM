@@ -39,6 +39,7 @@ def test_modules_under_test_were_not_imported_through_tensorrt_llm():
     )
     assert Fetches.__module__ == "disaggregation.base.cache_backend"
     through_package = (
+        "tensorrt_llm._torch.disaggregation.base.views",
         "tensorrt_llm._torch.disaggregation.orchestration.kv_transfer",
         "tensorrt_llm._torch.disaggregation.remote_cache",
     )

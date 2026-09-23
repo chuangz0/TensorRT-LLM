@@ -21,22 +21,58 @@ and a served set, so the rule that says what "arrived" means can be tested with 
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from itertools import chain
-from typing import Callable, Iterator, Literal, Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 
-from .orchestration.kv_transfer.interfaces import (
-    DEFER,
-    Defer,
-    FetchSource,
-    GroupKind,
-    GroupSpec,
-    RequestView,
-    ResourceReader,
-)
+from .base.backend import CacheKind
+from .base.cache_backend import Fetches
+from .base.views import GroupSpec, RequestView, ResourceReader
 
-__all__ = ["FetchPlan", "GroupPlan", "Planner", "merge", "required_ordinals", "retry_hint_from"]
+__all__ = [
+    "DEFER",
+    "Defer",
+    "FetchPlan",
+    "FetchSource",
+    "GroupPlan",
+    "Planner",
+    "merge",
+    "required_ordinals",
+    "retry_hint_from",
+]
+
+
+class Defer:
+    """The answer "do not schedule this request this round; ask again next round".
+
+    A class rather than a sentinel string so that ``isinstance`` works and so that it can never be
+    confused with a plan or with ``None`` (which means "compute locally, no fetch").
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "DEFER"
+
+
+DEFER = Defer()
+"""The single ``Defer`` instance. Compare with ``is``."""
+
+
+@dataclass(frozen=True)
+class FetchSource:
+    """One fetch backend in the assembly table (design §7.4).
+
+    Attributes:
+        name: Stable identifier; recorded on plans and attempts, and used as the allgather key.
+        backend: The backend itself.
+        hint_key: Which routing hint on a request this backend reads. ``None`` for a backend whose
+            destination is unique (a store), which then never gets ``open_route``.
+    """
+
+    name: str
+    backend: Fetches
+    hint_key: str | None
 
 
 @dataclass(frozen=True)
@@ -57,34 +93,21 @@ class FetchPlan:
         source: ``FetchSource.name``.
         hint: ``open_route`` input; only for a worker source.
         no_local_fallback: True for gen-init: a failure can only fail the request.
-        units_by_group: Block ordinals each local layer group asks for, keyed by ``local_group``.
-        unit_names: Every unit name the plan asks for, across groups.
-        group_plans: The per-group asks with their specs; what ``merge`` reads.
-        block_keys: One key per full prompt block, by ordinal; names are ``tag + block_keys[o]``.
+        group_plans: The per-group asks with their specs; what ``merge`` and ``fetch_extent``
+            read. Unit names are ``spec.tag + block_keys[o]`` for every ordinal ``o`` asked.
+        block_keys: One key per full prompt block, by ordinal.
         reuse_end: Blocks the local radix tree already serves; nothing below it is asked for.
         tokens_per_block: ``tpb``.
-        mode: Reserved for streamed fetches (design §10.2).
     """
 
     token_end: int
     source: str
     hint: Mapping[str, object] | None
     no_local_fallback: bool
-    units_by_group: Mapping[int, tuple[int, ...]]
-    unit_names: frozenset[bytes]
     group_plans: tuple[GroupPlan, ...]
     block_keys: tuple[bytes, ...]
     reuse_end: int
     tokens_per_block: int
-    mode: Literal["PREFETCH"] = "PREFETCH"
-
-
-@dataclass
-class _Deferral:
-    """One request's wait for a store lookup: rounds charged so far, and when it began."""
-
-    first_deferred_at: float
-    rounds: int = 0
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -111,7 +134,7 @@ def required_ordinals(spec: GroupSpec, history: int, reuse_end: int, tpb: int) -
     position.
     """
     full = history // tpb
-    if spec.kind is GroupKind.STATE:
+    if spec.kind is CacheKind.STATE:
         if history % tpb != 0 or full <= reuse_end:
             return frozenset()
         return frozenset({full - 1})
@@ -165,7 +188,7 @@ def retry_hint_from(plan: FetchPlan, served: frozenset[bytes]) -> int:
     units at a smaller target and are re-planned on retry. Falls back to all groups when the
     model has no full-attention group."""
     full_attention = tuple(
-        g for g in plan.group_plans if g.spec.kind is GroupKind.PAGED and g.spec.window_size is None
+        g for g in plan.group_plans if g.spec.kind is CacheKind.PAGED and g.spec.window_size is None
     )
     return _merge(plan, served, full_attention or plan.group_plans)
 
@@ -177,15 +200,10 @@ class Planner:
         sources: The assembly table, in priority order.
         reader: This rank's resource view.
         tokens_per_block: ``tpb``.
-        probe_budget_rounds: How many rounds a request may be deferred waiting for a store's
-            ``probe`` before the unanswered probe counts as "not held". ``None`` leaves the
-            wait to ``probe_timeout_s`` alone.
         probe_timeout_s: How long, from its first deferral, a request may wait for a store's
-            ``probe`` before the unanswered probe counts as "not held". ``None`` (the default)
-            leaves the wait to ``probe_budget_rounds`` alone; the engine assembly sets it from
-            the config. Whichever budget runs out first ends the wait.
-        clock: Source of ``probe_timeout_s`` time; the engine's loop clock, so that the same
-            clock drives this budget and the coordinator's deadlines.
+            ``probe`` before the unanswered probe counts as "not held". Measured on the ``now``
+            each ``decide`` receives, the loop clock the coordinator's deadlines also use.
+            ``None`` waits indefinitely.
     """
 
     def __init__(
@@ -194,18 +212,14 @@ class Planner:
         reader: ResourceReader,
         tokens_per_block: int,
         *,
-        probe_budget_rounds: int | None = 2,
         probe_timeout_s: float | None = None,
-        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._sources = tuple(sources)
         self._reader = reader
         self._tpb = tokens_per_block
-        self._probe_budget_rounds = probe_budget_rounds
         self._probe_timeout_s = probe_timeout_s
-        self._clock = clock
-        self._deferrals: dict[int, _Deferral] = {}
-        """Per deferred request: how many rounds it has waited, and since when."""
+        self._first_deferred_at: dict[int, float] = {}
+        """Per deferred request: the ``now`` of its first deferral."""
 
     def probe_query(self, req: RequestView) -> tuple[bytes, tuple[bytes, ...]] | None:
         """``(name, unit names)`` to ask a store about, or ``None`` if the request has nothing
@@ -222,40 +236,26 @@ class Planner:
 
     def forget(self, req_id: int) -> None:
         """Drop per-request planning state once a request is decided or gone."""
-        self._deferrals.pop(req_id, None)
+        self._first_deferred_at.pop(req_id, None)
 
-    def _spend_probe_round(self, req_id: int) -> bool:
-        """Spend one deferred round of ``req_id``'s probe budget; ``False`` if none was left.
+    def _may_still_wait_for_probe(self, req_id: int, now: float) -> bool:
+        """Whether ``req_id`` may be deferred once more for an unanswered probe.
 
-        The wait ends when either budget is spent: the round budget, or the wall-clock budget
-        counted from the first deferral. An idle loop round is about a millisecond, so rounds
-        alone would give a real store lookup no time to answer; time alone would let a busy loop
-        defer a request for very many rounds.
+        The first deferral only starts the clock; the wait ends once ``probe_timeout_s`` has
+        passed since then, so a zero budget allows exactly one deferral.
         """
-        now = self._clock()
-        deferral = self._deferrals.setdefault(req_id, _Deferral(first_deferred_at=now))
-        if self._probe_budget_is_spent(deferral, now):
-            return False
-        deferral.rounds += 1
-        return True
-
-    def _probe_budget_is_spent(self, deferral: _Deferral, now: float) -> bool:
-        rounds_spent = (
-            self._probe_budget_rounds is not None and deferral.rounds >= self._probe_budget_rounds
-        )
-        # The first deferral only starts the clock; time is measured from the second one on.
-        time_spent = (
-            self._probe_timeout_s is not None
-            and deferral.rounds > 0
-            and now - deferral.first_deferred_at >= self._probe_timeout_s
-        )
-        return rounds_spent or time_spent
+        first = self._first_deferred_at.get(req_id)
+        if first is None:
+            self._first_deferred_at[req_id] = now
+            return True
+        return self._probe_timeout_s is None or now - first < self._probe_timeout_s
 
     def decide(
         self,
         req: RequestView,
         probe_answers: Mapping[str, frozenset[bytes] | None],
         *,
+        now: float,
         retry_hint: int | None = None,
     ) -> FetchPlan | None | Defer:
         """The decision table of design §7.2 for one candidate.
@@ -263,6 +263,7 @@ class Planner:
         Args:
             req: The candidate.
             probe_answers: Per store source, what it holds; ``None`` or missing means unanswered.
+            now: The loop clock this round; the probe wait is measured on it.
             retry_hint: Upper bound on ``token_end`` after a short ``served`` (fetch retry).
         """
         tpb = self._tpb
@@ -280,7 +281,7 @@ class Planner:
             return DEFER
 
         # The decision below reads only inputs every rank shares (prompt, hints, probe answers).
-        # The local reuse depth differs per rank, so it only trims ``units_by_group`` (possibly
+        # The local reuse depth differs per rank, so it only trims the per-group asks (possibly
         # to nothing, which is still a legal plan) and never decides whether to fetch.
         nameable = (req.prompt_len - 1) // tpb
         if nameable <= 0:
@@ -311,7 +312,7 @@ class Planner:
                 break
 
         if chosen is None:
-            if pending and self._spend_probe_round(req.py_request_id):
+            if pending and self._may_still_wait_for_probe(req.py_request_id, now):
                 return DEFER
             self.forget(req.py_request_id)
             return None
@@ -353,7 +354,7 @@ class Planner:
     ) -> int:
         """Blocks from 0 that the store holds for every full-attention group (or every paged
         group when there is none), stopping at the first gap."""
-        specs = [s for s in self._reader.group_specs() if s.kind is GroupKind.PAGED]
+        specs = [s for s in self._reader.group_specs() if s.kind is CacheKind.PAGED]
         full_attention = [s for s in specs if s.window_size is None]
         check = full_attention or specs
         if not check:
@@ -379,22 +380,17 @@ class Planner:
         specs = [
             s
             for s in self._reader.group_specs()
-            if not (no_local_fallback and s.kind is GroupKind.STATE)
+            if not (no_local_fallback and s.kind is CacheKind.STATE)
         ]
         group_plans = tuple(
             GroupPlan(s, tuple(sorted(required_ordinals(s, token_end, reuse_end, self._tpb))))
             for s in specs
-        )
-        unit_names = frozenset(
-            g.spec.tag + keys[o] for g in group_plans for o in g.ordinals if o < len(keys)
         )
         return FetchPlan(
             token_end=token_end,
             source=source.name,
             hint=hint,
             no_local_fallback=no_local_fallback,
-            units_by_group={g.spec.local_group: g.ordinals for g in group_plans},
-            unit_names=unit_names,
             group_plans=group_plans,
             block_keys=keys,
             reuse_end=reuse_end,

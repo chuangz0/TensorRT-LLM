@@ -356,7 +356,7 @@ def test_freeing_the_allocation_makes_the_request_askable_again(manager, connect
 #
 # Two distinct windows over two layers give two layer groups, which is the only
 # shape where the per-layer-group callbacks are reachable and the only shape
-# where `_stale_block_range` has to pick a window rather than being handed the
+# where `stale_block_range` has to pick a window rather than being handed the
 # one there is. VSWA_PROMPT_LEN and VSWA_OFFER are sized so the offered prefix
 # straddles the sliding window's edge: some block ordinals fall out of window
 # and some stay live, in the same request.
@@ -431,7 +431,7 @@ def test_stale_block_range_uses_each_group_s_own_window(vswa_manager):
     """The full-attention group must never be masked, whatever the history.
 
     Computed here from the window rather than copied from the implementation:
-    a test that reuses `_stale_block_range` to predict `_stale_block_range`
+    a test that reuses `stale_block_range` to predict `stale_block_range`
     cannot catch a wrong window being selected for the group.
     """
     sliding, full = _sliding_and_full(vswa_manager)
@@ -439,8 +439,8 @@ def test_stale_block_range_uses_each_group_s_own_window(vswa_manager):
 
     for history_length in (0, 32, 64, 96, 128, 200):
         expected_end = max(0, (history_length + 1 - VSWA_WINDOW) // tokens_per_block)
-        assert vswa_manager._stale_block_range(sliding, history_length) == (0, expected_end)
-        assert vswa_manager._stale_block_range(full, history_length) == (0, 0), (
+        assert vswa_manager.stale_block_range(sliding, history_length) == (0, expected_end)
+        assert vswa_manager.stale_block_range(full, history_length) == (0, 0), (
             "a full-attention group has no stale range; masking it would hide "
             "pages the connector is entitled to save"
         )
@@ -652,7 +652,7 @@ def test_a_sliding_single_group_reports_sentinels_in_the_flat_list():
         _, flat = connector.allocs[0]
         assert flat, "a single-group cache must still report the flat block ids"
 
-        stale_beg, stale_end = mgr._stale_block_range(0, request.context_current_position)
+        stale_beg, stale_end = mgr.stale_block_range(0, request.context_current_position)
         assert stale_end > stale_beg, "the window must have passed a block for this to bite"
         assert BAD_PAGE_INDEX in flat
         live = [ordinal for ordinal, _ in valid_page_slots(flat)]
@@ -680,7 +680,7 @@ def test_a_served_prefix_survives_re_entry_under_a_sliding_window():
         assert schedule(mgr, request)
         run(mgr, request)
         served = request.context_current_position
-        stale_beg, stale_end = mgr._stale_block_range(0, served)
+        stale_beg, stale_end = mgr.stale_block_range(0, served)
         assert stale_end > stale_beg, "the window must have passed a block for this to bite"
 
         assert schedule(mgr, request)

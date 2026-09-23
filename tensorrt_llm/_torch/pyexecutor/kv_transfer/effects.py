@@ -16,9 +16,8 @@
 
 ``EngineRequestView`` is the ``RequestView`` over one ``LlmRequest``; ``PyExecutorKVTransferEffects``
 is the ``KVTransferEffects`` over one ``PyExecutor`` and the only place that writes a request's
-transfer state; ``EngineWorkQueue`` and ``EngineDist`` (``SingleRankDist`` for tests) complete the
-contract. The two state constants spell the coordination layer's states with the alias table of
-design §12.2.
+transfer state; ``EngineWorkQueue`` and ``EngineDist`` complete the contract. The two state
+constants spell the coordination layer's states with the alias table of design §12.2.
 """
 
 from __future__ import annotations
@@ -29,8 +28,7 @@ from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
 from tensorrt_llm.logger import logger
 
-from ...disaggregation.orchestration.kv_transfer.interfaces import Scope
-from ..kv_cache.kv_cache_manager_v2 import _settle_context_cursor
+from ..kv_cache.kv_cache_manager_v2 import settle_context_cursor
 from ..llm_request import LlmRequest, LlmRequestState, rewind_context_after_cache_drop
 from ..resource_manager import ResourceManagerType
 
@@ -46,8 +44,6 @@ __all__ = [
     "EngineRequestView",
     "EngineWorkQueue",
     "PyExecutorKVTransferEffects",
-    "SingleRankDist",
-    "collective_group_size",
 ]
 
 # Both aliases lie outside the V2 scheduler's schedulable range. The disagg transceiver writes
@@ -117,70 +113,44 @@ class EngineWorkQueue:
         return ran
 
 
-class SingleRankDist:
-    """``DistLike`` for a world of one rank: the gathered list is the payload itself."""
-
-    def allgather(self, payload: object, scope: str) -> list:
-        return [payload]
-
-
-def collective_group_size(mapping: ParallelMapping, scope: Scope) -> int:
-    """How many ranks take part in a collective of ``scope``: the world, or this rank's PP group."""
-    return mapping.pp_size if scope == "pp" else mapping.world_size
-
-
 class EngineDist:
-    """``DistLike`` over the executor's ``dist``: the whole world through ``allgather``, this rank's
-    pipeline group through ``pp_allgather``. A group of one rank answers with its own payload and
-    enters no collective, as the disagg transceiver's sync policy does for a world of one."""
+    """``DistLike`` over the executor's ``dist``, for the ranks that plan together.
+
+    Without attention DP every rank plans together: the whole world, through ``allgather``. Under
+    attention DP each replica plans on its own: this rank's pipeline group, through
+    ``pp_allgather``. A group of one rank answers with its own payload and enters no collective,
+    as the disagg transceiver's sync policy does for a world of one.
+    """
 
     def __init__(self, dist, mapping: ParallelMapping) -> None:
-        self._dist = dist
-        self._mapping = mapping
+        if mapping.enable_attention_dp:
+            self._group_size = mapping.pp_size
+            self._allgather = dist.pp_allgather
+        else:
+            self._group_size = mapping.world_size
+            self._allgather = dist.allgather
 
-    def allgather(self, payload: object, scope: Scope) -> list:
-        if collective_group_size(self._mapping, scope) == 1:
+    def allgather(self, payload: object) -> list:
+        if self._group_size == 1:
             return [payload]
-        if scope == "pp":
-            return self._dist.pp_allgather(payload)
-        return self._dist.allgather(payload)
+        return self._allgather(payload)
 
 
 class PyExecutorKVTransferEffects:
     """``KVTransferEffects`` over a ``PyExecutor``, in the order of the design §7.3 table.
 
-    Besides the effects it keeps two tables the release gate and ``close`` read: the parked
-    requests (fetch in flight) and the held requests (finished, publish in flight).
+    Stateless: which requests are parked or held is the coordinator's record table to answer.
     """
 
     def __init__(self, executor: PyExecutor) -> None:
         self._executor = executor
-        self._parked_requests: dict[int, LlmRequest] = {}
-        self._held_requests: dict[int, LlmRequest] = {}
-
-    @property
-    def parked_request_ids(self) -> frozenset[int]:
-        """Requests in ``KV_FETCH_IN_PROGRESS``."""
-        return frozenset(self._parked_requests)
-
-    @property
-    def held_request_ids(self) -> frozenset[int]:
-        """Finished requests the coordinator holds; each owes a ``terminate_request``."""
-        return frozenset(self._held_requests)
-
-    def requests_to_release_on_close(self) -> list[LlmRequest]:
-        """Every request still parked or held: what ``close`` frees after the backends stop."""
-        by_id = {**self._parked_requests, **self._held_requests}
-        return list(by_id.values())
 
     # ---- effects ----
 
     def park_for_fetch(self, requests: Sequence) -> None:
         """State -> ``KV_FETCH_IN_PROGRESS``; the scheduler skips the request until it lands."""
         for request in requests:
-            engine_request = _engine_request(request)
-            engine_request.state = KV_FETCH_IN_PROGRESS
-            self._parked_requests[engine_request.py_request_id] = engine_request
+            _engine_request(request).state = KV_FETCH_IN_PROGRESS
         logger.debug("kv transfer: parked %s for fetch", [r.py_request_id for r in requests])
 
     def unpark(self, request, token_end: int, no_local_fallback: bool, aux) -> None:
@@ -200,7 +170,6 @@ class PyExecutorKVTransferEffects:
             )
         kv_cache_manager = self._executor.kv_cache_manager
         self._check_history_declared(engine_request, token_end)
-        self._parked_requests.pop(engine_request.py_request_id, None)
         # CONTEXT_INIT first: the C++ request only lets a context-phase request move its cursor
         # (plan §10 #1).
         engine_request.state = LlmRequestState.CONTEXT_INIT
@@ -211,7 +180,7 @@ class PyExecutorKVTransferEffects:
         # that part.
         kv_cache = kv_cache_manager.kv_cache_map[engine_request.py_request_id]
         settle_at = max(token_end, int(kv_cache.num_committed_tokens))
-        _settle_context_cursor(engine_request, settle_at, kv_cache_manager.tokens_per_block)
+        settle_context_cursor(engine_request, settle_at, kv_cache_manager.tokens_per_block)
         # The pages now hold real content and are committed next; a later revert must not shrink
         # them away (plan §10 #11).
         engine_request.py_ctx_pre_resize_cap = None
@@ -237,7 +206,6 @@ class PyExecutorKVTransferEffects:
         # CONTEXT_INIT first, as in ``unpark``: reverting and rewinding move the context cursor,
         # which the C++ request only allows in the context phase (plan §10 #1).
         for engine_request in engine_requests:
-            self._parked_requests.pop(engine_request.py_request_id, None)
             engine_request.state = LlmRequestState.CONTEXT_INIT
         self._executor._revert_ctx_alloc(engine_requests)
         for engine_request in engine_requests:
@@ -267,9 +235,6 @@ class PyExecutorKVTransferEffects:
             self._release_seq_slot(engine_request)
             self._release_index_slot(engine_request)
             engine_request.state = KV_PUBLISH_IN_PROGRESS
-            request_id = engine_request.py_request_id
-            self._parked_requests.pop(request_id, None)
-            self._held_requests[request_id] = engine_request
 
     def terminate_request(self, request) -> None:
         """Final release of a held request once every transfer of it is done.
@@ -278,28 +243,15 @@ class PyExecutorKVTransferEffects:
         ``active_requests`` (only unfinished requests are kept there), and re-entering
         ``_terminate_request`` would ask the release gate again (plan §9).
         """
-        engine_request = _engine_request(request)
-        request_id = engine_request.py_request_id
-        self._held_requests.pop(request_id, None)
-        self._parked_requests.pop(request_id, None)
-        self._executor._do_terminate_request(engine_request)
-
-    def stage_transfer_response(self, request) -> None:
-        """No-op: a store publish answers nobody. The disagg context response belongs to the
-        transceiver path."""
-        return None
+        self._executor._do_terminate_request(_engine_request(request))
 
     def fail_requests(self, requests: Sequence, reason: str) -> None:
         """Fail requests through the engine's error path.
 
         The engine terminates a failed request through ``_terminate_request``, whose release gate
-        asks this layer whether it still holds the request; a held request is released here first
-        so that the gate answers "terminate now" and the request is not leaked.
+        asks the coordinator whether it holds the request (a fetch still in flight does).
         """
         engine_requests = [_engine_request(request) for request in requests]
-        for engine_request in engine_requests:
-            self._held_requests.pop(engine_request.py_request_id, None)
-            self._parked_requests.pop(engine_request.py_request_id, None)
         self._executor._handle_errors(reason, requests=engine_requests, charge_budget=False)
 
     def fail_fatal(self, error: BaseException) -> None:

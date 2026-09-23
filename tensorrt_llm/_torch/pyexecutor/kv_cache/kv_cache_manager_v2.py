@@ -1120,7 +1120,7 @@ def _rewind_context_cursor(req: LlmRequest, reuse: int) -> None:
         req.context_current_position = reuse
 
 
-def _settle_context_cursor(req: LlmRequest, reuse: int, tokens_per_block: int) -> None:
+def settle_context_cursor(req: LlmRequest, reuse: int, tokens_per_block: int) -> None:
     """Point a context cursor at a ``reuse``-token prefix, chunk included.
 
     The chunk is position-relative, so moving the position without it leaves the
@@ -3636,7 +3636,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # First chunk only: num_committed_tokens holds at the initial prefix
         # until context end, so reapplying later would rewind the cursor.
         if req.is_first_context_chunk and self.enable_block_reuse:
-            _settle_context_cursor(req, reused, self.tokens_per_block)
+            settle_context_cursor(req, reused, self.tokens_per_block)
         self._prepare_connector_prefix_reservation(req)
         return True
 
@@ -3735,7 +3735,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if reused is None:
             return False
         if self.enable_block_reuse:
-            _settle_context_cursor(req, reused, self.tokens_per_block)
+            settle_context_cursor(req, reused, self.tokens_per_block)
 
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
@@ -3917,7 +3917,11 @@ class KVCacheManagerV2(BaseResourceManager):
             ]
         return self._connector_life_cycle_by_group
 
-    def _stale_block_range(self, layer_group_id: int, history_length: int) -> Tuple[int, int]:
+    def num_sink_blocks(self, layer_group_id: int) -> int:
+        """Leading blocks ``layer_group_id`` keeps live below its window (attention sinks)."""
+        return int(self._life_cycle_by_layer_group()[layer_group_id].num_sink_blocks)
+
+    def stale_block_range(self, layer_group_id: int, history_length: int) -> Tuple[int, int]:
         """Block ordinals ``[start, end)`` that ``layer_group_id`` no longer reads.
 
         The cache's own life cycle decides this, so the connector's view and the
@@ -3960,7 +3964,7 @@ class KVCacheManagerV2(BaseResourceManager):
         by_group: List[List[int]] = []
         for layer_group_id in range(len(self.impl.layer_grouping)):
             indices = list(kv_cache.get_aggregated_page_indices(layer_group_id, valid_only=False))
-            stale_start, stale_end = self._stale_block_range(layer_group_id, history_length)
+            stale_start, stale_end = self.stale_block_range(layer_group_id, history_length)
             for ordinal in range(stale_start, min(stale_end, len(indices))):
                 indices[ordinal] = BAD_PAGE_INDEX
             by_group.append(indices)
@@ -4072,7 +4076,7 @@ class KVCacheManagerV2(BaseResourceManager):
             return
         reservation = self.kv_connector_manager.trim_prefix_reservation(req, local_end, end)
         if reservation is not None:
-            _settle_context_cursor(req, reservation.end, self.tokens_per_block)
+            settle_context_cursor(req, reservation.end, self.tokens_per_block)
 
     def release_unused_connector_reservations(self, accepted_request_ids: set[int]) -> None:
         """Release unstarted promises and tentative allocations excluded from the batch."""

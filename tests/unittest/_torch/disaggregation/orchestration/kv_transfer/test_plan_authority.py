@@ -12,9 +12,9 @@ and bounded by ``unlaunched_timeout_s`` exactly as between two voting ranks.
 import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.orchestration.kv_transfer.interfaces import DEFER, PlanAuthority  # noqa: E402
-from disaggregation.remote_cache import FetchPlan  # noqa: E402
-from fakes import FakeRequest, LockstepWorld, Rig, worker_request  # noqa: E402
+from disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority  # noqa: E402
+from disaggregation.remote_cache import DEFER, FetchPlan  # noqa: E402
+from fakes import FakeRequest, LockstepWorld, Rig, plan_unit_names, worker_request  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 
@@ -49,7 +49,7 @@ def store_request() -> FakeRequest:
 
 
 def advance_all(world, rigs, req, now):
-    """Every rank advances as its binding would: the request is a candidate where undecided."""
+    """Every rank advances as its hooks would: the request is a candidate where undecided."""
     world.run(
         lambda r: rigs[r].coord.advance(
             [req] if rigs[r].coord.plan_fetch(req) is DEFER else [], now
@@ -94,7 +94,8 @@ def test_owner_decides_and_the_follower_adopts_without_planning(world, rigs):
         owner_plan.token_end,
         owner_plan.source,
     )
-    assert follower_plan.unit_names == owner_plan.unit_names  # same groups, same reuse depth here
+    # Same groups, same reuse depth here: the same units.
+    assert plan_unit_names(follower_plan) == plan_unit_names(owner_plan)
     assert rigs[FOLLOWER].store.count("probe") == 0
     assert rigs[OWNER].coord.export_plan_answers() == answers  # until the next advance
 

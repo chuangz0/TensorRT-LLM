@@ -635,17 +635,19 @@ class KVCacheV2Scheduler(RequestScheduler):
     # ---- KV transfer seam (design §5) ----
 
     def _try_take_fetch_path(self, req: LlmRequest) -> FetchPathAction:
-        """Ask the KV transfer planner whether a first-chunk context request fetches its prefix.
+        """Ask the KV transfer planner whether a pending context request fetches its prefix.
 
-        ``NOT_A_FETCH``: no planner, not a candidate, or "compute locally"; the
-        request takes the ordinary context path. ``SKIP``: deferred this round, or
-        the reservation failed; the request stays in ``CONTEXT_INIT`` and is asked
-        again next round. ``RESERVED``: pages reserved up to the plan's target;
-        the request goes to the fetch launch queue and, like a disagg gen-init,
-        joins neither the request nor the token budget of this forward pass.
+        The planner owns the candidate rule (first chunk, not dummy, not disagg);
+        it answers ``None`` for anything else. ``NOT_A_FETCH``: no planner, not a
+        candidate, or "compute locally"; the request takes the ordinary context
+        path. ``SKIP``: deferred this round, or the reservation failed; the request
+        stays in ``CONTEXT_INIT`` and is asked again next round. ``RESERVED``: pages
+        reserved up to the plan's target; the request goes to the fetch launch
+        queue and, like a disagg gen-init, joins neither the request nor the token
+        budget of this forward pass.
         """
         planner = self.kv_transfer_planner
-        if planner is None or not self._is_first_chunk_context(req):
+        if planner is None:
             return FetchPathAction.NOT_A_FETCH
         plan = planner.plan_fetch(req)
         if plan is planner.DEFER:
@@ -1064,7 +1066,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     def _prepare_context_pair(self, req: LlmRequest) -> bool:
         """Prepare target/draft caches with one verified logical reuse depth."""
-        from ..kv_cache.kv_cache_manager_v2 import _settle_context_cursor
+        from ..kv_cache.kv_cache_manager_v2 import settle_context_cursor
 
         draft_manager = self._joint_draft_manager
         if draft_manager is None:
@@ -1110,7 +1112,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # No enable_block_reuse guard: reaching here means a paired draft pool
         # exists, and KvCacheCreator only pairs when block reuse is on.
-        _settle_context_cursor(req, common_reuse, self.kv_cache_manager.tokens_per_block)
+        settle_context_cursor(req, common_reuse, self.kv_cache_manager.tokens_per_block)
         return True
 
     def _try_allocate_context(self, req: LlmRequest, num_tokens: int) -> bool:

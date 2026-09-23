@@ -15,8 +15,7 @@ import time
 __extra_import_path__ = ["~/tensorrt_llm/_torch", "../../orchestration/kv_transfer"]
 from disaggregation.backends.blob.store import BlobStoreError  # noqa: E402
 from disaggregation.orchestration.kv_transfer.coordinator import KVTransferCoordinator  # noqa: E402
-from disaggregation.orchestration.kv_transfer.interfaces import DEFER, FetchSource  # noqa: E402
-from disaggregation.remote_cache import FetchPlan, Planner  # noqa: E402
+from disaggregation.remote_cache import DEFER, FetchPlan, FetchSource, Planner  # noqa: E402
 from fakes import (  # noqa: E402
     TPB,
     FakeDist,
@@ -25,6 +24,7 @@ from fakes import (  # noqa: E402
     FakeRequest,
     RecordingEffects,
     full_attention,
+    ordinals_by_group,
 )
 from store_fakes import (  # noqa: E402
     FakeBlobStore,
@@ -53,7 +53,8 @@ class Side:
         self.effects = RecordingEffects()
         self.queue = FakeEngineQueue()
         self.source = FetchSource("store", self.rank.backend, None)
-        self.planner = Planner([self.source], self.reader, TPB, probe_budget_rounds=2)
+        # Measured on the ``now`` the tests pass to ``advance``: deferred at 0.0 and 1.0, local at 2.0.
+        self.planner = Planner([self.source], self.reader, TPB, probe_timeout_s=2.0)
         self.coord = KVTransferCoordinator(
             [self.source],
             [self.rank.backend] if publishes else [],
@@ -100,7 +101,7 @@ def _publish(ctx: Side, req: FakeRequest) -> None:
     """Context side: offer the request's blocks and drive the publish record to its end."""
     for o in range(BLOCKS):
         ctx.write_block(o, pattern(o + 1, UNIT_BYTES))
-    ctx.coord.publish_committed_blocks([req], finished=[], now=0.0)
+    ctx.coord.publish_committed_blocks([req], now=0.0)
     assert ctx.records()[0]["state"] == "IN_FLIGHT" and ctx.records()[0]["direction"] == "publish"
     wait_until(lambda: len(ctx.rank.store.objects) == BLOCKS, what="publish to land in the store")
     ctx.coord.advance([], 1.0)
@@ -131,7 +132,7 @@ def test_publish_on_one_rank_then_probe_plan_launch_and_land_on_another():
 
         plan = _probe_and_plan(gen, req)
         assert plan.source == "store" and plan.token_end == END and plan.hint is None
-        assert plan.units_by_group == {0: tuple(range(BLOCKS))}
+        assert ordinals_by_group(plan) == {0: tuple(range(BLOCKS))}
         gen.fill_all(0xEE)
         gen.coord.launch_fetches([req], 1.0)
         assert gen.effects.names() == ["prepare_fetch_resources", "park_for_fetch"]

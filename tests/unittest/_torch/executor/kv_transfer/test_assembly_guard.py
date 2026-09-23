@@ -4,40 +4,23 @@
 
 ``check_engine_supports_kv_transfer`` refuses, with a reason, every engine configuration this
 feature does not host; ``attach_kv_transfer`` refuses a malformed config file before it builds
-anything; ``_build_coordinator`` hands the planner the wall-clock probe budget alone.
+anything; ``install_log_forwarding`` puts one forwarding handler on the layers' stdlib logger.
 """
 
-import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from engine_fakes import (
-    TPB,
-    FakeFetches,
-    FakeKVCacheManager,
-    FakePublishes,
-    FakeReader,
-    make_request,
-)
+from engine_fakes import FakeFetches
 
-from tensorrt_llm._torch.disaggregation.backends.config import BackendEntry, KVTransferConfig
 from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import (
-    DEFER,
-    PlanAuthority,
-)
+from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_transfer import assembly
 from tensorrt_llm._torch.pyexecutor.kv_transfer.assembly import (
     attach_kv_transfer,
     check_engine_supports_kv_transfer,
     plan_authority_for,
-)
-from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import (
-    EngineRequestView,
-    PyExecutorKVTransferEffects,
-    SingleRankDist,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -252,6 +235,44 @@ def test_attach_refuses_an_out_of_scope_engine_before_reading_the_config(tmp_pat
         )
 
 
+def test_two_attaches_install_one_forwarding_handler(monkeypatch):
+    """The coordinator and the backends log through stdlib ``logging`` (they do not import
+    ``tensorrt_llm``); the assembly forwards their WARNING+ records to the TRT-LLM logger with
+    one handler however many engines are assembled in the process."""
+    import logging
+
+    from tensorrt_llm.logger import logger as trtllm_logger
+
+    forwarded = Mock()
+    monkeypatch.setattr(trtllm_logger, "warning", forwarded)
+    namespace = logging.getLogger("tensorrt_llm._torch.disaggregation")
+    installed_before = [
+        h for h in namespace.handlers if isinstance(h, assembly._ForwardToTrtllmLogger)
+    ]
+    for handler in installed_before:
+        namespace.removeHandler(handler)
+    try:
+        assembly.install_log_forwarding()
+        assembly.install_log_forwarding()
+        forwarders = [
+            h for h in namespace.handlers if isinstance(h, assembly._ForwardToTrtllmLogger)
+        ]
+        assert len(forwarders) == 1
+        layer_logger = logging.getLogger(
+            "tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.coordinator"
+        )
+        layer_logger.warning("probe on %s failed, answer stays pending: %s", "store", "down")
+        forwarded.assert_called_once_with("probe on store failed, answer stays pending: down")
+        layer_logger.info("not forwarded: below WARNING")
+        assert forwarded.call_count == 1
+    finally:
+        for handler in list(namespace.handlers):
+            if isinstance(handler, assembly._ForwardToTrtllmLogger):
+                namespace.removeHandler(handler)
+        for handler in installed_before:
+            namespace.addHandler(handler)
+
+
 def test_status_dump_path_replaces_pid(monkeypatch):
     import os
 
@@ -259,73 +280,3 @@ def test_status_dump_path_replaces_pid(monkeypatch):
     assert assembly._status_dump_path() == f"/x/kvt-{os.getpid()}.json"
     monkeypatch.delenv(assembly.KV_TRANSFER_STATUS_DUMP_ENV)
     assert assembly._status_dump_path() is None
-
-
-class TestAssembledCoordinator:
-    """``_build_coordinator``: the planner gets ``probe_budget_rounds=None`` and the config's
-    ``probe_timeout_s``; a request whose probe is never answered is deferred until the wall-clock
-    budget runs out, then computed locally."""
-
-    def _build(
-        self,
-        *,
-        probe_timeout_s: float,
-        store: FakeFetches,
-        plan_authority: PlanAuthority = PlanAuthority.VOTED,
-    ):
-        kv = FakeKVCacheManager(TPB)
-        executor = object.__new__(PyExecutor)
-        executor.kv_cache_manager = kv
-        reader = FakeReader(kv)
-        effects = PyExecutorKVTransferEffects(executor)
-        publisher = FakePublishes()
-        handle = BackendHandle(
-            name="store",
-            hint_key=None,
-            fetcher=store,
-            publisher=publisher,
-            pool_registrar=None,
-            close=lambda: None,
-        )
-        config = KVTransferConfig(
-            backends=(BackendEntry.from_dict({"name": "store", "type": "fake"}),),
-            probe_timeout_s=probe_timeout_s,
-            fetch_timeout_s=12.5,
-            unlaunched_timeout_s=7.5,
-        )
-        coordinator = assembly._build_coordinator(
-            config,
-            [handle],
-            reader,
-            effects,
-            SingleRankDist(),
-            attention_dp=False,
-            plan_authority=plan_authority,
-        )
-        return coordinator, reader
-
-    def test_plan_authority_reaches_the_coordinator(self):
-        coordinator, _ = self._build(
-            probe_timeout_s=0.05,
-            store=FakeFetches(probe_answer="all"),
-            plan_authority=PlanAuthority.FOLLOWER,
-        )
-        assert coordinator.plan_authority is PlanAuthority.FOLLOWER
-        assert coordinator.status_dump()["plan_authority"] == "FOLLOWER"
-
-    def test_planner_budget_is_the_wall_clock_alone(self):
-        coordinator, _ = self._build(probe_timeout_s=0.05, store=FakeFetches(probe_answer=None))
-        planner = coordinator._planner
-        assert planner._probe_budget_rounds is None
-        assert planner._probe_timeout_s == 0.05
-        assert planner._clock is time.monotonic  # plan §10 #15: one clock with ``advance``
-        assert coordinator._fetch_timeout_s == 12.5 and coordinator._publish_timeout_s is None
-        assert coordinator._unlaunched_timeout_s == 7.5
-
-    def test_answered_probe_plans_within_the_budget(self):
-        coordinator, _ = self._build(probe_timeout_s=0.05, store=FakeFetches(probe_answer="all"))
-        view = EngineRequestView(make_request(1, 100))
-        coordinator.advance([view], time.monotonic())
-        plan = coordinator.plan_fetch(view)
-        assert plan is not None and plan is not DEFER
-        assert plan.token_end == 96 and plan.source == "store"

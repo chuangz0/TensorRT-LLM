@@ -122,7 +122,7 @@ if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
-    from .kv_transfer.binding import KVTransferEngineBinding
+    from .kv_transfer.hooks import KVTransferHooks
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
@@ -404,7 +404,7 @@ class PyExecutor:
     # (integration plan §4); attached by kv_transfer.assembly when
     # TRTLLM_KV_TRANSFER_CONFIG is set. A class default so that partially
     # constructed executors read None too.
-    kv_transfer: Optional["KVTransferEngineBinding"] = None
+    kv_transfer: Optional["KVTransferHooks"] = None
 
     def __init__(
             self,

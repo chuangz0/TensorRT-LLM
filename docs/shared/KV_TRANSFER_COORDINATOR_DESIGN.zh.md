@@ -221,7 +221,7 @@ sequenceDiagram
 | `advance(candidates, now)` | 循环头 | 四个阶段:收(poll、EngineQueue)、算(候选请求的计划、过期判定)、齐(一次集合通信)、用(放行、退页、终结)。详见 §7.1 |
 | `plan_fetch(req)`(钩子) | 调度器评估 context 请求时,**在** `prepare_context_cache` **之前** | 读记录表,答 `FetchPlan / None / DEFER`。不分配、不改状态、不阻塞 |
 | `launch_fetches(queue, now)` | 调度后,forward 前 | 对调度器已分配的请求发起 fetch |
-| `publish_committed_blocks(reqs, finished, now)` | 每个 context step 之后、响应 pass 之前 | 对本轮算了 context 的请求发起或推进 publish;`finished` 里的请求走 `notify_request_finished`,仍有记录在飞(publish 未 RELEASED,或 fetch 在飞)的 `hold_for_transfer` |
+| `publish_committed_blocks(reqs, now)` | 每个 context step 之后、响应 pass 之前 | 对本轮算了 context 的请求发起或推进 publish;结束的请求由引擎经释放门单独 `notify_request_finished`,仍有记录在飞(publish 未 RELEASED,或 fetch 在飞)的 `hold_for_transfer` |
 
 `candidates` = 处于 `CONTEXT_INIT` 且计划尚未决定的请求:新到的、上一轮 `DEFER` 的、失败后要重试的。计划在循环头算而不是在调度器里算,是因为 store 的 `probe` 可能要一个来回、路由提示异步到达,而计划必须在所有 rank 上一致。
 
@@ -270,6 +270,8 @@ stateDiagram-v2
     RELEASED --> [*]
 ```
 
+> 实现注:`RELEASED` 不是可观察状态。实现中"释放"是事件——记录出表(`_release` 直接 pop),`RecordState` 没有 `RELEASED` 值;下文的 "RELEASED" 读作"记录已释放(不在表中)"。
+
 答 `None` 或 `DEFER` 的候选**不建记录**;`DEFER` 的下一轮仍在 `candidates` 里。
 
 ### 4.2 请求状态 「待定 → §11 #1」
@@ -308,6 +310,8 @@ gen-init 落地后到被真正调度之间,引擎还要准备 seq slot、sampler
 | fetch | `FAILED` 之后、退页之前 | `give_back_fetch_pages` |
 | fetch | 请求结束、释放页之前 | 正常终结 |
 | publish | 当前 try 到终态时 | 记录 `RELEASED`;请求已结束的 `terminate_request` |
+
+> "RELEASED" 的读法见 §4.1 实现注:释放是事件(记录出表),不是可观察状态。
 
 **协调层不需要"钉住(pin)"原语。** 每一次传输的本地端点都由一个活着的请求持有:fetch 的目的页和 publish 的源页都归请求自己的 `_KVCache`。页在释放点 `quiesce` 为 `True` 之后才交还,就不会在传输途中被分给别人;答 `False` 时页随请求一直被占着,这就是 SPEC 要求的"退出使用"。过了 `deadline` 仍不静默的,走今天的 poison 路径:请求失败,页隔离。
 
@@ -468,6 +472,8 @@ class KVTransferCoordinator:
 - `LANDED` 的 fetch:`effects.unpark(...)`,attempt 的 `route.close()`。
 - `FAILED` 的 fetch:`quiesce` → `effects.give_back_fetch_pages(req)` → 有 `retries_left` 的回 `PLANNED` 并把 `served` 换算成重试提示,否则 `RELEASED`;`no_local_fallback` 的 `fail_requests`。
 - 到终态的 publish 记录:`quiesce` → `RELEASED`;请求已结束的 `effects.terminate_request`。
+
+> "RELEASED" 的读法见 §4.1 实现注:释放是事件(记录出表),不是可观察状态。
 - 写入本轮的计划答案,`plan_fetch` 随后只读它。
 
 `abandoned` 的记录随后按结局处理:普通 fetch 晚到的 `Delivered` 照常 `unpark`(数据不浪费);`no_local_fallback` 的过期即 `fail_requests`,晚到丢弃,保持今天 `kv_transfer_timeout_ms` 的语义;publish 过期时今天 `check_transfer_timeouts` 会让 ctx 发送失败,本设计相同。
@@ -483,29 +489,27 @@ class FetchPlan:
     source: str                                 # FetchSource.name
     hint: Mapping[str, object] | None           # open_route 的输入,worker 后端才有
     no_local_fallback: bool                     # gen-init 为 True:失败只能 fail,不能本地重算
-    units_by_group: Mapping[int, tuple[int, ...]] # 各层组要哪些块序号;归并与重试时对照
-    unit_names: frozenset[bytes]                # 询问集合;served 是它的子集
     group_plans: tuple[GroupPlan, ...]          # 每层组的 (GroupSpec, ordinals);fetch_extent 按它造 unit
     block_keys: tuple[bytes, ...]               # context_block_keys(req) 的快照
     reuse_end: int                              # 计划时的本地命中末端(token 数)
     tokens_per_block: int
-    mode: Literal["PREFETCH"] = "PREFETCH"      # 为 §10.2 预留
 
 DEFER = Defer()                                 # 单例:本轮别调度它,下轮再问
 
 class Planner:
     def __init__(self, sources: Sequence[FetchSource], reader: ResourceReader, tokens_per_block: int, *,
-                 probe_budget_rounds: int | None = 2, probe_timeout_s: float | None = None,
-                 clock: Callable[[], float] = time.monotonic): ...
+                 probe_timeout_s: float | None = None): ...
     def probe_query(self, req) -> tuple[bytes, tuple[bytes, ...]] | None: ...  # 该问 store 什么;None = 无可命名整块
-    def decide(self, req, probe_answers, *, retry_hint=None) -> FetchPlan | None | Defer: ...
+    def decide(self, req, probe_answers, *, now: float, retry_hint=None) -> FetchPlan | None | Defer: ...
     def forget(self, req_id: int) -> None: ...  # 请求结束,丢掉它的 probe 计时
 
 def merge(plan: FetchPlan, served: frozenset[bytes]) -> int: ...            # §6.3:归并后的 B
 def retry_hint_from(plan: FetchPlan, served: frozenset[bytes]) -> int: ...  # 重试时的 token_end 上界
 ```
 
-probe 的等待有两个预算,先到者为准:`probe_budget_rounds`(按 `decide` 被调用的轮数计,`None` 关闭)与 `probe_timeout_s`(按 `clock` 计,从首次 `DEFER` 起);超过即视为 store 未命中,按本地计算。
+> 实现注:`units_by_group` 与 `unit_names` 已从 `FetchPlan` 删去——二者都由 `group_plans`(各组的 `(GroupSpec, ordinals)`)与 `block_keys` 推出,归并与重试直接读 `group_plans`;`mode` 随 STREAMED 第一版(§10.2)加回。
+
+probe 的等待只有一个预算:`probe_timeout_s`,按传给 `decide` 的 `now`(与 `advance(now)` 同一只表)计,从首次 `DEFER` 起;超过即视为 store 未命中,按本地计算(`None` 无限等)。
 
 **计划的决策顺序**(每个候选请求一次):
 
@@ -516,7 +520,7 @@ probe 的等待有两个预算,先到者为准:`probe_budget_rounds`(按 `decide
 | 3 | 可命名整块数 > 本地命中块数? | `probe_context_reuse(req)` + `context_block_keys(req)` |
 | 4 | 有哪个后端值得问? | 按装配表顺序:请求带 `hint_key` 对应提示的 worker 后端;或 `probe` 答案非空的 store 后端。`probe` 答 `None`(后端还没查完,或答不了)则 `DEFER`,超过一个小预算后当 `None` |
 | 5 | token_end | worker:prompt 的整块末端;store:probe 答案的**连续**前缀末端;重试时用重试提示 |
-| 6 | 一致性 | 计划只用所有 rank 相同的输入(prompt、路由提示、probe 答案);本地命中深度各 rank 可能不同,只用它裁 `units_by_group`,裁到空仍是合法计划(契约允许 units 为空) |
+| 6 | 一致性 | 计划只用所有 rank 相同的输入(prompt、路由提示、probe 答案);本地命中深度各 rank 可能不同,只用它裁各组的询问(`group_plans`),裁到空仍是合法计划(契约允许 units 为空) |
 
 ### 7.3 引擎 effects(`orchestration/kv_transfer/interfaces.py`)
 
@@ -629,7 +633,7 @@ Coordinator 通过 effects 反向触达引擎,这是它对引擎的全部依赖�
 
 ### 9.6 超时与取消
 
-- 过期与 `abandon` 只把记录的 `abandoned` 置真。契约无撤销,目的页可能仍在被写。
+- 过期,以及请求结束时 fetch 仍在飞,只把记录的 `abandoned` 置真(`notify_request_finished`);没有单独的 `abandon` 入口。契约无撤销,目的页可能仍在被写。
 - 请求**继续 parked**。`advance` 继续 poll;拿到结局后走正常路径(§7.1)。
 - 响应路径今天按 `py_kv_transfer_timed_out` 分支;改后失败由 Coordinator 直接 `fail_requests`,响应路径不再需要这个分支。
 - 引擎线程上不调 `settle`;`quiesce` 只在释放点调。
@@ -679,7 +683,7 @@ class StreamsLayers(Protocol):
 - 引擎只在有后端实现了它时才注册 hook,hook 体是一行转发;**身份靠 `attempts` 传**(今天 connector 靠 `bind_connector_meta`)。
 - 请求带着"承诺前缀"进调度,边取边算;后端在 `before_layer` 里等这一层的数据。
 
-现在就预定三件事,以后加它不改记录模型:(1) `FetchPlan.mode` 已留位,请求状态的投影按 `mode == PREFETCH` 判(§4.2);(2) `STREAMED` 的失败没有退页可言(请求已在跑),直接 `fail_requests`;(3) 协调层预留读接口 `attempts_for(reqs)` 给 hook 取身份。它还需要 KV v2 能表达"承诺 N 个 token 已算好但页还没写完",今天没有这个概念(待定 → §11 #3)。
+现在就预定三件事,以后加它不改记录模型:(1) `FetchPlan.mode`(实现注:当前不在 `FetchPlan` 上,随 STREAMED 第一版加回)请求状态的投影按 `mode == PREFETCH` 判(§4.2);(2) `STREAMED` 的失败没有退页可言(请求已在跑),直接 `fail_requests`;(3) 协调层预留读接口 `attempts_for(reqs)` 给 hook 取身份。它还需要 KV v2 能表达"承诺 N 个 token 已算好但页还没写完",今天没有这个概念(待定 → §11 #3)。
 
 ### 10.3 新后端
 

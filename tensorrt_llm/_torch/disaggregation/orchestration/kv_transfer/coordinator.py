@@ -28,33 +28,31 @@ from __future__ import annotations
 import logging
 import time
 from enum import Enum
-from typing import Callable, Collection, Mapping, NamedTuple, Sequence, TypeVar
+from typing import Callable, Mapping, NamedTuple, Sequence, TypeVar
 
 from ...base.cache_backend import Attempt, Fetches, Publishes, SubmissionRejected
-from ...remote_cache import FetchPlan, Planner, merge, retry_hint_from
+from ...base.views import RequestView, ResourceReader
+from ...remote_cache import DEFER, Defer, FetchPlan, FetchSource, Planner, merge, retry_hint_from
 from .interfaces import (
-    DEFER,
     CarriesAux,
-    Defer,
     DistLike,
     EngineQueue,
-    FetchSource,
     KVTransferEffects,
     PlacesPieces,
     PlanAuthority,
-    RequestView,
-    ResourceReader,
-    Scope,
 )
 from .records import AttemptRecord, RecordKey, RecordState, TransferRecord
 
 __all__ = [
+    "DEFER",
     "MAX_CONSECUTIVE_LAUNCH_FAILURES",
     "KVTransferCoordinator",
     "PlanAnswers",
     "Vote",
     "VoteKind",
 ]
+# ``DEFER`` is re-exported: it is the coordinator's ``plan_fetch`` answer the engine compares
+# against, and the engine side takes everything it needs from this package.
 
 logger = logging.getLogger(__name__)
 
@@ -174,22 +172,18 @@ class KVTransferCoordinator:
         reader: This rank's resource view, for extents and chunks.
         effects: The engine's side effects.
         queue: Work backends post for the engine thread.
-        dist: The collective.
+        dist: The collective over the ranks that plan together; one ``allgather`` per ``advance``.
         fetch_timeout_s: Deadline for a fetch, from launch. ``None`` disables.
         publish_timeout_s: Deadline for a publish, from its first submission. ``None`` disables.
         unlaunched_timeout_s: Longest this rank may stay unlaunched on a fetch another rank has
             already launched before it votes the fetch failed. ``None`` disables. Never starts
             counting on a single rank.
-        attention_dp: Under attention DP the collective spans this rank's PP group only.
         plan_authority: Who decides plan answers on this rank. ``VOTED``: planned here and
             reduced in the collective. ``OWNER``: planned here alone, not carried in the
             payload, handed out with ``export_plan_answers``. ``FOLLOWER``: never planned or
             probed here; taken with ``adopt_plan_answers``. Votes and expiries travel through
             the collective in every mode.
         queue_budget: How many posted callables one ``advance`` runs.
-        gather: Replaces ``dist.allgather(payload, scope)`` for the one collective per
-            ``advance``; a test seam so the four phases can be driven on one thread with
-            hand-written peer payloads.
 
     The engine must call ``notify_request_finished`` for every request it ever passed in, so that
     fetch records reach their release point and per-request state is dropped.
@@ -208,10 +202,8 @@ class KVTransferCoordinator:
         fetch_timeout_s: float | None = None,
         publish_timeout_s: float | None = None,
         unlaunched_timeout_s: float | None = 30.0,
-        attention_dp: bool = False,
         plan_authority: PlanAuthority = PlanAuthority.VOTED,
         queue_budget: int = 64,
-        gather: Callable[[_Payload], list] | None = None,
     ) -> None:
         self._sources: dict[str, FetchSource] = {s.name: s for s in sources}
         self._publishers: dict[str, Publishes] = {
@@ -225,15 +217,12 @@ class KVTransferCoordinator:
         self._reader = reader
         self._effects = effects
         self._queue = queue
+        self._dist = dist
         self._fetch_timeout_s = fetch_timeout_s
         self._publish_timeout_s = publish_timeout_s
         self._unlaunched_timeout_s = unlaunched_timeout_s
         self._plan_authority = plan_authority
         self._queue_budget = queue_budget
-        scope: Scope = "pp" if attention_dp else "world"
-        self._gather: Callable[[_Payload], list] = gather or (
-            lambda payload: dist.allgather(payload, scope)
-        )
 
         self._records: dict[RecordKey, TransferRecord] = {}
         self._requests: dict[int, RequestView] = {}
@@ -247,17 +236,20 @@ class KVTransferCoordinator:
         self._finished: set[int] = set()
         self._held: set[int] = set()
         """Finished requests the engine was told to hold; each owes a ``terminate_request``."""
-        self._publish_outcome: dict[int, str | None] = {}
-        """Finished requests whose publish reached its end: failure reason, or ``None`` = landed."""
 
     # ---- loop entry points (each rank calls each the same number of times per round) ----
 
-    def advance(self, candidates: Sequence[RequestView], now: float) -> None:
-        """Head of the loop: reap outcomes into votes, plan candidates, agree across ranks, apply."""
+    def advance(self, candidates: Sequence[RequestView], now: float) -> int:
+        """Head of the loop: reap outcomes into votes, plan candidates, agree across ranks, apply.
+
+        Returns how many candidates are still undecided afterwards (``plan_fetch`` answers
+        ``DEFER``): each is waiting on a store lookup, or on the ranks' agreement.
+        """
         votes, expired = self._reap(now)
-        answers = self._plan(candidates)
+        answers = self._plan(candidates, now)
         verdicts, expired, answers = self._sync(votes, expired, answers, now)
         self._apply(verdicts, expired, answers)
+        return sum(1 for candidate in candidates if self.plan_fetch(candidate) is DEFER)
 
     def launch_fetches(self, queue: Sequence[RequestView], now: float | None = None) -> None:
         """After scheduling: start the fetch of every request the scheduler allocated for."""
@@ -275,24 +267,17 @@ class KVTransferCoordinator:
             self._effects.park_for_fetch(launched)
 
     def publish_committed_blocks(
-        self,
-        reqs: Sequence[RequestView],
-        finished: Collection[int],
-        now: float | None = None,
+        self, reqs: Sequence[RequestView], now: float | None = None
     ) -> None:
         """After a context step, before the response pass: offer the blocks each request committed.
 
-        ``finished`` names the requests that ended this step; a publish still in flight for one of
-        them holds the request (``hold_for_transfer``) instead of letting it terminate.
+        A request that ended this step is reported separately through ``notify_request_finished``
+        (the engine's release gate); a publish still in flight then holds it.
         """
         now = time.monotonic() if now is None else now
         if self._publishers:
             for req in reqs:
                 self._publish_one(req, now)
-        for rid in finished:
-            req = self._requests.get(rid)
-            if req is not None:
-                self.notify_request_finished(req)
 
     # ---- plan authority: owner hands out, follower takes ----
 
@@ -305,12 +290,12 @@ class KVTransferCoordinator:
         followers' ``adopt_plan_answers``. Empty in any other mode."""
         return [(rid, _wire(ans)) for rid, ans in sorted(self._answers_to_export.items())]
 
-    def adopt_plan_answers(self, views: Sequence[RequestView], answers: PlanAnswers) -> None:
+    def adopt_plan_answers(self, views: Sequence[RequestView], answers: PlanAnswers) -> int:
         """FOLLOWER: take the owner's answers. ``None`` decides a request local; ``(token_end,
         source)`` becomes this rank's own plan over its own layer groups. An answer for a request
         not yet among ``views`` (the undecided candidates here) is held until its request appears
         as a candidate, or is dropped when the request ends: the owner decides a request once and
-        does not export it again."""
+        does not export it again. Returns how many of ``views`` got no answer and stay deferred."""
         by_rid = {view.py_request_id: view for view in views}
         self._pending_answers.update(answers)
         for rid, wire in list(self._pending_answers.items()):
@@ -324,6 +309,8 @@ class KVTransferCoordinator:
             else:
                 token_end, source = wire
                 self._decide(rid, self._planner.materialize(view, token_end, source))
+        answered = {rid for rid, _ in answers}
+        return sum(1 for rid in by_rid if rid not in answered)
 
     # ---- scheduler hook (read-only, non-blocking) ----
 
@@ -371,28 +358,14 @@ class KVTransferCoordinator:
                 self._release(fetch)
         publish = self._records.get((rid, "publish"))
         if publish is not None and publish.state is not RecordState.IN_FLIGHT:
-            # Nothing is in flight for it. If every submission was refused, nothing was ever
-            # offered, which is a failed publish.
+            # Nothing is in flight for it: released now. A publish every publisher refused was
+            # warned about at submission and owes the engine nothing more.
             self._release(publish)
-            if publish.rejected:
-                self._publish_outcome[rid] = "kv publish rejected"
         if (rid, "fetch") in self._records or (rid, "publish") in self._records:
             self._held.add(rid)
             self._effects.hold_for_transfer([req])
             return
         self._finish_if_released(rid)
-
-    def abandon(self, req: RequestView) -> None:
-        """Mark the request's records abandoned. Nothing is stopped; outcomes are still reaped.
-
-        For a fetch this also stands in for "expired": a late outcome is still used (normal
-        fetch) or dropped (gen-init already failed). A publish keeps its deadline regardless,
-        because that deadline is what eventually fails a request the publish is holding.
-        """
-        for direction in ("fetch", "publish"):
-            rec = self._records.get((req.py_request_id, direction))
-            if rec is not None:
-                rec.abandoned = True
 
     def has_inflight(self) -> bool:
         return any(rec.state is RecordState.IN_FLIGHT for rec in self._records.values())
@@ -402,6 +375,29 @@ class KVTransferCoordinator:
         return frozenset(
             rec.request_id for rec in self._records.values() if rec.state is RecordState.IN_FLIGHT
         )
+
+    # ---- what the engine's release gate and cancel path read (design §4.3, plan §9 rule 5) ----
+
+    def parked_request_ids(self) -> frozenset[int]:
+        """Running requests whose fetch is in flight: out of the scheduler's reach until it lands
+        or is given back. A finished request with a fetch in flight is held, not parked."""
+        return frozenset(
+            rec.request_id
+            for rec in self._records.values()
+            if rec.direction == "fetch"
+            and rec.state is RecordState.IN_FLIGHT
+            and rec.request_id not in self._held
+        )
+
+    def held_request_ids(self) -> frozenset[int]:
+        """Finished requests held while a transfer still touches their pages; each is terminated
+        by this coordinator through ``terminate_request`` once every record of it is gone."""
+        return frozenset(self._held)
+
+    def tracked_requests(self) -> list[RequestView]:
+        """Every request this coordinator owns right now: parked or held."""
+        tracked = self.parked_request_ids() | self.held_request_ids()
+        return [self._requests[rid] for rid in sorted(tracked) if rid in self._requests]
 
     def status_dump(self) -> dict:
         return {
@@ -419,7 +415,6 @@ class KVTransferCoordinator:
                     "token_end": rec.plan.token_end if rec.plan else None,
                     "launch_gave_up": rec.launch_gave_up,
                     "peer_launched_at": rec.peer_launched_at,
-                    "last_vote": rec.last_vote,
                 }
                 for rec in self._records.values()
             ],
@@ -448,7 +443,6 @@ class KVTransferCoordinator:
                 vote = self._unlaunched_vote(rec, now)
             else:
                 continue
-            rec.last_vote = vote.kind.value
             if self._is_voting(rec):
                 votes[key] = vote
             elif rec.state is RecordState.IN_FLIGHT and vote.kind is not VoteKind.INFLIGHT:
@@ -530,7 +524,7 @@ class KVTransferCoordinator:
 
     # ---- advance, phase 2: plan ----
 
-    def _plan(self, candidates: Sequence[RequestView]) -> dict[int, _PlanAnswer]:
+    def _plan(self, candidates: Sequence[RequestView], now: float) -> dict[int, _PlanAnswer]:
         answers: dict[int, _PlanAnswer] = {}
         if self._plan_authority is PlanAuthority.FOLLOWER:
             # The owner plans; its answers arrive with the schedule (``adopt_plan_answers``).
@@ -548,6 +542,7 @@ class KVTransferCoordinator:
             answers[rid] = self._planner.decide(
                 req,
                 self._probe_answers.get(rid, {}),
+                now=now,
                 retry_hint=rec.retry_hint if rec is not None else None,
             )
         return answers
@@ -571,10 +566,14 @@ class KVTransferCoordinator:
             # engine loop down. The answer stays pending, so the planner defers until its probe
             # budget is spent and then plans without the store.
             try:
-                cache[source.name] = source.backend.probe(name, units)
+                answer = source.backend.probe(name, units)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("probe on %s failed, answer stays pending: %s", source.name, exc)
-                cache[source.name] = None
+                continue
+            # A pending answer (``None``) is not recorded: an absent entry means the same thing
+            # to the planner, and the backend is asked again next round.
+            if answer is not None:
+                cache[source.name] = answer
 
     # ---- advance, phase 3: one collective ----
 
@@ -591,7 +590,7 @@ class KVTransferCoordinator:
             sorted(expired),
             [(rid, _wire(ans)) for rid, ans in sorted(answers.items())] if voted else [],
         )
-        gathered = self._gather(payload)
+        gathered = self._dist.allgather(payload)
         ballots = _ballots_by_key(gathered)
         self._note_peer_launches(votes, ballots, now)
         verdicts = _reduce_votes(ballots, len(gathered))
@@ -775,26 +774,23 @@ class KVTransferCoordinator:
         self._finish_if_released(rec.request_id)
 
     def _finish_publish(self, rec: TransferRecord, *, failed: bool, reason: str) -> None:
+        """A publish reached its end. A failure is a warning, never a request failure: a
+        running request keeps running, and a finished one already has its response."""
         rec.state = RecordState.FAILED if failed else RecordState.LANDED
         if not self._quiesce(rec):
             return
         self._release(rec)
         rid = rec.request_id
-        if rid not in self._finished:
-            if failed:
-                logger.warning("request %d: %s while still running", rid, reason)
-            return
-        self._publish_outcome[rid] = reason if failed else None
+        if failed:
+            when = "after the request ended" if rid in self._finished else "while still running"
+            logger.warning("request %d: %s %s", rid, reason, when)
         self._finish_if_released(rid)
 
     def _finish_if_released(self, rid: int) -> None:
         """A finished request's last word to the engine, once no record of it remains.
 
-        A held request is terminated; if its publish landed after it ended, the response goes
-        out first. A publish that failed after the request ended is logged and the request is
-        terminated all the same: the client already has its final response, and a second, error
-        response would be a duplicate. A request that was never held and whose publish landed
-        before it ended owes the engine nothing: it terminates as usual.
+        A held request is terminated here, whatever its last transfer's outcome. A request that
+        was never held owes the engine nothing: it terminates as usual through the release gate.
         """
         if rid not in self._finished:
             return
@@ -803,16 +799,8 @@ class KVTransferCoordinator:
         req = self._requests.get(rid)
         if req is None:
             logger.warning("request %d finished with no request object on record", rid)
-        else:
-            if rid in self._publish_outcome:
-                reason = self._publish_outcome[rid]
-                if reason is not None:
-                    logger.warning("request %d: %s after the request ended", rid, reason)
-                else:
-                    self._effects.stage_transfer_response(req)
-                self._effects.terminate_request(req)
-            elif rid in self._held:
-                self._effects.terminate_request(req)
+        elif rid in self._held:
+            self._effects.terminate_request(req)
         self._forget_request(rid)
 
     # ---- launch / publish helpers ----
@@ -952,15 +940,18 @@ class KVTransferCoordinator:
         return aux or None
 
     def _release(self, rec: TransferRecord) -> None:
-        rec.state = RecordState.RELEASED
+        """The record leaves the table; release is an event, not a state."""
         self._records.pop(rec.key, None)
 
     def _forget_request(self, rid: int) -> None:
+        """Drop every per-request entry of a request that is gone, here and in the planner and
+        the reader. For a held request this runs at its termination, so the reader's per-request
+        cache keeps that one entry until then."""
         self._requests.pop(rid, None)
         self._plans.pop(rid, None)
         self._pending_answers.pop(rid, None)
         self._probe_answers.pop(rid, None)
         self._finished.discard(rid)
         self._held.discard(rid)
-        self._publish_outcome.pop(rid, None)
         self._planner.forget(rid)
+        self._reader.forget_request(rid)

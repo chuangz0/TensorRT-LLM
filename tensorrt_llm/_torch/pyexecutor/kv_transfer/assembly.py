@@ -16,32 +16,30 @@
 
 ``attach_kv_transfer`` runs once at creation when ``TRTLLM_KV_TRANSFER_CONFIG`` is set: it checks
 the engine is in scope, builds the resource reader and region resolver, builds the configured
-backends and registers the KV pools with those that need it, builds the coordinator, and attaches
-the ``KVTransferEngineBinding`` to the executor and its scheduler.
+backends and registers the KV pools with those that need it, builds the coordinator, forwards the
+import-light layers' stdlib logging to the TRT-LLM logger, and attaches the ``KVTransferHooks``
+to the executor and its scheduler.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import TYPE_CHECKING, Sequence
 
 from tensorrt_llm.logger import logger
 
-from ...disaggregation.backends.config import KVTransferConfig, load_kv_transfer_config
+from ...disaggregation.backends.config import load_kv_transfer_config
 from ...disaggregation.backends.registry import (
     BackendBuildContext,
     BackendHandle,
     build_backends,
     close_backends,
 )
-from ...disaggregation.orchestration.kv_transfer.coordinator import KVTransferCoordinator
-from ...disaggregation.orchestration.kv_transfer.interfaces import (
-    FetchSource,
-    GroupKind,
-    PlanAuthority,
-)
-from ...disaggregation.remote_cache import Planner
+from ...disaggregation.base.backend import CacheKind
+from ...disaggregation.orchestration.kv_transfer.build import build_coordinator
+from ...disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority
 from ...disaggregation.resource.kv_extractor import build_page_table_from_manager
 from ...disaggregation.resource.kv_v2_reader import KVv2ResourceReader
 from ...disaggregation.resource.region import (
@@ -50,8 +48,8 @@ from ...disaggregation.resource.region import (
     parallel_shard_tag,
 )
 from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from .binding import KVTransferEngineBinding
 from .effects import EngineDist, EngineWorkQueue, PyExecutorKVTransferEffects
+from .hooks import KVTransferHooks
 
 if TYPE_CHECKING:
     from ..py_executor import PyExecutor
@@ -60,11 +58,47 @@ __all__ = [
     "KV_TRANSFER_STATUS_DUMP_ENV",
     "attach_kv_transfer",
     "check_engine_supports_kv_transfer",
+    "install_log_forwarding",
     "plan_authority_for",
 ]
 
 KV_TRANSFER_STATUS_DUMP_ENV = "TRTLLM_KV_TRANSFER_STATUS_DUMP"
 """Test seam: a path (``{pid}`` replaced by the worker's pid) where ``close`` writes a JSON dump."""
+
+_DISAGGREGATION_LOGGER_NAME = "tensorrt_llm._torch.disaggregation"
+"""The stdlib logger namespace of the import-light layers below the engine (coordinator, backends).
+They log through ``logging`` because they do not import ``tensorrt_llm``; the engine forwards
+their WARNING+ records to the TRT-LLM logger so a store outage shows up in the engine's log."""
+
+
+class _ForwardToTrtllmLogger(logging.Handler):
+    """Re-emits each stdlib record it receives through ``tensorrt_llm.logger.logger`` at the
+    matching severity. Installed once per process by ``install_log_forwarding``."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 - a malformed record must not break the caller's log
+            self.handleError(record)
+            return
+        if record.levelno >= logging.CRITICAL:
+            logger.critical(message)
+        elif record.levelno >= logging.ERROR:
+            logger.error(message)
+        else:
+            logger.warning(message)
+
+
+def install_log_forwarding() -> None:
+    """Attach the forwarding handler to the disaggregation logger namespace unless one is there
+    already. Process-wide and idempotent: the handler outlives any one engine, so nothing
+    removes it."""
+    target = logging.getLogger(_DISAGGREGATION_LOGGER_NAME)
+    if not any(isinstance(handler, _ForwardToTrtllmLogger) for handler in target.handlers):
+        target.addHandler(_ForwardToTrtllmLogger())
 
 
 def _refuse(reason: str) -> None:
@@ -132,7 +166,7 @@ def plan_authority_for(mapping) -> PlanAuthority:
 
 def _check_layer_groups_are_full_attention(reader: KVv2ResourceReader) -> None:
     for group_spec in reader.group_specs():
-        if group_spec.kind is not GroupKind.PAGED or group_spec.window_size is not None:
+        if group_spec.kind is not CacheKind.PAGED or group_spec.window_size is not None:
             _refuse("only full-attention models are supported (no sliding window, no SSM)")
 
 
@@ -160,47 +194,6 @@ def _register_kv_pools(backends: Sequence[BackendHandle], resolver: KVv2RegionRe
         raise
 
 
-def _build_coordinator(
-    config: KVTransferConfig,
-    backends: Sequence[BackendHandle],
-    reader: KVv2ResourceReader,
-    effects: PyExecutorKVTransferEffects,
-    dist,
-    *,
-    attention_dp: bool,
-    plan_authority: PlanAuthority = PlanAuthority.VOTED,
-) -> KVTransferCoordinator:
-    fetch_sources = [
-        FetchSource(handle.name, handle.fetcher, handle.hint_key)
-        for handle in backends
-        if handle.fetcher is not None
-    ]
-    publishers = [handle.publisher for handle in backends if handle.publisher is not None]
-    # The wall-clock budget alone governs the wait for a store lookup; the planner's clock is
-    # left at its default, which is the clock the binding passes to ``advance`` (plan §10 #15).
-    planner = Planner(
-        fetch_sources,
-        reader,
-        reader.tokens_per_block,
-        probe_budget_rounds=None,
-        probe_timeout_s=config.probe_timeout_s,
-    )
-    return KVTransferCoordinator(
-        fetch_sources,
-        publishers,
-        planner,
-        reader,
-        effects,
-        EngineWorkQueue(),
-        dist,
-        fetch_timeout_s=config.fetch_timeout_s,
-        publish_timeout_s=config.publish_timeout_s,
-        unlaunched_timeout_s=config.unlaunched_timeout_s,
-        attention_dp=attention_dp,
-        plan_authority=plan_authority,
-    )
-
-
 def _status_dump_path() -> str | None:
     template = os.environ.get(KV_TRANSFER_STATUS_DUMP_ENV)
     if not template:
@@ -216,7 +209,7 @@ def attach_kv_transfer(
     spec_config,
     kv_connector_manager,
     max_beam_width: int,
-) -> KVTransferEngineBinding:
+) -> KVTransferHooks:
     """Guard, build, register, attach. Raises ``ValueError`` for a configuration out of scope or
     a malformed config file.
 
@@ -251,20 +244,20 @@ def attach_kv_transfer(
     _register_kv_pools(backends, resolver)
 
     effects = PyExecutorKVTransferEffects(executor)
-    coordinator = _build_coordinator(
+    coordinator = build_coordinator(
         config,
         backends,
         reader,
         effects,
+        EngineWorkQueue(),
         EngineDist(executor.dist, mapping),
-        attention_dp=mapping.enable_attention_dp,
         plan_authority=plan_authority_for(mapping),
     )
-    binding = KVTransferEngineBinding(
+    install_log_forwarding()
+    hooks = KVTransferHooks(
         executor,
         coordinator,
         effects,
-        reader,
         backends,
         config.backends,
         close_timeout_s=config.close_timeout_s,
@@ -272,8 +265,8 @@ def attach_kv_transfer(
         started_at=started_at,
         rank=mapping.rank,
     )
-    executor.scheduler.kv_transfer_planner = binding
-    executor.kv_transfer = binding
+    executor.scheduler.kv_transfer_planner = hooks
+    executor.kv_transfer = hooks
     logger.info(
         "KV transfer attached: backends=%s pools=%d layout=%s plan_authority=%s",
         [(entry.name, entry.type, sorted(entry.roles)) for entry in config.backends],
@@ -281,4 +274,4 @@ def attach_kv_transfer(
         build_context.layout_fingerprint.hex(),
         coordinator.plan_authority.value,
     )
-    return binding
+    return hooks

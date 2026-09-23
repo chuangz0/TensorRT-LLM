@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""``N`` real engine bindings on ``N`` threads, one per TP rank, whose coordinators meet in the
+"""``N`` real ``KVTransferHooks`` on ``N`` threads, one per TP rank, whose coordinators meet in the
 ``FakeDistGroup`` collective through the real ``EngineDist`` (plan S3 (b)).
 
 Each round every rank runs what the loop runs: ``advance_round``, ``plan_fetch``, the scheduler's
@@ -23,10 +23,8 @@ import pytest
 from engine_fakes import make_request
 from multi_rank_fakes import FakeDistGroup, RankRig
 
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import (
-    DEFER,
-    PlanAuthority,
-)
+from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority
+from tensorrt_llm._torch.disaggregation.remote_cache import DEFER
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 
 pytestmark = pytest.mark.cpu_only
@@ -38,7 +36,7 @@ UNLAUNCHED_TIMEOUT_S = 10.0
 
 @pytest.fixture
 def clock(monkeypatch):
-    """Freeze the binding's ``time.monotonic``; the fake collective's barriers keep their own
+    """Freeze the hooks' ``time.monotonic``; the fake collective's barriers keep their own
     wall clock, so a frozen clock never stalls them."""
     now = {"t": 1000.0}
     monkeypatch.setattr(time, "monotonic", lambda: now["t"])
@@ -117,7 +115,7 @@ def test_a_rank_without_pages_holds_the_landing_until_the_timeout_restarts_every
     launched.executor._revert_ctx_alloc.assert_called_once()
     assert laggard.effects.give_backs == 0
     for rig, request in zip(rigs, requests):
-        assert rig.binding.plan_fetch(request) is DEFER
+        assert rig.hooks.plan_fetch(request) is DEFER
         assert request.state == LlmRequestState.CONTEXT_INIT
 
     laggard.kv.reserve_answer = True
@@ -143,7 +141,7 @@ class Stage0:
 
     def owner_round(self, active) -> None:
         self._owner.schedule_round(active)
-        answers = self._owner.binding.export_plan_answers()
+        answers = self._owner.hooks.export_plan_answers()
         self.sent.append(answers)
         self._wire.put(pickle.dumps(answers))
 
@@ -172,7 +170,7 @@ def test_pp_follower_adopts_the_owners_plans_and_lands_in_the_same_round():
 
     assert stage0.sent == [[(1, (TOKEN_END, "store"))], []]
     assert follower.store.count("probe") == 0  # the follower never plans
-    assert follower.binding._num_deferred_requests == 0
+    assert follower.hooks._num_deferred_requests == 0
     for rig, request in zip((owner, follower), requests):
         assert rig.effects.unparks == 1 and rig.effects.give_backs == 0
         assert request.context_current_position == TOKEN_END
@@ -243,10 +241,10 @@ def test_pp_follower_without_an_answer_counts_the_candidate_as_deferred():
     group.run(engine_loop)
 
     assert stage0.sent == [[]]
-    assert owner.binding.plan_fetch(requests[0]) is DEFER
-    assert follower.binding.plan_fetch(requests[1]) is DEFER
-    assert follower.binding._num_deferred_requests == 1
-    assert owner.binding._num_deferred_requests == 1
+    assert owner.hooks.plan_fetch(requests[0]) is DEFER
+    assert follower.hooks.plan_fetch(requests[1]) is DEFER
+    assert follower.hooks._num_deferred_requests == 1
+    assert owner.hooks._num_deferred_requests == 1
 
 
 def test_attention_dp_replicas_run_without_a_collective_and_share_the_shard_tag():

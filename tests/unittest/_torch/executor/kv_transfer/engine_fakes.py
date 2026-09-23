@@ -6,7 +6,7 @@
 that suite runs without ``tensorrt_llm``. The engine-side modules under test here
 (``pyexecutor/kv_transfer/``) import it as ``tensorrt_llm._torch.disaggregation.*``, and one
 contract must not exist twice in a process. These are the same table-backed fakes, trimmed to what
-the engine binding exercises, over the ``tensorrt_llm`` copy of the contract.
+the engine hooks exercise, over the ``tensorrt_llm`` copy of the contract.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from typing import Iterable, Sequence
 from unittest.mock import Mock
 
+from tensorrt_llm._torch.disaggregation.base.backend import CacheKind
 from tensorrt_llm._torch.disaggregation.base.cache_backend import (
     CacheExtent,
     Delivered,
@@ -25,10 +26,7 @@ from tensorrt_llm._torch.disaggregation.base.cache_backend import (
     SubmissionRejected,
     Unit,
 )
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import (
-    GroupKind,
-    GroupSpec,
-)
+from tensorrt_llm._torch.disaggregation.base.views import GroupSpec
 from tensorrt_llm._torch.disaggregation.resource.naming import group_tag
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -39,7 +37,7 @@ TPB = 32
 
 
 def full_attention(local_group: int = 0) -> GroupSpec:
-    return GroupSpec(local_group, GroupKind.PAGED, group_tag(frozenset({"full"}), None))
+    return GroupSpec(local_group, CacheKind.PAGED, group_tag(frozenset({"full"}), None))
 
 
 def block_key(seed: str, ordinal: int) -> bytes:
@@ -161,6 +159,13 @@ class FakePublishes:
         return sum(1 for m, _ in self.calls if m == method)
 
 
+class SingleRankDist:
+    """``DistLike`` for a world of one rank: the gathered list is the payload itself."""
+
+    def allgather(self, payload: object) -> list:
+        return [payload]
+
+
 class HangingClose:
     """A backend ``close`` that blocks until the test opens the gate."""
 
@@ -189,7 +194,7 @@ class FakeKVCache:
 
 
 class FakeKVCacheManager:
-    """The slice of ``KVCacheManagerV2`` the effects, the binding and the reader touch.
+    """The slice of ``KVCacheManagerV2`` the effects, the hooks and the reader touch.
 
     ``commit_to[rid]`` overrides what ``try_commit_blocks`` commits (default: the cursor).
     ``release_index_slot`` is idempotent, as the real wrapper's is (plan §7 #3).
@@ -269,7 +274,7 @@ class FakeSlotManager:
 
 
 def make_executor(kv: FakeKVCacheManager, slots: FakeSlotManager) -> PyExecutor:
-    """A ``PyExecutor`` with only what the effects, the binding and the two real methods under
+    """A ``PyExecutor`` with only what the effects, the hooks and the two real methods under
     test (``_terminate_request``, ``_try_cancel_request``) read."""
     executor = object.__new__(PyExecutor)
     executor.kv_cache_manager = kv

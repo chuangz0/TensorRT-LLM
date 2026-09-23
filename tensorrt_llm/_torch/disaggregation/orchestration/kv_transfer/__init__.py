@@ -3,6 +3,7 @@
 """Coordination layer over the ``base/cache_backend.py`` contract.
 
 ``coordinator.py`` is the only writer of the record table; ``interfaces.py`` holds its Protocols
-towards the engine side and the page-table side; ``records.py`` keeps one record per request per
-direction. The policy input ``Planner`` lives in ``disaggregation/remote_cache.py``.
+towards the engine side; ``records.py`` keeps one record per request per direction; ``build.py``
+assembles a coordinator from the config and the built backends. The read-only views it consumes
+live in ``base/views.py``; the policy input ``Planner`` in ``disaggregation/remote_cache.py``.
 """

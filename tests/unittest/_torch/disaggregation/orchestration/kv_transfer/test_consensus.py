@@ -15,8 +15,7 @@ import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.base.cache_backend import Failed  # noqa: E402
-from disaggregation.orchestration.kv_transfer.interfaces import DEFER  # noqa: E402
-from disaggregation.remote_cache import FetchPlan  # noqa: E402
+from disaggregation.remote_cache import DEFER, FetchPlan  # noqa: E402
 from fakes import (  # noqa: E402
     FakeChunk,
     FakePlacingPublishes,
@@ -24,6 +23,7 @@ from fakes import (  # noqa: E402
     FakeRequest,
     LockstepWorld,
     Rig,
+    ordinals_by_group,
     worker_request,
 )
 
@@ -43,7 +43,7 @@ def world(request):
 
 def make_rigs(world, **kw):
     kw.setdefault("unlaunched_timeout_s", UNLAUNCHED_TIMEOUT_S)
-    return [Rig(gather=world.gathers[r], **kw) for r in range(world.n)]
+    return [Rig(dist=world.gathers[r], **kw) for r in range(world.n)]
 
 
 def peers(rigs):
@@ -56,7 +56,7 @@ def advance_all(world, rigs, candidates, now):
 
 
 def loop_advance_all(world, rigs, req, now):
-    """Each rank advances as its engine binding would: ``req`` is a candidate on the ranks whose
+    """Each rank advances as its engine hooks would: ``req`` is a candidate on the ranks whose
     answer for it is ``DEFER``."""
 
     def step(rank):
@@ -454,7 +454,7 @@ def make_publishing_rigs(world):
     rigs = []
     for rank in range(world.n):
         publisher = FakePlacingPublishes() if rank == DIVERGENT else FakePublishes()
-        rigs.append(Rig(gather=world.gathers[rank], publishers=[publisher]))
+        rigs.append(Rig(dist=world.gathers[rank], publishers=[publisher]))
     return rigs
 
 
@@ -465,7 +465,7 @@ def test_publish_rejected_piece_on_one_rank_waits_for_every_running_publish(worl
     laggard.reader.script_publish(req, [(range(0, 7), True, FakeChunk(3, 0))])
     laggard.publishers[0].reject_methods.add("place")
     for rig in rigs:
-        rig.coord.publish_committed_blocks([req], finished=(), now=0.0)
+        rig.coord.publish_committed_blocks([req], now=0.0)
     # Rank 1's ``place`` was refused, but its ``publish`` piece is still running: INFLIGHT, so
     # no verdict quiesces under it.
     advance_all(world, rigs, [], 1.0)
@@ -493,16 +493,13 @@ def test_publish_of_a_finished_request_settles_on_its_rank_without_the_others(wo
     rigs = make_publishing_rigs(world)
     req = FakeRequest(3, prompt_len=29)
     for rig in rigs:
-        rig.coord.publish_committed_blocks([req], finished=[3], now=0.0)
+        rig.coord.publish_committed_blocks([req], now=0.0)
+        rig.coord.notify_request_finished(req)
         assert rig.effects.names() == ["hold_for_transfer"]
     rigs[0].publishers[0].attempts[0].deliver_all()
     advance_all(world, rigs, [], 1.0)
     assert rigs[0].records() == [] and votes_of(rigs[0]) == []
-    assert rigs[0].effects.names() == [
-        "hold_for_transfer",
-        "stage_transfer_response",
-        "terminate_request",
-    ]
+    assert rigs[0].effects.names() == ["hold_for_transfer", "terminate_request"]
     for rig in rigs[1:]:
         assert rig.record(3, "publish")["state"] == "IN_FLIGHT"
         assert rig.effects.count("terminate_request") == 0
@@ -576,9 +573,9 @@ def test_identical_plans_are_kept_and_local_reuse_may_differ(world):
     assert [p.token_end for p in plans] == [END] * world.n
     for rank, plan in enumerate(plans):
         if rank == DIVERGENT:
-            assert plan.units_by_group == {0: (2, 3, 4, 5, 6)}
+            assert ordinals_by_group(plan) == {0: (2, 3, 4, 5, 6)}
         else:
-            assert plan.units_by_group == {0: tuple(range(7))}
+            assert ordinals_by_group(plan) == {0: tuple(range(7))}
     for rig in rigs:
         rig.coord.launch_fetches([req], 1.0)
     for rig in rigs:

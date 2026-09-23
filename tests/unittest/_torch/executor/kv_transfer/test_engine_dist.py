@@ -2,15 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """``EngineDist``: the coordinator's ``DistLike`` over the executor's ``dist`` and its ``Mapping``.
 
-The ``"world"`` scope is ``dist.allgather``, the ``"pp"`` scope ``dist.pp_allgather``; a group
-of one rank answers with its own payload and enters no collective at all.
+Without attention DP the ranks that plan together are the world (``dist.allgather``); under
+attention DP they are this rank's pipeline group (``dist.pp_allgather``). A group of one rank
+answers with its own payload and enters no collective at all.
 """
 
 from types import SimpleNamespace
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import EngineDist, collective_group_size
+from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import EngineDist
 
 pytestmark = pytest.mark.cpu_only
 
@@ -32,37 +33,46 @@ class RecordingDist:
         return [obj] * self.pp_size
 
 
-def mapping(*, world_size: int, pp_size: int) -> SimpleNamespace:
-    return SimpleNamespace(world_size=world_size, pp_size=pp_size)
+def mapping(*, world_size: int, pp_size: int, enable_attention_dp: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        world_size=world_size, pp_size=pp_size, enable_attention_dp=enable_attention_dp
+    )
 
 
-def test_group_size_is_the_world_or_the_pp_group():
-    m = mapping(world_size=8, pp_size=2)
-    assert collective_group_size(m, "world") == 8
-    assert collective_group_size(m, "pp") == 2
-
-
-def test_world_scope_enters_allgather_and_pp_scope_enters_pp_allgather():
+def test_without_attention_dp_the_world_gathers():
     dist = RecordingDist(world_size=4, pp_size=2)
-    engine_dist = EngineDist(dist, mapping(world_size=4, pp_size=2))
+    engine_dist = EngineDist(dist, mapping(world_size=4, pp_size=2, enable_attention_dp=False))
     payload = ([], [], [(1, "DEFER")])
 
-    assert engine_dist.allgather(payload, "world") == [payload] * 4
-    assert engine_dist.allgather(payload, "pp") == [payload] * 2
-    assert dist.calls == [("allgather", payload), ("pp_allgather", payload)]
+    assert engine_dist.allgather(payload) == [payload] * 4
+    assert dist.calls == [("allgather", payload)]
+
+
+def test_under_attention_dp_the_pipeline_group_gathers():
+    dist = RecordingDist(world_size=4, pp_size=2)
+    engine_dist = EngineDist(dist, mapping(world_size=4, pp_size=2, enable_attention_dp=True))
+    payload = ([], [], [(1, "DEFER")])
+
+    assert engine_dist.allgather(payload) == [payload] * 2
+    assert dist.calls == [("pp_allgather", payload)]
 
 
 @pytest.mark.parametrize(
-    "scope, world_size, pp_size",
-    [("world", 1, 1), ("pp", 4, 1)],
-    ids=["single_rank_world", "attention_dp_without_pp"],
+    "world_size, pp_size, enable_attention_dp",
+    [(1, 1, False), (4, 1, True)],
+    ids=["single_rank", "attention_dp_without_pp"],
 )
-def test_a_group_of_one_answers_locally_without_a_collective(scope, world_size, pp_size):
+def test_a_group_of_one_answers_locally_without_a_collective(
+    world_size, pp_size, enable_attention_dp
+):
     dist = RecordingDist(world_size=world_size, pp_size=pp_size)
-    engine_dist = EngineDist(dist, mapping(world_size=world_size, pp_size=pp_size))
+    engine_dist = EngineDist(
+        dist,
+        mapping(world_size=world_size, pp_size=pp_size, enable_attention_dp=enable_attention_dp),
+    )
     payload = {"x": 1}
 
-    gathered = engine_dist.allgather(payload, scope)
+    gathered = engine_dist.allgather(payload)
 
     assert gathered == [payload] and gathered[0] is payload
     assert dist.calls == []

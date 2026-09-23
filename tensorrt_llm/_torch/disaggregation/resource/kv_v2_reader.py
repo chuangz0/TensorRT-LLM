@@ -27,8 +27,9 @@ from typing import Sequence
 
 import numpy as np
 
+from ..base.backend import CacheKind
 from ..base.cache_backend import CacheExtent, Unit
-from ..orchestration.kv_transfer.interfaces import GroupKind, GroupSpec
+from ..base.views import GroupSpec
 from .kv_extractor import build_page_table_from_manager
 from .naming import group_tag, units_for_group
 from .page import KVCachePageTable, MambaLayerGroup
@@ -123,10 +124,10 @@ class KVv2ResourceReader:
         history_length = int(kv_cache.history_length)
         units: list[Unit] = []
         for group_spec in self._group_specs:
-            if group_spec.kind is not GroupKind.PAGED:
+            if group_spec.kind is not CacheKind.PAGED:
                 continue
             page_indices = self._page_indices_by_ordinal(kv_cache, group_spec.local_group)
-            stale_begin, stale_end = self._kv_cache_manager._stale_block_range(
+            stale_begin, stale_end = self._kv_cache_manager.stale_block_range(
                 group_spec.local_group, history_length
             )
             live_ordinals = [
@@ -169,23 +170,24 @@ class KVv2ResourceReader:
 
     def _describe_layer_groups(self) -> tuple[GroupSpec, ...]:
         """One ``GroupSpec`` per layer group: kind, shared tag, window and sink blocks."""
-        life_cycles = self._kv_cache_manager._life_cycle_by_layer_group()
         group_specs = []
         for local_group, layer_group in enumerate(self._page_table.layer_groups):
             pool_roles = frozenset().union(*(view.pool_role for view in layer_group.pool_views))
             if isinstance(layer_group, MambaLayerGroup):
                 group_specs.append(
-                    GroupSpec(local_group, GroupKind.STATE, group_tag(pool_roles, None))
+                    GroupSpec(local_group, CacheKind.STATE, group_tag(pool_roles, None))
                 )
                 continue
             window_size = layer_group.sliding_window_size
             num_sink_blocks = (
-                int(life_cycles[local_group].num_sink_blocks) if window_size is not None else 0
+                self._kv_cache_manager.num_sink_blocks(local_group)
+                if window_size is not None
+                else 0
             )
             group_specs.append(
                 GroupSpec(
                     local_group,
-                    GroupKind.PAGED,
+                    CacheKind.PAGED,
                     group_tag(pool_roles, window_size),
                     window_size,
                     num_sink_blocks,

@@ -100,7 +100,7 @@ def _recording_coordinator(calls: list) -> DisaggTransferCoordinator:
 
 
 def _recording_kv_transfer(calls: list) -> SimpleNamespace:
-    """The ``KVTransferEngineBinding`` hooks the PP loop calls, recorded as
+    """The ``KVTransferHooks`` methods the PP loop calls, recorded as
     ``("kv_transfer.<hook>", ...)``; answers are the empty ones of an idle
     round."""
 

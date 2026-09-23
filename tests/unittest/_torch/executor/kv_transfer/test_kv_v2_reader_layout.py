@@ -18,11 +18,8 @@ from engine_fakes import FakeFetches
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import (
-    FetchSource,
-    GroupKind,
-)
-from tensorrt_llm._torch.disaggregation.remote_cache import FetchPlan, Planner
+from tensorrt_llm._torch.disaggregation.base.backend import CacheKind
+from tensorrt_llm._torch.disaggregation.remote_cache import FetchPlan, FetchSource, Planner
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.kv_v2_reader import KVv2ResourceReader
 from tensorrt_llm._torch.disaggregation.resource.region import (
@@ -253,10 +250,10 @@ class TestFetchExtent:
         planner = Planner([FetchSource("store", store, None)], reader, TPB)
         (spec,) = reader.group_specs()
         answer = frozenset(spec.tag + keys[o] for o in range(6))
-        plan = planner.decide(view, {"store": answer})
+        plan = planner.decide(view, {"store": answer}, now=0.0)
         assert isinstance(plan, FetchPlan)
         assert plan.token_end == 6 * TPB and plan.reuse_end == 2
-        assert plan.units_by_group == {0: (2, 3, 4, 5)}
+        assert [g.ordinals for g in plan.group_plans] == [(2, 3, 4, 5)]
 
         # The scheduler's reservation, then the extent the coordinator launches.
         assert manager.reserve_transfer_pages(request, plan.token_end)
@@ -284,7 +281,7 @@ class TestFetchExtent:
         planner = Planner([FetchSource("store", store, None)], reader, TPB)
         name, units = planner.probe_query(view)
         assert len(units) == NAMEABLE  # one group
-        plan = planner.decide(view, {"store": frozenset(units)})
+        plan = planner.decide(view, {"store": frozenset(units)}, now=0.0)
         assert plan.token_end == NAMEABLE * TPB == 224
         assert manager.reserve_transfer_pages(request, plan.token_end)
         extent = reader.fetch_extent(view, plan)
@@ -297,7 +294,7 @@ class TestFetchExtent:
         store = FakeFetches(name="store", probe_answer="all")
         planner = Planner([FetchSource("store", store, None)], reader, TPB)
         _, units = planner.probe_query(view)
-        plan = planner.decide(view, {"store": frozenset(units)})
+        plan = planner.decide(view, {"store": frozenset(units)}, now=0.0)
         assert manager.reserve_transfer_pages(request, 3 * TPB)  # fewer pages than planned
         extent = reader.fetch_extent(view, plan)
         assert [u.name for u in extent.units] == [
@@ -353,7 +350,7 @@ class TestPublishDescription:
         specs = reader.group_specs()
         assert len(specs) == 1
         (spec,) = specs
-        assert spec.kind is GroupKind.PAGED and spec.window_size is None
+        assert spec.kind is CacheKind.PAGED and spec.window_size is None
         assert spec.local_group == 0 and spec.sink_blocks == 0
         assert len(spec.tag) == 8
         assert reader.tokens_per_block == TPB

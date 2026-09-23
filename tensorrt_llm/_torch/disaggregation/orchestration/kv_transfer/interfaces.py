@@ -12,64 +12,36 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""What the KV transfer coordination layer needs from its surroundings.
+"""What the KV transfer coordinator needs from the engine side, and the optional backend
+capabilities it recognises.
 
-Everything here is a ``Protocol`` or a small value type. The coordinator and planner depend on
-these and nothing else, so they can be driven by fakes: a scripted ``Fetches``, an effects recorder,
-a single-rank ``DistLike``, a table-backed ``ResourceReader``.
-
-The engine adapter (``pyexecutor``) provides the concrete ``RequestView`` (an ``LlmRequest``
-satisfies it structurally), the ``KVTransferEffects``, the ``EngineQueue`` and the ``DistLike``.
-``resource/`` provides the ``ResourceReader``. Nothing in this module imports the engine.
+Everything here is a ``Protocol`` or an enum. The engine adapter (``pyexecutor``) provides the
+``KVTransferEffects``, the ``EngineQueue`` and the ``DistLike``, so the coordinator can be driven
+by fakes: an effects recorder and a single-rank collective. The read-only views it consumes
+(``RequestView``, ``GroupSpec``, ``ResourceReader``) live in ``base/views.py``; the planner's
+answers and its source table (``DEFER``, ``FetchSource``) in ``remote_cache.py``. Nothing in this
+module imports the engine.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, Callable, Literal, Mapping, Protocol, Sequence, runtime_checkable
+from enum import Enum
+from typing import TYPE_CHECKING, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
-from ...base.cache_backend import Attempt, CacheExtent, Fetches
+from ...base.cache_backend import Attempt
+from ...base.views import RequestView
 
 if TYPE_CHECKING:
     from ...base.backend import Chunk
 
 __all__ = [
-    "DEFER",
     "CarriesAux",
-    "Defer",
     "DistLike",
     "EngineQueue",
-    "FetchSource",
-    "GroupKind",
-    "GroupSpec",
     "KVTransferEffects",
     "PlacesPieces",
     "PlanAuthority",
-    "RequestView",
-    "ResourceReader",
-    "Scope",
 ]
-
-Scope = Literal["world", "pp"]
-"""Which ranks take part in one collective: the whole world, or this rank's pipeline group."""
-
-
-class Defer:
-    """The answer "do not schedule this request this round; ask again next round".
-
-    A class rather than a sentinel string so that ``isinstance`` works and so that it can never be
-    confused with a plan or with ``None`` (which means "compute locally, no fetch").
-    """
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return "DEFER"
-
-
-DEFER = Defer()
-"""The single ``Defer`` instance. Compare with ``is``."""
 
 
 class PlanAuthority(Enum):
@@ -88,41 +60,6 @@ class PlanAuthority(Enum):
     VOTED = "VOTED"
     OWNER = "OWNER"
     FOLLOWER = "FOLLOWER"
-
-
-class RequestView(Protocol):
-    """The subset of ``LlmRequest`` the coordination layer reads.
-
-    Duck-typed: an ``LlmRequest`` satisfies it as-is, and tests pass a plain dataclass. The
-    coordination layer never writes to a request; every write goes through ``KVTransferEffects``.
-    """
-
-    @property
-    def py_request_id(self) -> int: ...
-
-    @property
-    def prompt_len(self) -> int: ...
-
-    @property
-    def is_gen_init(self) -> bool:
-        """A generation-side disagg request that must fetch its whole prompt KV from a context
-        worker before it can run. Its plan is a short-circuit (§7.2 step 1)."""
-        ...
-
-    @property
-    def is_gen_first_context(self) -> bool:
-        """A context-side request whose generation side arrived first and must be ready before
-        this side may be scheduled (§7.2 step 2)."""
-        ...
-
-    @property
-    def route_hints(self) -> Mapping[str, Mapping[str, object]]:
-        """Routing hints attached by the deployment, keyed by ``FetchSource.hint_key``.
-
-        Each value is the opaque ``hint`` a worker backend's ``open_route`` takes. A request with
-        no hints has an empty mapping.
-        """
-        ...
 
 
 class KVTransferEffects(Protocol):
@@ -169,11 +106,7 @@ class KVTransferEffects(Protocol):
         ...
 
     def terminate_request(self, request: RequestView) -> None:
-        """Final release of a request whose transfers are all ``RELEASED``."""
-        ...
-
-    def stage_transfer_response(self, request: RequestView) -> None:
-        """Context side: queue the response that tells the peer the publish is complete."""
+        """Final release of a held request, once every record of it is gone."""
         ...
 
     def fail_requests(self, requests: Sequence[RequestView], reason: str) -> None:
@@ -184,22 +117,6 @@ class KVTransferEffects(Protocol):
         """Mark the engine fatal. Used only when a backend cannot say the caller's memory is
         untouched (``quiesce`` answered false): the pages cannot be reused or freed."""
         ...
-
-
-@dataclass(frozen=True)
-class FetchSource:
-    """One fetch backend in the assembly table (design §7.4).
-
-    Attributes:
-        name: Stable identifier; recorded on plans and attempts, and used as the allgather key.
-        backend: The backend itself.
-        hint_key: Which routing hint on a request this backend reads. ``None`` for a backend whose
-            destination is unique (a store), which then never gets ``open_route``.
-    """
-
-    name: str
-    backend: Fetches
-    hint_key: str | None
 
 
 class EngineQueue(Protocol):
@@ -218,81 +135,14 @@ class EngineQueue(Protocol):
 
 
 class DistLike(Protocol):
-    """The one collective the coordinator uses. It needs no rank or world size: the gathered
-    list's length is the participant count, and every reduction is symmetric."""
+    """The one collective the coordinator uses, over the ranks that plan together (the world, or
+    this rank's pipeline group under attention DP; the assembly decides which). It needs no rank
+    or world size: the gathered list's length is the participant count, and every reduction is
+    symmetric."""
 
-    def allgather(self, obj: object, scope: Scope) -> list:
-        """Gather ``obj`` from every rank in ``scope``; the result is indexed by rank within that
-        scope. Must be called the same number of times on every participating rank."""
-        ...
-
-
-class GroupKind(IntEnum):
-    """How a layer group's units are read; mirrors ``base.CacheKind`` without importing the
-    heavier module that defines it.
-
-    PAGED: one unit per block, the end of a range is an upper bound (attention).
-    STATE: one unit standing for the whole request, the end is an exact checkpoint (recurrent).
-    """
-
-    PAGED = 0
-    STATE = 1
-
-
-@dataclass(frozen=True)
-class GroupSpec:
-    """One layer group as the merge rule needs to see it (design §6.2).
-
-    Attributes:
-        local_group: This rank's ordinal for the group. Local only; never sent.
-        kind: How the group's units are read.
-        tag: ``resource.naming.group_tag`` of the group; prefixed to every unit name.
-        window_size: Sliding window in tokens, or ``None`` for full attention. Tokens rather than
-            blocks, so that the stale range is computed with the exact formula KV v2 uses
-            (``AttnLifeCycle.get_stale_range``).
-        sink_blocks: Number of leading sink blocks a windowed group keeps.
-    """
-
-    local_group: int
-    kind: GroupKind
-    tag: bytes
-    window_size: int | None = None
-    sink_blocks: int = 0
-
-
-class ResourceReader(Protocol):
-    """Read-only view of this rank's cache resources, for planning and for building extents.
-
-    Provided by ``resource/``; it is the only thing between the coordination layer and KV v2. The
-    ``plan`` argument type is ``planner.FetchPlan``; it is left untyped here to avoid a cycle.
-    """
-
-    @property
-    def tokens_per_block(self) -> int: ...
-
-    def local_reuse_tokens(self, request: RequestView) -> int:
-        """Tokens the local radix tree can already serve for this prompt (advisory, no pages)."""
-        ...
-
-    def block_keys(self, request: RequestView) -> list[bytes]:
-        """One key per *full* prompt block, by block ordinal."""
-        ...
-
-    def group_specs(self) -> Sequence[GroupSpec]:
-        """Every layer group this rank holds."""
-        ...
-
-    def gen_first_ready(self, request: RequestView) -> bool:
-        """For a gen-first context request: whether the generation side is ready."""
-        ...
-
-    def fetch_extent(self, request: RequestView, plan: object) -> CacheExtent:
-        """The extent for a fetch the scheduler has already allocated pages for."""
-        ...
-
-    def publish_description(self, request: RequestView) -> tuple[CacheExtent, Chunk | None]:
-        """What this context step made available: named units, and the positional chunk for
-        backends that place pieces. Built from committed pages."""
+    def allgather(self, obj: object) -> list:
+        """Gather ``obj`` from every participating rank; the result is indexed by rank within the
+        group. Must be called the same number of times on every participating rank."""
         ...
 
 

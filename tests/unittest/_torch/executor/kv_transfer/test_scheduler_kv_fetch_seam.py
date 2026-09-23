@@ -345,10 +345,10 @@ def test_planner_is_asked_once_per_request_per_round():
 
 
 class FilteringPlanner(FakePlanner):
-    """A planner that applies the binding's real candidate filter before answering a plan."""
+    """A planner that applies the hooks' real candidate filter before answering a plan."""
 
     def plan_fetch(self, req):
-        from tensorrt_llm._torch.pyexecutor.kv_transfer.binding import _is_fetch_candidate
+        from tensorrt_llm._torch.pyexecutor.kv_transfer.hooks import _is_fetch_candidate
 
         self.asked.append(req.py_request_id)
         if not _is_fetch_candidate(req):
@@ -357,7 +357,7 @@ class FilteringPlanner(FakePlanner):
 
 
 def test_dummy_request_with_a_planner_attached_is_scheduled_normally():
-    """The binding's candidate filter (plan §9 rule 3) answers None for a dummy even when a plan
+    """The hooks' candidate filter (plan §9 rule 3) answers None for a dummy even when a plan
     would exist; the scheduler then takes the ordinary context path for it."""
     mgr = make_kv_cache_manager()
     sched = make_scheduler(mgr)
@@ -450,15 +450,21 @@ def test_generation_request_without_a_publish_in_flight_is_evicted_as_before():
     assert 99 in ids(out.paused_requests)
 
 
-def test_context_chunk_continuation_is_not_asked():
+def test_context_chunk_continuation_is_asked_and_takes_the_normal_path():
+    """The candidate rule lives in the planner: the scheduler asks about every pending context
+    request, and a chunk continuation is answered None."""
     mgr = make_kv_cache_manager()
     sched = make_scheduler(mgr)
     planner = FakePlanner()
     sched.kv_transfer_planner = planner
     continuation = make_ctx_request(1, 100, is_first_context_chunk=False)
     continuation.context_remaining_length = 40
-    sched.schedule_request([continuation], set())
-    assert planner.asked == []
+
+    out = sched.schedule_request([continuation], set())
+
+    assert planner.asked == [1]
+    assert ids(out.context_requests) == [1] and out.fetch_launch_queue == []
+    mgr.reserve_transfer_pages.assert_not_called()
 
 
 def test_disagg_gen_init_request_never_reaches_the_planner():

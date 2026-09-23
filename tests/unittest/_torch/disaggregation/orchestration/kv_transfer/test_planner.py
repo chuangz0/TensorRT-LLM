@@ -5,19 +5,16 @@
 import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.orchestration.kv_transfer.interfaces import (  # noqa: E402
-    DEFER,
-    Defer,
-    FetchSource,
-    GroupKind,
-)
-from disaggregation.remote_cache import FetchPlan, Planner  # noqa: E402
+from disaggregation.base.backend import CacheKind  # noqa: E402
+from disaggregation.remote_cache import DEFER, Defer, FetchPlan, FetchSource, Planner  # noqa: E402
 from fakes import (  # noqa: E402
     TPB,
     FakeFetches,
     FakeReader,
     FakeRequest,
     full_attention,
+    ordinals_by_group,
+    plan_unit_names,
     state_group,
     windowed,
 )
@@ -46,37 +43,37 @@ def reader():
 def test_gen_init_short_circuit_uses_prompt_len_and_routed_worker(reader):
     planner = make_planner(reader)
     req = FakeRequest(1, prompt_len=30, is_gen_init=True, route_hints={"ctx": HINT})
-    plan = planner.decide(req, {})
+    plan = planner.decide(req, {}, now=0.0)
     assert isinstance(plan, FetchPlan)
     assert plan.token_end == 30  # prompt_len, not a block boundary
     assert plan.no_local_fallback is True
     assert plan.source == "worker" and plan.hint == HINT
     # The live recurrent state is not part of the named ask for gen-init.
-    assert {g.spec.kind for g in plan.group_plans} == {GroupKind.PAGED}
-    assert 2 not in plan.units_by_group
-    assert plan.units_by_group[0] == tuple(range(7))
+    assert {g.spec.kind for g in plan.group_plans} == {CacheKind.PAGED}
+    assert 2 not in ordinals_by_group(plan)
+    assert ordinals_by_group(plan)[0] == tuple(range(7))
 
 
 def test_gen_init_without_matching_hint_is_none(reader):
     planner = make_planner(reader)
-    assert planner.decide(FakeRequest(1, prompt_len=30, is_gen_init=True), {}) is None
+    assert planner.decide(FakeRequest(1, prompt_len=30, is_gen_init=True), {}, now=0.0) is None
     other = FakeRequest(1, prompt_len=30, is_gen_init=True, route_hints={"other": HINT})
-    assert planner.decide(other, {}) is None
+    assert planner.decide(other, {}, now=0.0) is None
 
 
 def test_gen_init_without_any_worker_source_is_none(reader):
     planner = make_planner(reader, sources=("store",))
     req = FakeRequest(1, prompt_len=30, is_gen_init=True, route_hints={"ctx": HINT})
-    assert planner.decide(req, {}) is None
+    assert planner.decide(req, {}, now=0.0) is None
 
 
 def test_gen_init_ignores_probe_answers_and_local_reuse(reader):
     planner = make_planner(reader)
     reader.reuse_tokens[1] = 8
     req = FakeRequest(1, prompt_len=30, is_gen_init=True, route_hints={"ctx": HINT})
-    plan = planner.decide(req, {"store": frozenset()})
+    plan = planner.decide(req, {"store": frozenset()}, now=0.0)
     assert plan.token_end == 30 and plan.source == "worker"
-    assert plan.reuse_end == 2 and plan.units_by_group[0] == (2, 3, 4, 5, 6)
+    assert plan.reuse_end == 2 and ordinals_by_group(plan)[0] == (2, 3, 4, 5, 6)
 
 
 # ---- step 2: gen-first context waits for the generation side ----
@@ -86,10 +83,10 @@ def test_gen_first_not_ready_defers(reader):
     planner = make_planner(reader)
     req = FakeRequest(1, prompt_len=29, is_gen_first_context=True, route_hints={"ctx": HINT})
     reader.ready[1] = False
-    answer = planner.decide(req, {})
+    answer = planner.decide(req, {}, now=0.0)
     assert answer is DEFER and isinstance(answer, Defer)
     reader.ready[1] = True
-    assert isinstance(planner.decide(req, {}), FetchPlan)
+    assert isinstance(planner.decide(req, {}, now=0.0), FetchPlan)
 
 
 # ---- step 3: nothing nameable ----
@@ -101,7 +98,7 @@ def test_nothing_nameable_is_none(reader, prompt_len):
     # exactly one block has no nameable block (prompt_len 5 would have one).
     planner = make_planner(reader)
     req = FakeRequest(1, prompt_len=prompt_len, route_hints={"ctx": HINT})
-    assert planner.decide(req, {}) is None
+    assert planner.decide(req, {}, now=0.0) is None
     assert planner.probe_query(req) is None
 
 
@@ -110,9 +107,9 @@ def test_local_reuse_covering_every_nameable_block_still_plans_with_empty_asks(r
     planner = make_planner(reader)
     req = FakeRequest(1, prompt_len=29, route_hints={"ctx": HINT})  # nameable = 7
     reader.reuse_tokens[1] = 28
-    plan = planner.decide(req, {})
+    plan = planner.decide(req, {}, now=0.0)
     assert plan.token_end == 28 and plan.source == "worker"
-    assert plan.units_by_group == {0: (), 1: (), 2: ()} and plan.unit_names == frozenset()
+    assert ordinals_by_group(plan) == {0: (), 1: (), 2: ()} and plan_unit_names(plan) == frozenset()
     assert plan.reuse_end == 7
 
 
@@ -122,35 +119,34 @@ def test_local_reuse_covering_every_nameable_block_still_plans_with_empty_asks(r
 def test_worker_with_hint_takes_the_whole_nameable_prefix(reader):
     planner = make_planner(reader)
     req = FakeRequest(1, prompt_len=29, route_hints={"ctx": HINT})
-    plan = planner.decide(req, {})  # store never answered; the worker wins first
+    plan = planner.decide(req, {}, now=0.0)  # store never answered; the worker wins first
     assert plan.source == "worker" and plan.hint == HINT
     assert plan.token_end == 28 and plan.no_local_fallback is False
-    assert plan.units_by_group == {0: tuple(range(7)), 1: (0, 4, 5, 6), 2: (6,)}
-    assert plan.mode == "PREFETCH"
+    assert ordinals_by_group(plan) == {0: tuple(range(7)), 1: (0, 4, 5, 6), 2: (6,)}
 
 
 def test_worker_source_is_skipped_without_its_hint(reader):
     planner = make_planner(reader)
     req = FakeRequest(1, prompt_len=29, route_hints={"other": HINT})
     held = reader.unit_names(req, range(7))
-    plan = planner.decide(req, {"store": held})
+    plan = planner.decide(req, {"store": held}, now=0.0)
     assert plan.source == "store" and plan.hint is None and plan.token_end == 28
 
 
 def test_store_probe_unanswered_defers_within_budget_then_none(reader):
-    planner = make_planner(reader, sources=("store",), probe_budget_rounds=2)
+    planner = make_planner(reader, sources=("store",), probe_timeout_s=2.0)
     req = FakeRequest(1, prompt_len=29)
-    assert planner.decide(req, {}) is DEFER
-    assert planner.decide(req, {"store": None}) is DEFER
-    assert planner.decide(req, {}) is None
+    assert planner.decide(req, {}, now=0.0) is DEFER
+    assert planner.decide(req, {"store": None}, now=1.0) is DEFER
+    assert planner.decide(req, {}, now=2.0) is None
     # Budget is per request and reset once decided.
-    assert planner.decide(req, {}) is DEFER
+    assert planner.decide(req, {}, now=2.0) is DEFER
 
 
 def test_store_probe_empty_is_an_answer_not_a_deferral(reader):
     planner = make_planner(reader, sources=("store",))
     req = FakeRequest(1, prompt_len=29)
-    assert planner.decide(req, {"store": frozenset()}) is None
+    assert planner.decide(req, {"store": frozenset()}, now=0.0) is None
 
 
 def test_store_uses_contiguous_prefix_of_full_attention_units(reader):
@@ -162,7 +158,7 @@ def test_store_uses_contiguous_prefix_of_full_attention_units(reader):
     held = frozenset(full.tag + keys[o] for o in (0, 1, 3, 4, 5, 6)) | frozenset(
         window.tag + keys[o] for o in range(7)
     )
-    plan = planner.decide(req, {"store": held})
+    plan = planner.decide(req, {"store": held}, now=0.0)
     assert plan.source == "store" and plan.token_end == 8
 
 
@@ -172,7 +168,7 @@ def test_store_prefix_ignores_window_group_gaps(reader):
     full = reader.groups[0]
     keys = reader.block_keys(req)
     held = frozenset(full.tag + keys[o] for o in range(7))  # no window units at all
-    plan = planner.decide(req, {"store": held})
+    plan = planner.decide(req, {"store": held}, now=0.0)
     assert plan.token_end == 28
 
 
@@ -183,7 +179,7 @@ def test_store_prefix_uses_every_paged_group_when_no_full_attention():
     window = reader.groups[0]
     keys = reader.block_keys(req)
     held = frozenset(window.tag + keys[o] for o in range(3))
-    plan = planner.decide(req, {"store": held})
+    plan = planner.decide(req, {"store": held}, now=0.0)
     assert plan.token_end == 12
 
 
@@ -192,21 +188,21 @@ def test_store_prefix_inside_local_reuse_plans_with_reuse_capped_at_target(reade
     req = FakeRequest(1, prompt_len=29)
     reader.reuse_tokens[1] = 20  # reuse_end = 5, past what the store offers
     held = reader.unit_names(req, range(3))
-    plan = planner.decide(req, {"store": held})
+    plan = planner.decide(req, {"store": held}, now=0.0)
     assert plan.source == "store" and plan.token_end == 12
     # A plan never asks below its own target: reuse_end is capped at token_end // tpb.
     assert plan.reuse_end == 3
-    assert plan.units_by_group == {0: (), 1: (), 2: ()}
+    assert ordinals_by_group(plan) == {0: (), 1: (), 2: ()}
 
 
 def test_sources_are_tried_in_table_order(reader):
     planner = make_planner(reader, sources=("store", "worker"))
     req = FakeRequest(1, prompt_len=29, route_hints={"ctx": HINT})
     held = reader.unit_names(req, range(2))
-    plan = planner.decide(req, {"store": held})
+    plan = planner.decide(req, {"store": held}, now=0.0)
     assert plan.source == "store" and plan.token_end == 8
     # Store unanswered: the worker further down the table is still consulted, no DEFER.
-    plan = planner.decide(req, {})
+    plan = planner.decide(req, {}, now=0.0)
     assert plan.source == "worker" and plan.token_end == 28
 
 
@@ -220,7 +216,7 @@ def test_sources_are_tried_in_table_order(reader):
 def test_token_end_cap_is_floor_of_prompt_len_minus_one(reader, prompt_len, expected_end):
     planner = make_planner(reader)
     req = FakeRequest(1, prompt_len=prompt_len, route_hints={"ctx": HINT})
-    plan = planner.decide(req, {})
+    plan = planner.decide(req, {}, now=0.0)
     assert plan.token_end == expected_end == (prompt_len - 1) // TPB * TPB
     assert plan.token_end % TPB == 0
 
@@ -231,19 +227,19 @@ def test_token_end_cap_is_floor_of_prompt_len_minus_one(reader, prompt_len, expe
 def test_retry_hint_caps_token_end(reader):
     planner = make_planner(reader)
     req = FakeRequest(1, prompt_len=29, route_hints={"ctx": HINT})
-    plan = planner.decide(req, {}, retry_hint=16)
+    plan = planner.decide(req, {}, retry_hint=16, now=0.0)
     assert plan.token_end == 16
-    assert plan.units_by_group == {0: (0, 1, 2, 3), 1: (0, 1, 2, 3), 2: (3,)}
+    assert ordinals_by_group(plan) == {0: (0, 1, 2, 3), 1: (0, 1, 2, 3), 2: (3,)}
 
 
 def test_retry_hint_inside_local_prefix_plans_empty_and_zero_is_none(reader):
     planner = make_planner(reader)
     req = FakeRequest(1, prompt_len=29, route_hints={"ctx": HINT})
     reader.reuse_tokens[1] = 8
-    plan = planner.decide(req, {}, retry_hint=8)
+    plan = planner.decide(req, {}, retry_hint=8, now=0.0)
     assert plan.token_end == 8 and plan.reuse_end == 2
-    assert plan.units_by_group == {0: (), 1: (), 2: ()}
-    assert planner.decide(req, {}, retry_hint=0) is None
+    assert ordinals_by_group(plan) == {0: (), 1: (), 2: ()}
+    assert planner.decide(req, {}, retry_hint=0, now=0.0) is None
 
 
 # ---- step 6: rank-independence ----
@@ -255,15 +251,15 @@ def test_units_by_group_pruned_by_local_reuse_but_decision_is_not():
     for reuse in (0, 8, 24):
         reader = FakeReader(groups=[full_attention(0), windowed(1), state_group(2)])
         reader.reuse_tokens[1] = reuse
-        plans.append(make_planner(reader).decide(req, {}))
+        plans.append(make_planner(reader).decide(req, {}, now=0.0))
     assert [p.token_end for p in plans] == [28, 28, 28]
     assert [p.source for p in plans] == ["worker"] * 3
-    assert plans[0].units_by_group == {0: tuple(range(7)), 1: (0, 4, 5, 6), 2: (6,)}
-    assert plans[1].units_by_group == {0: (2, 3, 4, 5, 6), 1: (4, 5, 6), 2: (6,)}
+    assert ordinals_by_group(plans[0]) == {0: tuple(range(7)), 1: (0, 4, 5, 6), 2: (6,)}
+    assert ordinals_by_group(plans[1]) == {0: (2, 3, 4, 5, 6), 1: (4, 5, 6), 2: (6,)}
     # Pruned to almost nothing is still a legal plan.
-    assert plans[2].units_by_group == {0: (6,), 1: (6,), 2: (6,)}
-    assert plans[2].unit_names == reader.unit_names(
-        req, [6], kinds=(GroupKind.PAGED, GroupKind.STATE)
+    assert ordinals_by_group(plans[2]) == {0: (6,), 1: (6,), 2: (6,)}
+    assert plan_unit_names(plans[2]) == reader.unit_names(
+        req, [6], kinds=(CacheKind.PAGED, CacheKind.STATE)
     )
     assert plans[2].reuse_end == 6
 
@@ -276,7 +272,7 @@ def test_probe_query_is_rank_independent(reader):
     keys = reader.block_keys(req)
     assert name == keys[6]
     assert frozenset(units) == reader.unit_names(
-        req, range(7), kinds=(GroupKind.PAGED, GroupKind.STATE)
+        req, range(7), kinds=(CacheKind.PAGED, CacheKind.STATE)
     )
     assert len(units) == 21  # three groups x 7 blocks: state snapshots are named too
 
@@ -292,8 +288,8 @@ def test_aligned_prompt_names_one_block_fewer_than_it_fills(reader):
     planner = make_planner(reader)
     req = FakeRequest(1, prompt_len=28, route_hints={"ctx": HINT})
     assert len(reader.block_keys(req)) == 6
-    plan = planner.decide(req, {})
-    assert plan.token_end == 24 and plan.units_by_group[0] == tuple(range(6))
+    plan = planner.decide(req, {}, now=0.0)
+    assert plan.token_end == 24 and ordinals_by_group(plan)[0] == tuple(range(6))
 
 
 def test_hybrid_layout_state_group_named_for_content_fetch_not_for_gen_init(reader):
@@ -301,30 +297,30 @@ def test_hybrid_layout_state_group_named_for_content_fetch_not_for_gen_init(read
     state = reader.groups[2]
     keys = reader.block_keys(FakeRequest(1, prompt_len=29))
 
-    content = planner.decide(FakeRequest(1, prompt_len=29, route_hints={"ctx": HINT}), {})
+    content = planner.decide(FakeRequest(1, prompt_len=29, route_hints={"ctx": HINT}), {}, now=0.0)
     assert [g.spec.kind for g in content.group_plans] == [
-        GroupKind.PAGED,
-        GroupKind.PAGED,
-        GroupKind.STATE,
+        CacheKind.PAGED,
+        CacheKind.PAGED,
+        CacheKind.STATE,
     ]
-    assert content.units_by_group[2] == (6,)
-    assert state.tag + keys[6] in content.unit_names
+    assert ordinals_by_group(content)[2] == (6,)
+    assert state.tag + keys[6] in plan_unit_names(content)
 
     gen_init = planner.decide(
-        FakeRequest(2, prompt_len=29, is_gen_init=True, route_hints={"ctx": HINT}), {}
+        FakeRequest(2, prompt_len=29, is_gen_init=True, route_hints={"ctx": HINT}), {}, now=0.0
     )
-    assert all(g.spec.kind is GroupKind.PAGED for g in gen_init.group_plans)
-    assert 2 not in gen_init.units_by_group
-    assert not any(name.startswith(state.tag) for name in gen_init.unit_names)
+    assert all(g.spec.kind is CacheKind.PAGED for g in gen_init.group_plans)
+    assert 2 not in ordinals_by_group(gen_init)
+    assert not any(name.startswith(state.tag) for name in plan_unit_names(gen_init))
 
     _, units = planner.probe_query(FakeRequest(3, prompt_len=29))
     assert sum(1 for u in units if u.startswith(state.tag)) == 7
 
 
 def test_forget_drops_defer_budget(reader):
-    planner = make_planner(reader, sources=("store",), probe_budget_rounds=1)
+    planner = make_planner(reader, sources=("store",), probe_timeout_s=1.0)
     req = FakeRequest(1, prompt_len=29)
-    assert planner.decide(req, {}) is DEFER
+    assert planner.decide(req, {}, now=0.0) is DEFER
     planner.forget(1)
-    assert planner.decide(req, {}) is DEFER
-    assert planner.decide(req, {}) is None
+    assert planner.decide(req, {}, now=1.0) is DEFER  # the clock restarted
+    assert planner.decide(req, {}, now=2.0) is None

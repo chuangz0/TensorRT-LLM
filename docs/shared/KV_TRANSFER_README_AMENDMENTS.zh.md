@@ -38,7 +38,7 @@ README 无对应条目;它是 `resource/` 层"请求 → 可命名内容"的入�
 **B6. "在飞传输的登记"有两份。** 旧路 `orchestration/transfer_manager.py`(`AsyncTransferManager`,服务 transceiver),新路
 `orchestration/kv_transfer/records.py`(`TransferRecord` 表,服务 `KVTransferCoordinator`)。统一后后者取代前者(设计 §12.1)。
 
-**B7. 引擎侧三文件。** `pyexecutor/kv_transfer/effects.py`(唯一写请求状态处)、`kv_transfer/binding.py`(循环每轮调用的对象:
+**B7. 引擎侧三文件。** `pyexecutor/kv_transfer/effects.py`(唯一写请求状态处)、`kv_transfer/hooks.py`(循环每轮调用的对象 `KVTransferHooks`,引擎循环每个钩子点一个方法:
 `advance_round` / `launch_reserved_fetches` / `publish_committed_blocks` / `on_request_finished` / `is_tracking` / `pace_idle` / `close`)、
 `kv_transfer/assembly.py`(装配与范围守卫)。README 无引擎层;旧路对应 `pyexecutor/disagg_adapter.py`。
 

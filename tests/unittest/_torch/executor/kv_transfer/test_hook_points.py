@@ -6,7 +6,7 @@ Each hook is one guarded call in a shared engine file, placed relative to a name
 (after ``poll_gen_transfers``, before ``_send_kv_async``, ...). Running ``_executor_loop`` in a
 unit test would need the model engine, sampler and hang detector; the order the plan requires is
 a property of the source, so this checks the source: delete or move a hook and a test here fails
-and names it. Behaviour of each hook is covered by ``test_effects_binding.py``.
+and names it. Behaviour of each hook is covered by ``test_hooks.py``.
 """
 
 import ast

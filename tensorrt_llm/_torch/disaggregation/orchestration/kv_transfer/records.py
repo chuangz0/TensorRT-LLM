@@ -44,11 +44,13 @@ def _is_failure(outcome: Outcome | None) -> bool:
 
 
 class RecordState(Enum):
+    """The observable states of a record. Release is an event, not a state: a released record
+    leaves the table."""
+
     PLANNED = "PLANNED"
     IN_FLIGHT = "IN_FLIGHT"
     LANDED = "LANDED"
     FAILED = "FAILED"
-    RELEASED = "RELEASED"
 
 
 @dataclass
@@ -105,8 +107,6 @@ class TransferRecord:
             than ``UNLAUNCHED`` for the same record. Bounds how long an unlaunched rank may hold
             the others up (``unlaunched_timeout_s``). Cleared when this rank launches or the plan
             is dropped.
-        last_vote: The kind of the vote this rank last cast for the record, as its wire string;
-            ``None`` before the first. Diagnostic only, read by the status dump.
     """
 
     request_id: int
@@ -123,7 +123,6 @@ class TransferRecord:
     consecutive_launch_failures: int = 0
     launch_gave_up: bool = False
     peer_launched_at: float | None = None
-    last_vote: str | None = None
 
     @property
     def key(self) -> RecordKey:
@@ -143,14 +142,6 @@ class TransferRecord:
         """Every attempt of the current try has an outcome. False with no attempts at all."""
         current = self.current_try_attempts()
         return bool(current) and all(a.outcome is not None for a in current)
-
-    def all_delivered(self) -> bool:
-        """Terminal, and no attempt of the current try counts as a failure.
-
-        A local cancel (``Cancelled(by_peer=False)``) is an ordinary end that delivered nothing,
-        so it counts as ``Delivered`` with an empty ``served``.
-        """
-        return self.is_terminal() and not self.any_failed()
 
     def any_failed(self) -> bool:
         """Some attempt of the current try ended ``Failed`` or ``Cancelled(by_peer=True)``."""

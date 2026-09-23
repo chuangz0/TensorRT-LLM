@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""One real engine binding per rank, over the fakes of ``engine_fakes``, for the threaded
+"""One real ``KVTransferHooks`` per rank, over the fakes of ``engine_fakes``, for the threaded
 multi-rank tests: ``RankRig`` is one rank; its collective is a ``FakeDistRank`` of the
 ``FakeDistGroup`` all the rigs of a world share, reached through the real ``EngineDist``.
 """
@@ -27,19 +27,16 @@ from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
 from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.coordinator import (
     KVTransferCoordinator,
 )
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import (
-    FetchSource,
-    PlanAuthority,
-)
+from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority
 from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.records import TransferRecord
-from tensorrt_llm._torch.disaggregation.remote_cache import FetchPlan, Planner
+from tensorrt_llm._torch.disaggregation.remote_cache import FetchPlan, FetchSource, Planner
 from tensorrt_llm._torch.disaggregation.resource.region import parallel_shard_tag
-from tensorrt_llm._torch.pyexecutor.kv_transfer.binding import KVTransferEngineBinding
 from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import (
     EngineDist,
     EngineWorkQueue,
     PyExecutorKVTransferEffects,
 )
+from tensorrt_llm._torch.pyexecutor.kv_transfer.hooks import KVTransferHooks
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
 __extra_import_path__ = ["../../disaggregation"]
@@ -85,7 +82,7 @@ def rank_mapping(dist: FakeDistRank, *, enable_attention_dp: bool = False) -> Si
 
 
 class RankRig:
-    """One rank of a world: real coordinator, planner, effects and binding over the fakes, with
+    """One rank of a world: real coordinator, planner, effects and hooks over the fakes, with
     ``schedule_round`` standing in for what the engine loop and the V2 scheduler do per round.
 
     ``unlaunched_timeout_s``, ``fetch_timeout_s`` and ``plan_authority`` go to the coordinator;
@@ -113,9 +110,7 @@ class RankRig:
         self.store = FakeFetches(name="store")
         self.publisher = FakePublishes()
         sources = [FetchSource("store", self.store, None)]
-        self.planner = Planner(
-            sources, self.reader, TPB, probe_budget_rounds=None, probe_timeout_s=0.05
-        )
+        self.planner = Planner(sources, self.reader, TPB, probe_timeout_s=0.05)
         self.effects = CountingEffects(self.executor)
         self.coord = KVTransferCoordinator(
             sources,
@@ -127,7 +122,6 @@ class RankRig:
             EngineDist(self.dist, self.mapping),
             fetch_timeout_s=fetch_timeout_s,
             unlaunched_timeout_s=unlaunched_timeout_s,
-            attention_dp=enable_attention_dp,
             plan_authority=plan_authority,
         )
         handle = BackendHandle(
@@ -139,16 +133,15 @@ class RankRig:
             close=lambda: None,
         )
         entry = BackendEntry.from_dict({"name": "store", "type": "fake"})
-        self.binding = KVTransferEngineBinding(
+        self.hooks = KVTransferHooks(
             self.executor,
             self.coord,
             self.effects,
-            self.reader,
             [handle],
             [entry],
             close_timeout_s=5.0,
         )
-        self.executor.kv_transfer = self.binding
+        self.executor.kv_transfer = self.hooks
 
     # -- one round of the loop on this rank --
 
@@ -160,15 +153,15 @@ class RankRig:
         requests, it must return the owner's exported answers, which are adopted before the
         local scheduling below.
         """
-        self.binding.advance_round(list(active))
+        self.hooks.advance_round(list(active))
         if adopt is not None:
-            self.binding.adopt_plan_answers(list(active), adopt(list(active)))
+            self.hooks.adopt_plan_answers(list(active), adopt(list(active)))
         launch_queue = []
         for request in active:
-            plan = self.binding.plan_fetch(request)
+            plan = self.hooks.plan_fetch(request)
             if isinstance(plan, FetchPlan) and self.reserve(request, plan.token_end):
                 launch_queue.append(request)
-        self.binding.launch_reserved_fetches(launch_queue)
+        self.hooks.launch_reserved_fetches(launch_queue)
 
     def reserve(self, request: LlmRequest, token_end: int) -> bool:
         if not self.kv.reserve_transfer_pages(request, token_end):
@@ -189,7 +182,7 @@ class RankRig:
         self.kv.kv_cache_map.setdefault(
             request.py_request_id, FakeKVCache(history_length=request.prompt_len)
         )
-        self.binding.publish_committed_blocks([request])
+        self.hooks.publish_committed_blocks([request])
 
     # -- what a scenario reads --
 

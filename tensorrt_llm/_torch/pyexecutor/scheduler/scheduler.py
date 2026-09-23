@@ -357,7 +357,7 @@ class SerializableSchedulerOutput:
     """Request ids of recompute-paused requests."""
     kv_fetch_answers: list = dataclasses.field(default_factory=list)
     """KV transfer plan answers the scheduling rank decided this iteration, ``[(request_id, plan
-    wire)]``, for the other ranks to adopt (``KVTransferEngineBinding.adopt_plan_answers``)."""
+    wire)]``, for the other ranks to adopt (``KVTransferHooks.adopt_plan_answers``)."""
 
     @classmethod
     def from_scheduler_result(
