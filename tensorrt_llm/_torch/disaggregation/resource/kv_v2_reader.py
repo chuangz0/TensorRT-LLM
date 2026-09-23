@@ -28,7 +28,7 @@ from typing import Sequence
 import numpy as np
 
 from ..base.cache_backend import CacheExtent, Unit
-from ..orchestration.kv_transfer_interfaces import GroupKind, GroupSpec
+from ..orchestration.kv_transfer.interfaces import GroupKind, GroupSpec
 from .kv_extractor import build_page_table_from_manager
 from .naming import group_tag, units_for_group
 from .page import KVCachePageTable, MambaLayerGroup

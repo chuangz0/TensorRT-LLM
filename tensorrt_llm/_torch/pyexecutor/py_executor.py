@@ -122,7 +122,7 @@ if TYPE_CHECKING:
     from ray.actor import ActorHandle
 
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
-    from .kv_transfer_binding import KVTransferEngineBinding
+    from .kv_transfer.binding import KVTransferEngineBinding
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
@@ -401,7 +401,7 @@ class PyExecutor:
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
 
     # KV transfer coordination layer over the configured cache backends
-    # (integration plan §4); attached by kv_transfer_assembly when
+    # (integration plan §4); attached by kv_transfer.assembly when
     # TRTLLM_KV_TRANSFER_CONFIG is set. A class default so that partially
     # constructed executors read None too.
     kv_transfer: Optional["KVTransferEngineBinding"] = None

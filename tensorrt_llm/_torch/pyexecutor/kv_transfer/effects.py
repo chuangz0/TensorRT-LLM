@@ -28,12 +28,12 @@ from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
 from tensorrt_llm.logger import logger
 
-from .kv_cache.kv_cache_manager_v2 import _settle_context_cursor
-from .llm_request import LlmRequest, LlmRequestState, rewind_context_after_cache_drop
-from .resource_manager import ResourceManagerType
+from ..kv_cache.kv_cache_manager_v2 import _settle_context_cursor
+from ..llm_request import LlmRequest, LlmRequestState, rewind_context_after_cache_drop
+from ..resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
-    from .py_executor import PyExecutor
+    from ..py_executor import PyExecutor
 
 __all__ = [
     "KV_FETCH_IN_PROGRESS",

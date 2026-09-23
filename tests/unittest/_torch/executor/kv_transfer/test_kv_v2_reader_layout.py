@@ -18,11 +18,11 @@ from engine_fakes import FakeFetches
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer_interfaces import (
+from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import (
     FetchSource,
     GroupKind,
 )
-from tensorrt_llm._torch.disaggregation.orchestration.remote_cache import FetchPlan, Planner
+from tensorrt_llm._torch.disaggregation.remote_cache import FetchPlan, Planner
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.kv_v2_reader import KVv2ResourceReader
 from tensorrt_llm._torch.disaggregation.resource.region import (
@@ -30,7 +30,7 @@ from tensorrt_llm._torch.disaggregation.resource.region import (
     layout_fingerprint,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_transfer_effects import EngineRequestView
+from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import EngineRequestView
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig

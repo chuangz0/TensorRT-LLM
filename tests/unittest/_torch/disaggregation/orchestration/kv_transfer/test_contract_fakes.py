@@ -15,7 +15,7 @@ from disaggregation.base.cache_backend import (  # noqa: E402
     Publishes,
     RegistersPools,
 )
-from disaggregation.orchestration.kv_transfer_interfaces import (  # noqa: E402
+from disaggregation.orchestration.kv_transfer.interfaces import (  # noqa: E402
     CarriesAux,
     PlacesPieces,
 )
@@ -35,10 +35,13 @@ def test_modules_under_test_were_not_imported_through_tensorrt_llm():
     # This suite imports the coordination layer straight from ``tensorrt_llm/_torch`` and never
     # needs ``tensorrt_llm`` itself; a parent conftest may import it, this directory does not.
     assert (
-        KVTransferCoordinator.__module__ == "disaggregation.orchestration.kv_transfer_coordinator"
+        KVTransferCoordinator.__module__ == "disaggregation.orchestration.kv_transfer.coordinator"
     )
     assert Fetches.__module__ == "disaggregation.base.cache_backend"
-    through_package = "tensorrt_llm._torch.disaggregation.orchestration.kv_transfer"
+    through_package = (
+        "tensorrt_llm._torch.disaggregation.orchestration.kv_transfer",
+        "tensorrt_llm._torch.disaggregation.remote_cache",
+    )
     assert not any(name.startswith(through_package) for name in sys.modules)
     # One copy of the contract: the fakes and the coordinator see the same classes.
     assert isinstance(FakeFetches(), Fetches)

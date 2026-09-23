@@ -6,7 +6,7 @@ Each hook is one guarded call in a shared engine file, placed relative to a name
 (after ``poll_gen_transfers``, before ``_send_kv_async``, ...). Running ``_executor_loop`` in a
 unit test would need the model engine, sampler and hang detector; the order the plan requires is
 a property of the source, so this checks the source: delete or move a hook and a test here fails
-and names it. Behaviour of each hook is covered by ``test_kv_transfer_effects_binding.py``.
+and names it. Behaviour of each hook is covered by ``test_effects_binding.py``.
 """
 
 import ast
@@ -194,12 +194,12 @@ def test_creator_assembles_lazily_from_the_environment_variable():
     ordered(
         text,
         'os.environ.get("TRTLLM_KV_TRANSFER_CONFIG")',
-        "from .kv_transfer_assembly import attach_kv_transfer",
+        "from .kv_transfer.assembly import attach_kv_transfer",
         "attach_kv_transfer(",
         "py_executor.start_worker()",
     )
     module_text = inspect.getsource(py_executor_creator)
-    assert "kv_transfer_assembly" not in module_text.split("def _create_py_executor_impl")[0]
+    assert "kv_transfer.assembly" not in module_text.split("def _create_py_executor_impl")[0]
 
 
 def test_scheduler_asks_the_planner_after_the_prefix_probe_and_before_any_cache_work():

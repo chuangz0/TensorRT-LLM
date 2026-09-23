@@ -5,13 +5,13 @@
 import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.orchestration.kv_transfer_interfaces import (  # noqa: E402
+from disaggregation.orchestration.kv_transfer.interfaces import (  # noqa: E402
     DEFER,
     Defer,
     FetchSource,
     GroupKind,
 )
-from disaggregation.orchestration.remote_cache import FetchPlan, Planner  # noqa: E402
+from disaggregation.remote_cache import FetchPlan, Planner  # noqa: E402
 from fakes import (  # noqa: E402
     TPB,
     FakeFetches,

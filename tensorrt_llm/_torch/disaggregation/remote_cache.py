@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from itertools import chain
 from typing import Callable, Iterator, Literal, Mapping, Sequence
 
-from .kv_transfer_interfaces import (
+from .orchestration.kv_transfer.interfaces import (
     DEFER,
     Defer,
     FetchSource,

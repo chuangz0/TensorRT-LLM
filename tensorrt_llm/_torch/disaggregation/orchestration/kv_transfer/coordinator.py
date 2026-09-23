@@ -29,8 +29,9 @@ import logging
 import time
 from typing import Callable, Collection, Mapping, Sequence, TypeVar
 
-from ..base.cache_backend import Attempt, Fetches, Publishes, SubmissionRejected
-from .kv_transfer_interfaces import (
+from ...base.cache_backend import Attempt, Fetches, Publishes, SubmissionRejected
+from ...remote_cache import FetchPlan, Planner, merge, retry_hint_from
+from .interfaces import (
     DEFER,
     CarriesAux,
     Defer,
@@ -44,7 +45,6 @@ from .kv_transfer_interfaces import (
     Scope,
 )
 from .records import AttemptRecord, RecordKey, RecordState, TransferRecord
-from .remote_cache import FetchPlan, Planner, merge, retry_hint_from
 
 __all__ = ["MAX_CONSECUTIVE_REJECTIONS", "KVTransferCoordinator"]
 

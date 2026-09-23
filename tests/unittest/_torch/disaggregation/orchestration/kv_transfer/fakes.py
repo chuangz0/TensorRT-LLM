@@ -26,13 +26,13 @@ from disaggregation.base.cache_backend import (  # noqa: E402
     SubmissionRejected,
     Unit,
 )
-from disaggregation.orchestration.kv_transfer_coordinator import KVTransferCoordinator  # noqa: E402
-from disaggregation.orchestration.kv_transfer_interfaces import (  # noqa: E402
+from disaggregation.orchestration.kv_transfer.coordinator import KVTransferCoordinator  # noqa: E402
+from disaggregation.orchestration.kv_transfer.interfaces import (  # noqa: E402
     FetchSource,
     GroupKind,
     GroupSpec,
 )
-from disaggregation.orchestration.remote_cache import (  # noqa: E402
+from disaggregation.remote_cache import (  # noqa: E402
     FetchPlan,
     GroupPlan,
     Planner,

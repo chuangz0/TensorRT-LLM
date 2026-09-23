@@ -34,17 +34,17 @@ from engine_fakes import (
 from tensorrt_llm._torch.disaggregation.backends.config import BackendEntry
 from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
 from tensorrt_llm._torch.disaggregation.base.cache_backend import Failed
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer_coordinator import (
+from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.coordinator import (
     KVTransferCoordinator,
 )
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer_interfaces import (
+from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import (
     DEFER,
     FetchSource,
 )
-from tensorrt_llm._torch.disaggregation.orchestration.remote_cache import FetchPlan, Planner
-from tensorrt_llm._torch.pyexecutor import kv_transfer_binding, kv_transfer_effects
-from tensorrt_llm._torch.pyexecutor.kv_transfer_binding import KVTransferEngineBinding
-from tensorrt_llm._torch.pyexecutor.kv_transfer_effects import (
+from tensorrt_llm._torch.disaggregation.remote_cache import FetchPlan, Planner
+from tensorrt_llm._torch.pyexecutor.kv_transfer import binding, effects
+from tensorrt_llm._torch.pyexecutor.kv_transfer.binding import KVTransferEngineBinding
+from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import (
     KV_FETCH_IN_PROGRESS,
     KV_PUBLISH_IN_PROGRESS,
     EngineRequestView,
@@ -255,14 +255,14 @@ def rig():
 @pytest.fixture
 def effects_logger(monkeypatch):
     fake = Mock()
-    monkeypatch.setattr(kv_transfer_effects, "logger", fake)
+    monkeypatch.setattr(effects, "logger", fake)
     return fake
 
 
 @pytest.fixture
 def binding_logger(monkeypatch):
     fake = Mock()
-    monkeypatch.setattr(kv_transfer_binding, "logger", fake)
+    monkeypatch.setattr(binding, "logger", fake)
     return fake
 
 

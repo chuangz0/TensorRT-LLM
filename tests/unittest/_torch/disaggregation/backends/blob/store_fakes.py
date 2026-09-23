@@ -10,7 +10,7 @@ must lie inside a span ``register_buffer`` accepted, otherwise that key answers 
 and nothing is written (see ``UNREGISTERED`` for how this compares with the real client).
 
 This module is named ``store_fakes`` rather than ``fakes`` because pytest's default import mode
-puts each test directory on ``sys.path``, and ``kv_transfer/fakes.py`` already owns the name
+puts each test directory on ``sys.path``, and ``orchestration/kv_transfer/fakes.py`` already owns the name
 ``fakes`` in a session that collects both suites.
 """
 

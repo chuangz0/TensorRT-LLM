@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-__extra_import_path__ = ["~/tensorrt_llm/_torch", "../blob_backend"]
+__extra_import_path__ = ["~/tensorrt_llm/_torch", "blob"]
 from disaggregation.backends import registry as registry_module  # noqa: E402
 from disaggregation.backends.blob.backend import BlobStoreBackend  # noqa: E402
 from disaggregation.backends.config import (  # noqa: E402
@@ -429,7 +429,7 @@ MOONCAKE_OPTIONS = dict(
 )
 
 
-def test_mooncake_factory_builds_a_blob_backend_over_the_opened_client(mooncake_module):
+def test_mooncake_factory_builds_a_blob_store_backend_over_the_opened_client(mooncake_module):
     _, opened = mooncake_module
     config = KVTransferConfig(backends=(entry("store", "mooncake", **MOONCAKE_OPTIONS),))
     handles = build_backends(config, make_context())

@@ -25,10 +25,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
-from ..base.cache_backend import Attempt, CacheExtent, Cancelled, Delivered, Failed, Outcome, Route
+from ...base.cache_backend import Attempt, CacheExtent, Cancelled, Delivered, Failed, Outcome, Route
 
 if TYPE_CHECKING:
-    from .remote_cache import FetchPlan
+    from ...remote_cache import FetchPlan
 
 __all__ = ["AttemptRecord", "Direction", "RecordKey", "RecordState", "TransferRecord"]
 

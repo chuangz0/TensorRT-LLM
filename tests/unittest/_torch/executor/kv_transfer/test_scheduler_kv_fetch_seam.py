@@ -348,7 +348,7 @@ class FilteringPlanner(FakePlanner):
     """A planner that applies the binding's real candidate filter before answering a plan."""
 
     def plan_fetch(self, req):
-        from tensorrt_llm._torch.pyexecutor.kv_transfer_binding import _is_fetch_candidate
+        from tensorrt_llm._torch.pyexecutor.kv_transfer.binding import _is_fetch_candidate
 
         self.asked.append(req.py_request_id)
         if not _is_fetch_candidate(req):
@@ -577,10 +577,10 @@ def test_scheduler_and_executor_modules_do_not_import_the_coordination_layer():
         import tensorrt_llm._torch.pyexecutor.py_executor_creator
         banned = (
             "tensorrt_llm._torch.disaggregation.orchestration.kv_transfer",
-            "tensorrt_llm._torch.disaggregation.orchestration.remote_cache",
+            "tensorrt_llm._torch.disaggregation.remote_cache",
             "tensorrt_llm._torch.disaggregation.backends",
             "tensorrt_llm._torch.disaggregation.resource.kv_v2",
-            "tensorrt_llm._torch.pyexecutor.kv_transfer_",
+            "tensorrt_llm._torch.pyexecutor.kv_transfer",
         )
         loaded = sorted(m for m in sys.modules if m.startswith(banned))
         assert not loaded, f"coordination layer imported at module load: {loaded}"

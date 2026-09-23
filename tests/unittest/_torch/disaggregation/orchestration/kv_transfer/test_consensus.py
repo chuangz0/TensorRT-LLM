@@ -12,8 +12,8 @@ import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.base.cache_backend import Failed  # noqa: E402
-from disaggregation.orchestration.kv_transfer_interfaces import DEFER  # noqa: E402
-from disaggregation.orchestration.remote_cache import FetchPlan  # noqa: E402
+from disaggregation.orchestration.kv_transfer.interfaces import DEFER  # noqa: E402
+from disaggregation.remote_cache import FetchPlan  # noqa: E402
 from fakes import FakeRequest, LockstepWorld, Rig, worker_request  # noqa: E402
 
 END = 28

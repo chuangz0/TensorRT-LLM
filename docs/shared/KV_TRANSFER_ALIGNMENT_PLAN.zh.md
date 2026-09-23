@@ -33,7 +33,7 @@ SPDX-License-Identifier: Apache-2.0
 | 我们的 `resource/cache_reuse.py` 加了 `get_block_ordinals`,他们加了 `get_block_ids_with_ordinals`/`block_keys`——**本轮不碰**,留给 §6 的合并 | 两侧 diff |
 
 **B 的代价(写明,不隐藏):** 两份契约模块并存;他们每改契约要手工同步 `cache_backend.py`(S1 加一条可重复执行的核对命令);
-`kv_transfer_interfaces.py:35` 的 `TYPE_CHECKING` 从 `..base.backend` 取 `Chunk` 是有意的(`PlacesPieces.place(chunk)` 用的就是配对路径今天的 `Chunk`)。
+`orchestration/kv_transfer/interfaces.py:35` 的 `TYPE_CHECKING` 从 `...base.backend` 取 `Chunk` 是有意的(`PlacesPieces.place(chunk)` 用的就是配对路径今天的 `Chunk`)。
 
 ## 2. 目录与命名对齐 README §5
 
@@ -54,6 +54,8 @@ SPDX-License-Identifier: Apache-2.0
 | `orchestration/{kv_transfer_coordinator,records,kv_transfer_interfaces}.py` | 不变 | 目标名 `coordinator.py`/`interfaces.py` 被旧实现占用(§3、§6) |
 | 测试目录 `tests/unittest/_torch/disaggregation/store_backend/` | `blob_backend/` | 随实现走 |
 
+> 上表是 v4 时的前→后,保留为历史。其后布局计划又搬了一次:`orchestration/{kv_transfer_coordinator,records,kv_transfer_interfaces}.py` → `orchestration/kv_transfer/{coordinator,records,interfaces}.py`;`orchestration/remote_cache.py` → `disaggregation/remote_cache.py`;`pyexecutor/kv_transfer_{assembly,binding,effects}.py` → `pyexecutor/kv_transfer/{assembly,binding,effects}.py`;测试目录 `kv_transfer/`、`blob_backend/`、`engine_integration/` → `orchestration/kv_transfer/`、`backends/blob/`、`backends/`。本文其余处只改仍指向现存文件的路径;§2.3 的 `orchestration.planner` 字串、§3 命名表里的旧文件名、§5 的 DESIGN 修订记录、§7 基线命令与 S2 步骤、§8 核实记录按当时写法保留。
+
 ### 2.2 README 修订:提出来,不默默偏离
 
 README 自己规定"当前与它有哪些出入,另行成文",所以分两类(编号沿用 v1,故不连续)。README 不在我们分支里(选 B),修订以
@@ -69,16 +71,16 @@ README 自己规定"当前与它有哪些出入,另行成文",所以分两类(�
 3. `resource/kv_v2_reader.py`:请求 → 块键、层组、fetch/publish extent(`ResourceReader` 的 KV v2 实现)。
 4. 装配层:`backends/config.py`(装配表 YAML)、`backends/registry.py`(type → 工厂 → `BackendHandle`)。
 6. "在飞传输的登记"有两份:旧路 `transfer_manager.py`、新路 `records.py`;统一后后者取代前者(设计 §12.1)。
-7. 引擎侧:`pyexecutor/kv_transfer_effects.py`(唯一写请求状态处)、`kv_transfer_binding.py`(循环每轮调用的对象)、`kv_transfer_assembly.py`(装配);旧路对应 `pyexecutor/disagg_adapter.py`。
+7. 引擎侧:`pyexecutor/kv_transfer/effects.py`(唯一写请求状态处)、`kv_transfer/binding.py`(循环每轮调用的对象)、`kv_transfer/assembly.py`(装配);旧路对应 `pyexecutor/disagg_adapter.py`。
 9. **新契约的落点:** 在 `feat/mooncake-store-backend` 上,SPEC §7 的十三个名字从 `base/cache_backend.py` 导出,与 kv-shared-draft 的 `base/backend.py` 逐字节同步;`base/backend.py` 仍是配对路径的旧契约,直到 `transceiver.py`/`native/` 迁移。
 
 ### 2.3 `planner` → `remote_cache` 的 14 个导入点(已核实)
 
 | 类别 | 文件 |
 |---|---|
-| 生产(4) | `orchestration/kv_transfer_coordinator.py:46`;`orchestration/records.py:31`(`TYPE_CHECKING`);`pyexecutor/kv_transfer_assembly.py:40`;`pyexecutor/scheduler/scheduler_v2.py:40`(`TYPE_CHECKING`) |
+| 生产(4) | `orchestration/kv_transfer/coordinator.py:47`;`orchestration/kv_transfer/records.py:31`(`TYPE_CHECKING`);`pyexecutor/kv_transfer/assembly.py:40`;`pyexecutor/scheduler/scheduler_v2.py:40`(`TYPE_CHECKING`) |
 | 测试 `kv_transfer/`(6) | `fakes.py:35`、`test_planner.py:14`、`test_coordinator.py:15`、`test_consensus.py:16`、`test_merge_rule.py:26`、`test_planner_time_budget.py:15` |
-| 测试其他(4) | `store_backend/test_with_coordinator.py:18`;`executor/kv_transfer/test_kv_v2_reader_layout.py:25`、`test_kv_transfer_effects_binding.py:44`;`test_scheduler_kv_fetch_seam.py:587` 是 **monkeypatch 字串** `"tensorrt_llm._torch.disaggregation.orchestration.planner"`,grep import 语句找不到 |
+| 测试其他(4) | `backends/blob/test_with_coordinator.py:18`;`executor/kv_transfer/test_kv_v2_reader_layout.py:25`、`test_effects_binding.py:44`;`test_scheduler_kv_fetch_seam.py:587` 是 **monkeypatch 字串** `"tensorrt_llm._torch.disaggregation.orchestration.planner"`,grep import 语句找不到 |
 
 `test_planner.py`/`test_planner_time_budget.py` 文件名保留:测的是 `Planner` 类。
 
@@ -96,10 +98,10 @@ README 自己规定"当前与它有哪些出入,另行成文",所以分两类(�
 | 现在 | 目标 | 在哪 | 理由 |
 |---|---|---|---|
 | `prepare_disagg_gen_init(req, token_end=None)` | 新增 `reserve_transfer_pages(req, token_end)` 承载实现;`prepare_disagg_gen_init(req)` 保留为一行别名给 gen-init 调用点(`KVCacheV2Scheduler` gen-init 分支 :802、`transceiver.py` 报错文字 :1291/1316) | `kv_cache_manager_v2.py::prepare_disagg_gen_init` | fetch 接缝 `KVCacheV2Scheduler._try_take_fetch_path`(:634)调的是"为一次传输预留页",与 disagg 无关;别名让 T4 与 transceiver 零改动 |
-| `KVTransferEngineBinding.advance_transfers` | `advance_round` | `kv_transfer_binding.py` | 与 `KVTransferCoordinator.advance(candidates, now)` 签名不同不能同名;`advance_round` 说明"每轮一次、先挑候选再转调" |
+| `KVTransferEngineBinding.advance_transfers` | `advance_round` | `pyexecutor/kv_transfer/binding.py` | 与 `KVTransferCoordinator.advance(candidates, now)` 签名不同不能同名;`advance_round` 说明"每轮一次、先挑候选再转调" |
 | `KVTransferCoordinator.publish_context_progress` / `Binding.publish_completed_contexts` | 两层同名 `publish_committed_blocks` | coordinator、binding | 同一件事(binding 只多一层过滤);"committed blocks"是发布对象(设计 §3.2 ④) |
 | `BackendHandle.fetches`/`.publishes`(对象) vs `BackendEntry.fetches`/`.publishes`(布尔) | `BackendHandle.fetcher`/`.publisher`;`BackendEntry.serves_fetch`/`.serves_publish` | `registry.py::BackendHandle`、`kv_transfer_config.py::BackendEntry`、`mooncake.py::build_mooncake_backend`、`kv_transfer_assembly.py::attach_kv_transfer` | 同名不同类型 |
-| `KVTransferEffects.hold_for_transfer` | **不改** | — | 对在飞 **fetch** 也 hold:`notify_request_finished` 里 `(rid, "fetch") in self._records or (rid, "publish") in self._records` 都触发;`test_coordinator.py:150–165` 断言之。设计 §7.3 的 `hold_for_publish` 是文档错(§5.1)。**既有褶皱:** `PyExecutorKVTransferEffects.hold_for_transfer` 一律置 `KV_PUBLISH_IN_PROGRESS`(`kv_transfer_effects.py:241`),fetch hold 也如此——记进设计 §4.2 待决,本轮不改 |
+| `KVTransferEffects.hold_for_transfer` | **不改** | — | 对在飞 **fetch** 也 hold:`notify_request_finished` 里 `(rid, "fetch") in self._records or (rid, "publish") in self._records` 都触发;`test_coordinator.py:150–165` 断言之。设计 §7.3 的 `hold_for_publish` 是文档错(§5.1)。**既有褶皱:** `PyExecutorKVTransferEffects.hold_for_transfer` 一律置 `KV_PUBLISH_IN_PROGRESS`(`kv_transfer/effects.py:241`),fetch hold 也如此——记进设计 §4.2 待决,本轮不改 |
 | `RecordState.PLANNED` 用于 publish 记录 | **不改,不加 `PENDING`** | `records.py::RecordState` | 第六个状态给同一条边两个名字是复杂度不是可读性 |
 | `Binding.launch_reserved_fetches`/`Coordinator.launch_fetches`;`notify_request_finished`/`on_request_finished` | 不变 | — | 已区分 |
 
@@ -149,7 +151,7 @@ README 自己规定"当前与它有哪些出入,另行成文",所以分两类(�
    `records.py::TransferRecord.merged_served` 的守卫防混接。
 3. **`backends/worker/`**:搬 `PeerFetch`/`PeerPublish`,补 `Fetches` 五个必需成员,`PlaceOutcome → Outcome` 映射后再实现 `PlacesPieces`。
 4. **契约换名**:删 `base/cache_backend.py`,`base/backend.py` 取新契约,8 处 import 改 `from ..base import`(`registry.py`、`blob/backend.py`、
-   `kv_transfer_coordinator.py`、`records.py`、`kv_v2_reader.py`、`naming.py`、`kv_transfer_interfaces.py` + T3 测试)。
+   `kv_transfer/coordinator.py`、`kv_transfer/records.py`、`kv_v2_reader.py`、`naming.py`、`kv_transfer/interfaces.py` + T3 测试)。
 5. 之后:`Planner` 短路规则接上调度器路由(设计 §12.2 第 1–2 步),T1 的 339 个用例对照附录 C 迁到 `KVTransferCoordinator`,删旧协调层三文件。
 
 ## 7. 步骤、检查点、风险、回滚

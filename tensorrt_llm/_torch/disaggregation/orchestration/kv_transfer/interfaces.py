@@ -29,10 +29,10 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Callable, Literal, Mapping, Protocol, Sequence, runtime_checkable
 
-from ..base.cache_backend import Attempt, CacheExtent, Fetches
+from ...base.cache_backend import Attempt, CacheExtent, Fetches
 
 if TYPE_CHECKING:
-    from ..base.backend import Chunk
+    from ...base.backend import Chunk
 
 __all__ = [
     "DEFER",

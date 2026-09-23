@@ -12,10 +12,10 @@ The backend answers on its own threads, so each step that depends on it waits on
 
 import time
 
-__extra_import_path__ = ["~/tensorrt_llm/_torch", "../kv_transfer"]
-from disaggregation.orchestration.kv_transfer_coordinator import KVTransferCoordinator  # noqa: E402
-from disaggregation.orchestration.kv_transfer_interfaces import DEFER, FetchSource  # noqa: E402
-from disaggregation.orchestration.remote_cache import FetchPlan, Planner  # noqa: E402
+__extra_import_path__ = ["~/tensorrt_llm/_torch", "../../orchestration/kv_transfer"]
+from disaggregation.orchestration.kv_transfer.coordinator import KVTransferCoordinator  # noqa: E402
+from disaggregation.orchestration.kv_transfer.interfaces import DEFER, FetchSource  # noqa: E402
+from disaggregation.remote_cache import FetchPlan, Planner  # noqa: E402
 from fakes import (  # noqa: E402
     TPB,
     FakeDist,

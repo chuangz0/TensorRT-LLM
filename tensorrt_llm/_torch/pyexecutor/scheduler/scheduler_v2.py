@@ -38,7 +38,7 @@ from .scheduler import (
 )
 
 if TYPE_CHECKING:
-    from ...disaggregation.orchestration.remote_cache import FetchPlan
+    from ...disaggregation.remote_cache import FetchPlan
 
 
 class ScheduleAction(enum.Enum):

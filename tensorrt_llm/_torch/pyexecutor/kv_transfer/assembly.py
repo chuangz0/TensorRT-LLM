@@ -28,25 +28,25 @@ from typing import TYPE_CHECKING, Sequence
 
 from tensorrt_llm.logger import logger
 
-from ..disaggregation.backends.config import KVTransferConfig, load_kv_transfer_config
-from ..disaggregation.backends.registry import (
+from ...disaggregation.backends.config import KVTransferConfig, load_kv_transfer_config
+from ...disaggregation.backends.registry import (
     BackendBuildContext,
     BackendHandle,
     build_backends,
     close_backends,
 )
-from ..disaggregation.orchestration.kv_transfer_coordinator import KVTransferCoordinator
-from ..disaggregation.orchestration.kv_transfer_interfaces import FetchSource, GroupKind
-from ..disaggregation.orchestration.remote_cache import Planner
-from ..disaggregation.resource.kv_extractor import build_page_table_from_manager
-from ..disaggregation.resource.kv_v2_reader import KVv2ResourceReader
-from ..disaggregation.resource.region import KVv2RegionResolver, layout_fingerprint
-from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from .kv_transfer_binding import KVTransferEngineBinding
-from .kv_transfer_effects import EngineWorkQueue, PyExecutorKVTransferEffects, SingleRankDist
+from ...disaggregation.orchestration.kv_transfer.coordinator import KVTransferCoordinator
+from ...disaggregation.orchestration.kv_transfer.interfaces import FetchSource, GroupKind
+from ...disaggregation.remote_cache import Planner
+from ...disaggregation.resource.kv_extractor import build_page_table_from_manager
+from ...disaggregation.resource.kv_v2_reader import KVv2ResourceReader
+from ...disaggregation.resource.region import KVv2RegionResolver, layout_fingerprint
+from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from .binding import KVTransferEngineBinding
+from .effects import EngineWorkQueue, PyExecutorKVTransferEffects, SingleRankDist
 
 if TYPE_CHECKING:
-    from .py_executor import PyExecutor
+    from ..py_executor import PyExecutor
 
 __all__ = ["KV_TRANSFER_STATUS_DUMP_ENV", "attach_kv_transfer", "check_engine_supports_kv_transfer"]
 
@@ -69,7 +69,7 @@ def check_engine_supports_kv_transfer(
     max_beam_width: int,
 ) -> None:
     """The scope guard of plan §1 item 7: raise ``ValueError`` naming the first unmet condition."""
-    from .scheduler.scheduler_v2 import KVCacheV2Scheduler
+    from ..scheduler.scheduler_v2 import KVCacheV2Scheduler
 
     kv_cache_manager = executor.kv_cache_manager
     if not isinstance(kv_cache_manager, KVCacheManagerV2):

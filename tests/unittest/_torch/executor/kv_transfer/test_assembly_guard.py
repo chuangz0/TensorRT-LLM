@@ -23,14 +23,14 @@ from engine_fakes import (
 
 from tensorrt_llm._torch.disaggregation.backends.config import BackendEntry, KVTransferConfig
 from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer_interfaces import DEFER
-from tensorrt_llm._torch.pyexecutor import kv_transfer_assembly
+from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import DEFER
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_transfer_assembly import (
+from tensorrt_llm._torch.pyexecutor.kv_transfer import assembly
+from tensorrt_llm._torch.pyexecutor.kv_transfer.assembly import (
     attach_kv_transfer,
     check_engine_supports_kv_transfer,
 )
-from tensorrt_llm._torch.pyexecutor.kv_transfer_effects import (
+from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import (
     EngineRequestView,
     PyExecutorKVTransferEffects,
 )
@@ -181,10 +181,10 @@ def test_attach_refuses_an_out_of_scope_engine_before_reading_the_config(tmp_pat
 def test_status_dump_path_replaces_pid(monkeypatch):
     import os
 
-    monkeypatch.setenv(kv_transfer_assembly.KV_TRANSFER_STATUS_DUMP_ENV, "/x/kvt-{pid}.json")
-    assert kv_transfer_assembly._status_dump_path() == f"/x/kvt-{os.getpid()}.json"
-    monkeypatch.delenv(kv_transfer_assembly.KV_TRANSFER_STATUS_DUMP_ENV)
-    assert kv_transfer_assembly._status_dump_path() is None
+    monkeypatch.setenv(assembly.KV_TRANSFER_STATUS_DUMP_ENV, "/x/kvt-{pid}.json")
+    assert assembly._status_dump_path() == f"/x/kvt-{os.getpid()}.json"
+    monkeypatch.delenv(assembly.KV_TRANSFER_STATUS_DUMP_ENV)
+    assert assembly._status_dump_path() is None
 
 
 class TestAssembledCoordinator:
@@ -212,7 +212,7 @@ class TestAssembledCoordinator:
             probe_timeout_s=probe_timeout_s,
             fetch_timeout_s=12.5,
         )
-        coordinator = kv_transfer_assembly._build_coordinator(config, [handle], reader, effects)
+        coordinator = assembly._build_coordinator(config, [handle], reader, effects)
         return coordinator, reader
 
     def test_planner_budget_is_the_wall_clock_alone(self):

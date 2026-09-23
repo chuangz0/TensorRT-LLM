@@ -463,7 +463,7 @@ class KVTransferCoordinator:
 
 ### 7.2 `Planner`
 
-**职责**:来源策略(取不取、问谁、取到哪)和归并(§6.3)。它是唯一**为了做决策而读请求内容**的地方;extent 与 chunk 的构造、命名在 `resource/`。文件 `orchestration/remote_cache.py`(README §5 的名字;类名说它做什么)。
+**职责**:来源策略(取不取、问谁、取到哪)和归并(§6.3)。它是唯一**为了做决策而读请求内容**的地方;extent 与 chunk 的构造、命名在 `resource/`。文件 `disaggregation/remote_cache.py`(README §5 的名字;类名说它做什么)。
 
 ```python
 @dataclass(frozen=True)
@@ -507,9 +507,9 @@ probe 的等待有两个预算,先到者为准:`probe_budget_rounds`(按 `decide
 | 5 | token_end | worker:prompt 的整块末端;store:probe 答案的**连续**前缀末端;重试时用重试提示 |
 | 6 | 一致性 | 计划只用所有 rank 相同的输入(prompt、路由提示、probe 答案);本地命中深度各 rank 可能不同,只用它裁 `units_by_group`,裁到空仍是合法计划(契约允许 units 为空) |
 
-### 7.3 引擎 effects(`orchestration/kv_transfer_interfaces.py`)
+### 7.3 引擎 effects(`orchestration/kv_transfer/interfaces.py`)
 
-Coordinator 通过 effects 反向触达引擎,这是它对引擎的全部依赖。引擎侧实现(`pyexecutor/kv_transfer_effects.py`,唯一写请求状态的地方)每个一行职责。旧路(disagg 配对路径)对应的是 `orchestration/interfaces.py` 与 `pyexecutor/disagg_adapter.py`,两对文件待 §12 统一后合并:
+Coordinator 通过 effects 反向触达引擎,这是它对引擎的全部依赖。引擎侧实现(`pyexecutor/kv_transfer/effects.py`,唯一写请求状态的地方)每个一行职责。旧路(disagg 配对路径)对应的是 `orchestration/interfaces.py` 与 `pyexecutor/disagg_adapter.py`,两对文件待 §12 统一后合并:
 
 | effect | 新/旧 | 作用 |
 |---|---|---|
@@ -541,7 +541,7 @@ Coordinator 通过 effects 反向触达引擎,这是它对引擎的全部依赖�
 
 ### 7.5 契约之外的可选协议 「已定」
 
-第一版只有两个,都只有 worker 后端实现,放在 `orchestration/kv_transfer_interfaces.py`。与契约里 `RegistersPools` 同一套路:实现了才有此能力,用 `isinstance` 判断。**每个协议至少有一个成员**:空的 `@runtime_checkable` Protocol 对任何对象都判真。
+第一版只有两个,都只有 worker 后端实现,放在 `orchestration/kv_transfer/interfaces.py`。与契约里 `RegistersPools` 同一套路:实现了才有此能力,用 `isinstance` 判断。**每个协议至少有一个成员**:空的 `@runtime_checkable` Protocol 对任何对象都判真。
 
 - **`PlacesPieces.place(chunk: Chunk) -> Attempt`**
   解决:尾部半块、活 SSM 状态没有名字,只能按位置搬(README §2 的"放置入口")。`Chunk` 今天在 `base/backend.py`(配对路径的旧契约),kv-shared-draft 已把它搬到 `resource/page.py`;本分支随配对路径迁移一并跟进(ALIGNMENT_PLAN §6)。

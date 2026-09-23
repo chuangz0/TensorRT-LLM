@@ -40,16 +40,16 @@ from typing import TYPE_CHECKING, Sequence
 
 from tensorrt_llm.logger import logger
 
-from ..disaggregation.backends.config import BackendEntry
-from ..disaggregation.backends.registry import BackendHandle, close_backends
-from ..disaggregation.orchestration.kv_transfer_coordinator import KVTransferCoordinator
-from ..disaggregation.orchestration.kv_transfer_interfaces import DEFER
-from ..disaggregation.resource.kv_v2_reader import KVv2ResourceReader
-from .kv_transfer_effects import EngineRequestView, PyExecutorKVTransferEffects
-from .llm_request import LlmRequest, LlmRequestState
+from ...disaggregation.backends.config import BackendEntry
+from ...disaggregation.backends.registry import BackendHandle, close_backends
+from ...disaggregation.orchestration.kv_transfer.coordinator import KVTransferCoordinator
+from ...disaggregation.orchestration.kv_transfer.interfaces import DEFER
+from ...disaggregation.resource.kv_v2_reader import KVv2ResourceReader
+from ..llm_request import LlmRequest, LlmRequestState
+from .effects import EngineRequestView, PyExecutorKVTransferEffects
 
 if TYPE_CHECKING:
-    from .py_executor import PyExecutor
+    from ..py_executor import PyExecutor
 
 __all__ = ["KVTransferEngineBinding"]
 

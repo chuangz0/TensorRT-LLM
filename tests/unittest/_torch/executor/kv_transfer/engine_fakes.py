@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fakes for the engine-side KV transfer tests, imported through ``tensorrt_llm``.
 
-``kv_transfer/fakes.py`` imports the coordination layer as ``disaggregation.*`` so that suite runs
-without ``tensorrt_llm``; the engine-side modules under test here (``pyexecutor/kv_transfer_*``)
-import it as ``tensorrt_llm._torch.disaggregation.*``, and one contract must not exist twice in a
-process. These are the same table-backed fakes, trimmed to what the engine binding exercises, over
-the ``tensorrt_llm`` copy of the contract.
+``orchestration/kv_transfer/fakes.py`` imports the coordination layer as ``disaggregation.*`` so
+that suite runs without ``tensorrt_llm``. The engine-side modules under test here
+(``pyexecutor/kv_transfer/``) import it as ``tensorrt_llm._torch.disaggregation.*``, and one
+contract must not exist twice in a process. These are the same table-backed fakes, trimmed to what
+the engine binding exercises, over the ``tensorrt_llm`` copy of the contract.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from tensorrt_llm._torch.disaggregation.base.cache_backend import (
     SubmissionRejected,
     Unit,
 )
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer_interfaces import (
+from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import (
     GroupKind,
     GroupSpec,
 )

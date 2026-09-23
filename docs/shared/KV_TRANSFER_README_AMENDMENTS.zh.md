@@ -10,7 +10,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## A 类:改终态设计,需要作者批准
 
-**A1. `orchestration/remote_cache.py` 承载 `Planner`。**
+**A1. `disaggregation/remote_cache.py` 承载 `Planner`。**
 README §5 给 `remote_cache.py` 的职责是"远端缓存的取用策略"。本分支落地的 `Planner` 正是它:决定取不取、问谁、取到哪并归并(`merge`、`retry_hint_from`),
 也决定 gen-init 的短路与 gen-first 的 `DEFER`。它**不**持有目的区域——调度器经 `reserve_transfer_pages(req, token_end)` 预留页;**不**构造 extent——
 `KVv2ResourceReader.fetch_extent` 做。README 中与路由提示相关的 `hint.py` 尚不存在,随 worker 后端一并拆出(见 B2)。
@@ -35,11 +35,11 @@ README 无对应条目;它是 `resource/` 层"请求 → 可命名内容"的入�
 `backends/registry.py`(`type` → 工厂 → `BackendHandle`;内置表按名懒加载)。README 只写"装配表一行加一个后端",没写装配表长什么样。
 
 **B6. "在飞传输的登记"有两份。** 旧路 `orchestration/transfer_manager.py`(`AsyncTransferManager`,服务 transceiver),新路
-`orchestration/records.py`(`TransferRecord` 表,服务 `KVTransferCoordinator`)。统一后后者取代前者(设计 §12.1)。
+`orchestration/kv_transfer/records.py`(`TransferRecord` 表,服务 `KVTransferCoordinator`)。统一后后者取代前者(设计 §12.1)。
 
-**B7. 引擎侧三文件。** `pyexecutor/kv_transfer_effects.py`(唯一写请求状态处)、`kv_transfer_binding.py`(循环每轮调用的对象:
+**B7. 引擎侧三文件。** `pyexecutor/kv_transfer/effects.py`(唯一写请求状态处)、`kv_transfer/binding.py`(循环每轮调用的对象:
 `advance_round` / `launch_reserved_fetches` / `publish_committed_blocks` / `on_request_finished` / `is_tracking` / `pace_idle` / `close`)、
-`kv_transfer_assembly.py`(装配与范围守卫)。README 无引擎层;旧路对应 `pyexecutor/disagg_adapter.py`。
+`kv_transfer/assembly.py`(装配与范围守卫)。README 无引擎层;旧路对应 `pyexecutor/disagg_adapter.py`。
 
 **B9. 新契约的落点。** 在 `feat/mooncake-store-backend` 上,SPEC §7 的十三个名字从 `base/cache_backend.py` 导出,与 kv-shared-draft 的
 `base/backend.py` **逐字节同步**(模块 docstring 末尾有核对命令);`base/backend.py` 仍是配对路径(`transceiver.py`、`native/`)的旧契约,
@@ -50,7 +50,7 @@ README 无对应条目;它是 `resource/` 层"请求 → 可命名内容"的入�
 | README §5 | 本分支 |
 |---|---|
 | `backends/blob/` | `backends/blob/{backend,client,keys,staging,worker_pool,mooncake}.py` |
-| `orchestration/remote_cache.py` | 同名,类 `Planner` |
+| `disaggregation/remote_cache.py` | 同名,类 `Planner` |
 | `resource/region.py`(页表 → 指针) | 同名,`KVv2RegionResolver` + `layout_fingerprint` |
 | `base/region.py` | 追加 `RegionResolver` Protocol 与 `Segment` |
 | `backends/config.py` | 同名,`KVTransferConfig` / `BackendEntry` / `load_kv_transfer_config` |
