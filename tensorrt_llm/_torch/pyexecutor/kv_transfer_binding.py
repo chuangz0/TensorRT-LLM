@@ -158,6 +158,13 @@ class KVTransferEngineBinding:
     def has_transfer_in_flight(self) -> bool:
         return self.coordinator.has_inflight()
 
+    def inflight_request_ids(self) -> frozenset[int]:
+        """Requests whose pages a backend may still read or write. They stay schedulable, but the
+        scheduler must neither evict nor recompute-pause them (``schedule_request``'s
+        ``protected_from_eviction_request_ids``), and the engine must not free them behind the
+        release gate."""
+        return self.coordinator.inflight_request_ids()
+
     def pace_idle(self) -> None:
         """An idle loop pass that only a backend can unblock (a transfer in flight, or a lookup a
         request is deferred on) yields briefly instead of spinning through the probe budget."""
@@ -217,7 +224,9 @@ class KVTransferEngineBinding:
         closer.join(self._close_timeout_s)
         if closer.is_alive():
             logger.error(
-                "kv transfer: backends did not close within %.1f s; giving them up",
+                "kv transfer: backends did not close within %.1f s; giving them up. The KV pools "
+                "are about to be freed while a backend operation may still be in flight; the "
+                "backend threads are daemons, so they cannot keep the process from exiting.",
                 self._close_timeout_s,
             )
             return False
@@ -249,16 +258,17 @@ class KVTransferEngineBinding:
     def _publishable_completed_contexts(
         self, context_requests: Sequence[LlmRequest]
     ) -> list[EngineRequestView]:
-        """Plan §9 rule 4: prefill ended, pages present (a failed request has none), not
+        """Plan §9 rule 4: prefill ended, pages present and active on the GPU (a failed request
+        has none; a suspended cache has left the GPU and the store must not read it), not
         generation-only (its prefix was published by the context worker that computed it), not
         dummy. A request that finished with its first token still publishes."""
-        kv_cache_map = self._executor.kv_cache_manager.kv_cache_map
+        kv_cache_manager = self._executor.kv_cache_manager
         completed = []
         for request in context_requests:
             has_prefill_ended = request.context_remaining_length == 0
-            has_pages = request.py_request_id in kv_cache_map
+            has_active_pages = kv_cache_manager.is_request_active(request.py_request_id)
             is_generation_side = request.is_generation_only_request
-            if not has_prefill_ended or not has_pages or is_generation_side:
+            if not has_prefill_ended or not has_active_pages or is_generation_side:
                 continue
             if request.is_dummy_request:
                 continue

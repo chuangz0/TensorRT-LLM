@@ -6661,8 +6661,19 @@ class PyExecutor:
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
-        scheduler_output = self.scheduler.schedule_request(
-            self.active_requests, self.inflight_req_ids)
+        if self.kv_transfer is not None:
+            # A store backend may still read or write the pages of a request with a KV transfer in
+            # flight; evicting or recompute-pausing it would hand those pages to someone else and
+            # poison the store. The request stays schedulable (its own active cache locks the
+            # pages); only eviction and pause are ruled out.
+            scheduler_output = self.scheduler.schedule_request(
+                self.active_requests,
+                self.inflight_req_ids,
+                protected_from_eviction_request_ids=self.kv_transfer.
+                inflight_request_ids())
+        else:
+            scheduler_output = self.scheduler.schedule_request(
+                self.active_requests, self.inflight_req_ids)
 
         scheduled_encoder_requests = scheduler_output.encoder_requests
         should_batch_encoder_requests = (self.is_encoder_decoder
@@ -8726,6 +8737,17 @@ class PyExecutor:
         if not requests:
             return
         for req in requests:
+            if (self.kv_transfer is not None and req.py_request_id
+                    in self.kv_transfer.inflight_request_ids()):
+                # Freeing here bypasses the KV transfer release gate while a store backend may
+                # still read the pages; the scheduler excludes such requests from recompute
+                # pause, so this is a guard against poisoning the store, not an expected path.
+                # Nothing leaks: the request keeps running and its resources are released by
+                # its normal termination, through the gate.
+                logger.warning(
+                    "request %d: recompute pause skipped its resource release, a KV transfer "
+                    "is in flight", req.py_request_id)
+                continue
             if (self._disagg_pp_termination_handler is not None
                     and not req.is_dummy_request):
                 request_id = req.py_request_id

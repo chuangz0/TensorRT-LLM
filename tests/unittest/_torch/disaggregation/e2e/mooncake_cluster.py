@@ -30,9 +30,28 @@ import yaml
 KV_TRANSFER_CONFIG_ENV = "TRTLLM_KV_TRANSFER_CONFIG"
 KV_TRANSFER_STATUS_DUMP_ENV = "TRTLLM_KV_TRANSFER_STATUS_DUMP"
 
-MODEL_PATH = os.environ.get(
-    "TINYLLAMA_MODEL_PATH", "/workspaces/tekit/.models/TinyLlama-1.1B-Chat-v1.0"
-)
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), *([".."] * 5)))
+_MODEL_NAME = "TinyLlama-1.1B-Chat-v1.0"
+
+
+def _model_path() -> str:
+    """``$TINYLLAMA_MODEL_PATH``, else the model under ``$LLM_MODELS_ROOT`` (directly or in
+    ``llama-models-v2/``, the layout the model root uses), else the repo's ``.models/``."""
+    explicit = os.environ.get("TINYLLAMA_MODEL_PATH")
+    if explicit:
+        return explicit
+    root = os.environ.get("LLM_MODELS_ROOT")
+    if root:
+        for candidate in (
+            os.path.join(root, _MODEL_NAME),
+            os.path.join(root, "llama-models-v2", _MODEL_NAME),
+        ):
+            if os.path.isdir(candidate):
+                return candidate
+    return os.path.join(_REPO_ROOT, ".models", _MODEL_NAME)
+
+
+MODEL_PATH = _model_path()
 MASTER = shutil.which("mooncake_master") or os.path.expanduser("~/.local/bin/mooncake_master")
 
 TOKENS_PER_BLOCK = 32
@@ -208,6 +227,9 @@ def start_segment_provider(
 @pytest.fixture
 def mooncake_cluster():
     """A master and one segment provider, killed at teardown whatever happened."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("the engines need a GPU")
     pytest.importorskip("mooncake.store")
     if not os.access(MASTER, os.X_OK):
         pytest.skip("mooncake_master binary not found")

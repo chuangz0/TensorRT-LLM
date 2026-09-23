@@ -33,7 +33,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Iterator, Mapping, Optional, Sequence, TypeVar
 
@@ -52,8 +51,14 @@ from .config import MooncakeStoreConfig
 from .keys import KeyScheme
 from .regions import RegionResolver, Segment
 from .staging import HostStagingPool
+from .worker_pool import DaemonWorkerPool
 
-__all__ = ["MooncakeStoreBackend", "StoreCounters"]
+__all__ = ["MAX_PROBES", "MooncakeStoreBackend", "StoreCounters"]
+
+MAX_PROBES = 1024
+"""Bound on remembered lookups, pending or answered. A lookup thread that stopped answering must
+not let the table grow without end; past the bound a new ``probe`` raises and the caller plans
+without the store."""
 
 # The stdlib logger keeps this module import-light (no ``tensorrt_llm`` import); note that
 # ``TLLM_LOG_LEVEL_BY_MODULE`` does not route it, so configure ``logging`` for this name directly.
@@ -184,9 +189,11 @@ class MooncakeStoreBackend:
         """Spans whose ``register_buffer`` call is in progress; they refuse overlaps like live ones."""
         self._probes: dict[tuple[bytes, tuple[bytes, ...]], _Probe] = {}
         self._inflight = threading.BoundedSemaphore(config.max_inflight_ops)
-        self._pool = ThreadPoolExecutor(config.num_workers, thread_name_prefix="mooncake-store")
+        # Daemon workers: a store call that never returns must not keep the process alive once
+        # the engine has given the backend up.
+        self._pool = DaemonWorkerPool(config.num_workers, thread_name_prefix="mooncake-store")
         # Lookups have their own thread so a probe is not queued behind every delivery in flight.
-        self._lookups = ThreadPoolExecutor(1, thread_name_prefix="mooncake-store-probe")
+        self._lookups = DaemonWorkerPool(1, thread_name_prefix="mooncake-store-probe")
         self._closed = False
         self.counters = StoreCounters()
 
@@ -265,8 +272,9 @@ class MooncakeStoreBackend:
         """Queue a lookup on first sight and answer ``None``; hand out the answer once it is in.
 
         The answer is consumed by the call that receives it, and an unclaimed one expires after
-        ``probe_ttl_s``. A lookup that failed raises here, once, and is then forgotten so the next
-        call asks again.
+        ``probe_ttl_s``, as does a lookup still pending after that long (it is asked again on the
+        next call). A lookup that failed raises here, once, and is then forgotten so the next
+        call asks again. With ``MAX_PROBES`` lookups remembered, a new one raises instead.
         """
         if not units:
             return frozenset()
@@ -278,6 +286,8 @@ class MooncakeStoreBackend:
             if entry is None:
                 if self._closed:
                     raise RuntimeError("store backend is closed")
+                if len(self._probes) >= MAX_PROBES:
+                    raise RuntimeError(f"{MAX_PROBES} store lookups already remembered")
                 entry = _Probe(created=now)
                 self._probes[key] = entry
                 try:
@@ -422,8 +432,11 @@ class MooncakeStoreBackend:
         return present
 
     def _staged(self, count: int, body: Callable[[list[int]], _T]) -> _T:
-        """Run ``body`` with ``count`` staging slots. Copies are drained before the slots go back,
-        even when ``body`` raises: a copy still in flight into a slot someone else then reuses
+        """Run ``body`` with ``count`` staging slots, which go back when it returns or raises.
+
+        Drain contract: ``body`` waits for its own copies (``staging.sync``) before it returns,
+        so on the normal path the slots are quiet when released. When ``body`` raises, the copies
+        are drained here instead: a copy still in flight into a slot someone else then reuses
         would corrupt their delivery, and one out of the caller's memory would break quiescence."""
         assert self._staging is not None
         slots = self._staging.acquire(count)
@@ -487,8 +500,12 @@ class MooncakeStoreBackend:
         pending: list[_Task] = []
         for batch in _batched(tasks, self._batch):
             present = self._exists(batch)
-            # Present units are merged, not rewritten (§6.3 requirement 2); a failed lookup is
-            # retried as a write, which the store resolves the same way.
+            if any(status < 0 for status in present):
+                # A store that cannot answer whether it holds a unit is out of reach; treating the
+                # answer as "absent" would turn an outage into writes against it (and a fetch on
+                # the same answer fails, so the two directions agree).
+                return Failed("store lookup failed")
+            # Present units are merged, not rewritten (§6.3 requirement 2).
             pending.extend(task for task, status in zip(batch, present) if status != 1)
             served.update(task.name for task, status in zip(batch, present) if status == 1)
         with self._lock:
@@ -550,7 +567,9 @@ class MooncakeStoreBackend:
 
         A unit the store declined but holds anyway lost a race with another publisher and counts
         as taken; one it declined and does not hold is simply not served. Only a call that itself
-        misbehaves (exception, wrong count, failed lookup) is a failure.
+        misbehaves (exception, wrong count, failed lookup) is a failure. Units written before such
+        a failure are still returned and counted in ``publish_stored`` (they are in the store),
+        but the caller's attempt ends ``Failed`` and reports no served set.
 
         TODO: the Python bindings expose no error-code table, so every non-zero put status is
         treated as "declined" here. Once the codes for already-exists and no-space are known,
@@ -561,6 +580,8 @@ class MooncakeStoreBackend:
             return [], f"batch_put answered {len(results)} of {len(tasks)} keys"
         taken = [task for task, status in zip(tasks, results) if status == 0]
         declined = [task for task, status in zip(tasks, results) if status != 0]
+        with self._lock:
+            self.counters.publish_stored += len(taken)
         raced: list[_Task] = []
         if declined:
             present = self._exists(declined)
@@ -576,7 +597,6 @@ class MooncakeStoreBackend:
                     codes,
                 )
         with self._lock:
-            self.counters.publish_stored += len(taken)
             self.counters.publish_raced += len(raced)
         return taken + raced, None
 
@@ -604,11 +624,13 @@ class MooncakeStoreBackend:
                 entry.done = True
 
     def _expire_probes(self, now: float) -> None:
-        """Caller holds the lock."""
+        """Drop answered and still-pending lookups older than the TTL. Caller holds the lock.
+
+        A pending entry that expires is detached, not cancelled: the lookup thread writes its
+        answer into an object nobody reads any more, which is harmless.
+        """
         ttl = self._config.probe_ttl_s
-        stale = [
-            key for key, entry in self._probes.items() if entry.done and now - entry.created > ttl
-        ]
+        stale = [key for key, entry in self._probes.items() if now - entry.created > ttl]
         for key in stale:
             del self._probes[key]
 

@@ -95,6 +95,9 @@ class TransferRecord:
         rejected: Publish only; some submission of this record raised ``SubmissionRejected``.
             The units it carried were never offered, so the publish as a whole has failed even if
             the other pieces land.
+        consecutive_rejections: Fetch only; ``SubmissionRejected`` answers in a row since the
+            last launch that went through. Past ``MAX_CONSECUTIVE_REJECTIONS`` the source counts
+            as unavailable for this record.
     """
 
     request_id: int
@@ -108,6 +111,7 @@ class TransferRecord:
     abandoned: bool = False
     retry_hint: int | None = None
     rejected: bool = False
+    consecutive_rejections: int = 0
 
     @property
     def key(self) -> RecordKey:

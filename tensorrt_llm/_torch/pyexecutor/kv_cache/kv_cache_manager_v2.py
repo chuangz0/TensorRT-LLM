@@ -3758,7 +3758,12 @@ class KVCacheManagerV2(BaseResourceManager):
             if req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
-        self._fill_fresh_kv_pages(req.py_request_id)
+        if token_end is None:
+            # The diagnostic fill is an asynchronous write on the engine stream; a store backend
+            # writes the fetched pages from its own thread with no ordering against it, so the
+            # two could race. The fetch fills every reserved block itself, and the fill runs again
+            # on the next generation step for anything the fetch did not cover.
+            self._fill_fresh_kv_pages(req.py_request_id)
         self._log_window_crossing(
             req, kv_cache, pre_cap, capacity, "disagg_gen_init" if token_end is None else "kv_fetch"
         )

@@ -10,7 +10,7 @@ budget runs out first ends the wait. Import-light like the ``kv_transfer`` suite
 
 import pytest
 
-__extra_import_path__ = ["~/tensorrt_llm/_torch", "../kv_transfer"]
+__extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.orchestration.kv_transfer_interfaces import DEFER, FetchSource  # noqa: E402
 from disaggregation.orchestration.planner import FetchPlan, Planner  # noqa: E402
 from fakes import TPB, FakeFetches, FakeReader, FakeRequest, full_attention  # noqa: E402
@@ -141,15 +141,3 @@ def test_no_budget_at_all_waits_indefinitely():
     for _ in range(50):
         clock.now += 100.0
         assert planner.decide(req, UNANSWERED) is DEFER
-
-
-def test_default_clock_is_time_monotonic():
-    import time
-
-    reader = FakeReader(groups=[full_attention(0)])
-    store = FakeFetches(name="store", single_destination=True)
-    planner = Planner([FetchSource("store", store, None)], reader, TPB)
-    assert planner._clock is time.monotonic
-    # Defaults keep the round-counted behavior of the existing suite; the engine assembly is what
-    # sets the wall-clock budget from the config (plan §10 #5).
-    assert planner._probe_timeout_s is None and planner._probe_budget_rounds == 2

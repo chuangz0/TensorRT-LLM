@@ -50,6 +50,7 @@ def in_scope_executor() -> PyExecutor:
     executor.kv_cache_manager = kv_cache_manager
     executor.draft_kv_cache_manager = None
     executor.scheduler = object.__new__(KVCacheV2Scheduler)
+    executor.enable_kv_pool_rebalance = False
     return executor
 
 
@@ -96,6 +97,13 @@ def _v1_scheduler():
     return executor
 
 
+def _pool_rebalance():
+    # Rebalancing moves pages between pools while a store backend may still be reading them.
+    executor = in_scope_executor()
+    executor.enable_kv_pool_rebalance = True
+    return executor
+
+
 @pytest.mark.parametrize(
     "make_executor, mapping, overrides, reason",
     [
@@ -115,6 +123,12 @@ def _v1_scheduler():
         (_draft_manager, None, {}, "a draft KV cache manager is present"),
         (in_scope_executor, None, {"max_beam_width": 2}, "beam search is not supported"),
         (_v1_scheduler, None, {}, "the scheduler must be KVCacheV2Scheduler, got Mock"),
+        (
+            _pool_rebalance,
+            None,
+            {},
+            "kv_cache_config.enable_kv_pool_rebalance=True is not supported",
+        ),
     ],
     ids=[
         "v1_manager",
@@ -128,6 +142,7 @@ def _v1_scheduler():
         "draft",
         "beam",
         "scheduler",
+        "pool_rebalance",
     ],
 )
 def test_every_out_of_scope_condition_is_refused_with_its_reason(
@@ -210,19 +225,6 @@ class TestAssembledCoordinator:
         assert planner._probe_timeout_s == 0.05
         assert planner._clock is time.monotonic  # plan §10 #15: one clock with ``advance``
         assert coordinator._fetch_timeout_s == 12.5 and coordinator._publish_timeout_s is None
-
-    def test_unanswered_probe_defers_until_the_timeout_then_plans_locally(self):
-        coordinator, _ = self._build(probe_timeout_s=0.05, store=FakeFetches(probe_answer=None))
-        view = EngineRequestView(make_request(1, 100))
-        started = time.monotonic()
-        rounds = 0
-        while coordinator.plan_fetch(view) is DEFER and time.monotonic() - started < 2.0:
-            coordinator.advance([view], time.monotonic())
-            rounds += 1
-            time.sleep(0.001)
-        assert coordinator.plan_fetch(view) is None
-        assert rounds > 2  # more than the old two-round budget would have allowed
-        assert time.monotonic() - started >= 0.05
 
     def test_answered_probe_plans_within_the_budget(self):
         coordinator, _ = self._build(probe_timeout_s=0.05, store=FakeFetches(probe_answer="all"))

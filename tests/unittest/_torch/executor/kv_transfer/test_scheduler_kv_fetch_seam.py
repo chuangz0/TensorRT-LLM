@@ -343,20 +343,110 @@ def test_planner_is_asked_once_per_request_per_round():
 # ---------------------------------------------------------------------------------------------
 
 
+class FilteringPlanner(FakePlanner):
+    """A planner that applies the binding's real candidate filter before answering a plan."""
+
+    def plan_fetch(self, req):
+        from tensorrt_llm._torch.pyexecutor.kv_transfer_binding import _is_fetch_candidate
+
+        self.asked.append(req.py_request_id)
+        if not _is_fetch_candidate(req):
+            return None
+        return self.answers.get(req.py_request_id)
+
+
 def test_dummy_request_with_a_planner_attached_is_scheduled_normally():
-    """The binding answers None for a dummy (plan §9 rule 3); the scheduler then takes the
-    ordinary context path for it, exactly as with no planner."""
+    """The binding's candidate filter (plan §9 rule 3) answers None for a dummy even when a plan
+    would exist; the scheduler then takes the ordinary context path for it."""
     mgr = make_kv_cache_manager()
     sched = make_scheduler(mgr)
-    planner = FakePlanner({1: None})
+    planner = FilteringPlanner({1: FakePlan(token_end=64), 2: FakePlan(token_end=64)})
     sched.kv_transfer_planner = planner
     dummy = make_ctx_request(1, 100)
     dummy.is_dummy_request = True
-    out = sched.schedule_request([dummy], set())
-    assert ids(out.context_requests) == [1]
-    assert out.fetch_launch_queue == []
-    mgr.prepare_context.assert_called_once()
-    mgr.prepare_disagg_gen_init.assert_not_called()
+    real = make_ctx_request(2, 100)
+    out = sched.schedule_request([dummy, real], set())
+    assert planner.asked == [1, 2]
+    assert ids(out.context_requests) == [1]  # the dummy computed locally
+    assert ids(out.fetch_launch_queue) == [2]  # the real request fetches
+    mgr.prepare_disagg_gen_init.assert_called_once_with(real, 64)
+
+
+# ---------------------------------------------------------------------------------------------
+# A request with a publish in flight keeps its pages (plan §9 rule 5, design §4.3)
+# ---------------------------------------------------------------------------------------------
+
+PROTECT_99 = dict(protected_from_eviction_request_ids=frozenset({99}))
+"""What the executor passes: ``kv_transfer.inflight_request_ids()`` at scheduling time."""
+
+
+def test_generation_request_with_a_publish_in_flight_is_not_evicted():
+    """Pool pressure would evict the started request at the tail; its blocks are being read by
+    a backend, so the scheduler must pick nobody and the asking request self-evicts instead."""
+
+    def alloc_fn(req):
+        return req.request_id in (0, 99)  # gen1 never fits; the victim itself does
+
+    mgr = make_kv_cache_manager()
+    mgr.try_allocate_generation.side_effect = alloc_fn
+    sched = make_scheduler(mgr, max_num_tokens=100)
+    victim = make_gen_request(99)  # started before gen1: the ordinary eviction victim
+    out = sched.schedule_request(
+        [make_gen_request(0), victim, make_gen_request(1)], set(), **PROTECT_99
+    )
+    assert ids(out.generation_requests) == [0, 99]
+    assert 99 not in ids(out.paused_requests)
+    assert 99 not in ids(out.recompute_paused_requests)
+    for call_args in mgr.suspend_request.call_args_list:
+        assert call_args.args[0] is not victim
+    assert ids(out.paused_requests) == [1]  # gen1 evicted itself
+
+
+def test_generation_request_with_a_publish_in_flight_is_not_recompute_paused():
+    """With a secondary tier the fallback is a full recompute teardown; a request whose pages a
+    backend is still reading is not a candidate for that either."""
+
+    def alloc_fn(req):
+        return req.request_id in (0, 99)
+
+    mgr = make_kv_cache_manager()
+    mgr.can_evict = True
+    mgr.try_allocate_generation.side_effect = alloc_fn
+    sched = make_scheduler(mgr, max_num_tokens=100)
+    victim = make_gen_request(99)
+    out = sched.schedule_request(
+        [make_gen_request(0), victim, make_gen_request(1)], set(), **PROTECT_99
+    )
+    assert 99 not in ids(out.recompute_paused_requests)
+    assert 99 not in ids(out.paused_requests)
+    for call_args in mgr.free_resources.call_args_list:
+        assert call_args.args[0] is not victim
+    assert ids(out.generation_requests) == [0, 99]
+
+
+def test_protected_request_that_cannot_allocate_is_progress_for_the_deadlock_detector():
+    """Nothing scheduled and nothing evicted, but the one generation request is protected by a
+    transfer in flight: that transfer is what will free pages, so this is not a deadlock."""
+    mgr = make_kv_cache_manager()
+    mgr.try_allocate_generation.side_effect = lambda req: False
+    sched = make_scheduler(mgr, max_num_tokens=100)
+    protected = make_gen_request(99)
+    out = sched.schedule_request([protected], set(), **PROTECT_99)  # no deadlock error
+    assert out.generation_requests == []
+    assert 99 not in ids(out.paused_requests) and 99 not in ids(out.recompute_paused_requests)
+    mgr.suspend_request.assert_not_called()
+
+
+def test_generation_request_without_a_publish_in_flight_is_evicted_as_before():
+    def alloc_fn(req):
+        return req.request_id == 0
+
+    mgr = make_kv_cache_manager()
+    mgr.try_allocate_generation.side_effect = alloc_fn
+    sched = make_scheduler(mgr, max_num_tokens=100)
+    victim = make_gen_request(99)
+    out = sched.schedule_request([make_gen_request(0), make_gen_request(1), victim], set())
+    assert 99 in ids(out.paused_requests)
 
 
 def test_context_chunk_continuation_is_not_asked():

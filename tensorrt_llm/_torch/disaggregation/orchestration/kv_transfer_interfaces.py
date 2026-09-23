@@ -124,9 +124,12 @@ class KVTransferEffects(Protocol):
         no_local_fallback: bool,
         aux: Mapping[str, object] | None,
     ) -> None:
-        """A fetch landed. Settle the context cursor at ``token_end``, commit the pages on every
-        resource manager, apply ``aux``, and return the request to ``CONTEXT_INIT`` (or the
-        gen-init "landed, awaiting activation" state when ``no_local_fallback``)."""
+        """A fetch landed. Settle the context cursor at ``token_end`` (or further, if local reuse
+        already reached past it), commit the pages on the resource managers the assembly hosts,
+        apply ``aux`` if the assembly has a consumer for it, and return the request to
+        ``CONTEXT_INIT``. ``no_local_fallback`` marks a gen-init landing, which goes to the
+        "landed, awaiting activation" state instead; an assembly that does not host gen-init
+        requests may refuse it."""
         ...
 
     def give_back_fetch_pages(self, requests: Sequence[RequestView]) -> None:

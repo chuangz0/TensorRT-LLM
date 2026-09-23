@@ -14,8 +14,9 @@
 # limitations under the License.
 """The KV transfer configuration file: which backends to assemble, and the coordinator's limits.
 
-Read from the YAML named by ``TRTLLM_KV_TRANSFER_CONFIG`` (integration plan §8). The ``backends``
-list is the assembly table of design §7.4: its order is the fetch priority, each entry names a
+The executor creator reads ``TRTLLM_KV_TRANSFER_CONFIG`` and hands the YAML path to the assembly,
+which loads it here (integration plan §8); this module reads no environment. The ``backends`` list
+is the assembly table of design §7.4: its order is the fetch priority, each entry names a
 registered backend type and carries that type's own settings unread. Nothing here imports a backend.
 """
 

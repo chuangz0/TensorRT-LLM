@@ -91,6 +91,11 @@ def check_engine_supports_kv_transfer(
         _refuse("a draft KV cache manager is present")
     if max_beam_width != 1:
         _refuse("beam search is not supported")
+    if getattr(executor, "enable_kv_pool_rebalance", False):
+        _refuse(
+            "kv_cache_config.enable_kv_pool_rebalance=True is not supported: a rebalance moves "
+            "pages under a transfer still in flight"
+        )
     if not isinstance(executor.scheduler, KVCacheV2Scheduler):
         _refuse(
             f"the scheduler must be KVCacheV2Scheduler, got {type(executor.scheduler).__name__}"

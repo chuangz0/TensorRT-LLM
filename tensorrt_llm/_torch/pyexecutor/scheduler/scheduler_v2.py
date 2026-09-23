@@ -273,6 +273,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Duck-typed and attached by the executor assembly; None keeps every request
         # on the local compute path.
         self.kv_transfer_planner = None
+        # Set per ``schedule_request`` call; see its docstring.
+        self._protected_from_eviction_request_ids: frozenset[int] = frozenset()
 
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
@@ -295,8 +297,17 @@ class KVCacheV2Scheduler(RequestScheduler):
         return self.no_schedule_until_state, self.no_schedule_after_state
 
     def schedule_request(
-        self, active_requests: RequestList, inflight_request_ids: set[int]
+        self,
+        active_requests: RequestList,
+        inflight_request_ids: set[int],
+        *,
+        protected_from_eviction_request_ids: frozenset[int] = frozenset(),
     ) -> SchedulerOutput:
+        """``protected_from_eviction_request_ids``: requests whose pages a KV transfer backend may
+        still read or write. They are scheduled as usual (their own active cache locks the pages)
+        but are never evicted or recompute-paused, since either would hand the pages to another
+        request while the backend is still on them."""
+        self._protected_from_eviction_request_ids = protected_from_eviction_request_ids
         active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
         # Main scheduling loop
         (
@@ -1426,10 +1437,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Self-eviction: suspend this gen request to free its
         # GPU pages so other requests can resume().
         # Skip if already suspended — suspending again is a no-op
-        # that frees no pages.
-        if self.kv_cache_manager.is_request_active(
-            req.py_request_id
-        ) and not self._has_pending_connector_load(req):
+        # that frees no pages. Skip too while a KV transfer backend may
+        # still read its pages: suspending would move them under it.
+        if (
+            self.kv_cache_manager.is_request_active(req.py_request_id)
+            and not self._has_pending_connector_load(req)
+            and not self._is_protected_from_eviction(req)
+        ):
             logger.debug(
                 f"[V2Scheduler] Self-evicting request {req.py_request_id} "
                 f"(state={req.state.name}) to free GPU pages"
@@ -1592,6 +1606,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             and not r.is_generation_to_complete_state
             and r.request_id not in inflight_request_ids
             and not self._has_pending_connector_load(r)
+            and not self._is_protected_from_eviction(r)
         )
         num_ctx_candidates = sum(
             1
@@ -1611,6 +1626,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         # A connector load in flight releases its pages when it lands, so a
         # pass that reclaims nothing while one is outstanding is not a stall.
         if any(self._has_pending_connector_load(r) for r in active_requests):
+            self._stalled_schedules = 0
+            return
+
+        # A request protected from eviction by an in-flight KV transfer is progress in the
+        # making, like a pipeline in-flight request: its transfer will land and free the way.
+        if self._protected_from_eviction_request_ids:
             self._stalled_schedules = 0
             return
 
@@ -1741,7 +1762,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         Already-suspended requests are not useful eviction victims
         because suspending them again is a no-op that frees no pages.
         """
-        if req.request_id in inflight_request_ids:
+        if req.request_id in inflight_request_ids or self._is_protected_from_eviction(req):
             return False
         if not self._is_started_request(req):
             return False
@@ -1749,10 +1770,14 @@ class KVCacheV2Scheduler(RequestScheduler):
             return False
         return self.kv_cache_manager.is_request_active(req.py_request_id)
 
+    def _is_protected_from_eviction(self, req: LlmRequest) -> bool:
+        """A KV transfer backend may still be on this request's pages (see ``schedule_request``)."""
+        return req.request_id in self._protected_from_eviction_request_ids
+
     def _is_recompute_pause_candidate(
         self, req: LlmRequest, inflight_request_ids: set[int]
     ) -> bool:
-        if req.request_id in inflight_request_ids:
+        if req.request_id in inflight_request_ids or self._is_protected_from_eviction(req):
             return False
         if self._has_pending_connector_load(req):
             return False

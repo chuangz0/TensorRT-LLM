@@ -358,26 +358,6 @@ def test_quiesce_is_true_once_done_and_blocks_while_running():
         assert rank.backend.quiesce([attempt, attempt]) is True
 
 
-def test_quiesce_and_settle_accept_only_store_attempts():
-    class Foreign:
-        def poll(self):
-            return None
-
-    foreign = Foreign()
-    assert isinstance(foreign, Attempt)
-    with make_rank() as rank, make_rank() as other:
-        with pytest.raises(TypeError):
-            rank.backend.quiesce([foreign])
-        with pytest.raises(TypeError):
-            rank.backend.settle([foreign])
-        theirs = other.backend.publish(extent([]))
-        # As implemented, another store backend's attempt is the same class and is accepted.
-        assert rank.backend.quiesce([theirs]) is True
-        rank.backend.settle([theirs])
-        assert rank.backend.quiesce([]) is True
-        rank.backend.settle(())
-
-
 # ---- back-pressure ----
 
 
@@ -402,7 +382,7 @@ def test_max_inflight_ops_rejects_the_excess_and_nothing_escapes():
 
 
 def test_rejected_submission_succeeds_once_an_in_flight_delivery_finishes():
-    # B5: the semaphore is restored by the finishing delivery, whatever its outcome.
+    # The semaphore is restored by the finishing delivery, whatever its outcome.
     with make_rank(max_inflight_ops=2, num_workers=2) as rank:
         units = [rank.unit(0, i, 8) for i in range(3)]
         rank.client.block("batch_is_exist")

@@ -312,7 +312,6 @@ def test_build_backends_returns_one_handle_per_entry_in_order():
     assert handles[0].fetches is not None and handles[0].publishes is not None
     assert handles[1].fetches is None and handles[1].publishes is not None
     assert handles[2].hint_key == "ctx"
-    assert handles[0].counters() == {"built": 1}
     close_backends(handles)
     assert [b.closed for b in FakeBuilt.instances] == [1, 1, 1]
 

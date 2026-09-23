@@ -46,9 +46,12 @@ from .kv_transfer_interfaces import (
 from .planner import FetchPlan, Planner, merge, retry_hint_from
 from .records import AttemptRecord, RecordKey, RecordState, TransferRecord
 
-__all__ = ["KVTransferCoordinator"]
+__all__ = ["MAX_CONSECUTIVE_REJECTIONS", "KVTransferCoordinator"]
 
 logger = logging.getLogger(__name__)
+
+MAX_CONSECUTIVE_REJECTIONS = 3
+"""``SubmissionRejected`` answers in a row after which a fetch record gives up on its source."""
 
 T = TypeVar("T")
 
@@ -428,6 +431,8 @@ class KVTransferCoordinator:
                 self._finish_publish(rec, failed=True, reason="kv publish timed out")
             elif rec.plan.no_local_fallback:
                 self._fetch_failed(rec, hint=None, reason="kv fetch timed out")
+            else:
+                self._fail_expired_fetch(rec)
 
         for key in sorted(arrivals):
             rec = self._records.get(key)
@@ -495,6 +500,20 @@ class KVTransferCoordinator:
             self._release(rec)
             self._plans[rec.request_id] = None
 
+    def _fail_expired_fetch(self, rec: TransferRecord) -> None:
+        """A normal fetch past its deadline: fail the request now, keep its pages held.
+
+        A hung store must not park a request forever, so the wait is bounded by the deadline
+        and the request fails. Its pages cannot be given back yet: the backend may still be
+        writing them, so the record stays in flight and the request is held until the outcome
+        arrives (or ``close``). The late outcome then only releases; it no longer unparks.
+        """
+        req = self._requests[rec.request_id]
+        self._effects.fail_requests([req], "kv fetch timed out")
+        # The engine ends a failed request through its release gate, which notifies this
+        # coordinator; the call is repeated here so the hold does not depend on the engine.
+        self.notify_request_finished(req)
+
     def _release_finished_fetch(self, rec: TransferRecord) -> None:
         """A fetch whose request ended while it was in flight: its outcome is moot. Quiesce,
         release; no ``unpark`` and no ``give_back`` for a request that is gone. The held request
@@ -522,8 +541,10 @@ class KVTransferCoordinator:
         """A finished request's last word to the engine, once no record of it remains.
 
         A held request is terminated; if its publish landed after it ended, the response goes
-        out first; if its publish failed, it fails instead. A request that was never held and
-        whose publish landed before it ended owes the engine nothing: it terminates as usual.
+        out first. A publish that failed after the request ended is logged and the request is
+        terminated all the same: the client already has its final response, and a second, error
+        response would be a duplicate. A request that was never held and whose publish landed
+        before it ended owes the engine nothing: it terminates as usual.
         """
         if rid not in self._finished:
             return
@@ -536,10 +557,10 @@ class KVTransferCoordinator:
             if rid in self._publish_outcome:
                 reason = self._publish_outcome[rid]
                 if reason is not None:
-                    self._effects.fail_requests([req], reason)
+                    logger.warning("request %d: %s after the request ended", rid, reason)
                 else:
                     self._effects.stage_transfer_response(req)
-                    self._effects.terminate_request(req)
+                self._effects.terminate_request(req)
             elif rid in self._held:
                 self._effects.terminate_request(req)
         self._forget_request(rid)
@@ -578,14 +599,27 @@ class KVTransferCoordinator:
         except SubmissionRejected as exc:
             # Nothing escaped, so nothing to quiesce: give the pages back and let the request be
             # planned again without consuming a retry (this is the one back-pressure signal).
-            # The record stays so the retry budget is one budget, not one per rejection.
+            # The record stays so the retry budget is one budget, not one per rejection. A
+            # backend that keeps refusing is treated as unavailable after a few rejections in a
+            # row, so a request cannot bounce between planning and rejection forever.
             logger.info("request %d: fetch rejected by %s: %s", rid, source.name, exc)
             if route is not None:
                 route.close()
+            rec.consecutive_rejections += 1
+            if rec.consecutive_rejections >= MAX_CONSECUTIVE_REJECTIONS:
+                logger.warning(
+                    "request %d: %s rejected %d fetches in a row; computing locally",
+                    rid,
+                    source.name,
+                    rec.consecutive_rejections,
+                )
+                self._drop_launch(req, rec, replan=False, reason=f"kv fetch rejected: {exc}")
+                return False
             self._drop_launch(
                 req, rec, replan=True, reason=f"kv fetch rejected: {exc}", keep_record=True
             )
             return False
+        rec.consecutive_rejections = 0
         try_index = rec.try_index + 1 if rec.attempts else 0
         rec.extent = extent
         rec.attempts.append(

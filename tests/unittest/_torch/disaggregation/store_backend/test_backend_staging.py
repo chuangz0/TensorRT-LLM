@@ -260,7 +260,7 @@ def test_staging_does_not_require_the_callers_pool_to_be_registered():
         assert rank.client.objects[rank.key(u)] == pattern(1, 8)
 
 
-# ---- copier failure part-way through a unit (B1) ----
+# ---- copier failure part-way through a unit ----
 
 
 def _sync_precedes_release(rank, thread: int) -> None:
@@ -311,7 +311,7 @@ def test_copier_failing_on_the_second_segment_syncs_before_releasing_the_slot(di
         rank.trace.check_slot_exclusivity(rank.pool)
 
 
-# ---- interleaved staged traffic (B8) ----
+# ---- interleaved staged traffic ----
 
 
 def test_interleaved_staged_publish_and_fetch_keep_slots_exclusive_and_bytes_exact():
@@ -357,7 +357,7 @@ def test_interleaved_staged_publish_and_fetch_keep_slots_exclusive_and_bytes_exa
         assert all(len(s) <= 2 for s in acquires) and len(acquires) >= 6
 
 
-# ---- close while parked or racing submissions (B9) ----
+# ---- close while parked or racing submissions ----
 
 
 def test_close_wakes_a_worker_parked_for_a_slot_and_fails_its_delivery():
@@ -414,3 +414,64 @@ def test_submissions_racing_close_are_rejected_or_reach_an_outcome():
         outcome = attempt.poll()
         assert isinstance(outcome, (Delivered, Failed))
     rank.trace.check_slot_exclusivity(rank.pool)
+
+
+# ---- the store declining or failing a put once the units are already in host slots ----
+
+
+def test_staged_declined_put_for_a_unit_another_publisher_made_present_counts_as_taken():
+    """Staged variant of the publish race: between our lookup and our put another publisher
+    stores ``first``; the store declines our write of it. The unit is held under its name, so it
+    is served, the slots go back, and the attempt is quiet."""
+    client = FakeStoreClient()
+    with make_rank(client) as other, _staged(client, slots=4) as staged:
+        first, second = staged.unit(0, 0, 32), staged.unit(0, 1, 32)
+        staged.write(first, pattern(1, 32))
+        staged.write(second, pattern(2, 32))
+        theirs = other.unit(0, 0, 32)  # the same name from another rank's memory
+        other.write(theirs, pattern(1, 32))
+        orig = client.batch_put_from_multi_buffers
+
+        def raced_put(keys, ptrs, sizes):
+            client.batch_put_from_multi_buffers = orig  # one-shot: ``other`` needs the real one
+            assert isinstance(other.finish(other.backend.publish(extent([theirs]))), Delivered)
+            results = list(orig(keys, ptrs, sizes))
+            results[keys.index(staged.key(first))] = -1
+            return results
+
+        client.batch_put_from_multi_buffers = raced_put
+        attempt = staged.backend.publish(extent([first, second]))
+        outcome = staged.finish(attempt)
+        assert outcome == Delivered(frozenset({first.name, second.name}))
+        assert staged.backend.counters.publish_stored == 1
+        assert staged.backend.counters.publish_raced == 1
+        assert staged.backend.counters.failed_attempts == 0
+        assert client.objects[staged.key(first)] == pattern(1, 32)
+        assert client.objects[staged.key(second)] == pattern(2, 32)
+        assert staged.backend.quiesce([attempt]) is True
+        every_slot = list(range(staged.pool.num_slots))
+        assert sorted(staged.pool.acquire(staged.pool.num_slots)) == every_slot  # all came back
+        staged.pool.release(every_slot)
+        staged.trace.check_slot_exclusivity(staged.pool)
+
+
+def test_staged_put_raising_after_the_gather_fails_frees_the_slots_and_is_quiet():
+    """The units were copied into host slots (the caller's memory is done with) when the store
+    call raises: the delivery fails, nothing is stored, the slots are released, and ``quiesce``
+    answers True because the gather is what read the caller's memory."""
+    with _staged(slots=2) as rank:
+        a, b = rank.unit(0, 0, 32), rank.unit(0, 1, 32)
+        rank.write(a, pattern(1, 32))
+        rank.write(b, pattern(2, 32))
+        rank.client.fail_next("batch_put_from_multi_buffers", RuntimeError("store unreachable"))
+        attempt = rank.backend.publish(extent([a, b]))
+        outcome = rank.finish(attempt)
+        assert isinstance(outcome, Failed) and "store unreachable" in outcome.reason
+        assert rank.client.objects == {}
+        assert rank.copier.kinds() == ["d2h", "d2h"]  # gathered before the put
+        assert rank.backend.counters.failed_attempts == 1
+        assert rank.backend.counters.publish_stored == 0
+        assert rank.backend.quiesce([attempt]) is True
+        assert sorted(rank.pool.acquire(2)) == [0, 1]
+        rank.pool.release([0, 1])
+        rank.trace.check_slot_exclusivity(rank.pool)

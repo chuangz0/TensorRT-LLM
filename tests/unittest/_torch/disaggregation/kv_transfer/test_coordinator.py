@@ -560,17 +560,28 @@ def test_gen_init_delivery_unparks_at_prompt_len_with_no_local_fallback():
     assert rig.effects.only("unpark") == [(req, 30, True, None)]
 
 
-def test_normal_fetch_expiry_only_abandons_and_late_delivery_still_unparks():
+def test_normal_fetch_expiry_fails_the_request_and_holds_its_pages_until_the_outcome():
+    """A fetch past its deadline fails the request; its pages stay held (the backend may still
+    write them) until the outcome arrives, and a late Delivered lands nothing."""
     rig = Rig(fetch_timeout_s=10.0)
     req = worker_request()
     attempt = rig.plan_and_launch(req, now=0.0)
     rig.coord.advance([], 10.0)
     rec = rig.record(1)
     assert rec["state"] == "IN_FLIGHT" and rec["abandoned"] is True
-    assert rig.effects.names() == ["prepare_fetch_resources", "park_for_fetch"]
+    assert rig.effects.names() == [
+        "prepare_fetch_resources",
+        "park_for_fetch",
+        "fail_requests",
+        "hold_for_transfer",
+    ]
+    assert rig.effects.only("fail_requests") == [((req,), "kv fetch timed out")]
     attempt.deliver_all()
     rig.coord.advance([], 20.0)
-    assert rig.effects.only("unpark") == [(req, END, False, None)]
+    assert rig.effects.names()[-1:] == ["terminate_request"]
+    assert rig.effects.count("unpark") == 0 and rig.effects.count("give_back_fetch_pages") == 0
+    assert rig.worker.count("quiesce") == 1
+    assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
 
 
 def test_no_timeout_means_no_deadline():
@@ -649,42 +660,46 @@ def test_publish_landed_before_request_end_terminates_immediately_at_end():
     assert rig.coord.status_dump()["finished_pending"] == []
 
 
-def test_publish_failure_after_request_end_fails_the_request():
+def test_publish_failure_after_request_end_terminates_the_held_request():
+    """The request already answered its client; a publish that then fails is the store's loss,
+    not the request's: held while in flight, then terminated, never failed."""
     pub = FakePublishes()
     rig = Rig(publishers=[pub])
     req = FakeRequest(3, prompt_len=29)
     rig.coord.publish_context_progress([req], finished=[3], now=0.0)
     pub.attempts[0].finish(Failed("peer gone"))
     rig.coord.advance([], 1.0)
-    assert rig.effects.names() == ["hold_for_transfer", "fail_requests"]
-    assert rig.effects.only("fail_requests") == [((req,), "kv publish failed")]
+    assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
+    assert rig.effects.count("fail_requests") == 0
+    assert rig.effects.count("stage_transfer_response") == 0
     assert rig.records() == []
 
 
-def test_publish_expiry_fails_held_request():
+def test_publish_expiry_terminates_the_held_request():
     pub = FakePublishes()
     rig = Rig(publishers=[pub], publish_timeout_s=5.0)
     req = FakeRequest(3, prompt_len=29)
     rig.coord.publish_context_progress([req], finished=[3], now=0.0)
     rig.coord.advance([], 5.0)
-    assert rig.effects.only("fail_requests") == [((req,), "kv publish timed out")]
+    assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
+    assert rig.effects.count("fail_requests") == 0
     assert pub.count("quiesce") == 1 and rig.records() == []
 
 
-def test_publish_rejected_outright_fails_the_finished_request():
+def test_publish_rejected_outright_terminates_the_finished_request():
     pub = FakePublishes()
     rig = Rig(publishers=[pub])
     req = FakeRequest(3, prompt_len=29)
     pub.reject_next = 1
     rig.coord.publish_context_progress([req], finished=[3], now=0.0)
     assert pub.attempts == [] and pub.count("quiesce") == 0  # nothing escaped, nothing to quiesce
-    # Nothing was ever offered: not held, failed straight away, and the record is gone.
-    assert rig.effects.names() == ["fail_requests"]
-    assert rig.effects.only("fail_requests") == [((req,), "kv publish rejected")]
+    # Nothing was ever offered: not held, terminated straight away, and the record is gone.
+    assert rig.effects.names() == ["terminate_request"]
+    assert rig.effects.count("fail_requests") == 0
     assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
 
 
-def test_partial_publish_rejection_fails_the_record_at_next_reap():
+def test_partial_publish_rejection_terminates_the_held_request_at_next_reap():
     # Publish accepted, place rejected: the pieces that were offered may land, the publish as a
     # whole has still failed.
     placing = FakePlacingPublishes()
@@ -699,12 +714,12 @@ def test_partial_publish_rejection_fails_the_record_at_next_reap():
     placing.attempts[0].deliver_all()
     rig.coord.advance([], 1.0)
     assert placing.count("quiesce") == 1
-    assert rig.effects.names() == ["hold_for_transfer", "fail_requests"]
-    assert rig.effects.only("fail_requests") == [((req,), "kv publish failed")]
+    assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
+    assert rig.effects.count("fail_requests") == 0
     assert rig.records() == []
 
 
-def test_one_of_two_publishers_rejecting_fails_the_record_even_if_the_other_lands():
+def test_one_of_two_publishers_rejecting_still_terminates_once_the_other_lands():
     ok, bad = FakePublishes(name="ok"), FakePublishes(name="bad")
     rig = Rig(publishers=[ok, bad])
     req = FakeRequest(3, prompt_len=29)
@@ -713,8 +728,9 @@ def test_one_of_two_publishers_rejecting_fails_the_record_even_if_the_other_land
     assert len(ok.attempts) == 1 and bad.attempts == []
     assert rig.effects.names() == ["hold_for_transfer"]
     ok.attempts[0].deliver_all()
-    rig.coord.advance([], 1.0)  # failed arrival even without polling anything from ``bad``
-    assert rig.effects.only("fail_requests") == [((req,), "kv publish failed")]
+    rig.coord.advance([], 1.0)  # a failed publish even without polling anything from ``bad``
+    assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
+    assert rig.effects.count("fail_requests") == 0
     assert ok.count("quiesce") == 1 and bad.count("quiesce") == 0
     assert rig.records() == []
 
@@ -753,7 +769,7 @@ def test_publish_deadline_expires_with_terminal_intermediate_pieces():
     assert rig.effects.calls == []  # request still running: the warning is the only word
 
 
-def test_publish_rejected_while_fetch_in_flight_fails_once_the_fetch_releases():
+def test_publish_rejected_while_fetch_in_flight_terminates_once_the_fetch_releases():
     pub = FakePublishes()
     rig = Rig(publishers=[pub])
     req = worker_request()
@@ -767,9 +783,10 @@ def test_publish_rejected_while_fetch_in_flight_fails_once_the_fetch_releases():
     attempt.deliver_all()
     rig.coord.advance([], 2.0)
     assert rig.worker.count("quiesce") == 1
-    assert rig.effects.names()[-1:] == ["fail_requests"]
-    assert rig.effects.only("fail_requests") == [((req,), "kv publish rejected")]
-    assert rig.effects.count("terminate_request") == 0 and rig.effects.count("unpark") == 0
+    assert rig.effects.names()[-1:] == ["terminate_request"]
+    assert rig.effects.count("fail_requests") == 0
+    assert rig.effects.count("stage_transfer_response") == 0
+    assert rig.effects.count("unpark") == 0
     assert rig.coord.status_dump() == {"records": [], "decided_plans": 0, "finished_pending": []}
 
 
@@ -792,7 +809,7 @@ def test_publish_landed_first_waits_for_the_in_flight_fetch_before_terminating()
     assert rig.coord.status_dump() == {"records": [], "decided_plans": 0, "finished_pending": []}
 
 
-def test_abandoned_publish_of_held_request_still_times_out():
+def test_abandoned_publish_of_held_request_still_times_out_and_terminates():
     pub = FakePublishes()
     rig = Rig(publishers=[pub], publish_timeout_s=5.0)
     req = FakeRequest(3, prompt_len=29)
@@ -800,8 +817,10 @@ def test_abandoned_publish_of_held_request_still_times_out():
     rig.coord.abandon(req)
     assert rig.record(3, "publish")["abandoned"] is True
     rig.coord.advance([], 5.0)
-    # Abandoning stops nothing and forgives nothing: the deadline is what fails a held request.
-    assert rig.effects.only("fail_requests") == [((req,), "kv publish timed out")]
+    # Abandoning stops nothing and forgives nothing: the deadline is what releases a held
+    # request, and a finished request is terminated rather than failed.
+    assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
+    assert rig.effects.count("fail_requests") == 0
     assert pub.count("quiesce") == 1 and rig.records() == []
 
 
@@ -1115,3 +1134,41 @@ def test_two_requests_progress_independently(candidates_twice):
     rig.coord.advance([], 2.0)
     assert rig.effects.only("unpark") == [(b, 16, False, None)]
     assert rig.record(1)["state"] == "IN_FLIGHT" and rig.record(2)["state"] == "LANDED"
+
+
+# ---- back-pressure that never lets up ----
+
+
+def test_three_consecutive_rejections_send_a_normal_fetch_to_local_compute():
+    rig = Rig()
+    req = worker_request()
+    rig.worker.reject_next = 10
+    for round_index in range(6):
+        if rig.coord.plan_fetch(req) is DEFER:  # undecided: a candidate for this round
+            rig.coord.advance([req], float(round_index))
+        plan = rig.coord.plan_fetch(req)
+        if plan is None:
+            break
+        assert isinstance(plan, FetchPlan)
+        rig.coord.launch_fetches([req], float(round_index))
+    assert rig.coord.plan_fetch(req) is None
+    assert rig.worker.count("fetch") == 3
+    assert rig.effects.count("give_back_fetch_pages") == 3
+    assert rig.effects.count("fail_requests") == 0
+    assert rig.records() == []
+
+
+def test_three_consecutive_rejections_fail_a_gen_init_fetch():
+    rig = Rig()
+    req = FakeRequest(1, prompt_len=29, is_gen_init=True, route_hints={"ctx": {"peer": "peer1"}})
+    rig.worker.reject_next = 10
+    for round_index in range(3):
+        rig.coord.advance([req], float(round_index))
+        assert isinstance(rig.coord.plan_fetch(req), FetchPlan)
+        rig.coord.launch_fetches([req], float(round_index))
+    assert rig.worker.count("fetch") == 3
+    assert rig.effects.count("give_back_fetch_pages") == 3
+    (failed,) = rig.effects.only("fail_requests")
+    assert failed[0] == (req,) and failed[1].startswith("kv fetch rejected")
+    assert rig.coord.plan_fetch(req) is None
+    assert rig.records() == []

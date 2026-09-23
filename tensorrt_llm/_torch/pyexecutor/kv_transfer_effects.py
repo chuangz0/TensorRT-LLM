@@ -158,7 +158,12 @@ class PyExecutorKVTransferEffects:
     def unpark(self, request, token_end: int, no_local_fallback: bool, aux) -> None:
         """A fetch landed: settle the cursor at ``max(token_end, num_committed_tokens)``, commit,
         back to ``CONTEXT_INIT``. The maximum because local reuse may already exceed the
-        block-aligned target (design §7.2 step 6) and the cursor never moves below a commit."""
+        block-aligned target (design §7.2 step 6) and the cursor never moves below a commit.
+
+        Narrower than the protocol allows, by the scope guard: only the primary KV cache manager
+        commits (no draft manager), ``aux`` has no consumer (no worker backend, so nothing rides
+        along), and a gen-init landing (``no_local_fallback``) raises because gen-init requests
+        belong to the disagg transceiver, never to this assembly."""
         engine_request = _engine_request(request)
         if no_local_fallback:
             raise RuntimeError(

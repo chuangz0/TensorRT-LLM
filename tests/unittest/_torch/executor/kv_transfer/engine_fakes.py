@@ -204,6 +204,11 @@ class FakeKVCacheManager:
         kv_cache = self.kv_cache_map.get(request.py_request_id)
         return None if kv_cache is None else kv_cache.history_length
 
+    def is_request_active(self, request_id: int) -> bool:
+        """As the wrapper's: pages on the device, not suspended to a lower tier."""
+        kv_cache = self.kv_cache_map.get(request_id)
+        return kv_cache is not None and kv_cache.is_active
+
     def try_commit_blocks(self, request) -> None:
         rid = request.py_request_id
         self.calls.append(("try_commit_blocks", rid))

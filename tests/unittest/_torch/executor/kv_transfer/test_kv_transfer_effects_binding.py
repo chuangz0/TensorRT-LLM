@@ -137,7 +137,10 @@ class Rig:
             publishes=self.publisher if publish else None,
             pool_registrar=None,
             close=self.backend_close,
-            counters=lambda: {"fetch_hits": 7, "publish_stored": 3},
+            counters=lambda: {
+                "fetch_hits": self.store.count("fetch"),
+                "publish_stored": self.publisher.count("publish"),
+            },
         )
         entry = BackendEntry.from_dict(
             {
@@ -353,6 +356,23 @@ class TestUnpark:
         rig.executor._do_terminate_request.assert_called_once_with(req)
         assert rig.records() == []
 
+    def test_landing_below_the_committed_depth_settles_at_the_commit(self, rig):
+        """Local reuse already committed further than the fetch target (the ask was empty):
+        the cursor settles at the committed depth and the commit is a no-op."""
+        req = make_request(1, 200)
+        rig.store.probe_answer = rig.reader.unit_names(req, range(3))  # the store holds 3 blocks
+        plan = rig.plan(req)
+        assert plan.token_end == 96
+        rig.reserve(req, plan.token_end, committed=128)  # local reuse went further
+        rig.kv.kv_cache_map[1].history_length = 128
+        attempt = rig.launch(req)
+        attempt.deliver_all()
+        rig.advance(req)
+        assert req.state == CONTEXT_INIT
+        assert req.context_current_position == 128
+        assert rig.kv.kv_cache_map[1].num_committed_tokens == 128
+        assert not rig.binding.is_tracking(req)
+
     def test_landing_below_the_declared_history_is_a_wiring_error(self, rig):
         req = make_request(1, 100)
         plan = rig.plan(req)
@@ -466,7 +486,7 @@ class TestHoldForTransfer:
         assert rig.effects.held_request_ids == {1}
         assert rig.effects.parked_request_ids == frozenset()
         assert rig.slots.freed == [1] and rig.slots.slots == set()
-        assert rig.kv.index_slots_released == [1]
+        assert rig.kv.count("release_index_slot") == 1
         assert 1 in rig.kv.kv_cache_map  # the pages stay for the backend
         assert rig.kv.count("free_resources") == 0
         assert rig.binding.is_tracking(req)
@@ -482,8 +502,7 @@ class TestHoldForTransfer:
         rig.kv.release_index_slot(1)  # and this
         rig.executor._terminate_request(req)
         assert rig.slots.freed == [1, 1] and rig.slots.slots == set()
-        assert rig.kv.index_slots_released == [1]  # the second release did nothing
-        assert rig.kv.count("release_index_slot") == 2
+        assert rig.kv.count("release_index_slot") == 2  # the wrapper makes the second a no-op
         assert req.state == KV_PUBLISH_IN_PROGRESS
 
     def test_hold_without_a_cache_skips_the_index_slot(self, rig):
@@ -588,6 +607,18 @@ class TestPublishSelection:
         rig.binding.publish_completed_contexts([req])
         assert rig.publisher.count("publish") == 0
 
+    def test_a_suspended_cache_is_not_offered(self, rig):
+        """A request whose cache was suspended (evicted to a lower tier) has no pages on the
+        device to read; it is skipped rather than published from memory that is not there."""
+        req = make_request(1, 100)
+        finish_prefill(req)
+        cache = FakeKVCache(history_length=100)
+        cache.is_active = False
+        rig.kv.kv_cache_map[1] = cache
+        rig.binding.publish_completed_contexts([req])
+        assert rig.publisher.count("publish") == 0
+        assert rig.reader.calls == []
+
     def test_no_publisher_configured_offers_nothing(self):
         rig = Rig(publish=False)
         req = make_request(1, 100)
@@ -638,17 +669,20 @@ class TestReleaseGate:
         assert not rig.binding.is_tracking(req) and not rig.binding.has_transfer_in_flight()
         assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
 
-    def test_case_b_publish_failure_fails_the_held_request_instead(self, rig):
+    def test_case_b_publish_failure_still_terminates_the_finished_request_once(self, rig, caplog):
+        """The request already answered its client; a store that then fails to take its blocks
+        is a warning, not a request failure. The layer terminates it exactly once."""
         req = make_request(1, 100)
         attempt = rig.publish(req)
         rig.executor._terminate_request(req)
         attempt.finish(Failed("store down"))
-        rig.advance()
-        rig.executor._handle_errors.assert_called_once_with(
-            "kv publish failed", requests=[req], charge_budget=False
-        )
-        rig.executor._do_terminate_request.assert_not_called()  # _handle_errors terminates
+        with caplog.at_level("WARNING"):
+            rig.advance()
+        rig.executor._handle_errors.assert_not_called()
+        rig.executor._do_terminate_request.assert_called_once_with(req)
+        assert any("kv publish failed" in r.getMessage() for r in caplog.records)
         assert not rig.binding.is_tracking(req)
+        assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
 
     def test_case_c_ctx_only_send_done_first_publish_in_flight(self, rig):
         """The disagg ``release_transfer`` reaches ``_terminate_request`` first, with the seq and
@@ -663,7 +697,7 @@ class TestReleaseGate:
 
         assert rig.terminations() == 0
         assert rig.effects.held_request_ids == {1}
-        assert rig.kv.index_slots_released == [1]  # no second real release
+        assert rig.kv.count("release_index_slot") == 2  # the wrapper makes the second a no-op
         attempt.deliver_all()
         rig.advance()
         rig.executor._do_terminate_request.assert_called_once_with(req)
@@ -841,16 +875,6 @@ class TestCancelAndIdle:
         rig2.binding.pace_idle()
         assert sleeps == [0.001, 0.001]
 
-    def test_deferred_request_is_planned_locally_once_the_probe_budget_is_spent(self):
-        rig = Rig(probe_answer=None)
-        req = make_request(1, 100)
-        rig.advance(req)
-        assert rig.binding.plan_fetch(req) is DEFER
-        rig.now += 0.1  # past probe_timeout_s
-        rig.advance(req)
-        assert rig.binding.plan_fetch(req) is None
-        assert rig.store.count("fetch") == 0
-
     def test_candidates_are_first_chunk_context_init_non_dummy_only(self, rig):
         first = make_request(1, 100)
         dummy = make_request(2, 100)
@@ -1002,7 +1026,7 @@ class TestClose:
                 "name": "store",
                 "type": "fake",
                 "roles": ["fetch", "publish"],
-                "counters": {"fetch_hits": 7, "publish_stored": 3},
+                "counters": {"fetch_hits": 1, "publish_stored": 1},  # read at dump time
             }
         ]
 
@@ -1023,11 +1047,11 @@ class TestClose:
 
 
 class TestHeldRequestFailurePaths:
-    """A held request whose publish fails or expires: the coordinator fails it through
-    ``fail_requests``, the engine's error path terminates it through the gate, and the layer
-    has already let go, so ``_do_terminate_request`` runs exactly once."""
+    """A held request whose publish fails or expires has already answered its client: the
+    store's trouble is logged as a WARNING and the layer terminates the request exactly once,
+    without the engine's error path."""
 
-    def test_publish_failure_on_a_held_request_terminates_once(self, rig):
+    def test_publish_failure_on_a_held_request_warns_and_terminates_once(self, rig, caplog):
         rig.wire_engine_error_path()
         req = make_request(1, 100)
         attempt = rig.publish(req)
@@ -1035,11 +1059,13 @@ class TestHeldRequestFailurePaths:
         assert rig.effects.held_request_ids == {1}
 
         attempt.finish(Failed("store down"))
-        rig.advance()
+        with caplog.at_level("WARNING"):
+            rig.advance()
 
-        rig.executor._handle_errors.assert_called_once()
+        rig.executor._handle_errors.assert_not_called()
         rig.executor._do_terminate_request.assert_called_once_with(req)
-        assert req.state == LlmRequestState.GENERATION_COMPLETE
+        assert any("kv publish failed" in r.getMessage() for r in caplog.records)
+        assert req.state != LlmRequestState.GENERATION_COMPLETE  # not failed
         assert rig.effects.held_request_ids == frozenset()
         assert not rig.binding.is_tracking(req)
         assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
@@ -1047,7 +1073,7 @@ class TestHeldRequestFailurePaths:
             rig.advance()
         assert rig.terminations() == 1
 
-    def test_publish_expiry_on_a_held_request_terminates_once(self, monkeypatch):
+    def test_publish_expiry_on_a_held_request_warns_and_terminates_once(self, monkeypatch, caplog):
         now = [5000.0]
         monkeypatch.setattr(time, "monotonic", lambda: now[0])
         rig = Rig(publish_timeout_s=10.0)
@@ -1061,14 +1087,85 @@ class TestHeldRequestFailurePaths:
         assert rig.terminations() == 0 and rig.effects.held_request_ids == {1}
 
         now[0] += 1.5  # past the deadline, no outcome
-        rig.advance()
+        with caplog.at_level("WARNING"):
+            rig.advance()
 
-        rig.executor._handle_errors.assert_called_once()
-        assert rig.executor._handle_errors.call_args.args[0] == "kv publish timed out"
+        rig.executor._handle_errors.assert_not_called()
+        assert any("kv publish timed out" in r.getMessage() for r in caplog.records)
         rig.executor._do_terminate_request.assert_called_once_with(req)
         assert rig.effects.held_request_ids == frozenset()
         assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
         assert rig.publisher.count("quiesce") == 1  # the pages were vouched for first
+
+
+class TestFetchExpiry:
+    """A normal fetch past ``fetch_timeout_s``: the request fails through the engine's error
+    path, but its pages stay held until the backend's outcome arrives (or ``close`` frees them);
+    a Delivered that arrives after the expiry no longer lands anything."""
+
+    def _expire_parked_fetch(self, rig, now):
+        rig.wire_engine_error_path()
+        req = make_request(1, 100)
+        rig.executor.active_requests = [req]
+        plan, attempt = rig.plan_reserve_launch(req)  # deadline: now + 10
+        now[0] += 10.5
+        rig.advance(req)
+        rig.executor._handle_errors.assert_called_once()
+        assert rig.executor._handle_errors.call_args.args[0] == "kv fetch timed out"
+        assert rig.executor._handle_errors.call_args.kwargs["requests"] == [req]
+        # The engine error path reached the gate, which held the request: its pages may still
+        # be written by the backend.
+        assert rig.terminations() == 0
+        assert rig.effects.held_request_ids == {1}
+        assert req.state == KV_PUBLISH_IN_PROGRESS
+        assert 1 in rig.kv.kv_cache_map
+        rig.executor._revert_ctx_alloc.assert_not_called()
+        return req, attempt
+
+    def test_expired_fetch_fails_the_request_and_holds_its_pages(self, monkeypatch):
+        now = [5000.0]
+        monkeypatch.setattr(time, "monotonic", lambda: now[0])
+        rig = Rig(fetch_timeout_s=10.0)
+        req, attempt = self._expire_parked_fetch(rig, now)
+        attempt.deliver_all()  # late: the request is gone
+        rig.advance()
+        rig.executor._do_terminate_request.assert_called_once_with(req)
+        assert req.context_current_position == 0  # never unparked
+        assert rig.kv.count("try_commit_blocks") == 0
+        assert rig.records() == [] and not rig.binding.is_tracking(req)
+
+    def test_expired_fetch_without_an_outcome_is_freed_by_close(self, monkeypatch, tmp_path):
+        now = [5000.0]
+        monkeypatch.setattr(time, "monotonic", lambda: now[0])
+        rig = Rig(fetch_timeout_s=10.0, status_dump_path=str(tmp_path / "kvt.json"))
+        req, _ = self._expire_parked_fetch(rig, now)
+        rig.binding.close()
+        rig.executor._free_request_resources.assert_called_once_with(req)
+        assert rig.terminations() == 0
+
+
+class TestRejectedSubmissions:
+    def test_consecutive_rejections_are_capped_then_the_request_computes_locally(self, rig):
+        """Back-pressure is a reason to try again, not forever: after a bounded run of
+        ``SubmissionRejected`` the request is planned as local compute."""
+        rig.store.reject_next = 100
+        req = make_request(1, 100)
+        rounds = 0
+        while rounds < 10:
+            rig.advance(req)
+            plan = rig.binding.plan_fetch(req)
+            if plan is None:
+                break
+            assert isinstance(plan, FetchPlan)
+            rig.reserve(req, plan.token_end)
+            rig.binding.launch_reserved_fetches([req])
+            rounds += 1
+        assert rig.binding.plan_fetch(req) is None, "rejections were never capped"
+        assert rig.store.count("fetch") <= 3
+        assert rig.store.attempts == []  # nothing escaped
+        assert rig.executor._revert_ctx_alloc.call_count == rig.store.count("fetch")
+        assert req.state == CONTEXT_INIT and not rig.binding.is_tracking(req)
+        assert rig.records() == []
 
     def test_publish_expiry_of_a_running_request_only_warns(self, monkeypatch):
         now = [5000.0]
@@ -1123,6 +1220,37 @@ class TestEngineErrorPathWithParkedRequests:
             dump = json.load(f)
         assert dump["coordinator"]["finished_pending"] == [1]
         assert [r["state"] for r in dump["coordinator"]["records"]] == ["IN_FLIGHT"]
+
+
+class TestRecomputePauseProtection:
+    """A request whose publish is in flight must keep its pages: the executor's recompute-pause
+    teardown skips it (the scheduler never picks it as a victim either; see the scheduler seam
+    tests)."""
+
+    def test_terminate_recompute_paused_requests_skips_a_request_with_a_publish_in_flight(
+        self, rig
+    ):
+        publishing = make_request(1, 100)
+        rig.publish(publishing)  # still running: not finished, publish IN_FLIGHT
+        assert 1 in rig.coord.inflight_request_ids()
+        plain = make_request(2, 100)
+        batch = SimpleNamespace(recompute_paused_requests=[publishing, plain])
+
+        rig.executor._terminate_recompute_paused_requests(batch)
+
+        rig.executor._free_request_resources.assert_called_once_with(plain)
+        assert 1 in rig.kv.kv_cache_map
+
+    def test_terminate_recompute_paused_requests_frees_once_the_publish_landed(self, rig):
+        req = make_request(1, 100)
+        attempt = rig.publish(req)
+        attempt.deliver_all()
+        rig.advance()
+        assert rig.coord.inflight_request_ids() == frozenset()
+        rig.executor._terminate_recompute_paused_requests(
+            SimpleNamespace(recompute_paused_requests=[req])
+        )
+        rig.executor._free_request_resources.assert_called_once_with(req)
 
 
 class TestCancelWhileParked:

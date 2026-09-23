@@ -119,8 +119,23 @@ def test_publish_where_the_store_declines_a_unit_is_not_served_not_failed():
         assert rank.client.objects == {}
 
 
+def test_publish_whose_lookup_answers_a_negative_status_is_failed():
+    """A negative ``batch_is_exist`` status is a failed lookup, not "absent": the publish is
+    Failed and nothing is put (the contract forbids reading a failure as a miss, §5.2)."""
+    with make_rank() as rank:
+        u = rank.unit(0, 0, 8)
+        rank.write(u, pattern(1, 8))
+        rank.client.batch_is_exist = lambda keys: [-1 for _ in keys]
+        outcome = rank.finish(rank.backend.publish(extent([u])))
+        assert isinstance(outcome, Failed)
+        assert rank.client.count("batch_put_from_multi_buffers") == 0
+        assert rank.client.objects == {}
+        assert rank.backend.counters.publish_stored == 0
+        assert rank.backend.counters.failed_attempts == 1
+
+
 def test_declined_put_for_a_unit_another_publisher_made_present_counts_as_taken():
-    # B2 race: the store refuses our write because a concurrent publisher got there first. The
+    # A race: the store refuses our write because a concurrent publisher got there first. The
     # unit is held under its name, so it is served; the bytes are the same by construction.
     a, b = _pair()
     with a, b:
@@ -237,7 +252,7 @@ def test_present_at_lookup_but_unreadable_is_failed():
 
 
 def test_unit_gone_between_lookup_and_get_is_a_miss_with_destination_untouched():
-    # B3: exist said 1, the get says OBJECT_NOT_FOUND (-704). The store wrote nothing, so this is
+    # Exist said 1, the get says OBJECT_NOT_FOUND (-704). The store wrote nothing, so this is
     # a miss (SPEC §5.1 inv. 2), counted as one, and the other present unit is still served.
     a, b = _pair()
     with a, b:
@@ -427,7 +442,7 @@ def test_probe_negative_status_is_an_outage_not_an_empty_answer():
 
 
 def test_probe_is_answered_while_every_delivery_worker_is_blocked():
-    # B7: lookups run on their own thread, so a probe is not queued behind deliveries in flight.
+    # Lookups run on their own thread, so a probe is not queued behind deliveries in flight.
     with make_rank(num_workers=2) as rank:
         a, b, c = rank.unit(0, 0, 8), rank.unit(0, 1, 8), rank.unit(0, 2, 8)
         assert isinstance(rank.finish(rank.backend.publish(extent([a]))), Delivered)
@@ -500,3 +515,46 @@ def test_store_never_reads_is_last_on_either_path():
             ).poll(),
             Failed,
         )
+
+
+# ---- the probe table is bounded and forgets ----
+
+
+def test_probe_table_is_bounded_and_a_new_lookup_past_the_bound_raises():
+    from disaggregation.backends.store.backend import MAX_PROBES
+
+    with make_rank() as rank:
+        rank.client.block("batch_is_exist")  # every lookup stays pending
+        for i in range(MAX_PROBES):
+            assert rank.backend.probe(f"n{i}".encode(), [b"u"]) is None
+        with pytest.raises(RuntimeError, match=f"{MAX_PROBES} store lookups already remembered"):
+            rank.backend.probe(b"one-too-many", [b"u"])
+        rank.client.unblock()
+
+
+def test_pending_probe_past_the_ttl_is_dropped_and_asked_again():
+    with make_rank(probe_ttl_s=0.05) as rank:
+        rank.client.block("batch_is_exist")
+        assert rank.backend.probe(b"n", [b"u"]) is None
+        rank.client.wait_entered(2)  # register_buffer, then the lookup parked at the gate
+        time.sleep(0.1)  # past the TTL while still pending
+        # The stale pending entry is dropped and the same question is asked afresh.
+        assert rank.backend.probe(b"n", [b"u"]) is None
+        rank.client.unblock()
+        wait_until(lambda: rank.client.count("batch_is_exist") == 2, what="second lookup")
+        # The fresh lookup answers; an answer is consumed once.
+        wait_until(lambda: rank.backend.probe(b"n", [b"u"]) is not None, what="answer")
+        assert rank.backend.probe(b"n", [b"u"]) is None  # consumed: asked again
+
+
+def test_answered_probe_past_the_ttl_is_forgotten():
+    with make_rank(probe_ttl_s=0.05) as rank:
+        u = rank.unit(0, 0, 8)
+        rank.write(u, pattern(1, 8))
+        assert isinstance(rank.finish(rank.backend.publish(extent([u]))), Delivered)
+        assert rank.backend.probe(b"n", [u.name]) is None
+        wait_until(lambda: rank.backend.counters.probe_hits == 1, what="lookup")
+        time.sleep(0.1)  # nobody collected the answer
+        assert rank.backend.probe(b"n", [u.name]) is None  # forgotten: a new lookup starts
+        wait_until(lambda: rank.backend.counters.probe_hits == 2, what="second lookup")
+        assert rank.backend.probe(b"n", [u.name]) == frozenset({u.name})

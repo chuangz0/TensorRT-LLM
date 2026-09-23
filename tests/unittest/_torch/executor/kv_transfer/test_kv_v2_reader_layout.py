@@ -205,6 +205,19 @@ class TestPrepareDisaggGenInitTokenEnd:
         assert 2 in manager.kv_cache_map
         assert manager.get_history_length(request) >= NAMEABLE * TPB
 
+    def test_fetch_reservation_does_not_fill_the_reserved_pages(self, manager):
+        """The diagnostic fresh-page fill is an asynchronous write on the engine stream; a store
+        backend writes the fetched pages from its own thread with no ordering against it. The
+        ``token_end`` path therefore skips the fill (the fetch fills every reserved block); the
+        gen-init path keeps it."""
+        manager._fresh_page_fill = 0.0  # what TRTLLM_KV_FRESH_PAGE_FILL=zero parses to
+        fetching = make_request(1, prompt_tokens(1))
+        assert manager.prepare_disagg_gen_init(fetching, 128)
+        assert not manager._fresh_pages_filled.get(1)
+        gen_init = make_request(2, prompt_tokens(2))
+        assert manager.prepare_disagg_gen_init(gen_init)
+        assert manager._fresh_pages_filled.get(2)
+
     def test_revert_after_a_fetch_reservation_drops_the_cache(self, manager):
         """Plan §7 #1 verification: the reservation grew the cache from nothing to ``token_end``
         with history declared there; reverting cannot shrink below the history, so the cache is
