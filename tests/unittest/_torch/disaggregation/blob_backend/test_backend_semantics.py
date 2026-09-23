@@ -521,7 +521,7 @@ def test_store_never_reads_is_last_on_either_path():
 
 
 def test_probe_table_is_bounded_and_a_new_lookup_past_the_bound_raises():
-    from disaggregation.backends.store.backend import MAX_PROBES
+    from disaggregation.backends.blob.backend import MAX_PROBES
 
     with make_rank() as rank:
         rank.client.block("batch_is_exist")  # every lookup stays pending

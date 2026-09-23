@@ -22,11 +22,11 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Sequence
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.backends.store.backend import MooncakeStoreBackend  # noqa: E402
-from disaggregation.backends.store.config import MooncakeStoreConfig  # noqa: E402
-from disaggregation.backends.store.regions import Segment  # noqa: E402
-from disaggregation.backends.store.staging import HostStagingPool  # noqa: E402
+from disaggregation.backends.blob.backend import BlobStoreBackend  # noqa: E402
+from disaggregation.backends.blob.mooncake import MooncakeStoreConfig  # noqa: E402
+from disaggregation.backends.blob.staging import HostStagingPool  # noqa: E402
 from disaggregation.base.cache_backend import CacheExtent, Unit  # noqa: E402
+from disaggregation.base.region import Segment  # noqa: E402
 
 MISSING = -704
 """The status Mooncake answers for a key that is not in the store."""
@@ -443,7 +443,7 @@ class Rank:
     client. ``unit(g, l, *sizes)`` carves memory and returns the ``Unit`` naming it."""
 
     client: FakeStoreClient
-    backend: MooncakeStoreBackend
+    backend: BlobStoreBackend
     arena: MemoryArena
     resolver: ArenaResolver
     registration: object | None = None
@@ -502,7 +502,7 @@ def make_rank(
     arena = MemoryArena(arena_bytes)
     resolver = ArenaResolver(arena)
     cfg = config(**config_overrides)
-    backend = MooncakeStoreBackend(client, cfg, resolver, fingerprint, staging=staging)
+    backend = BlobStoreBackend(client, cfg, resolver, fingerprint, staging=staging)
     rank = Rank(client, backend, arena, resolver)
     if register and not cfg.stage_through_host:
         rank.registration = backend.register_pool(arena.address, arena.size)

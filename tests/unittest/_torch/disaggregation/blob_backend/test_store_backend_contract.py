@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""``MooncakeStoreBackend`` against the cache backend contract's shape: protocols satisfied,
+"""``BlobStoreBackend`` against the cache backend contract's shape: protocols satisfied,
 registration rules (SPEC §6.4), submission rules (§6.2/§6.3), ``poll``/``settle``/``quiesce``
 (§6.1), back-pressure and lifetime. Content semantics are in ``test_backend_semantics.py``.
 
@@ -15,8 +15,8 @@ import time
 import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.backends.store.backend import MooncakeStoreBackend, StoreCounters  # noqa: E402
-from disaggregation.backends.store.staging import HostStagingPool  # noqa: E402
+from disaggregation.backends.blob.backend import BlobStoreBackend, StoreCounters  # noqa: E402
+from disaggregation.backends.blob.staging import HostStagingPool  # noqa: E402
 from disaggregation.base.cache_backend import (  # noqa: E402
     Attempt,
     Delivered,
@@ -52,7 +52,7 @@ def test_backend_satisfies_the_three_protocols():
 
 def test_staging_requires_a_pool_when_configured():
     with pytest.raises(ValueError, match="HostStagingPool"):
-        MooncakeStoreBackend(
+        BlobStoreBackend(
             FakeStoreClient(), config(stage_through_host=True), lambda group, local: (), b"\x01"
         )
 

@@ -43,8 +43,8 @@ from .kv_transfer_interfaces import (
     ResourceReader,
     Scope,
 )
-from .planner import FetchPlan, Planner, merge, retry_hint_from
 from .records import AttemptRecord, RecordKey, RecordState, TransferRecord
+from .remote_cache import FetchPlan, Planner, merge, retry_hint_from
 
 __all__ = ["MAX_CONSECUTIVE_REJECTIONS", "KVTransferCoordinator"]
 
@@ -166,13 +166,13 @@ class KVTransferCoordinator:
         if launched:
             self._effects.park_for_fetch(launched)
 
-    def publish_context_progress(
+    def publish_committed_blocks(
         self,
         reqs: Sequence[RequestView],
         finished: Collection[int],
         now: float | None = None,
     ) -> None:
-        """After a context step, before the response pass: offer what each request committed.
+        """After a context step, before the response pass: offer the blocks each request committed.
 
         ``finished`` names the requests that ended this step; a publish still in flight for one of
         them holds the request (``hold_for_transfer``) instead of letting it terminate.

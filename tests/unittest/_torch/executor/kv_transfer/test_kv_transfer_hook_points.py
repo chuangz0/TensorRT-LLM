@@ -50,14 +50,14 @@ def test_advance_runs_at_the_loop_head_after_the_disagg_poll_and_before_scheduli
         text,
         "self.disagg.poll_gen_transfers()",
         GUARD,
-        "self.kv_transfer.advance_transfers(self.active_requests)",
+        "self.kv_transfer.advance_round(self.active_requests)",
         "self.disagg.check_transfer_timeouts()",
         "self._schedule(",
         GUARD,
         "self.kv_transfer.launch_reserved_fetches(",
         "self._kv_fetch_launch_queue",
     )
-    assert len(hook_calls(text, "advance_transfers")) == 1
+    assert len(hook_calls(text, "advance_round")) == 1
     assert len(hook_calls(text, "launch_reserved_fetches")) == 1
 
 
@@ -86,13 +86,13 @@ def test_publish_follows_the_context_commit_and_precedes_the_disagg_send_in_the_
         "self._update_requests(sample_state",
         "self._update_v2_context_resources(scheduled_batch)",
         GUARD,
-        "self.kv_transfer.publish_completed_contexts(",
+        "self.kv_transfer.publish_committed_blocks(",
         "scheduled_batch.context_requests",
         "self._send_kv_async(scheduled_batch.all_requests())",
         "self.disagg.pace_idle()",
         "self.kv_transfer.pace_idle()",
     )
-    assert len(hook_calls(text, "publish_completed_contexts")) == 1
+    assert len(hook_calls(text, "publish_committed_blocks")) == 1
 
 
 def test_overlap_loop_publishes_only_the_previous_batch():
@@ -103,7 +103,7 @@ def test_overlap_loop_publishes_only_the_previous_batch():
         "self._update_requests(",
         "self.previous_batch.sample_state",
         GUARD,
-        "self.kv_transfer.publish_completed_contexts(",
+        "self.kv_transfer.publish_committed_blocks(",
         "self.previous_batch.scheduled_requests",
         "self._send_kv_async(",
         "self.previous_batch.scheduled_requests.all_requests()",
@@ -111,11 +111,11 @@ def test_overlap_loop_publishes_only_the_previous_batch():
         "self.kv_transfer.pace_idle()",
     )
     publish = re.search(
-        r"self\.kv_transfer\.publish_completed_contexts\(\s*self\.previous_batch\.scheduled_requests\.\s*context_requests\)",
+        r"self\.kv_transfer\.publish_committed_blocks\(\s*self\.previous_batch\.scheduled_requests\.\s*context_requests\)",
         text,
     )
     assert publish is not None, "the overlap loop must publish previous_batch only"
-    assert len(hook_calls(text, "publish_completed_contexts")) == 1
+    assert len(hook_calls(text, "publish_committed_blocks")) == 1
 
 
 # ---- release gate, cancel, idle, shutdown ----

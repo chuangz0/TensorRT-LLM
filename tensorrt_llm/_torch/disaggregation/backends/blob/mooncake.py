@@ -12,7 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Settings for the Mooncake store backend: how to reach the pool and how to move bytes into it."""
+"""The Mooncake driver: the ``mooncake`` backend type as ``BlobStoreBackend`` over a real
+``MooncakeDistributedStore``.
+
+Everything Mooncake-specific lives here: ``MooncakeStoreConfig`` (a config entry's options),
+``open_mooncake_client`` (the only place the Mooncake bindings are imported) and
+``build_mooncake_backend``, the registry's factory for ``type: mooncake``. The factory opens the
+client, sets up host staging when asked to, and returns a ``BackendHandle`` whose ``counters``
+are the store counters. A further blob driver sits beside this file and reuses ``backend.py``.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +28,18 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-__all__ = ["DEFAULT_METADATA_SERVER", "MooncakeStoreConfig"]
+from ..config import BackendEntry
+from ..registry import BackendBuildContext, BackendHandle
+from .backend import BlobStoreBackend
+from .client import StoreClient
+from .staging import HostStagingPool, open_default_staging, plan_slot_geometry
+
+__all__ = [
+    "DEFAULT_METADATA_SERVER",
+    "MooncakeStoreConfig",
+    "build_mooncake_backend",
+    "open_mooncake_client",
+]
 
 DEFAULT_METADATA_SERVER = "P2PHANDSHAKE"
 """Mooncake's peer-to-peer handshake, which needs no separate metadata process."""
@@ -100,3 +119,82 @@ class MooncakeStoreConfig:
         if unknown:
             raise ValueError(f"unknown MooncakeStoreConfig keys: {unknown}")
         return cls(**raw)
+
+
+def _default_hostname() -> str:
+    import socket
+
+    return socket.gethostbyname(socket.gethostname())
+
+
+def open_mooncake_client(config: MooncakeStoreConfig) -> StoreClient:
+    """Connect a real ``MooncakeDistributedStore`` to the master named by ``config``.
+
+    Raises:
+        ImportError: The Mooncake Python bindings are not installed.
+        RuntimeError: ``setup`` returned a non-zero status.
+    """
+    try:
+        from mooncake.store import MooncakeDistributedStore
+    except ImportError as exc:
+        raise ImportError(
+            "The Mooncake store backend needs the Mooncake Python bindings "
+            "(`pip install mooncake-transfer-engine`)."
+        ) from exc
+
+    store = MooncakeDistributedStore()
+    status = store.setup(
+        config.local_hostname or _default_hostname(),
+        config.metadata_server,
+        config.global_segment_size,
+        config.local_buffer_size,
+        config.protocol,
+        config.device_name,
+        config.master_server_address,
+    )
+    if status != 0:
+        raise RuntimeError(
+            f"MooncakeDistributedStore.setup failed with status {status} "
+            f"(master={config.master_server_address!r}, metadata={config.metadata_server!r}, "
+            f"protocol={config.protocol!r})"
+        )
+    return store
+
+
+def build_mooncake_backend(entry: BackendEntry, context: BackendBuildContext) -> BackendHandle:
+    """Factory for ``type: mooncake``. A store has one destination, so it takes no ``hint_key``."""
+    if entry.hint_key is not None:
+        raise ValueError(f"backend {entry.name!r}: a mooncake store takes no hint_key")
+    store_config = MooncakeStoreConfig.from_dict(entry.options)
+    client = open_mooncake_client(store_config)
+    try:
+        staging = _open_staging(store_config, context, client)
+        backend = BlobStoreBackend(
+            client, store_config, context.resolver, context.layout_fingerprint, staging=staging
+        )
+    except Exception:
+        client.close()
+        raise
+    return BackendHandle(
+        name=entry.name,
+        hint_key=None,
+        fetcher=backend if entry.serves_fetch else None,
+        publisher=backend if entry.serves_publish else None,
+        # Staging copies through a registered host buffer, so the KV pools stay unregistered.
+        pool_registrar=None if store_config.stage_through_host else backend,
+        close=backend.close,
+        counters=lambda: dataclasses.asdict(backend.counters),
+    )
+
+
+def _open_staging(
+    store_config: MooncakeStoreConfig, context: BackendBuildContext, client: StoreClient
+) -> HostStagingPool | None:
+    if not store_config.stage_through_host:
+        return None
+    slot_bytes, num_slots = plan_slot_geometry(
+        context.max_unit_bytes, store_config.transfer_batch_size, store_config.staging_buffer_bytes
+    )
+    return open_default_staging(
+        client, slot_bytes=slot_bytes, num_slots=num_slots, device_index=context.device_index
+    )

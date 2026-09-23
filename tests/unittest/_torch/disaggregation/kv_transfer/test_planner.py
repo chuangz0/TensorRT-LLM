@@ -11,7 +11,7 @@ from disaggregation.orchestration.kv_transfer_interfaces import (  # noqa: E402
     FetchSource,
     GroupKind,
 )
-from disaggregation.orchestration.planner import FetchPlan, Planner  # noqa: E402
+from disaggregation.orchestration.remote_cache import FetchPlan, Planner  # noqa: E402
 from fakes import (  # noqa: E402
     TPB,
     FakeFetches,

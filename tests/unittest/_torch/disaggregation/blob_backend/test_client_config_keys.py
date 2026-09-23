@@ -10,13 +10,13 @@ import types
 import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.backends.store import client as client_module  # noqa: E402
-from disaggregation.backends.store.client import open_mooncake_client  # noqa: E402
-from disaggregation.backends.store.config import (  # noqa: E402
+from disaggregation.backends.blob import mooncake as client_module  # noqa: E402
+from disaggregation.backends.blob.keys import KeyScheme  # noqa: E402
+from disaggregation.backends.blob.mooncake import (  # noqa: E402
     DEFAULT_METADATA_SERVER,
     MooncakeStoreConfig,
+    open_mooncake_client,
 )
-from disaggregation.backends.store.keys import KeyScheme  # noqa: E402
 
 # ---- config ----
 

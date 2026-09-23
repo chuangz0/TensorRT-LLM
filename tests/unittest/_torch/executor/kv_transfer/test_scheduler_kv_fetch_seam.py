@@ -4,7 +4,7 @@
 
 The scheduler asks a duck-typed ``kv_transfer_planner`` about every first-chunk context request
 before it prepares any cache for it. ``DEFER`` skips the request this round at no cost; a plan
-reserves pages with ``prepare_disagg_gen_init(req, token_end)`` and puts the request on
+reserves pages with ``reserve_transfer_pages(req, token_end)`` and puts the request on
 ``fetch_launch_queue`` outside the forward-pass budget; ``None`` takes the ordinary path. The two
 pre-existing ``continue`` statements of the pending-context loop still come first, and the module
 imports nothing of the coordination layer.
@@ -114,7 +114,7 @@ class _KVCacheMap(dict):
 
 def make_kv_cache_manager(
     *,
-    prepare_disagg_gen_init_fn=None,
+    reserve_transfer_pages_fn=None,
     enable_block_reuse: bool = False,
     block_reuse_policy=BlockReusePolicy.PER_REQUEST,
     first_new_block_fn=None,
@@ -137,9 +137,10 @@ def make_kv_cache_manager(
     mgr.probe_context_reuse.side_effect = lambda req: None
     mgr.resize_context.side_effect = lambda req, n: True
     mgr.try_allocate_draft_context.side_effect = lambda req, n: True
-    mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (
-        lambda req, token_end=None: True
+    mgr.reserve_transfer_pages.side_effect = reserve_transfer_pages_fn or (
+        lambda req, token_end: True
     )
+    mgr.prepare_disagg_gen_init.side_effect = lambda req: True
     mgr.try_allocate_generation.side_effect = lambda req: True
     mgr._resume_and_restore.return_value = True
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
@@ -214,7 +215,7 @@ def test_without_a_planner_every_context_request_takes_the_normal_path():
     assert ids(out.context_requests) == [1]
     assert out.fetch_launch_queue == []
     mgr.prepare_context.assert_called_once()
-    mgr.prepare_disagg_gen_init.assert_not_called()
+    mgr.reserve_transfer_pages.assert_not_called()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -238,7 +239,7 @@ def test_defer_skips_the_request_this_round_without_preparing_a_cache():
     assert 1 not in mgr.kv_cache_map
     for call_args in mgr.prepare_context.call_args_list:
         assert call_args.args[0] is not deferred
-    mgr.prepare_disagg_gen_init.assert_not_called()
+    mgr.reserve_transfer_pages.assert_not_called()
 
 
 def test_plan_reserves_pages_to_token_end_and_queues_the_request_for_launch():
@@ -250,7 +251,7 @@ def test_plan_reserves_pages_to_token_end_and_queues_the_request_for_launch():
 
     out = sched.schedule_request([req], set())
 
-    mgr.prepare_disagg_gen_init.assert_called_once_with(req, 96)
+    mgr.reserve_transfer_pages.assert_called_once_with(req, 96)
     assert ids(out.fetch_launch_queue) == [1]
     assert out.context_requests == [] and out.generation_requests == []
     # The ordinary context admission never ran for it.
@@ -276,7 +277,7 @@ def test_planned_request_is_exempt_from_the_request_and_token_budgets():
 
 
 def test_failed_reservation_skips_the_request_and_drops_its_cache():
-    mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=lambda req, token_end=None: False)
+    mgr = make_kv_cache_manager(reserve_transfer_pages_fn=lambda req, token_end=None: False)
     sched = make_scheduler(mgr)
     planner = FakePlanner({1: FakePlan(token_end=64)})
     sched.kv_transfer_planner = planner
@@ -286,7 +287,7 @@ def test_failed_reservation_skips_the_request_and_drops_its_cache():
 
     out = sched.schedule_request([req], set())
 
-    mgr.prepare_disagg_gen_init.assert_called_once_with(req, 64)
+    mgr.reserve_transfer_pages.assert_called_once_with(req, 64)
     assert out.fetch_launch_queue == [] and out.context_requests == []
     mgr.free_resources.assert_called_once_with(req)
     # rewind_context_after_cache_drop: the cursor is back at the start of the prompt.
@@ -297,7 +298,7 @@ def test_failed_reservation_skips_the_request_and_drops_its_cache():
 
 
 def test_failed_reservation_without_a_cache_only_rewinds():
-    mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=lambda req, token_end=None: False)
+    mgr = make_kv_cache_manager(reserve_transfer_pages_fn=lambda req, token_end=None: False)
     sched = make_scheduler(mgr)
     sched.kv_transfer_planner = FakePlanner({1: FakePlan(token_end=64)})
     req = make_ctx_request(1, 100)
@@ -322,7 +323,7 @@ def test_none_answer_takes_the_normal_context_path():
     assert ids(out.context_requests) == [1]
     assert out.fetch_launch_queue == []
     mgr.prepare_context.assert_called_once()
-    mgr.prepare_disagg_gen_init.assert_not_called()
+    mgr.reserve_transfer_pages.assert_not_called()
 
 
 def test_planner_is_asked_once_per_request_per_round():
@@ -369,7 +370,7 @@ def test_dummy_request_with_a_planner_attached_is_scheduled_normally():
     assert planner.asked == [1, 2]
     assert ids(out.context_requests) == [1]  # the dummy computed locally
     assert ids(out.fetch_launch_queue) == [2]  # the real request fetches
-    mgr.prepare_disagg_gen_init.assert_called_once_with(real, 64)
+    mgr.reserve_transfer_pages.assert_called_once_with(real, 64)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -504,7 +505,7 @@ def test_exhausted_chunk_token_budget_skips_the_request_before_the_planner_is_as
     assert ids(out.generation_requests) == [1]
     assert planner.asked == []  # the chunk-budget ``continue`` came first
     assert out.fetch_launch_queue == [] and out.context_requests == []
-    mgr.prepare_disagg_gen_init.assert_not_called()
+    mgr.reserve_transfer_pages.assert_not_called()
 
 
 def test_contributed_first_block_skips_the_duplicate_before_the_planner_is_asked():
@@ -528,7 +529,7 @@ def test_contributed_first_block_skips_the_duplicate_before_the_planner_is_asked
     assert ids(out.context_requests) == [1]
     assert planner.asked == [1]
     assert out.fetch_launch_queue == []
-    mgr.prepare_disagg_gen_init.assert_not_called()
+    mgr.reserve_transfer_pages.assert_not_called()
 
 
 def test_planner_is_asked_after_the_prefix_probe_but_before_any_cache_work():
@@ -576,7 +577,7 @@ def test_scheduler_and_executor_modules_do_not_import_the_coordination_layer():
         import tensorrt_llm._torch.pyexecutor.py_executor_creator
         banned = (
             "tensorrt_llm._torch.disaggregation.orchestration.kv_transfer",
-            "tensorrt_llm._torch.disaggregation.orchestration.planner",
+            "tensorrt_llm._torch.disaggregation.orchestration.remote_cache",
             "tensorrt_llm._torch.disaggregation.backends",
             "tensorrt_llm._torch.disaggregation.resource.kv_v2",
             "tensorrt_llm._torch.pyexecutor.kv_transfer_",

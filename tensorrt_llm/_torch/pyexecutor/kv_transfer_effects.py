@@ -285,7 +285,7 @@ class PyExecutorKVTransferEffects:
     # ---- helpers ----
 
     def _check_history_declared(self, engine_request: LlmRequest, token_end: int) -> None:
-        """The scheduler reserved the fetch with ``prepare_disagg_gen_init(token_end)``, which
+        """The scheduler reserved the fetch with ``reserve_transfer_pages(token_end)``, which
         declares history up to ``token_end``; a landing below that is a wiring error."""
         history = self._executor.kv_cache_manager.get_history_length(engine_request)
         if history is None or history < token_end:

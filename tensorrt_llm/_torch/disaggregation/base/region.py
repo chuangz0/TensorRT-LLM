@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import IntFlag, auto
-from typing import List, NamedTuple, Optional
+from typing import List, NamedTuple, Optional, Protocol, Sequence
 
 import numpy as np
 
@@ -116,3 +116,22 @@ class RegionMapperBase(ABC):
             List of RegionPairs mapping source to destination.
         """
         ...
+
+
+Segment = tuple[int, int]
+"""``(address, size)`` of one contiguous piece of a unit."""
+
+
+class RegionResolver(Protocol):
+    """Resolve ``(local_group, local)`` to the segments that hold the unit, in a fixed order.
+
+    The mapping from a unit's local coordinates to memory, which the cache backend contract leaves
+    to the backend. The order is part of the stored byte layout: segments are concatenated into one
+    object, so a resolver that reorders them between two processes makes their bytes disagree.
+    Whatever fixes the order must therefore be folded into the layout fingerprint the key scheme
+    carries.
+
+    Raises ``KeyError`` or ``ValueError`` for coordinates it does not know.
+    """
+
+    def __call__(self, local_group: int, local: int) -> Sequence[Segment]: ...

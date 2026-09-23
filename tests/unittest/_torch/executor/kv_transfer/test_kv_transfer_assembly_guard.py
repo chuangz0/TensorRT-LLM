@@ -21,10 +21,7 @@ from engine_fakes import (
     make_request,
 )
 
-from tensorrt_llm._torch.disaggregation.backends.kv_transfer_config import (
-    BackendEntry,
-    KVTransferConfig,
-)
+from tensorrt_llm._torch.disaggregation.backends.config import BackendEntry, KVTransferConfig
 from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
 from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer_interfaces import DEFER
 from tensorrt_llm._torch.pyexecutor import kv_transfer_assembly
@@ -205,8 +202,8 @@ class TestAssembledCoordinator:
         handle = BackendHandle(
             name="store",
             hint_key=None,
-            fetches=store,
-            publishes=publisher,
+            fetcher=store,
+            publisher=publisher,
             pool_registrar=None,
             close=lambda: None,
         )

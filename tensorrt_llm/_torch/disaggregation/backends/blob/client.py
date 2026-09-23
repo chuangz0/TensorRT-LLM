@@ -12,19 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The slice of ``MooncakeDistributedStore`` the backend uses, and how to open the real one.
+"""The slice of a blob store client the backend uses.
 
-The backend takes the client by injection so that all of its logic runs against a fake; the real
-class is imported only inside ``open_mooncake_client``.
+``BlobStoreBackend`` takes the client by injection so that all of its logic runs against a fake;
+a driver (``mooncake.py``) opens the real one. The conventions are those of
+``mooncake.store.MooncakeDistributedStore``, which is the first driver.
 """
 
 from __future__ import annotations
 
 from typing import Protocol, Sequence
 
-from .config import MooncakeStoreConfig
-
-__all__ = ["OBJECT_NOT_FOUND", "StoreClient", "open_mooncake_client"]
+__all__ = ["OBJECT_NOT_FOUND", "StoreClient"]
 
 OBJECT_NOT_FOUND = -704
 """Status a get or ``get_size`` answers for a key the store does not hold; nothing is written."""
@@ -77,43 +76,3 @@ class StoreClient(Protocol):
     ) -> Sequence[int]: ...
 
     def close(self) -> int: ...
-
-
-def _default_hostname() -> str:
-    import socket
-
-    return socket.gethostbyname(socket.gethostname())
-
-
-def open_mooncake_client(config: MooncakeStoreConfig) -> StoreClient:
-    """Connect a real ``MooncakeDistributedStore`` to the master named by ``config``.
-
-    Raises:
-        ImportError: The Mooncake Python bindings are not installed.
-        RuntimeError: ``setup`` returned a non-zero status.
-    """
-    try:
-        from mooncake.store import MooncakeDistributedStore
-    except ImportError as exc:
-        raise ImportError(
-            "The Mooncake store backend needs the Mooncake Python bindings "
-            "(`pip install mooncake-transfer-engine`)."
-        ) from exc
-
-    store = MooncakeDistributedStore()
-    status = store.setup(
-        config.local_hostname or _default_hostname(),
-        config.metadata_server,
-        config.global_segment_size,
-        config.local_buffer_size,
-        config.protocol,
-        config.device_name,
-        config.master_server_address,
-    )
-    if status != 0:
-        raise RuntimeError(
-            f"MooncakeDistributedStore.setup failed with status {status} "
-            f"(master={config.master_server_address!r}, metadata={config.metadata_server!r}, "
-            f"protocol={config.protocol!r})"
-        )
-    return store

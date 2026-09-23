@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Sequence
 
 from tensorrt_llm.logger import logger
 
-from ..disaggregation.backends.kv_transfer_config import KVTransferConfig, load_kv_transfer_config
+from ..disaggregation.backends.config import KVTransferConfig, load_kv_transfer_config
 from ..disaggregation.backends.registry import (
     BackendBuildContext,
     BackendHandle,
@@ -37,10 +37,10 @@ from ..disaggregation.backends.registry import (
 )
 from ..disaggregation.orchestration.kv_transfer_coordinator import KVTransferCoordinator
 from ..disaggregation.orchestration.kv_transfer_interfaces import FetchSource, GroupKind
-from ..disaggregation.orchestration.planner import Planner
+from ..disaggregation.orchestration.remote_cache import Planner
 from ..disaggregation.resource.kv_extractor import build_page_table_from_manager
-from ..disaggregation.resource.kv_v2_layout import KVv2RegionResolver, layout_fingerprint
 from ..disaggregation.resource.kv_v2_reader import KVv2ResourceReader
+from ..disaggregation.resource.region import KVv2RegionResolver, layout_fingerprint
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_transfer_binding import KVTransferEngineBinding
 from .kv_transfer_effects import EngineWorkQueue, PyExecutorKVTransferEffects, SingleRankDist
@@ -128,11 +128,11 @@ def _build_coordinator(
     effects: PyExecutorKVTransferEffects,
 ) -> KVTransferCoordinator:
     fetch_sources = [
-        FetchSource(handle.name, handle.fetches, handle.hint_key)
+        FetchSource(handle.name, handle.fetcher, handle.hint_key)
         for handle in backends
-        if handle.fetches is not None
+        if handle.fetcher is not None
     ]
-    publishers = [handle.publishes for handle in backends if handle.publishes is not None]
+    publishers = [handle.publisher for handle in backends if handle.publisher is not None]
     # The wall-clock budget alone governs the wait for a store lookup; the planner's clock is
     # left at its default, which is the clock the binding passes to ``advance`` (plan §10 #15).
     planner = Planner(

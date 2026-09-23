@@ -127,7 +127,7 @@ README 自己规定"当前与它有哪些出入,另行成文",所以分两类(�
 | §3 图 | `advance_round · launch_reserved_fetches · publish_committed_blocks`;`backends/blob/{backend,mooncake}.py`;`backends/config.py`;`orchestration/remote_cache.py`;`resource/region.py`(含 `layout_fingerprint`) |
 | §4 命名表 | 上述改名;`BackendHandle.fetcher/publisher`;`BackendEntry.serves_fetch/serves_publish`;新增 `reserve_transfer_pages`;`Planner(probe_budget_rounds=, probe_timeout_s=, clock=)` |
 | §6:156 | "改名决定 … 本轮不改" → 已改为 `BlobStoreBackend` |
-| §11、§12 | `test_planner_time_budget.py` 现在在 `kv_transfer/`;`store_backend/test_store_backend_contract.py` → 随目录 `blob_backend/`;新增 `test_worker_pool.py`、`executor/kv_transfer/test_kv_transfer_hook_points.py`;测试数 345 → 534 |
+| §11、§12 | `test_planner_time_budget.py` 现在在 `kv_transfer/`;`store_backend/test_store_backend_contract.py` → 随目录 `blob_backend/`;新增 `test_worker_pool.py`、`executor/kv_transfer/test_kv_transfer_hook_points.py`;测试数 345 → 561(含 test_kv_transfer_hook_points.py、test_worker_pool.py) |
 | §14 | 行号基于 f974a61764a,过期。改"函数名 + 相邻语句"锚点;HEAD 更新 |
 
 ### 5.3 其他
@@ -159,7 +159,7 @@ README 自己规定"当前与它有哪些出入,另行成文",所以分两类(�
 | 代号 | 命令 | 基线 |
 |---|---|---|
 | T1 旧协调层 | `pytest tests/unittest/_torch/disaggregation --ignore=…/{kv_transfer,store_backend,engine_integration,e2e}` | **339**(collect 核实) |
-| T3 新协调层 | `pytest tests/unittest/_torch/disaggregation/{kv_transfer,store_backend,engine_integration} tests/unittest/_torch/executor/kv_transfer` | **534**(核实;S2 后目录名变 `blob_backend`) |
+| T3 新协调层 | `pytest tests/unittest/_torch/disaggregation/{kv_transfer,store_backend,engine_integration} tests/unittest/_torch/executor/kv_transfer` | **561**(核实;S2 后目录名变 `blob_backend`) |
 | T4 KV v2 wrapper | `pytest tests/unittest/_torch/executor/kv_cache` | 任务描述说 513;本机整目录 925 —— S1 pin 出集合写进本节 |
 | E1/E2 | `pytest tests/unittest/_torch/disaggregation/e2e`(GPU + `mooncake_master` + TinyLlama) | 2 用例 |
 
@@ -170,7 +170,7 @@ T2(`tests/unittest/disaggregated`)本轮不受影响:没有一步碰它 import �
 | 步 | 做什么 | 验证 |
 |---|---|---|
 | S1 契约副本核对 | `cache_backend.py` 头注释(§2.1 首行);把核对命令写进模块 docstring 末尾:`git show origin/feat/kv-shared-draft:tensorrt_llm/_torch/disaggregation/base/backend.py \| git diff --no-index - tensorrt_llm/_torch/disaggregation/base/cache_backend.py`(应仅剩头注释那几行);pin T4 | 命令跑通且差异只在注释;T3 绿 |
-| S2 目录与文件改名 | §2.1 表全部 `git mv` + 类名 `BlobStoreBackend`;`mooncake.py` 吸收 `open_mooncake_client` 与 `MooncakeStoreConfig`;`RegionResolver`/`Segment` 追加进 `base/region.py`;`kv_v2_layout.py` → `resource/region.py`。**连带清单:** (1) `registry.py::_BUILTIN_FACTORIES` 字串 `".store.mooncake:build_mooncake_backend"` → `".blob.mooncake:…"`;(2) `test_kv_transfer_config_registry.py` 子进程断言的模块名 `disaggregation.backends.store.mooncake`/`.store.backend`(:391–397)与 `mooncake_module` fixture 的 `import_module("disaggregation.backends.store.mooncake")`(:409);(3) `engine_integration/conftest.py:12` 的 `__extra_import_path__` 中 `"../store_backend"`(`test_with_coordinator.py:15` 指向 `../kv_transfer`,不受影响);(4) §2.3 的 14 个 `planner` 导入点(含 monkeypatch 字串);(5) e2e YAML 的 `type: mooncake` 不变 | T3 534、T4、E1/E2 绿;`grep -rn "backends.store\|backends/store\|kv_v2_layout\|kv_transfer_config\|store_backend\|orchestration.planner\|from .planner" tensorrt_llm tests/unittest/_torch` 为空 |
+| S2 目录与文件改名 | §2.1 表全部 `git mv` + 类名 `BlobStoreBackend`;`mooncake.py` 吸收 `open_mooncake_client` 与 `MooncakeStoreConfig`;`RegionResolver`/`Segment` 追加进 `base/region.py`;`kv_v2_layout.py` → `resource/region.py`。**连带清单:** (1) `registry.py::_BUILTIN_FACTORIES` 字串 `".store.mooncake:build_mooncake_backend"` → `".blob.mooncake:…"`;(2) `test_kv_transfer_config_registry.py` 子进程断言的模块名 `disaggregation.backends.store.mooncake`/`.store.backend`(:391–397)与 `mooncake_module` fixture 的 `import_module("disaggregation.backends.store.mooncake")`(:409);(3) `engine_integration/conftest.py:12` 的 `__extra_import_path__` 中 `"../store_backend"`(`test_with_coordinator.py:15` 指向 `../kv_transfer`,不受影响);(4) §2.3 的 14 个 `planner` 导入点(含 monkeypatch 字串);(5) e2e YAML 的 `type: mooncake` 不变 | T3 561、T4、E1/E2 绿;`grep -rn "backends.store\|backends/store\|kv_v2_layout\|kv_transfer_config\.py\|backends\.kv_transfer_config\|store_backend\|orchestration.planner\|from .planner" tensorrt_llm tests/unittest/_torch` 为空 |
 | S3 可读性改名 | §4 表前四条;`reserve_transfer_pages` 落地 + 别名 | T1、T3、T4 绿;`grep -rn "advance_transfers\|publish_completed_contexts\|\.fetches\b\|\.publishes\b" tensorrt_llm` 为空;调用点按符号核对:`PyExecutor._prepare_and_schedule_batch`(`advance_round`、`launch_reserved_fetches`)、`PyExecutor._executor_loop`/`_executor_loop_overlap`(`publish_committed_blocks`)、`KVCacheV2Scheduler._try_take_fetch_path`(`reserve_transfer_pages`) |
 | S4 文档 | §5.1–5.3;README 修订按 §2.2 两类写进 PR 描述并给作者留言;`rm` 两份草稿 | 文档里每个文件名 `ls` 得到、每个方法名 `grep` 得到 |
 | S5 收尾 | PR 描述:改名理由、README A/B 两类修订、grep 结论、测试数、§6 后续;`pre-commit` | 四组全绿 |
@@ -194,6 +194,6 @@ T2(`tests/unittest/disaggregated`)本轮不受影响:没有一步碰它 import �
 `orchestration.planner` 的 14 个导入点(含 `test_scheduler_kv_fetch_seam.py:587` 字串);`_BUILTIN_FACTORIES` 字串、registry 测试的模块名断言、
 `engine_integration/conftest.py:12`;`notify_request_finished` 对 fetch 记录也调 `hold_for_transfer`,`kv_transfer_effects.py:241` 置
 `KV_PUBLISH_IN_PROGRESS`;`prepare_disagg_gen_init` 两个调用点;`py_executor.py` 三个调用点所在函数;两份草稿无引用;S0 已提交为 c0fd92e8d13;
-T1 = 339、T3 = 534。
+T1 = 339、T3 = 561。
 
 **未核实:** T4 的"513"对应哪个集合;E1/E2 在本机是否仍可跑;kv-shared-draft 作者对 A 类两条修订的态度。

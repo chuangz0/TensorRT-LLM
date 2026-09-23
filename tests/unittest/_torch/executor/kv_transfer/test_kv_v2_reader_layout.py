@@ -3,7 +3,7 @@
 """U1 (integration plan §7, §11): the KV v2 wrapper changes and ``resource/kv_v2_*`` against a
 real ``KVCacheManagerV2`` (2 layers, 4 KV heads, tpb 32, 2048 tokens of pool).
 
-``context_block_keys`` count, determinism and divergence; ``prepare_disagg_gen_init(token_end)``
+``context_block_keys`` count, determinism and divergence; ``reserve_transfer_pages(token_end)``
 declaring history to the fetch target; the fetch extent naming exactly the nameable blocks the
 local radix tree does not serve; two identical committed requests publishing under identical
 names; ``layout_fingerprint`` stable per layout and different across layouts; the region
@@ -22,13 +22,13 @@ from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer_interfaces imp
     FetchSource,
     GroupKind,
 )
-from tensorrt_llm._torch.disaggregation.orchestration.planner import FetchPlan, Planner
+from tensorrt_llm._torch.disaggregation.orchestration.remote_cache import FetchPlan, Planner
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
-from tensorrt_llm._torch.disaggregation.resource.kv_v2_layout import (
+from tensorrt_llm._torch.disaggregation.resource.kv_v2_reader import KVv2ResourceReader
+from tensorrt_llm._torch.disaggregation.resource.region import (
     KVv2RegionResolver,
     layout_fingerprint,
 )
-from tensorrt_llm._torch.disaggregation.resource.kv_v2_reader import KVv2ResourceReader
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_transfer_effects import EngineRequestView
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
@@ -164,14 +164,14 @@ class TestContextBlockKeys:
 
 
 # ---------------------------------------------------------------------------------------------
-# prepare_disagg_gen_init(token_end) (plan §7 #1)
+# reserve_transfer_pages(token_end) (plan §7 #1)
 # ---------------------------------------------------------------------------------------------
 
 
 class TestPrepareDisaggGenInitTokenEnd:
     def test_history_is_declared_to_token_end_only(self, manager):
         request = make_request(1, prompt_tokens(1))
-        assert manager.prepare_disagg_gen_init(request, 128)
+        assert manager.reserve_transfer_pages(request, 128)
         assert manager.get_history_length(request) == 128
         kv_cache = manager.kv_cache_map[1]
         assert kv_cache.capacity >= 128
@@ -200,7 +200,7 @@ class TestPrepareDisaggGenInitTokenEnd:
         request = make_request(2, prompt_tokens(1))
         assert manager.probe_context_reuse(request) == PROMPT_LEN - 1 > NAMEABLE * TPB
 
-        assert manager.prepare_disagg_gen_init(request, NAMEABLE * TPB)
+        assert manager.reserve_transfer_pages(request, NAMEABLE * TPB)
 
         assert 2 in manager.kv_cache_map
         assert manager.get_history_length(request) >= NAMEABLE * TPB
@@ -212,7 +212,7 @@ class TestPrepareDisaggGenInitTokenEnd:
         gen-init path keeps it."""
         manager._fresh_page_fill = 0.0  # what TRTLLM_KV_FRESH_PAGE_FILL=zero parses to
         fetching = make_request(1, prompt_tokens(1))
-        assert manager.prepare_disagg_gen_init(fetching, 128)
+        assert manager.reserve_transfer_pages(fetching, 128)
         assert not manager._fresh_pages_filled.get(1)
         gen_init = make_request(2, prompt_tokens(2))
         assert manager.prepare_disagg_gen_init(gen_init)
@@ -223,7 +223,7 @@ class TestPrepareDisaggGenInitTokenEnd:
         with history declared there; reverting cannot shrink below the history, so the cache is
         dropped and the request re-enters as a fresh first chunk."""
         request = make_request(1, prompt_tokens(1))
-        assert manager.prepare_disagg_gen_init(request, 128)
+        assert manager.reserve_transfer_pages(request, 128)
         assert manager.revert_allocate_context(request) is False
         assert 1 not in manager.kv_cache_map
         assert request.context_current_position == 0
@@ -258,7 +258,7 @@ class TestFetchExtent:
         assert plan.units_by_group == {0: (2, 3, 4, 5)}
 
         # The scheduler's reservation, then the extent the coordinator launches.
-        assert manager.prepare_disagg_gen_init(request, plan.token_end)
+        assert manager.reserve_transfer_pages(request, plan.token_end)
         assert manager.get_history_length(request) == plan.token_end
         extent = reader.fetch_extent(view, plan)
 
@@ -285,7 +285,7 @@ class TestFetchExtent:
         assert len(units) == NAMEABLE  # one group
         plan = planner.decide(view, {"store": frozenset(units)})
         assert plan.token_end == NAMEABLE * TPB == 224
-        assert manager.prepare_disagg_gen_init(request, plan.token_end)
+        assert manager.reserve_transfer_pages(request, plan.token_end)
         extent = reader.fetch_extent(view, plan)
         assert len(extent.units) == NAMEABLE
         assert frozenset(u.name for u in extent.units) == frozenset(units)
@@ -297,7 +297,7 @@ class TestFetchExtent:
         planner = Planner([FetchSource("store", store, None)], reader, TPB)
         _, units = planner.probe_query(view)
         plan = planner.decide(view, {"store": frozenset(units)})
-        assert manager.prepare_disagg_gen_init(request, 3 * TPB)  # fewer pages than planned
+        assert manager.reserve_transfer_pages(request, 3 * TPB)  # fewer pages than planned
         extent = reader.fetch_extent(view, plan)
         assert [u.name for u in extent.units] == [
             reader.group_specs()[0].tag + k for k in reader.block_keys(view)[:3]
@@ -343,7 +343,7 @@ class TestPublishDescription:
     def test_publish_offers_only_committed_blocks(self, manager, reader):
         """A request whose cache exists but committed nothing yet offers nothing."""
         request = make_request(1, prompt_tokens(1))
-        assert manager.prepare_disagg_gen_init(request, 128)
+        assert manager.reserve_transfer_pages(request, 128)
         extent, _ = reader.publish_description(EngineRequestView(request))
         assert extent.units == ()
         assert extent.is_last is False  # prefill has not ended

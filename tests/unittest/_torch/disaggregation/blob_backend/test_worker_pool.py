@@ -12,7 +12,7 @@ import time
 import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.backends.store.worker_pool import DaemonWorkerPool  # noqa: E402
+from disaggregation.backends.blob.worker_pool import DaemonWorkerPool  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""``MooncakeStoreBackend`` over the real ``MooncakeDistributedStore`` and a ``mooncake_master``
+"""``BlobStoreBackend`` over the real ``MooncakeDistributedStore`` and a ``mooncake_master``
 started for the test (TCP transport, P2P handshake, loopback). Skipped when the bindings or the
 master binary are missing.
 

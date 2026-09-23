@@ -93,7 +93,7 @@ class KVv2ResourceReader:
         return True
 
     def fetch_extent(self, request, plan) -> CacheExtent:
-        """Units for the pages the scheduler reserved with ``prepare_disagg_gen_init``."""
+        """Units for the pages the scheduler reserved with ``reserve_transfer_pages``."""
         kv_cache = self._kv_cache_manager.kv_cache_map[request.py_request_id]
         units: list[Unit] = []
         for group_plan in plan.group_plans:

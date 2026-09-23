@@ -31,7 +31,7 @@ from engine_fakes import (
     make_request,
 )
 
-from tensorrt_llm._torch.disaggregation.backends.kv_transfer_config import BackendEntry
+from tensorrt_llm._torch.disaggregation.backends.config import BackendEntry
 from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
 from tensorrt_llm._torch.disaggregation.base.cache_backend import Failed
 from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer_coordinator import (
@@ -41,7 +41,7 @@ from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer_interfaces imp
     DEFER,
     FetchSource,
 )
-from tensorrt_llm._torch.disaggregation.orchestration.planner import FetchPlan, Planner
+from tensorrt_llm._torch.disaggregation.orchestration.remote_cache import FetchPlan, Planner
 from tensorrt_llm._torch.pyexecutor import kv_transfer_binding, kv_transfer_effects
 from tensorrt_llm._torch.pyexecutor.kv_transfer_binding import KVTransferEngineBinding
 from tensorrt_llm._torch.pyexecutor.kv_transfer_effects import (
@@ -133,8 +133,8 @@ class Rig:
         handle = BackendHandle(
             name="store",
             hint_key=None,
-            fetches=self.store,
-            publishes=self.publisher if publish else None,
+            fetcher=self.store,
+            publisher=self.publisher if publish else None,
             pool_registrar=None,
             close=self.backend_close,
             counters=lambda: {
@@ -168,7 +168,7 @@ class Rig:
     # -- the loop, one hook at a time --
 
     def advance(self, *active) -> None:
-        self.binding.advance_transfers(list(active))
+        self.binding.advance_round(list(active))
 
     def plan(self, req) -> FetchPlan:
         self.advance(req)
@@ -177,7 +177,7 @@ class Rig:
         return plan
 
     def reserve(self, req, token_end: int, *, committed: int = 0) -> FakeKVCache:
-        """What the scheduler's ``prepare_disagg_gen_init(req, token_end)`` leaves behind."""
+        """What the scheduler's ``reserve_transfer_pages(req, token_end)`` leaves behind."""
         kv_cache = FakeKVCache(history_length=token_end, num_committed_tokens=committed)
         self.kv.kv_cache_map[req.py_request_id] = kv_cache
         req.py_ctx_pre_resize_cap = 0
@@ -203,7 +203,7 @@ class Rig:
         )
         self.slots.add(req)
         before = len(self.publisher.attempts)
-        self.binding.publish_completed_contexts([req])
+        self.binding.publish_committed_blocks([req])
         assert len(self.publisher.attempts) == before + 1, "no publish attempt was made"
         return self.publisher.attempts[-1]
 
@@ -587,7 +587,7 @@ class TestPublishSelection:
         rig.kv.kv_cache_map[5] = FakeKVCache(history_length=100)
         dummy.is_dummy_request = True
 
-        rig.binding.publish_completed_contexts([done, mid, failed, first_token_done, dummy])
+        rig.binding.publish_committed_blocks([done, mid, failed, first_token_done, dummy])
 
         assert [c for c in rig.reader.calls if c[0] == "publish_description"] == [
             ("publish_description", 1),
@@ -604,7 +604,7 @@ class TestPublishSelection:
         assert req.is_generation_only_request
         finish_prefill(req)
         rig.kv.kv_cache_map[1] = FakeKVCache(history_length=100)
-        rig.binding.publish_completed_contexts([req])
+        rig.binding.publish_committed_blocks([req])
         assert rig.publisher.count("publish") == 0
 
     def test_a_suspended_cache_is_not_offered(self, rig):
@@ -615,7 +615,7 @@ class TestPublishSelection:
         cache = FakeKVCache(history_length=100)
         cache.is_active = False
         rig.kv.kv_cache_map[1] = cache
-        rig.binding.publish_completed_contexts([req])
+        rig.binding.publish_committed_blocks([req])
         assert rig.publisher.count("publish") == 0
         assert rig.reader.calls == []
 
@@ -624,7 +624,7 @@ class TestPublishSelection:
         req = make_request(1, 100)
         finish_prefill(req)
         rig.kv.kv_cache_map[1] = FakeKVCache(history_length=100)
-        rig.binding.publish_completed_contexts([req])
+        rig.binding.publish_committed_blocks([req])
         assert rig.reader.calls == []
         assert rig.executor._terminate_request(req) is None
         assert rig.terminations() == 1  # nothing to hold it
@@ -791,7 +791,7 @@ class TestReleaseGate:
         req.is_dummy_request = True
         finish_prefill(req)
         rig.kv.kv_cache_map[1] = FakeKVCache(history_length=100)
-        rig.binding.publish_completed_contexts([req])  # never offered (rule 4) ...
+        rig.binding.publish_committed_blocks([req])  # never offered (rule 4) ...
         assert rig.publisher.count("publish") == 0
         notify = Mock(wraps=rig.coord.notify_request_finished)
         rig.coord.notify_request_finished = notify
@@ -1362,7 +1362,7 @@ class TestCandidatesAndPublishers:
         req.py_decoding_iter = 1
         req.state = LlmRequestState.GENERATION_COMPLETE
         rig.kv.kv_cache_map[1] = FakeKVCache(history_length=100)
-        rig.binding.publish_completed_contexts([req])
+        rig.binding.publish_committed_blocks([req])
         assert rig.publisher.count("publish") == 1
         extent = rig.publisher.attempts[0].payload
         assert extent.is_last and len(extent.units) == 3  # (100 - 1) // 32 nameable blocks

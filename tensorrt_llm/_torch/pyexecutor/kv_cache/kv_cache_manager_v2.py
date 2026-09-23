@@ -3711,16 +3711,22 @@ class KVCacheManagerV2(BaseResourceManager):
         target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
         return kv_cache.resize(max(kv_cache.capacity, target))
 
-    def prepare_disagg_gen_init(self, req: LlmRequest, token_end: int | None = None) -> bool:
+    def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
+        """Reserve the full prompt for a disagg generation-init request; see
+        ``reserve_transfer_pages``."""
+        return self.reserve_transfer_pages(req, None)
+
+    def reserve_transfer_pages(self, req: LlmRequest, token_end: int | None) -> bool:
         """Reserve pages that a transfer, not this worker, will fill.
 
-        With ``token_end`` unset (a disagg generation init request) this
-        allocates capacity for the full prompt (+ draft) and declares
-        ``prompt_len`` as history. With ``token_end`` set (a content fetch for
-        an ordinary context request) it allocates and declares history up to
-        ``token_end`` only; the rest of the prompt is computed locally once the
-        fetch has landed. Either way history is declared at allocation time so
-        that windowed layer groups never hold pages they will not read.
+        With ``token_end`` ``None`` (a disagg generation init request, via
+        ``prepare_disagg_gen_init``) this allocates capacity for the full
+        prompt (+ draft) and declares ``prompt_len`` as history. With
+        ``token_end`` set (a content fetch for an ordinary context request) it
+        allocates and declares history up to ``token_end`` only; the rest of
+        the prompt is computed locally once the fetch has landed. Either way
+        history is declared at allocation time so that windowed layer groups
+        never hold pages they will not read.
 
         Returns True on success, False if preparation or resize failed (cache
         is suspended on resize failure).

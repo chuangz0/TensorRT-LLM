@@ -14,6 +14,17 @@
 # limitations under the License.
 """What a cache backend is asked to do, and when the caller may reuse the memory it named.
 
+This module is the contract of ``docs/shared/CACHE_BACKEND_SPEC.md`` §7: the thirteen names in
+``__all__``. It is a byte-for-byte copy of ``base/backend.py`` on ``feat/kv-shared-draft``; the
+name differs only because ``base/backend.py`` here still carries the older contract that
+``transceiver.py`` and ``native/`` implement. Once those move onto these types, this file is
+renamed ``backend.py``. Before syncing a contract change, check the copy has not drifted -- the
+only lines allowed to differ are this paragraph::
+
+    git diff --no-index \\
+        <(git show origin/feat/kv-shared-draft:tensorrt_llm/_torch/disaggregation/base/backend.py) \\
+        tensorrt_llm/_torch/disaggregation/base/cache_backend.py
+
 This is the surface a backend implements. It names content rather than requests: the same bytes
 serve different requests, which is what reuse means, so a backend keyed on a request id could not
 be a store.

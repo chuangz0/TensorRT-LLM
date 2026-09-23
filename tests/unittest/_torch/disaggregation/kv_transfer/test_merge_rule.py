@@ -23,7 +23,7 @@ import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.orchestration.kv_transfer_interfaces import GroupKind, GroupSpec  # noqa: E402
-from disaggregation.orchestration.planner import (  # noqa: E402
+from disaggregation.orchestration.remote_cache import (  # noqa: E402
     _stale_range,
     merge,
     required_ordinals,

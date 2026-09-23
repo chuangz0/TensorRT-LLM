@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Import the store backend as ``disaggregation.backends.store.*`` straight from
+"""Import the blob store backend as ``disaggregation.backends.blob.*`` straight from
 ``tensorrt_llm/_torch``.
 
 The package under test depends on nothing outside ``disaggregation``, so it is tested without

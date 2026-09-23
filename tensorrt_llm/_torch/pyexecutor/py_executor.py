@@ -3948,7 +3948,7 @@ class PyExecutor:
         self.disagg.poll_gen_transfers()
         if self.kv_transfer is not None:
             # Plan §5 #1, design §3.2 ①: loop head; this round's schedule sees last round's landings.
-            self.kv_transfer.advance_transfers(self.active_requests)
+            self.kv_transfer.advance_round(self.active_requests)
         self.disagg.check_transfer_timeouts()
 
         iter_stats = self._init_iter_stats_if_sampled(len(new_requests))
@@ -4673,7 +4673,7 @@ class PyExecutor:
                         self._update_v2_context_resources(scheduled_batch)
                     if self.kv_transfer is not None:
                         # Plan §5 #3, design §3.2 ④: publish after the forward completed and the blocks were committed.
-                        self.kv_transfer.publish_completed_contexts(
+                        self.kv_transfer.publish_committed_blocks(
                             scheduled_batch.context_requests)
                     self._send_kv_async(scheduled_batch.all_requests())
 
@@ -5516,7 +5516,7 @@ class PyExecutor:
 
                     if self.kv_transfer is not None:
                         # Plan §5 #4, design §3.2 ④: only previous_batch is committed and forward-complete here.
-                        self.kv_transfer.publish_completed_contexts(
+                        self.kv_transfer.publish_committed_blocks(
                             self.previous_batch.scheduled_requests.
                             context_requests)
                     self._send_kv_async(

@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, Sequence
 
 from tensorrt_llm.logger import logger
 
-from ..disaggregation.backends.kv_transfer_config import BackendEntry
+from ..disaggregation.backends.config import BackendEntry
 from ..disaggregation.backends.registry import BackendHandle, close_backends
 from ..disaggregation.orchestration.kv_transfer_coordinator import KVTransferCoordinator
 from ..disaggregation.orchestration.kv_transfer_interfaces import DEFER
@@ -106,8 +106,9 @@ class KVTransferEngineBinding:
 
     # ---- loop entry points ----
 
-    def advance_transfers(self, active_requests: Sequence[LlmRequest]) -> None:
-        """Loop head (design §3.2 step 1): reap landed transfers, plan undecided requests."""
+    def advance_round(self, active_requests: Sequence[LlmRequest]) -> None:
+        """Loop head (design §3.2 step 1), once per round: pick the undecided candidates, then
+        ``coordinator.advance`` reaps landed transfers and plans them."""
         candidates = self._undecided_candidates(active_requests)
         self.coordinator.advance(candidates, time.monotonic())
         self._num_deferred_requests = sum(
@@ -129,12 +130,12 @@ class KVTransferEngineBinding:
             views = [EngineRequestView(request) for request in fetch_launch_queue]
             self.coordinator.launch_fetches(views, time.monotonic())
 
-    def publish_completed_contexts(self, context_requests: Sequence[LlmRequest]) -> None:
+    def publish_committed_blocks(self, context_requests: Sequence[LlmRequest]) -> None:
         """After a context step whose forward has completed and whose blocks are committed
         (design §3.2 step 4, plan §5 #3-#4): offer the blocks of requests whose prefill ended."""
         completed = self._publishable_completed_contexts(context_requests)
         if completed:
-            self.coordinator.publish_context_progress(completed, finished=(), now=time.monotonic())
+            self.coordinator.publish_committed_blocks(completed, finished=(), now=time.monotonic())
 
     # ---- release gate, cancel path, idle pacing ----
 

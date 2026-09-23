@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 > **状态:草案 v4,讨论中。** 经三轮多视角评审(易读性、对照代码的可行性、可维护可扩展性)修订。
 > 本文把 `docs/shared/README.md` §5 中今天只服务 disagg 的 `orchestration/` 层,扩展为所有传输后端共用的协调层。它建立在 `CACHE_BACKEND_SPEC.md` 规定的后端契约之上,不修改契约;需要契约变化的地方集中在 §11。
-> **目标分支:`origin/feat/kv-shared-draft`(commit `2ea958f8817`)。** 契约代码、规格与 `resource/naming.py` 只在该分支上。
+> **目标分支:`origin/feat/kv-shared-draft`(commit `2ea958f8817`)。** 规格在该分支上;契约代码在本分支以逐字节副本落在 `base/cache_backend.py`(与其 `base/backend.py` 同步;配对路径迁移后换名,见 `KV_TRANSFER_ALIGNMENT_PLAN.zh.md` §1、§6),`resource/naming.py` 与其只差一行 import。
 > 范围只覆盖 PyTorch 执行器与 KV Cache Manager V2;V1 不在考虑之内。
 > **「已定」** 是讨论已收敛的结论;**「待定 → §11 #n」** 指向待决问题表。
 > 与 vLLM / SGLang 的逐条对照、源码行号、评审中否决的方案,在配套的 `KV_TRANSFER_COORDINATOR_DESIGN.notes.zh.md`。
@@ -130,7 +130,7 @@ flowchart TB
         C --> Q
     end
 
-    subgraph CONTRACT["公共契约 base/backend.py(未冻结)"]
+    subgraph CONTRACT["公共契约 base/cache_backend.py(与 kv-shared-draft base/backend.py 逐字节同步;配对路径迁移后换名)"]
         F[Fetches / Publishes<br/>CacheExtent · Attempt · Outcome]
         OPT[可选协议 §7.5<br/>PlacesPieces · CarriesAux]
     end
@@ -145,7 +145,7 @@ flowchart TB
     KV[KV Cache Manager V2]
 
     S -->|plan_fetch 只读| C
-    L -->|advance · launch_fetches · publish_context_progress| C
+    L -->|advance · launch_fetches · publish_committed_blocks| C
     C -->|effects| L
     C -->|fetch / publish / poll / quiesce| F
     F --> W & ST & K
@@ -192,7 +192,7 @@ sequenceDiagram
     L->>S: schedule()
     S->>C: plan_fetch(req)  只读,在 prepare_context_cache 之前
     C-->>S: FetchPlan | None | DEFER
-    S->>KV: prepare_disagg_gen_init(req, token_end)  同今天 gen-init 的分配
+    S->>KV: reserve_transfer_pages(req, token_end)  同今天 gen-init 的分配(prepare_disagg_gen_init 是其别名)
     S-->>L: ScheduledRequests + fetch_launch_queue
     end
 
@@ -208,11 +208,11 @@ sequenceDiagram
     L->>L: forward
 
     rect rgb(250, 240, 255)
-    Note over L,BE: ④ forward 后 publish_context_progress,在响应 pass 之前
-    L->>C: publish_context_progress(ctx_requests_stepped)
+    Note over L,BE: ④ forward 后 publish_committed_blocks,在响应 pass 之前
+    L->>C: publish_committed_blocks(ctx_requests_stepped, finished, now)
     Note over C: 先 commit 再发布,extent 与 chunk 用提交后的页
     C->>BE: 对每个 publisher publish(extent),对 PlacesPieces 再 place(chunk)
-    C->>L: effects.hold_for_publish(req)  [请求已结束而发布未 RELEASED]
+    C->>L: effects.hold_for_transfer(req)  [请求已结束而仍有记录在飞:publish 未 RELEASED,或 fetch 在飞]
     end
 ```
 
@@ -220,8 +220,8 @@ sequenceDiagram
 |---|---|---|
 | `advance(candidates, now)` | 循环头 | 四个阶段:收(poll、EngineQueue)、算(候选请求的计划、过期判定)、齐(一次集合通信)、用(放行、退页、终结)。详见 §7.1 |
 | `plan_fetch(req)`(钩子) | 调度器评估 context 请求时,**在** `prepare_context_cache` **之前** | 读记录表,答 `FetchPlan / None / DEFER`。不分配、不改状态、不阻塞 |
-| `launch_fetches(queue)` | 调度后,forward 前 | 对调度器已分配的请求发起 fetch |
-| `publish_context_progress(reqs)` | 每个 context step 之后、响应 pass 之前 | 对本轮算了 context 的请求发起或推进 publish;请求已结束的 `hold_for_publish` |
+| `launch_fetches(queue, now)` | 调度后,forward 前 | 对调度器已分配的请求发起 fetch |
+| `publish_committed_blocks(reqs, finished, now)` | 每个 context step 之后、响应 pass 之前 | 对本轮算了 context 的请求发起或推进 publish;`finished` 里的请求走 `notify_request_finished`,仍有记录在飞(publish 未 RELEASED,或 fetch 在飞)的 `hold_for_transfer` |
 
 `candidates` = 处于 `CONTEXT_INIT` 且计划尚未决定的请求:新到的、上一轮 `DEFER` 的、失败后要重试的。计划在循环头算而不是在调度器里算,是因为 store 的 `probe` 可能要一个来回、路由提示异步到达,而计划必须在所有 rank 上一致。
 
@@ -259,7 +259,7 @@ class TransferRecord:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PLANNED: fetch 由 advance 的计划阶段写入,publish 由 publish_context_progress 建立
+    [*] --> PLANNED: fetch 由 advance 的计划阶段写入,publish 由 publish_committed_blocks 建立
     PLANNED --> IN_FLIGHT: fetch 或 publish 返回 Attempt
     PLANNED --> RELEASED: SubmissionRejected(什么都没逃出去)或请求被取消
     IN_FLIGHT --> LANDED: 当前 try 全部 Delivered 且 served 齐全且共识通过
@@ -287,6 +287,8 @@ stateDiagram-v2
 2. **gen-init 不是状态,是计划阶段的一条短路规则**(§7.2);gen-first 的 context 请求等 generation 侧就绪,是计划阶段的 `DEFER` 答案。
 
 gen-init 落地后到被真正调度之间,引擎还要准备 seq slot、sampler(§7.3 `unpark`)。这是引擎自己的中间态,今天叫 `DISAGG_GENERATION_TRANS_COMPLETE`,不属于协调层。
+
+**待决(→ §11 #1 的一部分):** 今天 `hold_for_transfer` 对已结束而 **fetch** 仍在飞的请求也会被调用(`notify_request_finished` 对两个方向的记录一视同仁),而引擎侧实现 `PyExecutorKVTransferEffects.hold_for_transfer` 一律置 `KV_PUBLISH_IN_PROGRESS`——fetch hold 也如此。状态名与含义不符,但两者都在调度器排除区间之外,行为正确;随 C++ 枚举收敛一并处理。
 
 `LlmRequestState` 是 C++ 枚举,经 nanobind 暴露;gen-init 请求在 C++ 构造器里就带 `kDISAGG_GENERATION_INIT`;C++ 的 `createResult` 按 disagg 状态决定是否附带 `contextPhaseParams`;Python 侧约 60 处枚举使用加约 34 处 `is_disagg_*` 属性。这是 batch_manager owner 范围的改动。在它完成之前,协调层用**别名表**工作(§12.2)。
 
@@ -342,7 +344,7 @@ stateDiagram-v2
     GENERATION_IN_PROGRESS --> KV_PUBLISH_IN_PROGRESS: 同上
     KV_PUBLISH_IN_PROGRESS --> [*]: 记录 RELEASED,terminate_request
     note right of CONTEXT_INIT
-        context 每步之后 publish_context_progress
+        context 每步之后 publish_committed_blocks
         发布不改变还在跑的请求的状态
     end note
 ```
@@ -412,22 +414,29 @@ class FetchSource:
 
 class KVTransferCoordinator:
     def __init__(self, sources: Sequence[FetchSource], publishers: Sequence[Publishes],
-                 planner: Planner, effects: ExecutorEffects, queue: EngineQueue,
-                 registry: ActiveRequestRegistry, dist: DistLike): ...
+                 planner: Planner, reader: ResourceReader, effects: KVTransferEffects,
+                 queue: EngineQueue, dist: DistLike, *,
+                 fetch_timeout_s: float | None = None, publish_timeout_s: float | None = None,
+                 attention_dp: bool = False, queue_budget: int = 64,
+                 gather: Callable[[Payload], list] | None = None): ...
 
     # ---- 循环入口(每个 rank 每轮调用次数必须一致)----
-    def advance(self, candidates: Sequence[LlmRequest], now: float) -> None: ...
-    def launch_fetches(self, queue: Sequence[LlmRequest]) -> None: ...
-    def publish_context_progress(self, reqs: Sequence[LlmRequest]) -> None: ...
+    def advance(self, candidates: Sequence[RequestView], now: float) -> None: ...
+    def launch_fetches(self, queue: Sequence[RequestView], now: float | None = None) -> None: ...
+    def publish_committed_blocks(self, reqs: Sequence[RequestView], finished: Collection[int],
+                                 now: float | None = None) -> None: ...
 
     # ---- 调度器钩子(只读、非阻塞)----
-    def plan_fetch(self, req: LlmRequest) -> FetchPlan | None | Defer: ...
+    def plan_fetch(self, req: RequestView) -> FetchPlan | None | Defer: ...
 
     # ---- 控制(不是入口)----
-    def abandon(self, req: LlmRequest) -> None: ...        # 置 abandoned,不叫停
+    def notify_request_finished(self, req: RequestView) -> None: ...  # 释放门:未在飞的 fetch 到释放点;在飞的记录 hold 请求
     def has_inflight(self) -> bool: ...                    # pace_idle 与基准门控用
+    def inflight_request_ids(self) -> frozenset[int]: ... # 调度器的 protected_from_eviction 与释放门用
     def status_dump(self) -> dict: ...                     # hang detector 用(今天就有)
 ```
+
+`reader` 是本 rank 的资源视图(extent 与 chunk 从它取);`gather` 可替换 `dist.allgather`,供测试注入。`registry: ActiveRequestRegistry` 已不在签名里——请求以 `py_request_id` 为键记在协调层自己的表中。
 
 `advance` 的四个阶段,每个阶段只操作记录表:
 
@@ -454,7 +463,7 @@ class KVTransferCoordinator:
 
 ### 7.2 `Planner`
 
-**职责**:来源策略(取不取、问谁、取到哪)和归并(§6.3)。它是唯一**为了做决策而读请求内容**的地方;extent 与 chunk 的构造、命名在 `resource/`。
+**职责**:来源策略(取不取、问谁、取到哪)和归并(§6.3)。它是唯一**为了做决策而读请求内容**的地方;extent 与 chunk 的构造、命名在 `resource/`。文件 `orchestration/remote_cache.py`(README §5 的名字;类名说它做什么)。
 
 ```python
 @dataclass(frozen=True)
@@ -463,14 +472,29 @@ class FetchPlan:
     source: str                                 # FetchSource.name
     hint: Mapping[str, object] | None           # open_route 的输入,worker 后端才有
     no_local_fallback: bool                     # gen-init 为 True:失败只能 fail,不能本地重算
-    units_by_group: Mapping[int, Sequence[int]] # 各层组要哪些块序号;归并与重试时对照
+    units_by_group: Mapping[int, tuple[int, ...]] # 各层组要哪些块序号;归并与重试时对照
+    unit_names: frozenset[bytes]                # 询问集合;served 是它的子集
+    group_plans: tuple[GroupPlan, ...]          # 每层组的 (GroupSpec, ordinals);fetch_extent 按它造 unit
+    block_keys: tuple[bytes, ...]               # context_block_keys(req) 的快照
+    reuse_end: int                              # 计划时的本地命中末端(token 数)
+    tokens_per_block: int
     mode: Literal["PREFETCH"] = "PREFETCH"      # 为 §10.2 预留
 
 DEFER = Defer()                                 # 单例:本轮别调度它,下轮再问
 
 class Planner:
-    def __init__(self, sources: Sequence[FetchSource], reader: ResourceReader, tokens_per_block: int): ...
+    def __init__(self, sources: Sequence[FetchSource], reader: ResourceReader, tokens_per_block: int, *,
+                 probe_budget_rounds: int | None = 2, probe_timeout_s: float | None = None,
+                 clock: Callable[[], float] = time.monotonic): ...
+    def probe_query(self, req) -> tuple[bytes, tuple[bytes, ...]] | None: ...  # 该问 store 什么;None = 无可命名整块
+    def decide(self, req, probe_answers, *, retry_hint=None) -> FetchPlan | None | Defer: ...
+    def forget(self, req_id: int) -> None: ...  # 请求结束,丢掉它的 probe 计时
+
+def merge(plan: FetchPlan, served: frozenset[bytes]) -> int: ...            # §6.3:归并后的 B
+def retry_hint_from(plan: FetchPlan, served: frozenset[bytes]) -> int: ...  # 重试时的 token_end 上界
 ```
+
+probe 的等待有两个预算,先到者为准:`probe_budget_rounds`(按 `decide` 被调用的轮数计,`None` 关闭)与 `probe_timeout_s`(按 `clock` 计,从首次 `DEFER` 起);超过即视为 store 未命中,按本地计算。
 
 **计划的决策顺序**(每个候选请求一次):
 
@@ -483,9 +507,9 @@ class Planner:
 | 5 | token_end | worker:prompt 的整块末端;store:probe 答案的**连续**前缀末端;重试时用重试提示 |
 | 6 | 一致性 | 计划只用所有 rank 相同的输入(prompt、路由提示、probe 答案);本地命中深度各 rank 可能不同,只用它裁 `units_by_group`,裁到空仍是合法计划(契约允许 units 为空) |
 
-### 7.3 引擎 effects(`orchestration/interfaces.py`)
+### 7.3 引擎 effects(`orchestration/kv_transfer_interfaces.py`)
 
-Coordinator 通过 effects 反向触达引擎,这是它对引擎的全部依赖。引擎侧实现(`pyexecutor/disagg_adapter.py`)每个一行职责:
+Coordinator 通过 effects 反向触达引擎,这是它对引擎的全部依赖。引擎侧实现(`pyexecutor/kv_transfer_effects.py`,唯一写请求状态的地方)每个一行职责。旧路(disagg 配对路径)对应的是 `orchestration/interfaces.py` 与 `pyexecutor/disagg_adapter.py`,两对文件待 §12 统一后合并:
 
 | effect | 新/旧 | 作用 |
 |---|---|---|
@@ -493,7 +517,7 @@ Coordinator 通过 effects 反向触达引擎,这是它对引擎的全部依赖�
 | `unpark(req, token_end, no_local_fallback, aux)` | 新,合并今天两处 | 见下 |
 | `give_back_fetch_pages(reqs)` | 改名自 `revert_ctx_alloc` | 对所有资源管理器 `revert_allocate_context`;请求 → `CONTEXT_INIT` |
 | `prepare_fetch_resources(reqs)` | 改名自 `prepare_gen_resources` | spec / draft 资源管理器的准备 |
-| `hold_for_publish(reqs)` | 新 | 请求已结束但 publish 未 RELEASED:状态 → `KV_PUBLISH_IN_PROGRESS`;释放 seq slot、spec 资源(今天 `AsyncTransferManager.start_transfer` 做的),对所有管理器 `release_index_slot`;页本身还锁着 |
+| `hold_for_transfer(reqs)` | 新 | 请求已结束但仍有记录在飞(publish 未 RELEASED,或 fetch 在飞):状态 → `KV_PUBLISH_IN_PROGRESS`(fetch hold 也置此值,§4.2 待决);释放 seq slot、spec 资源(今天 `AsyncTransferManager.start_transfer` 做的),对所有管理器 `release_index_slot`;页本身还锁着 |
 | `terminate_request(req)` | 沿用 | 最终释放 |
 | `stage_transfer_response(req, ...)` | 沿用 | ctx 侧响应 |
 | `fail_requests(reqs, reason)` / `fail_fatal(exc)` | 沿用 | |
@@ -512,15 +536,15 @@ Coordinator 通过 effects 反向触达引擎,这是它对引擎的全部依赖�
 
 - 后端在装配期(`py_executor_creator`)一次性构造,活整个进程;实现了 `RegistersPools` 的,装配期把所有 pool 登记给它;需要引擎线程的,装配期拿到 `EngineQueue`。
 - 装配把 fetch 后端排成有序表 `Sequence[FetchSource]` 交给 Coordinator 与 Planner;publish 后端是 `Sequence[Publishes]`。**加一个后端 = 新目录 + 装配表一行**。
-- **路由只属于 worker 类后端。** `hint_key` 说明该后端认哪一个路由提示;`launch_fetches` 为本次尝试调 `open_route(hint)`,存在 `AttemptRecord.route`,`LANDED` 或 quiesce 后 `close`(尽早还 aux slot)。store 后端 `hint_key = None`,`open_route` 拒绝。
+- **路由只属于 worker 类后端。** `hint_key` 说明该后端认哪一个路由提示;`launch_fetches` 为本次尝试调 `open_route(hint)`,存在 `AttemptRecord.route`,`LANDED` 或 quiesce 后 `close`(尽早还 aux slot)。blob 后端(`backends/blob/`,Mooncake 驱动)`hint_key = None`,`open_route` 拒绝。
 - 一个请求一次只从一个来源取。多来源不在第一版(§10.4)。
 
 ### 7.5 契约之外的可选协议 「已定」
 
-第一版只有两个,都只有 worker 后端实现,放在 `orchestration/interfaces.py`。与契约里 `RegistersPools` 同一套路:实现了才有此能力,用 `isinstance` 判断。**每个协议至少有一个成员**:空的 `@runtime_checkable` Protocol 对任何对象都判真。
+第一版只有两个,都只有 worker 后端实现,放在 `orchestration/kv_transfer_interfaces.py`。与契约里 `RegistersPools` 同一套路:实现了才有此能力,用 `isinstance` 判断。**每个协议至少有一个成员**:空的 `@runtime_checkable` Protocol 对任何对象都判真。
 
 - **`PlacesPieces.place(chunk: Chunk) -> Attempt`**
-  解决:尾部半块、活 SSM 状态没有名字,只能按位置搬(README §2 的"放置入口";`Chunk` 是 `resource/page.py` 已有类型)。
+  解决:尾部半块、活 SSM 状态没有名字,只能按位置搬(README §2 的"放置入口")。`Chunk` 今天在 `base/backend.py`(配对路径的旧契约),kv-shared-draft 已把它搬到 `resource/page.py`;本分支随配对路径迁移一并跟进(ALIGNMENT_PLAN §6)。
   用法:Coordinator 从 `resource/` 一次拿到 `(extent, chunk)`,对所有 publisher 调 `publish(extent)`,对实现者再调 `place(chunk)`。
   附带语义:实现者按序列工作,**每个 chunk 都收到**;未实现者只在最后一个 chunk 收到一次 `publish`,且不得读 `is_last`。
 
@@ -538,7 +562,7 @@ Coordinator 通过 effects 反向触达引擎,这是它对引擎的全部依赖�
 
 | # | 在哪 | 改什么 | 为什么 |
 |---|---|---|---|
-| 1 | wrapper `prepare_disagg_gen_init(req, token_end=None)` | 加一个参数,缺省 `prompt_len`。传入时:history 声明到 `token_end`;像 gen-init 一样**关掉** `enable_swa_scratch_reuse`(否则 `resize` 断言);cached-token 归因用同一条件;`_assert_disagg_history_declared` 改为与 `token_end` 比较。**hybrid 重载**在此把 `token_end` 无条件登记为该请求的快照点:登记要在 `_apply_branch_snapshot_point` 补 `prompt_len` 缺省**之后**,且不能套 `point > current_position` 的过滤,否则 unpark 那一轮它已被剔掉 | `expect_snapshot_points` 每轮调度都被重建,写在请求上会被覆盖;hybrid 的 `try_commit_blocks` 只在 `context_current_position` 是快照点时提交并快照 |
+| 1 | wrapper 新增 `reserve_transfer_pages(req, token_end)`;`prepare_disagg_gen_init(req)` 保留为 gen-init 的一行别名(`token_end=None`) | `None` 即缺省 `prompt_len`。传入时:history 声明到 `token_end`;像 gen-init 一样**关掉** `enable_swa_scratch_reuse`(否则 `resize` 断言);cached-token 归因用同一条件;`_assert_disagg_history_declared` 改为与 `token_end` 比较。**hybrid 重载**在此把 `token_end` 无条件登记为该请求的快照点:登记要在 `_apply_branch_snapshot_point` 补 `prompt_len` 缺省**之后**,且不能套 `point > current_position` 的过滤,否则 unpark 那一轮它已被剔掉 | `expect_snapshot_points` 每轮调度都被重建,写在请求上会被覆盖;hybrid 的 `try_commit_blocks` 只在 `context_current_position` 是快照点时提交并快照 |
 | 2 | wrapper 新增 `context_block_keys(req) -> list[bytes]` | 十几行 glue:把 `_context_reuse_tokens(req)` 与 reuse scope 交给 runtime 公开的 `sequence_to_blockchain_keys` | 远端分支的 `cache_reuse.py` 已在调这个名字,方法本身还没写;多模态 digest token 由 `_context_reuse_tokens` 处理 |
 | 3 | runtime `BlockRadixTree.match_keys(root_key, keys) -> ReuseMatch` | `_match_token_path` 去掉 token 的变体:沿 `next[key]` 走到第一个缺失,tokens 从 `Block.tokens` 取回,再走 `_prune_match(ssm_lc_id=None)`。**attention-only 剪枝**,SSM 快照由调用方单独核对 | children 本来就按 `BlockKey` 索引。若带 SSM 剪枝,匹配会被截到最近一个有快照的块 |
 | 4 | runtime `create_kv_cache(reuse_scope, input_tokens=None, *, reuse_keys=None, ...)` | 与 `input_tokens` 二选一,走同一个 `_setup_for_reuse` | 让应答 demand 复用现有 hold/lock 机制 |
@@ -570,9 +594,9 @@ Coordinator 通过 effects 反向触达引擎,这是它对引擎的全部依赖�
 
 ### 9.2 disagg:context 侧发送(含分块 prefill)
 
-1. 每个 context step 之后 `publish_context_progress(reqs)`。`update_context_resources` 已经提交了本 chunk。
+1. 每个 context step 之后 `publish_committed_blocks(reqs, finished, now)`。`update_context_resources` 已经提交了本 chunk。
 2. Coordinator 从 `resource/` 取该请求的 `(extent, chunk)`。worker 后端实现了 `PlacesPieces`,每个 chunk 都收到 `publish(extent)` 与 `place(chunk)`;是否真的分块发由它决定。非最后一个 chunk 时请求状态不变。
-3. 最后一个 chunk 后请求结束,publish 记录仍在 `IN_FLIGHT`:`hold_for_publish` → `KV_PUBLISH_IN_PROGRESS`,seq slot 与 spec 资源先还。这一步在同一轮的响应 pass 之前,`createResult` 才能照常附带 `contextPhaseParams`。
+3. 最后一个 chunk 后请求结束,publish 记录仍在 `IN_FLIGHT`:`hold_for_transfer` → `KV_PUBLISH_IN_PROGRESS`,seq slot 与 spec 资源先还。这一步在同一轮的响应 pass 之前,`createResult` 才能照常附带 `contextPhaseParams`。
 4. generation 侧拉完 → `Delivered` → 释放点 `quiesce` → `RELEASED` → `stage_transfer_response` → `terminate_request`。过期则失败,与今天相同。
 
 ### 9.3 跨请求:从别的 worker 按内容取
@@ -586,11 +610,11 @@ Coordinator 通过 effects 反向触达引擎,这是它对引擎的全部依赖�
 
 ### 9.4 从 store 取
 
-同 9.3,差别:§7.2 决策第 4 步用 `probe(name, units)` 问 store 持有哪些;store 后端自己在后台查,查完之前 `probe` 答 `None`,请求 `DEFER` 一两轮;token_end 取答案的**连续**前缀末端;没有路由。`probe` 的答案只是建议(SPEC §6.2 不变式 8),取时少了就走 9.3 第 4 步的重试。
+同 9.3,差别:§7.2 决策第 4 步用 `probe(name, units)` 问 store 持有哪些;blob 后端(Mooncake 驱动)自己在后台查,查完之前 `probe` 答 `None`,请求 `DEFER` 一两轮;token_end 取答案的**连续**前缀末端;没有路由。`probe` 的答案只是建议(SPEC §6.2 不变式 8),取时少了就走 9.3 第 4 步的重试。
 
 ### 9.5 发布到 store
 
-`publish_context_progress` 时,若装配了 store publisher 且请求允许发布:extent = 已提交整块的 unit。store 不实现 `PlacesPieces`,只在最后一个 chunk 收到一次。同名重复发布是合并(SPEC §6.3 实现要求 2)。请求若继续 generation,状态不变;若已结束而发布未 RELEASED,`hold_for_publish`。每个已提交块都发,不按命中次数门控;要不要少发是策略开关,不影响正确性。
+`publish_committed_blocks` 时,若装配了 blob publisher(Mooncake 驱动)且请求允许发布:extent = 已提交整块的 unit。blob 后端不实现 `PlacesPieces`,只在最后一个 chunk 收到一次。同名重复发布是合并(SPEC §6.3 实现要求 2)。请求若继续 generation,状态不变;若已结束而发布未 RELEASED,`hold_for_transfer`。每个已提交块都发,不按命中次数门控;要不要少发是策略开关,不影响正确性。
 
 ### 9.6 超时与取消
 
@@ -626,7 +650,7 @@ sequenceDiagram
 
 契约已经容得下:两条轴互不蕴含,SPEC 明确写了"对端可以停止碰内存而关于结果的消息仍在路上"。缓冲归后端自己管,协调层、Planner、KV v2 都不知道它存在;这和 C++ NIXL 路径上的 bounce buffer 是同一思路。
 
-要把"早静默"变成"早放页",现在预定两件事,以后不必重做记录模型:(1) 契约加一个**非阻塞的静默查询**(待定 → §11 #4),`advance` 的收阶段顺手问;(2) **记录可以比请求活得久**:`hold_for_publish` 在静默后就释放页并终结请求,记录留到结局出来只为 ctx 响应。
+要把"早静默"变成"早放页",现在预定两件事,以后不必重做记录模型:(1) 契约加一个**非阻塞的静默查询**(待定 → §11 #4),`advance` 的收阶段顺手问;(2) **记录可以比请求活得久**:`hold_for_transfer` 在静默后就释放页并终结请求,记录留到结局出来只为 ctx 响应。
 
 第二条路是用 **KV v2 自己的 host tier 当源**:页提交后被 offload 到 host,publish 或应答 demand 直接从 host 页发(README §2 的"已提交(可寻址层)")。需要 `pin_by_keys` 有"只 hold 不 lock 到 GPU"的变体(§11 #2)和 `resource/` 页表给出 host 层地址。也不动协调层。
 
@@ -682,7 +706,7 @@ class StreamsLayers(Protocol):
 | `connectors/kv_cache_connector.py`、`kv_cache_layout.py`、`registry.py` | **删除**(G8) |
 | `KVCacheManagerV2._run_kv_connector_hooks`、`_mark_connector_prefix_populated`、`report_batch_to_connector`、`_connector_may_serve`、`py_connector_*` 字段 | 删除 |
 | `orchestration/admission.py`、`transfer_window_bypass_eligible` | 删除 |
-| `orchestration/transfer_manager.py`(`AsyncTransferManager`) | 并入 `TransferRecord` 表;它释放 seq slot / spec 资源的职责进 `hold_for_publish` |
+| `orchestration/transfer_manager.py`(`AsyncTransferManager`) | 并入 `TransferRecord` 表(新路已是 `records.py`);它释放 seq slot / spec 资源的职责进 `hold_for_transfer` |
 | `orchestration/coordinator.py`(`DisaggTransferCoordinator`) | 演化为 `KVTransferCoordinator` |
 | `transceiver.py` 中的状态写点、`_positional_window`、`_build_prefill_extent` | 状态写点移除;来源策略移入 `Planner`;extent / chunk 构造移入 `resource/`;传输部分收进 worker 后端 |
 | `fitting_disagg_gen_init_requests` | 改名 `fetch_launch_queue`,语义一般化 |
@@ -691,9 +715,9 @@ class StreamsLayers(Protocol):
 
 ### 12.2 分阶段
 
-0. **落契约。** 把 `origin/feat/kv-shared-draft` 的 `base/backend.py`、`resource/naming.py`、两份文档合进目标分支。
-1. **记录表与入口。** 只接 worker 后端。范围比"只有 gen-init"大:删 `transfer_manager.py` 就要有 ctx 侧的 publish 记录与 `hold_for_publish`,删 `prepare_context_schedulable` 就要有计划阶段的 gen-first `DEFER`;计划的短路规则此时还没有消费者(调度器仍按 `DISAGG_GENERATION_INIT` 路由)。行为对照附录 C 逐行验证。**代码量与今天相当**,收益是单一写手和后面几步的基础。
-2. **调度器接缝。** `plan_fetch` / `fetch_launch_queue`,`prepare_disagg_gen_init` 加 `token_end`。请求状态用别名表:`KV_FETCH_IN_PROGRESS ≡ DISAGG_GENERATION_TRANS_IN_PROGRESS`(调度器已排除)、`KV_PUBLISH_IN_PROGRESS ≡ DISAGG_CONTEXT_TRANS_IN_PROGRESS`(`createResult` 照常工作,前提是 `hold_for_publish` 在响应 pass 之前),gen-init 到达时由一个 effect 归一为 `CONTEXT_INIT`。C++ 收敛另开一线。
+0. **落契约。** 已完成:契约以逐字节副本落在 `base/cache_backend.py`,`resource/naming.py` 与其只差一行 import;与 kv-shared-draft 的合并、配对路径迁移与契约换名见 `KV_TRANSFER_ALIGNMENT_PLAN.zh.md` §6。
+1. **记录表与入口。** 只接 worker 后端。范围比"只有 gen-init"大:删 `transfer_manager.py` 就要有 ctx 侧的 publish 记录与 `hold_for_transfer`,删 `prepare_context_schedulable` 就要有计划阶段的 gen-first `DEFER`;计划的短路规则此时还没有消费者(调度器仍按 `DISAGG_GENERATION_INIT` 路由)。行为对照附录 C 逐行验证。**代码量与今天相当**,收益是单一写手和后面几步的基础。
+2. **调度器接缝。** `plan_fetch` / `fetch_launch_queue`,`prepare_disagg_gen_init` 加 `token_end`。请求状态用别名表:`KV_FETCH_IN_PROGRESS ≡ DISAGG_GENERATION_TRANS_IN_PROGRESS`(调度器已排除)、`KV_PUBLISH_IN_PROGRESS ≡ DISAGG_CONTEXT_TRANS_IN_PROGRESS`(`createResult` 照常工作,前提是 `hold_for_transfer` 在响应 pass 之前),gen-init 到达时由一个 effect 归一为 `CONTEXT_INIT`。C++ 收敛另开一线。
 3. **KV v2 四件事 + `resource/` 两个服务 + 内容寻址。** §8;worker 后端的 `serve.py`;接 store 后端。
 4. **删 connector。**
 
@@ -735,6 +759,7 @@ class StreamsLayers(Protocol):
 | effects | 协调层反向调用引擎的一组回调,§7.3 |
 | EngineQueue | 后端把需要 KV v2 的工作排进来、协调层在引擎线程执行的队列 |
 | worker 后端 / store 后端 | 见 §1.1 |
+| blob 后端 | store 后端在代码里的落点:`backends/blob/backend.py::BlobStoreBackend` 只依赖 `StoreClient` Protocol,同时实现 `Fetches` / `Publishes` / `RegistersPools`;驱动 `backends/blob/mooncake.py`(配置、开客户端、注册表工厂)是第一个,后续驱动与其并列 |
 | parked | 请求处于 `KV_FETCH_IN_PROGRESS`,不被调度 |
 | canonical schedule | PP 下 rank 0 决定、跟随者照做的调度结果 |
 | ADP | attention data parallel |
@@ -747,7 +772,7 @@ class StreamsLayers(Protocol):
 |---|---|
 | 本地命中深度 | `probe_context_reuse(req)`,不占页 |
 | 层组的读法、窗口、sink | `impl.layer_grouping` + `kv_cache_manager_py_config.layers`,`kv_extractor` 已在读 |
-| 预留目的页 | `prepare_disagg_gen_init(req, token_end)`(§8.1 #1);helix 用 `total_input_len_cp`,现有代码已处理 |
+| 预留目的页 | `reserve_transfer_pages(req, token_end)`(§8.1 #1;gen-init 经别名 `prepare_disagg_gen_init(req)`);helix 用 `total_input_len_cp`,现有代码已处理 |
 | 每层组的目的页 / slot | `get_aggregated_page_indices(group, valid_only=False)`、`get_ssm_block_base_index(group)`、`_stale_block_range(group, token_end)` |
 | 落地后推进请求并提交 | 直接写游标或 `_settle_context_cursor(req, token_end, tpb)`(§7.3)+ `try_commit_blocks(req)`;`commit()` 自己推进 history |
 | 退页 | `revert_allocate_context(req)` |
@@ -763,9 +788,9 @@ class StreamsLayers(Protocol):
 | 中毒 buffer → `fail_fatal` | 保留 |
 | gen-first ctx 门控(`prepare_context_schedulable`) | 保留:计划答案 `DEFER` |
 | `gen_only_no_context` 基准模式 | 保留:计划答 `None`;基准门控改用 `has_inflight()` |
-| pipelined 分块发送 | 保留:`publish_context_progress` 每步调用,worker 实现 `PlacesPieces` |
+| pipelined 分块发送 | 保留:`publish_committed_blocks` 每步调用,worker 实现 `PlacesPieces` |
 | 子请求的投票 id | 保留:共识按记录 id |
-| `AsyncTransferManager.start_transfer` 释放 seq slot、spec 资源、draft 的 index slot | 保留:`hold_for_publish` |
+| `AsyncTransferManager.start_transfer` 释放 seq slot、spec 资源、draft 的 index slot | 保留:`hold_for_transfer` |
 | `pace_idle` / `poll_progress_when_idle` | 保留:循环层用 `has_inflight()`;空闲路径也执行 `EngineQueue` |
 | 超时的 ADP allgather、`check_transfer_timeouts` 对 ctx 发送的超时 | 保留:并入共识;publish 记录有 deadline |
 | aux 通道(首 token、draft token、ctx_usage) | 保留:`CarriesAux`,经 `unpark` 交给引擎 |

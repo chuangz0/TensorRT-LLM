@@ -12,10 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A cache backend over a Mooncake distributed store: ``Fetches``, ``Publishes``, ``RegistersPools``.
+"""A cache backend over a blob store: ``Fetches``, ``Publishes``, ``RegistersPools``.
 
-One store object per unit. A unit's segments go in as that object's buffer list, so it is stored
-whole or not at all, which is what per-unit atomic visibility needs (contract §6.3). Every
+The class depends only on the ``StoreClient`` protocol; a driver such as ``mooncake.py`` opens
+the client and builds it. One store object per unit. A unit's segments go in as that object's
+buffer list, so it is stored whole or not at all, which is what per-unit atomic visibility needs
+(contract §6.3). Every
 delivery runs on the backend's own threads; they call the store client and, when staging, the
 copier, and nothing else. ``probe`` is answered the same way on a thread of its own: the first
 call queues the lookup and answers ``None``, a later call returns the answer once.
@@ -34,7 +36,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Iterator, Mapping, Optional, Sequence, TypeVar
+from typing import TYPE_CHECKING, Callable, Iterable, Iterator, Mapping, Optional, Sequence, TypeVar
 
 from ...base.cache_backend import (
     Attempt,
@@ -46,14 +48,16 @@ from ...base.cache_backend import (
     Route,
     SubmissionRejected,
 )
+from ...base.region import RegionResolver, Segment
 from .client import OBJECT_NOT_FOUND, StoreClient
-from .config import MooncakeStoreConfig
 from .keys import KeyScheme
-from .regions import RegionResolver, Segment
 from .staging import HostStagingPool
 from .worker_pool import DaemonWorkerPool
 
-__all__ = ["MAX_PROBES", "MooncakeStoreBackend", "StoreCounters"]
+if TYPE_CHECKING:
+    from .mooncake import MooncakeStoreConfig
+
+__all__ = ["MAX_PROBES", "BlobStoreBackend", "StoreCounters"]
 
 MAX_PROBES = 1024
 """Bound on remembered lookups, pending or answered. A lookup thread that stopped answering must
@@ -130,7 +134,7 @@ class _Probe:
 
 
 class _Registration:
-    def __init__(self, backend: MooncakeStoreBackend, address: int, size: int) -> None:
+    def __init__(self, backend: BlobStoreBackend, address: int, size: int) -> None:
         self.address = address
         self.size = size
         self.live = True
@@ -152,12 +156,14 @@ def _batched(items: Sequence[_T], size: int) -> Iterator[Sequence[_T]]:
         yield items[start : start + size]
 
 
-class MooncakeStoreBackend:
-    """Fetch from and publish to one Mooncake store.
+class BlobStoreBackend:
+    """Fetch from and publish to one blob store.
 
     Args:
         client: An opened store client. Owned from here on; ``close`` closes it.
-        config: Batch sizes, bounds and whether to stage through host memory.
+        config: Batch sizes, bounds and whether to stage through host memory. Only the fields
+            shared by every driver are read: ``namespace``, ``transfer_batch_size``,
+            ``stage_through_host``, ``max_inflight_ops``, ``num_workers``, ``probe_ttl_s``.
         resolver: Maps a unit's local coordinates to its memory segments.
         layout_fingerprint: Folded into every key; see ``KeyScheme``.
         staging: Required when ``config.stage_through_host``; ignored otherwise. Owned from here

@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Literal
 from ..base.cache_backend import Attempt, CacheExtent, Cancelled, Delivered, Failed, Outcome, Route
 
 if TYPE_CHECKING:
-    from .planner import FetchPlan
+    from .remote_cache import FetchPlan
 
 __all__ = ["AttemptRecord", "Direction", "RecordKey", "RecordState", "TransferRecord"]
 

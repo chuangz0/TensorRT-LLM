@@ -32,7 +32,7 @@ from disaggregation.orchestration.kv_transfer_interfaces import (  # noqa: E402
     GroupKind,
     GroupSpec,
 )
-from disaggregation.orchestration.planner import (  # noqa: E402
+from disaggregation.orchestration.remote_cache import (  # noqa: E402
     FetchPlan,
     GroupPlan,
     Planner,

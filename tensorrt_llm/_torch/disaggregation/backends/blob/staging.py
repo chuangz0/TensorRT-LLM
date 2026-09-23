@@ -29,8 +29,8 @@ from __future__ import annotations
 import threading
 from typing import Literal, Protocol, Sequence
 
+from ...base.region import Segment
 from .client import StoreClient
-from .regions import Segment
 
 __all__ = ["Copier", "HostStagingPool", "open_default_staging", "plan_slot_geometry"]
 

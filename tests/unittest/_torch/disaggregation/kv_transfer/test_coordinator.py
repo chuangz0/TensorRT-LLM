@@ -12,7 +12,7 @@ import pytest
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.base.cache_backend import Cancelled, Delivered, Failed  # noqa: E402
 from disaggregation.orchestration.kv_transfer_interfaces import DEFER  # noqa: E402
-from disaggregation.orchestration.planner import FetchPlan  # noqa: E402
+from disaggregation.orchestration.remote_cache import FetchPlan  # noqa: E402
 from fakes import (  # noqa: E402
     FakeChunk,
     FakePlacingPublishes,
@@ -614,7 +614,7 @@ def test_publish_flow_holds_then_terminates_after_quiesce():
     req = FakeRequest(3, prompt_len=29)
     ext = rig.reader.script_publish(req, [(range(0, 4), False, None), (range(4, 7), True, None)])
 
-    rig.coord.publish_context_progress([req], finished=(), now=0.0)
+    rig.coord.publish_committed_blocks([req], finished=(), now=0.0)
     # A publisher that does not place pieces is not offered an intermediate piece.
     assert pub.payloads("publish") == []
     rec = rig.record(3, "publish")
@@ -623,7 +623,7 @@ def test_publish_flow_holds_then_terminates_after_quiesce():
     rig.coord.advance([], 1.0)
     assert rig.record(3, "publish")["state"] == "PLANNED" and pub.count("quiesce") == 0
 
-    rig.coord.publish_context_progress([req], finished=[3], now=2.0)
+    rig.coord.publish_committed_blocks([req], finished=[3], now=2.0)
     assert pub.payloads("publish") == [ext[1]]
     assert rig.record(3, "publish")["state"] == "IN_FLIGHT" and rig.coord.has_inflight()
     assert rig.effects.names() == ["hold_for_transfer"]
@@ -650,7 +650,7 @@ def test_publish_landed_before_request_end_terminates_immediately_at_end():
     pub = FakePublishes()
     rig = Rig(publishers=[pub])
     req = FakeRequest(3, prompt_len=29)
-    rig.coord.publish_context_progress([req], finished=(), now=0.0)  # default: everything, is_last
+    rig.coord.publish_committed_blocks([req], finished=(), now=0.0)  # default: everything, is_last
     pub.attempts[0].deliver_all()
     rig.coord.advance([], 1.0)
     assert rig.records() == [] and pub.count("quiesce") == 1
@@ -666,7 +666,7 @@ def test_publish_failure_after_request_end_terminates_the_held_request():
     pub = FakePublishes()
     rig = Rig(publishers=[pub])
     req = FakeRequest(3, prompt_len=29)
-    rig.coord.publish_context_progress([req], finished=[3], now=0.0)
+    rig.coord.publish_committed_blocks([req], finished=[3], now=0.0)
     pub.attempts[0].finish(Failed("peer gone"))
     rig.coord.advance([], 1.0)
     assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
@@ -679,7 +679,7 @@ def test_publish_expiry_terminates_the_held_request():
     pub = FakePublishes()
     rig = Rig(publishers=[pub], publish_timeout_s=5.0)
     req = FakeRequest(3, prompt_len=29)
-    rig.coord.publish_context_progress([req], finished=[3], now=0.0)
+    rig.coord.publish_committed_blocks([req], finished=[3], now=0.0)
     rig.coord.advance([], 5.0)
     assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
     assert rig.effects.count("fail_requests") == 0
@@ -691,7 +691,7 @@ def test_publish_rejected_outright_terminates_the_finished_request():
     rig = Rig(publishers=[pub])
     req = FakeRequest(3, prompt_len=29)
     pub.reject_next = 1
-    rig.coord.publish_context_progress([req], finished=[3], now=0.0)
+    rig.coord.publish_committed_blocks([req], finished=[3], now=0.0)
     assert pub.attempts == [] and pub.count("quiesce") == 0  # nothing escaped, nothing to quiesce
     # Nothing was ever offered: not held, terminated straight away, and the record is gone.
     assert rig.effects.names() == ["terminate_request"]
@@ -707,7 +707,7 @@ def test_partial_publish_rejection_terminates_the_held_request_at_next_reap():
     req = FakeRequest(3, prompt_len=29)
     rig.reader.script_publish(req, [(range(0, 7), True, FakeChunk(3, 0))])
     placing.reject_methods.add("place")
-    rig.coord.publish_context_progress([req], finished=[3], now=0.0)
+    rig.coord.publish_committed_blocks([req], finished=[3], now=0.0)
     assert placing.count("publish") == 1 and placing.count("place") == 1
     assert len(placing.attempts) == 1
     assert rig.effects.names() == ["hold_for_transfer"]  # one piece is genuinely in flight
@@ -724,7 +724,7 @@ def test_one_of_two_publishers_rejecting_still_terminates_once_the_other_lands()
     rig = Rig(publishers=[ok, bad])
     req = FakeRequest(3, prompt_len=29)
     bad.reject_next = 1
-    rig.coord.publish_context_progress([req], finished=[3], now=0.0)
+    rig.coord.publish_committed_blocks([req], finished=[3], now=0.0)
     assert len(ok.attempts) == 1 and bad.attempts == []
     assert rig.effects.names() == ["hold_for_transfer"]
     ok.attempts[0].deliver_all()
@@ -742,7 +742,7 @@ def test_failed_intermediate_piece_is_reported_before_is_last():
     rig.reader.script_publish(
         req, [(range(0, 3), False, FakeChunk(3, 0)), (range(3, 7), True, FakeChunk(3, 1))]
     )
-    rig.coord.publish_context_progress([req], finished=(), now=0.0)
+    rig.coord.publish_committed_blocks([req], finished=(), now=0.0)
     placing.attempts[0].deliver_all()  # publish of piece 0 fine ...
     placing.attempts[1].finish(Failed("place lost"))  # ... its place failed
     rig.coord.advance([], 1.0)
@@ -758,7 +758,7 @@ def test_publish_deadline_expires_with_terminal_intermediate_pieces():
     rig.reader.script_publish(
         req, [(range(0, 3), False, FakeChunk(3, 0)), (range(3, 7), True, FakeChunk(3, 1))]
     )
-    rig.coord.publish_context_progress([req], finished=(), now=0.0)
+    rig.coord.publish_committed_blocks([req], finished=(), now=0.0)
     for a in placing.attempts:
         a.finish(Delivered(frozenset()))  # publish and place of piece 0 both done
     rig.coord.advance([], 4.0)
@@ -775,7 +775,7 @@ def test_publish_rejected_while_fetch_in_flight_terminates_once_the_fetch_releas
     req = worker_request()
     attempt = rig.plan_and_launch(req)
     pub.reject_next = 1
-    rig.coord.publish_context_progress([req], finished=[1], now=1.0)
+    rig.coord.publish_committed_blocks([req], finished=[1], now=1.0)
     # The publish verdict waits: the fetch still names the pages.
     assert rig.effects.names()[-1:] == ["hold_for_transfer"]
     assert rig.effects.count("fail_requests") == 0
@@ -795,7 +795,7 @@ def test_publish_landed_first_waits_for_the_in_flight_fetch_before_terminating()
     rig = Rig(publishers=[pub])
     req = worker_request()
     attempt = rig.plan_and_launch(req)
-    rig.coord.publish_context_progress([req], finished=[1], now=1.0)
+    rig.coord.publish_committed_blocks([req], finished=[1], now=1.0)
     assert rig.effects.names()[-1:] == ["hold_for_transfer"]
     pub.attempts[0].deliver_all()
     rig.coord.advance([], 2.0)
@@ -813,7 +813,7 @@ def test_abandoned_publish_of_held_request_still_times_out_and_terminates():
     pub = FakePublishes()
     rig = Rig(publishers=[pub], publish_timeout_s=5.0)
     req = FakeRequest(3, prompt_len=29)
-    rig.coord.publish_context_progress([req], finished=[3], now=0.0)
+    rig.coord.publish_committed_blocks([req], finished=[3], now=0.0)
     rig.coord.abandon(req)
     assert rig.record(3, "publish")["abandoned"] is True
     rig.coord.advance([], 5.0)
@@ -829,7 +829,7 @@ def test_both_records_in_flight_fetch_releases_first_then_publish_lands():
     rig = Rig(publishers=[pub])
     req = worker_request()
     attempt = rig.plan_and_launch(req)
-    rig.coord.publish_context_progress([req], finished=[1], now=1.0)
+    rig.coord.publish_committed_blocks([req], finished=[1], now=1.0)
     assert rig.effects.names()[-1:] == ["hold_for_transfer"]
     assert (
         rig.record(1)["state"] == "IN_FLIGHT" and rig.record(1, "publish")["state"] == "IN_FLIGHT"
@@ -854,7 +854,7 @@ def test_both_records_in_flight_fetch_releases_first_then_publish_lands():
 def test_no_publishers_means_no_publish_records():
     rig = Rig()
     req = FakeRequest(3, prompt_len=29)
-    rig.coord.publish_context_progress([req], finished=[3], now=0.0)
+    rig.coord.publish_committed_blocks([req], finished=[3], now=0.0)
     assert rig.records() == [] and rig.effects.calls == []
     assert rig.reader.calls == []  # publish_description is not even asked
 
@@ -873,7 +873,7 @@ def test_places_pieces_gets_every_chunk_plain_publisher_only_the_last():
         ],
     )
     for i in range(3):
-        rig.coord.publish_context_progress([req], finished=[3] if i == 2 else (), now=float(i))
+        rig.coord.publish_committed_blocks([req], finished=[3] if i == 2 else (), now=float(i))
 
     assert placing.payloads("place") == chunks
     assert placing.payloads("publish") == ext
@@ -886,7 +886,7 @@ def test_places_pieces_not_called_without_a_chunk():
     placing = FakePlacingPublishes()
     rig = Rig(publishers=[placing])
     req = FakeRequest(3, prompt_len=29)
-    rig.coord.publish_context_progress([req], finished=(), now=0.0)
+    rig.coord.publish_committed_blocks([req], finished=(), now=0.0)
     assert placing.count("publish") == 1 and placing.count("place") == 0
 
 
@@ -932,7 +932,7 @@ def test_one_allgather_per_advance_over_world():
     rig.coord.launch_fetches([req], 0.0)
     rig.coord.advance([], 1.0)
     rig.coord.notify_request_finished(req)
-    rig.coord.publish_context_progress([], finished=(), now=2.0)
+    rig.coord.publish_committed_blocks([], finished=(), now=2.0)
     assert len(rig.dist.calls) == 2
     assert all(scope == "world" for scope, _ in rig.dist.calls)
 

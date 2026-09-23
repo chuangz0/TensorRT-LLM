@@ -88,11 +88,11 @@ class BackendEntry:
         )
 
     @property
-    def fetches(self) -> bool:
+    def serves_fetch(self) -> bool:
         return "fetch" in self.roles
 
     @property
-    def publishes(self) -> bool:
+    def serves_publish(self) -> bool:
         return "publish" in self.roles
 
 

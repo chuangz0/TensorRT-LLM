@@ -17,9 +17,10 @@ from types import SimpleNamespace
 
 import pytest
 
-__extra_import_path__ = ["~/tensorrt_llm/_torch", "../store_backend"]
+__extra_import_path__ = ["~/tensorrt_llm/_torch", "../blob_backend"]
 from disaggregation.backends import registry as registry_module  # noqa: E402
-from disaggregation.backends.kv_transfer_config import (  # noqa: E402
+from disaggregation.backends.blob.backend import BlobStoreBackend  # noqa: E402
+from disaggregation.backends.config import (  # noqa: E402
     BACKEND_ROLES,
     KV_TRANSFER_CONFIG_ENV,
     BackendEntry,
@@ -33,7 +34,6 @@ from disaggregation.backends.registry import (  # noqa: E402
     build_backends,
     close_backends,
 )
-from disaggregation.backends.store.backend import MooncakeStoreBackend  # noqa: E402
 from store_fakes import FINGERPRINT, ArenaResolver, FakeStoreClient, MemoryArena  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
@@ -89,7 +89,7 @@ def test_plan_section_8_example_loads(tmp_path):
     assert entry.type == "mooncake"
     assert entry.hint_key is None
     assert entry.roles == frozenset({"fetch", "publish"})
-    assert entry.fetches and entry.publishes
+    assert entry.serves_fetch and entry.serves_publish
     # Type-specific keys pass through unread; entry keys do not.
     assert entry.options == {
         "master_server_address": "127.0.0.1:50051",
@@ -128,7 +128,7 @@ def test_publish_only_role(tmp_path):
         """,
     )
     entry = config.backends[0]
-    assert entry.publishes and not entry.fetches
+    assert entry.serves_publish and not entry.serves_fetch
 
 
 def test_backend_order_is_kept(tmp_path):
@@ -282,8 +282,8 @@ def fake_factory(entry: BackendEntry, context: BackendBuildContext) -> BackendHa
     return BackendHandle(
         name=entry.name,
         hint_key=entry.hint_key,
-        fetches=built if entry.fetches else None,
-        publishes=built if entry.publishes else None,
+        fetcher=built if entry.serves_fetch else None,
+        publisher=built if entry.serves_publish else None,
         pool_registrar=None,
         close=built.close,
         counters=lambda: {"built": 1},
@@ -309,8 +309,8 @@ def test_build_backends_returns_one_handle_per_entry_in_order():
     )
     handles = build_backends(config, make_context(), registry)
     assert [h.name for h in handles] == ["a", "b", "c"]
-    assert handles[0].fetches is not None and handles[0].publishes is not None
-    assert handles[1].fetches is None and handles[1].publishes is not None
+    assert handles[0].fetcher is not None and handles[0].publisher is not None
+    assert handles[1].fetcher is None and handles[1].publisher is not None
     assert handles[2].hint_key == "ctx"
     close_backends(handles)
     assert [b.closed for b in FakeBuilt.instances] == [1, 1, 1]
@@ -388,12 +388,12 @@ def test_importing_the_registry_does_not_import_the_mooncake_driver():
         """
         import sys
         import disaggregation.backends.registry as registry
-        assert "disaggregation.backends.store.mooncake" not in sys.modules, "eager import"
-        assert "disaggregation.backends.store.backend" not in sys.modules, "eager import"
+        assert "disaggregation.backends.blob.mooncake" not in sys.modules, "eager import"
+        assert "disaggregation.backends.blob.backend" not in sys.modules, "eager import"
         factory = registry.BackendRegistry().factory_for("mooncake")
-        assert factory.__module__ == "disaggregation.backends.store.mooncake"
+        assert factory.__module__ == "disaggregation.backends.blob.mooncake"
         assert factory.__name__ == "build_mooncake_backend"
-        assert "disaggregation.backends.store.mooncake" in sys.modules
+        assert "disaggregation.backends.blob.mooncake" in sys.modules
         """
     )
     subprocess.run(
@@ -407,7 +407,7 @@ def test_importing_the_registry_does_not_import_the_mooncake_driver():
 @pytest.fixture
 def mooncake_module(monkeypatch):
     """The driver module with its client opener replaced by a fake; yields (module, opened)."""
-    module = importlib.import_module("disaggregation.backends.store.mooncake")
+    module = importlib.import_module("disaggregation.backends.blob.mooncake")
     opened: list[FakeStoreClient] = []
 
     def open_fake(config):
@@ -429,7 +429,7 @@ MOONCAKE_OPTIONS = dict(
 )
 
 
-def test_mooncake_factory_builds_a_store_backend_over_the_opened_client(mooncake_module):
+def test_mooncake_factory_builds_a_blob_backend_over_the_opened_client(mooncake_module):
     _, opened = mooncake_module
     config = KVTransferConfig(backends=(entry("store", "mooncake", **MOONCAKE_OPTIONS),))
     handles = build_backends(config, make_context())
@@ -440,10 +440,10 @@ def test_mooncake_factory_builds_a_store_backend_over_the_opened_client(mooncake
         assert opened[0].opened_with.stage_through_host is False
         handle = handles[0]
         assert handle.name == "store" and handle.hint_key is None
-        assert isinstance(handle.fetches, MooncakeStoreBackend)
-        assert handle.publishes is handle.fetches
+        assert isinstance(handle.fetcher, BlobStoreBackend)
+        assert handle.publisher is handle.fetcher
         # No staging: the pools must be registered with the transport, by the backend itself.
-        assert handle.pool_registrar is handle.fetches
+        assert handle.pool_registrar is handle.fetcher
         assert set(handle.counters()) >= {"fetch_hits", "fetch_misses", "publish_stored"}
     finally:
         close_backends(handles)
@@ -458,8 +458,8 @@ def test_mooncake_publish_only_entry_has_no_fetches(mooncake_module):
     )
     handles = build_backends(config, make_context())
     try:
-        assert handles[0].fetches is None
-        assert isinstance(handles[0].publishes, MooncakeStoreBackend)
+        assert handles[0].fetcher is None
+        assert isinstance(handles[0].publisher, BlobStoreBackend)
     finally:
         close_backends(handles)
 

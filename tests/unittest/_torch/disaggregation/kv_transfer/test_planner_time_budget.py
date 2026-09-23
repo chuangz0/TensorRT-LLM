@@ -12,7 +12,7 @@ import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.orchestration.kv_transfer_interfaces import DEFER, FetchSource  # noqa: E402
-from disaggregation.orchestration.planner import FetchPlan, Planner  # noqa: E402
+from disaggregation.orchestration.remote_cache import FetchPlan, Planner  # noqa: E402
 from fakes import TPB, FakeFetches, FakeReader, FakeRequest, full_attention  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only

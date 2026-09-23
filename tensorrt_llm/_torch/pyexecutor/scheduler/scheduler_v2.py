@@ -38,7 +38,7 @@ from .scheduler import (
 )
 
 if TYPE_CHECKING:
-    from ...disaggregation.orchestration.planner import FetchPlan
+    from ...disaggregation.orchestration.remote_cache import FetchPlan
 
 
 class ScheduleAction(enum.Enum):
@@ -662,10 +662,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         prefix-reuse holds it took, so the cache is dropped and the cursor rewound,
         exactly as after a failed first-chunk context admission.
         """
-        if self.kv_cache_manager.prepare_disagg_gen_init(req, plan.token_end):
+        if self.kv_cache_manager.reserve_transfer_pages(req, plan.token_end):
             return FetchPathAction.RESERVED
         logger.debug(
-            "prepare_disagg_gen_init(token_end=%d) failed for request %s",
+            "reserve_transfer_pages(token_end=%d) failed for request %s",
             plan.token_end,
             req.py_request_id,
         )

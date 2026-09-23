@@ -23,40 +23,40 @@ SPDX-License-Identifier: Apache-2.0
 | 8 | key 里缺并行布局导致 TP 错切(vLLM #40900 的 TP-rank bug);SGLang MLA 用 TP 无关的 key | **避开**。SPEC §4.2 不变式 3:凡两侧不一致即读错字节的量进名字;TP 切分不同表现为未命中而不是错数据。跨 TP 重切分只在 worker 后端的 mapper 里做 |
 | 9 | 各 rank 独立的后台线程各自 all-reduce,导致死锁和树分叉(SGLang #22607,代码注释"This is so tricky") | **避开**。主文 §3.1 线程规则:后端线程不做集合通信、不碰 KV v2;决定都在引擎线程的一次集合通信里 |
 | 10 | 部分成功无法表达(SGLang `batch_set` 返回 bool);准入前缀要取跨 rank 的 MIN | **避开**。`served` 按 unit 报告;B 取跨 rank 的 MIN |
-| 11 | SGLang `write_through_selective` 按命中次数(≥2)门控 host 备份,L3 写跟在 host ack 之后;首次出现的前缀被驱逐前来不及进 L3(#39444) | **避开**。每个已提交块都发布;要不要按策略少发,是 `publish_context_progress` 的一个开关,不影响正确性 |
+| 11 | SGLang `write_through_selective` 按命中次数(≥2)门控 host 备份,L3 写跟在 host ack 之后;首次出现的前缀被驱逐前来不及进 L3(#39444) | **避开**。每个已提交块都发布;要不要按策略少发,是 `publish_committed_blocks` 的一个开关,不影响正确性 |
 | 12 | 投机解码的 draft 状态不在缓存单元里,命中反而比冷 prefill 慢(SGLang #31600) | **未覆盖**。gen-init 经 aux 带首 token 与 draft token;跨请求取回时 draft KV 是否成为 unit,待定(§11 #10) |
 
 另外两条 vLLM 的接口级教训直接体现在契约里:`(0, True)` 这类"命中为零但异步"的非法组合,契约用"units 可为空且不是错误"消掉;整段命中必须重算最后一个 token,主文用 `token_end ≤ ⌊(prompt_len − 1)/tpb⌋·tpb` 与 gen-init 的 aux 首 token 分别处理。
 
 ## 2. 主文主张的源码位置
 
-路径相对 `tensorrt_llm/`;runtime 指 `runtime/kv_cache_manager_v2/`。
+路径相对 `tensorrt_llm/`;runtime 指 `runtime/kv_cache_manager_v2/`。定位用**函数名 + 相邻语句**,不用行号(行号随每次改动漂移);`grep -n "def <名字>"` 即可找到。
 
 | 主张 | 位置 |
 |---|---|
-| history 不能回退;新块跳过 stale 范围 | runtime `_core/_kv_cache.py` `resize`:`:838-839`、`:889-914`、`:1005-1007` |
-| `commit()` 终点须等于 history(`commit_min_snapshot`) | 同上 `:1089-1096`;开关 `_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py:2837-2840`,Mamba 强制开 `mamba_cache_manager.py:4025`;默认策略 `all_reusable` `llmapi/llm_args.py:4117` |
-| `commit()` 推进 history | `_core/_kv_cache.py:1102` |
-| 提交时放开 stale 页、rebasing | `_core/_kv_cache.py:1845-1850`、`:1785-1834` |
-| SSM 快照挂到 tree block | `_core/_kv_cache.py:1638-1663`、`:1839-1843` |
-| `resume()` 的门与延迟拷贝,返回 False 不抛 | `_core/_kv_cache.py:1292-1294`、`:1315-1331`、`:1361-1369`;`close()` 释放 scratch 与 holder `:2390-2408` |
-| serve 用的 `_KVCache` 会进统计 | `_core/_kv_cache.py:666-671`(`close()` 更新 tuner 统计) |
-| radix tree children 按 key 索引 | runtime `_block_radix_tree.py:738-739`;`Block.tokens` `:416`;`_prune_match` 的 SSM 截断 `:774-788`;`_get_matched_tokens` `_core/_kv_cache.py:2157-2166` |
-| `hold()` 只防 drop;HELD 页在非最后一级可迁移 | runtime `_page.py:86-95`;runtime `_storage_manager.py:417-428` |
-| `_settle_context_cursor` 与 C++ 断言 | `kv_cache_manager_v2.py:1086-1106`;`cpp/include/tensorrt_llm/batch_manager/llmRequest.h:1081` |
-| `prepare_disagg_gen_init` 与 scratch 开关 | `kv_cache_manager_v2.py:3528-3546`、`:3635-3670`;`_assert_disagg_history_declared` `_torch/disaggregation/transceiver.py:1286-1318` |
-| `expect_snapshot_points` 每轮重建;`prompt_len` 缺省与 `point > position` 过滤 | `_torch/pyexecutor/py_executor.py:6321-6324`、`:2711-2714`;`mamba_cache_manager.py:1512-1535`、`:3669-3696`(`:3688-3689`、`:3694`)、`:4688-4740` |
-| admission 被 bypass | `_torch/disaggregation/orchestration/coordinator.py:45-60`;`py_executor.py:962-977` |
-| 共识范围与 allgather | `transceiver.py:276-280`、`:514-540`、`:1162`、`:1197` |
-| 今天没有页在 NIXL 在飞时被释放 | `native/transfer.py:1995-1999`、`:3416-3425`;`transceiver.py:699-701`、`:756-773`、`:1118-1126`、`:1331-1358` |
-| demand 在监听线程处理、只碰预建的 session | `native/transfer.py:1503-1528`、`:1570-1599`、`:1728-1736`;`native/messenger.py:149-175` |
-| gen 侧 session 完成即 close 释放 aux slot | `transceiver.py:1231`;`native/transfer.py:2201-2203` |
-| PP 跟随者的调和;`_pp_retry_until_can_schedule` 只查 `scheduled_batch` | `py_executor.py:2594-2611`、`:2624-2626`、`:2715-2722`;`SerializableSchedulerOutput` `_torch/pyexecutor/scheduler/scheduler.py:329-380` |
-| gen-init 落地后的批级准备;gen-init 不计入预算 | `py_executor.py:7102-7134`;`_torch/pyexecutor/scheduler_v2.py:365-396` |
-| `AsyncTransferManager.start_transfer` 释放 seq slot / spec 资源 | `orchestration/transfer_manager.py:69-79` |
-| `_send_kv_async` 每轮调用;pipelined 的 `_build_prefill_extent` 输入与策略 | `py_executor.py:4383`、`:5213`;`orchestration/coordinator.py:409-456`;`transceiver.py:840-892`(`:854`、`:868-873`) |
-| 调度器排除的状态 | `_torch/pyexecutor/scheduler.py:293-304` |
-| connector 的 per-layer hook | `py_executor.py:1168-1173` |
+| history 不能回退;新块跳过 stale 范围 | runtime `_core/_kv_cache.py` `_KVCache.resize`:history 单调检查,以及为新块跳过 stale 范围的分支 |
+| `commit()` 终点须等于 history(`commit_min_snapshot`) | `_KVCache.commit` 里的 `commit_min_snapshot` 检查;开关在 `_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py` `KVCacheManagerV2._build_base_config`,Mamba 强制开于 `mamba_cache_manager.py` `MambaHybridCacheManagerV2._build_cache_config`;默认策略 `all_reusable` 见 `llmapi/llm_args.py` `BlockReuseConfig` |
+| `commit()` 推进 history | `_KVCache.commit` 末尾 |
+| 提交时放开 stale 页、rebasing | `_KVCache._commit_block` |
+| SSM 快照挂到 tree block | `_KVCache._snapshot_ssm_to_tree_block`,由 `_commit_block` 调用 |
+| `resume()` 的门与延迟拷贝,返回 False 不抛 | `_KVCache.resume`;`_KVCache.close` 释放 scratch 与 holder |
+| serve 用的 `_KVCache` 会进统计 | `_KVCache.close`(更新 tuner 统计) |
+| radix tree children 按 key 索引 | runtime `_block_radix_tree.py` `BlockRadixTree._match_token_path`;`Block.tokens`;`BlockRadixTree._prune_match` 的 SSM 截断;`_get_matched_tokens` 于 `_core/_kv_cache.py` |
+| `hold()` 只防 drop;HELD 页在非最后一级可迁移 | runtime `_page.py` `Page.hold`;runtime `_storage_manager.py` `StorageManager.is_evictable` |
+| `_settle_context_cursor` 与 C++ 断言 | `kv_cache_manager_v2.py` `_settle_context_cursor`;`cpp/include/tensorrt_llm/batch_manager/llmRequest.h` `setPrepopulatedPromptLen` 的断言 |
+| `reserve_transfer_pages`(`prepare_disagg_gen_init` 是其 gen-init 别名)与 scratch 开关 | `kv_cache_manager_v2.py` `KVCacheManagerV2.prepare_context_cache`、`KVCacheManagerV2.reserve_transfer_pages`(`token_end` 给定时置 `enable_swa_scratch_reuse = False`);`_torch/disaggregation/transceiver.py` `KvCacheTransceiverV2._assert_disagg_history_declared` |
+| `expect_snapshot_points` 每轮重建;`prompt_len` 缺省与 `point > position` 过滤 | `_torch/pyexecutor/py_executor.py` 两处 `kv_cache_manager.prepare_expect_snapshot_points(...)` 调用(`_executor_loop_pp` 与调度前的批准备);`mamba_cache_manager.py` `MambaHybridCacheManager.prepare_expect_snapshot_points`、`MambaHybridCacheManagerV2.prepare_expect_snapshot_points`、`MambaHybridCacheManagerV2.try_commit_blocks` |
+| admission 被 bypass | `_torch/disaggregation/orchestration/coordinator.py` `transfer_window_bypass_eligible` 及其在 `py_executor.py` 的调用点 |
+| 共识范围与 allgather | `transceiver.py` `KvCacheTransceiverV2._init_sync_policy`、`_ctx_consensus`、`_gen_consensus`、`check_gen_transfer_status` |
+| 今天没有页在 NIXL 在飞时被释放 | `native/transfer.py` `TxSession.is_completed`、`RxSession.is_completed`;`transceiver.py` `KvCacheTransceiverV2._collect_done`、`_ownership_blocks_retirement`、`check_context_transfer_status`、`cancel_request` |
+| demand 在监听线程处理、只碰预建的 session | `native/transfer.py` `Sender._start_listener`、`Sender._respond_with_kv`、`Sender._save_peer_req_info`;`native/messenger.py` `ZMQMessenger.listener` |
+| gen 侧 session 完成即 close 释放 aux slot | `transceiver.py` `KvCacheTransceiverV2.check_gen_transfer_status` 里完成分支的 `close()`;`native/transfer.py` `RxSession.close` |
+| PP 跟随者的调和;`_pp_retry_until_can_schedule` 只查 `scheduled_batch` | `py_executor.py` `PyExecutor._pp_schedule_and_propagate`、`_executor_loop_pp`、`_pp_retry_until_can_schedule`;`_torch/pyexecutor/scheduler/scheduler.py` `SerializableSchedulerOutput` |
+| gen-init 落地后的批级准备;gen-init 不计入预算 | `py_executor.py` 处理 `DISAGG_GENERATION_TRANS_COMPLETE` 请求的批级准备;`_torch/pyexecutor/scheduler/scheduler_v2.py` `KVCacheV2Scheduler._schedule_loop` 的 gen-init 分支与 `_try_schedule_disagg_gen_init` |
+| `AsyncTransferManager.start_transfer` 释放 seq slot / spec 资源 | `orchestration/transfer_manager.py` `start_transfer` |
+| `_send_kv_async` 每轮调用;pipelined 的 `_build_prefill_extent` 输入与策略 | `py_executor.py` `_executor_loop` 与 `_executor_loop_overlap` 里的 `_send_kv_async` 调用;`orchestration/coordinator.py` `DisaggTransferCoordinator.send_completed_context`;`transceiver.py` `KvCacheTransceiverV2._build_prefill_extent` |
+| 调度器排除的状态 | `_torch/pyexecutor/scheduler/scheduler.py` `RequestScheduler` 的可调度状态判定 |
+| connector 的 per-layer hook | `py_executor.py` `PyExecutor._maybe_init_kv_connector_manager` |
 | 空 `@runtime_checkable` Protocol 对任何对象判真 | Python 3.12 行为,评审中在本仓库环境验证 |
 
 ## 3. 评审中否决或修正的方案

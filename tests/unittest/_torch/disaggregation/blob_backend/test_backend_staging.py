@@ -13,7 +13,7 @@ import time
 import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.backends.store.staging import HostStagingPool, plan_slot_geometry  # noqa: E402
+from disaggregation.backends.blob.staging import HostStagingPool, plan_slot_geometry  # noqa: E402
 from disaggregation.base.cache_backend import Delivered, Failed, SubmissionRejected  # noqa: E402
 from store_fakes import (  # noqa: E402
     FakeCopier,

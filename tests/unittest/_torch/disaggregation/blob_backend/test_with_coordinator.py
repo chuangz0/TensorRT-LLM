@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""``MooncakeStoreBackend`` under a real ``KVTransferCoordinator``: one coordinator publishes a
+"""``BlobStoreBackend`` under a real ``KVTransferCoordinator``: one coordinator publishes a
 context request's blocks, a second one on another "rank" (its own memory, its own backend, the
 same store) probes, plans, launches and lands the fetch. Engine effects, reader, queue and
 collective are the ``kv_transfer`` suite's fakes; only the store backend is real.
@@ -15,7 +15,7 @@ import time
 __extra_import_path__ = ["~/tensorrt_llm/_torch", "../kv_transfer"]
 from disaggregation.orchestration.kv_transfer_coordinator import KVTransferCoordinator  # noqa: E402
 from disaggregation.orchestration.kv_transfer_interfaces import DEFER, FetchSource  # noqa: E402
-from disaggregation.orchestration.planner import FetchPlan, Planner  # noqa: E402
+from disaggregation.orchestration.remote_cache import FetchPlan, Planner  # noqa: E402
 from fakes import (  # noqa: E402
     TPB,
     FakeDist,
@@ -99,7 +99,7 @@ def _publish(ctx: Side, req: FakeRequest) -> None:
     """Context side: offer the request's blocks and drive the publish record to its end."""
     for o in range(BLOCKS):
         ctx.write_block(o, pattern(o + 1, UNIT_BYTES))
-    ctx.coord.publish_context_progress([req], finished=[], now=0.0)
+    ctx.coord.publish_committed_blocks([req], finished=[], now=0.0)
     assert ctx.records()[0]["state"] == "IN_FLIGHT" and ctx.records()[0]["direction"] == "publish"
     wait_until(lambda: len(ctx.rank.client.objects) == BLOCKS, what="publish to land in the store")
     ctx.coord.advance([], 1.0)

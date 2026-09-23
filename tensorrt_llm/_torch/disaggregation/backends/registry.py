@@ -29,8 +29,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional, Sequence
 
 from ..base.cache_backend import Fetches, Publishes, RegistersPools
-from .kv_transfer_config import BackendEntry, KVTransferConfig
-from .store.regions import RegionResolver
+from ..base.region import RegionResolver
+from .config import BackendEntry, KVTransferConfig
 
 __all__ = [
     "BackendBuildContext",
@@ -69,8 +69,8 @@ class BackendHandle:
     Attributes:
         name: ``FetchSource.name``.
         hint_key: Routing hint the backend reads, or ``None``.
-        fetches: The backend as a ``Fetches``, or ``None`` when the entry has no fetch role.
-        publishes: The backend as a ``Publishes``, or ``None`` when it has no publish role.
+        fetcher: The backend as a ``Fetches``, or ``None`` when the entry has no fetch role.
+        publisher: The backend as a ``Publishes``, or ``None`` when it has no publish role.
         pool_registrar: The backend as a ``RegistersPools`` when it needs the KV pools registered
             with its transport; ``None`` when it reaches memory another way.
         close: Stops the backend and releases what it holds. Idempotent.
@@ -79,8 +79,8 @@ class BackendHandle:
 
     name: str
     hint_key: Optional[str]
-    fetches: Optional[Fetches]
-    publishes: Optional[Publishes]
+    fetcher: Optional[Fetches]
+    publisher: Optional[Publishes]
     pool_registrar: Optional[RegistersPools]
     close: Callable[[], None]
     counters: Callable[[], Mapping[str, int]] = field(default=dict)
@@ -89,7 +89,7 @@ class BackendHandle:
 BackendFactory = Callable[[BackendEntry, BackendBuildContext], BackendHandle]
 """Builds one backend from its config entry. Raises ``ValueError`` for an entry it cannot serve."""
 
-_BUILTIN_FACTORIES: Mapping[str, str] = {"mooncake": ".store.mooncake:build_mooncake_backend"}
+_BUILTIN_FACTORIES: Mapping[str, str] = {"mooncake": ".blob.mooncake:build_mooncake_backend"}
 """Type name -> ``<module relative to this package>:<factory name>``; imported on first use."""
 
 
