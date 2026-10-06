@@ -8,6 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 > **状态:草案 v4,讨论中。** 经三轮多视角评审(易读性、对照代码的可行性、可维护可扩展性)修订。
 > 本文把 `docs/shared/README.md` §5 中今天只服务 disagg 的 `orchestration/` 层,扩展为所有传输后端共用的协调层。它建立在 `CACHE_BACKEND_SPEC.md` 规定的后端契约之上,不修改契约;需要契约变化的地方集中在 §11。
 > **目标分支:`origin/feat/kv-shared-draft`(commit `2ea958f8817`)。** 规格在该分支上;契约代码在本分支以逐字节副本落在 `base/cache_backend.py`(与其 `base/backend.py` 同步;配对路径迁移后换名,见 `KV_TRANSFER_ALIGNMENT_PLAN.zh.md` §1、§6),`resource/naming.py` 与其只差一行 import。
+> **上游 README 已改版。** `origin/feat/kv-shared-draft` 的 `docs/shared/README.md` 在 `147ed68276e` 重写:代码组织从 §5 移到 §4;目标形状里不再有 `backends/` 这一层(`blob/`、`kvcr/`、`nixl/`、`native/` 直接在 `disaggregation/` 下),不再有 `remote_cache.py`,远端缓存策略改为 KVManager 侧的 `pyexecutor/kv_cache/remote_policy.py`。本文对照的是 `2ea958f8817` 的 README,文中 "README §5" 均指该版本;与新版 §4 的出入逐条见 `KV_TRANSFER_README_AMENDMENTS.zh.md`。
 > 范围只覆盖 PyTorch 执行器与 KV Cache Manager V2;V1 不在考虑之内。
 > **「已定」** 是讨论已收敛的结论;**「待定 → §11 #n」** 指向待决问题表。
 > 与 vLLM / SGLang 的逐条对照、源码行号、评审中否决的方案,在配套的 `KV_TRANSFER_COORDINATOR_DESIGN.notes.zh.md`。
@@ -209,7 +210,7 @@ sequenceDiagram
 
     rect rgb(250, 240, 255)
     Note over L,BE: ④ forward 后 publish_committed_blocks,在响应 pass 之前
-    L->>C: publish_committed_blocks(ctx_requests_stepped, finished, now)
+    L->>C: publish_committed_blocks(ctx_requests, now)
     Note over C: 先 commit 再发布,extent 与 chunk 用提交后的页
     C->>BE: 对每个 publisher publish(extent),对 PlacesPieces 再 place(chunk)
     C->>L: effects.hold_for_transfer(req)  [请求已结束而仍有记录在飞:publish 未 RELEASED,或 fetch 在飞]
@@ -250,10 +251,12 @@ class TransferRecord:
     plan: FetchPlan | None = None       # fetch:advance 的计划阶段写入
     extent: CacheExtent | None = None   # launch / publish 时才有,units 依赖调度器的分配
     attempts: list[AttemptRecord] = []  # 分块发送时一次 publish 多个,重试时跨 try 累积
-    retries_left: int = 1               # fetch:served 不全时最多重来一次
-    deadline: float | None = None       # fetch 与 publish 都有;worker 用 kv_transfer_timeout,store 可配
-    abandoned: bool = False             # 过期或取消;传输本身无法叫停
+    retries_left: int = 1               # fetch:任一失败共识(少到、失败、放弃发起、等待超时)都耗一次;耗尽即本地算
+    deadline: float | None = None       # fetch 与 publish 都有:fetch_timeout_s / publish_timeout_s,缺省 30 / 60 s
+    expired: bool = False               # 某 rank 看到 deadline 已过;记录从此只在本 rank 上结算。传输本身无法叫停
 ```
+
+实现中的 `TransferRecord` 另有 `quiesce_refused`、`retry_hint`、`rejected`、`consecutive_launch_failures`、`launch_gave_up`、`peer_launched_at`、`landing`、`committed_names`、`waiting_since`,各字段含义见 `records.py` 的 docstring。
 
 **终态的定义**:当前 `try_index` 的每个 attempt 都有 `outcome` 才算到终态。全部 `Delivered` 且合并后的 `served` 满足 §6.3 的 B = token_end 为 `LANDED`;任一 `Failed` 或 `Cancelled(by_peer)`,或 served 不全,为 `FAILED`。
 
@@ -262,13 +265,16 @@ stateDiagram-v2
     [*] --> PLANNED: fetch 由 advance 的计划阶段写入,publish 由 publish_committed_blocks 建立
     PLANNED --> IN_FLIGHT: fetch 或 publish 返回 Attempt(device-direct)
     PLANNED --> STAGING: LandsOnHost 来源:_record_answer 写下计划即 fetch_to_host,不占页
-    PLANNED --> RELEASED: 请求被取消(SubmissionRejected 见 §5:保留计划,下轮再发起)
+    PLANNED --> RELEASED: 计划答案为 None,或请求结束(已过期的立即出表,否则投完票共识后出表),或未发起即失败共识且重试耗尽。SubmissionRejected 不走这条边(§5,保留计划、留在 PLANNED,下轮再发起)
     STAGING --> STAGED: 全 rank 落到后端 host 内存(共识 TERMINAL,B = token_end);等调度器给页
-    STAGING --> FAILED: 任一 Failed,或 served 不全,或过期;释放落地区,不 quiesce、不退页
+    STAGING --> FAILED: 共识判失败(任一 rank 落地 Failed 或投 FAILED)或 served 不全。释放落地区,不 quiesce、不退页
+    STAGING --> RELEASED: 请求结束或过期,释放落地区。已过期的立即出表,否则投 TERMINAL 到共识后出表
     STAGED --> IN_FLIGHT: 调度器 reserve 后 launch_reserved_fetches 调 Landing.place(extent)
-    STAGED --> FAILED: 等页超过 landing_wait_timeout_s(票 FAILED),或放置被拒 3 次
+    STAGED --> PLANNED: 等页超过 landing_wait_timeout_s、同伴已发起而本 rank 超过 unlaunched_timeout_s、或放置被拒 3 次后投 FAILED。失败共识不经 FAILED 态,释放落地区,有重试则丢计划回 PLANNED
+    STAGED --> RELEASED: 同上而重试已耗尽,出表,请求本地算
     IN_FLIGHT --> LANDED: 当前 try 全部 Delivered 且 served 齐全且共识通过
-    IN_FLIGHT --> FAILED: 任一 Failed,或 served 不全,或过期,或共识判失败
+    IN_FLIGHT --> FAILED: 共识判失败(任一 rank 的 attempt Failed 或投 FAILED)或 served 不全
+    IN_FLIGHT --> RELEASED: 请求已结束(含过期失败)的 fetch 拿到结局后 quiesce、出表,不经 LANDED / FAILED
     LANDED --> RELEASED: 释放点到达,quiesce 为 True(有落地区的在 unpark 后立即释放它)
     FAILED --> PLANNED: fetch 且 retries_left 大于 0,quiesce 后退页(有落地区的释放它),请求回到 candidates
     FAILED --> RELEASED: 其余情况,quiesce 后退页或终结
@@ -277,7 +283,7 @@ stateDiagram-v2
 
 > 实现注:`RELEASED` 不是可观察状态。实现中"释放"是事件——记录出表(`_release` 直接 pop),`RecordState` 没有 `RELEASED` 值;下文的 "RELEASED" 读作"记录已释放(不在表中)"。
 >
-> `STAGING` / `STAGED` 只属于 `LandsOnHost` 来源的 fetch(`KV_TRANSFER_HOST_FIRST_FETCH_DESIGN.zh.md` §5):内容先落在后端自己的 host 内存(`TransferRecord.landing`),GPU 页在 `STAGED → IN_FLIGHT` 时才被预留,放置阶段就是今天的 `IN_FLIGHT`。这两个状态期间请求仍是 `CONTEXT_INIT`,`plan_fetch` 对 `STAGING` 答 `DEFER`、对 `STAGED` 答 `FetchPlan`;记录没有页,请求结束时不 hold、立即释放。
+> `STAGING` / `STAGED` 只属于 `LandsOnHost` 来源的 fetch(`KV_TRANSFER_HOST_FIRST_FETCH_DESIGN.zh.md` §5):内容先落在后端自己的 host 内存(`TransferRecord.landing`),GPU 页在 `STAGED → IN_FLIGHT` 时才被预留,放置阶段就是今天的 `IN_FLIGHT`。这两个状态期间请求仍是 `CONTEXT_INIT`,`plan_fetch` 对 `STAGING` 答 `DEFER`、对 `STAGED` 答 `FetchPlan`;记录没有页。请求结束时落地区立即释放,记录留到共识后出表(已过期的立即出表),期间请求被 hold。
 
 答 `None` 或 `DEFER` 的候选**不建记录**;`DEFER` 的下一轮仍在 `candidates` 里。
 
@@ -318,9 +324,9 @@ gen-init 落地后到被真正调度之间,引擎还要准备 seq slot、sampler
 | fetch | 请求结束、释放页之前 | 正常终结 |
 | publish | 当前 try 到终态时 | 记录 `RELEASED`;请求已结束的 `terminate_request` |
 
-> "RELEASED" 的读法见 §4.1 实现注:释放是事件(记录出表),不是可观察状态。
-
 **协调层不需要"钉住(pin)"原语。** 每一次传输的本地端点都由一个活着的请求持有:fetch 的目的页和 publish 的源页都归请求自己的 `_KVCache`。页在释放点 `quiesce` 为 `True` 之后才交还,就不会在传输途中被分给别人;答 `False` 时页随请求一直被占着,这就是 SPEC 要求的"退出使用"。过了 `deadline` 仍不静默的,走今天的 poison 路径:请求失败,页隔离。
+
+**第一版实现**(`KVTransferCoordinator._quiesce`):`quiesce` 答 `False` 即 `effects.fail_fatal`,记录带 `quiesce_refused` 留在表中、不再投票,请求被 hold、其页不再分出;"等到 deadline 再走 poison 路径"没有实现,后端只被问一次。
 
 需要"按名字找到已提交的页并钉住"的只有一处:worker 后端**应答**别人按内容发来的 demand 时,那些页在 radix tree 里、不属于任何活请求。这由 `resource/pin_by_keys` 用 KV v2 已有的 hold/lock 机制完成(§8.2)。
 
@@ -339,8 +345,9 @@ gen-init 落地后到被真正调度之间,引擎还要准备 seq slot、sampler
 | 排除 3 个 DISAGG 状态 | 排除 1 个 `KV_FETCH_IN_PROGRESS` |
 | draft 管理器的联合配对只看 prompt_len | 也按 `token_end` |
 | PP:rank 0 的 canonical schedule 带 gen-init 请求 id | 也带每个请求的 `token_end`;跟随者在收到 schedule 与重跑 `schedule_request` 之间由协调层把计划写进记录表。跟随者分配不足今天就没有处理,本设计不改善(`_pp_retry_until_can_schedule` 只查 `scheduled_batch`) |
+| 在飞传输无驱逐保护 | 调度器多收一个参数 `protected_from_eviction_request_ids`(引擎每轮从 `inflight_request_ids()` 取):其中的请求不被驱逐、不被 recompute-pause;调度器只拿到 id 集合,不读记录表 |
 
-后端接不下(`SubmissionRejected`)时,`launch_reserved_fetches` 用 `give_back_fetch_pages` 把页退回,记录**保留计划、留在 `PLANNED`**(`LandsOnHost` 来源的放置被拒则留在 `STAGED`),请求回到 `candidates`,**不消耗** `retries_left`,计 `consecutive_launch_failures`,连续 3 次后本地算(`KV_TRANSFER_MULTI_RANK_PLAN.zh.md` S0 的修订;早先版本写作"记录 `RELEASED`")。这是 GPU 页方向唯一的背压机制。`LandsOnHost` 后端的容量不足不走这条路:它在后端内部排队等待;排队等待与等页都由 `landing_wait_timeout_s` 封顶(后端排队用同一配置值,经 `BackendBuildContext` 传入;host-first 设计 §4、§7)。
+后端接不下(`SubmissionRejected`)时,`launch_reserved_fetches` 用 `give_back_fetch_pages` 把页退回,记录**保留计划、留在 `PLANNED`**(`LandsOnHost` 来源的放置被拒则留在 `STAGED`),请求回到 `candidates`,**不消耗** `retries_left`,计 `consecutive_launch_failures`,连续 `MAX_CONSECUTIVE_LAUNCH_FAILURES`(3)次后记录 `launch_gave_up`:对调度器答 `DEFER`、每轮投 `FAILED` 直到共识;失败共识耗一次重试、丢计划重新规划,重试也耗尽才出表本地算。这是 GPU 页方向唯一的背压机制。`LandsOnHost` 后端的容量不足不走这条路:它在后端内部排队等待;排队等待与等页都由 `landing_wait_timeout_s` 封顶(后端排队用同一配置值,经 `BackendBuildContext` 传入;host-first 设计 §4、§7)。
 
 ```mermaid
 stateDiagram-v2
@@ -360,7 +367,7 @@ stateDiagram-v2
     end note
 ```
 
-**调度器只读 `FetchPlan` 和请求状态,永远不读记录表。** 这条不变量是 §10.2 按层流式以后能加进来的前提。
+**调度器只读 `plan_fetch` 的答案、请求状态和引擎传入的保护 id 集合,永远不读记录表。** 这条不变量是 §10.2 按层流式以后能加进来的前提。
 
 一个已知的、今天同样存在且同样没加门的问题:取回中的请求把 KV 占满,forward 没东西算。等有数据再决定。
 
@@ -390,7 +397,7 @@ partial                                             not named
 | 层组 | 读法(SPEC §2) | extent 里的 unit | 目的地 |
 |---|---|---|---|
 | full attention | 分页,终点是**上界** | `[reuse_end, token_end)` 每块一个 | 页 |
-| 窗口(含 sink) | 分页 | sink 块加窗口块 `[stale_end(token_end), token_end)`,减去本地已有的;由 `_stale_block_range(group, token_end)` 给出 | 页 |
+| 窗口(含 sink) | 分页 | sink 块加窗口块 `[stale_end(token_end), token_end)`,减去本地已有的;由 `stale_block_range(group, token_end)` 给出 | 页 |
 | SSM/state | 状态,终点是**精确检查点** | 一个:`token_end` 所在块末尾的快照 | 请求自己的 SSM slot |
 | 窗口(发布侧) | 分页 | `publish_extent_and_chunk` 按 `stale_block_range(group, history)` 命名 `[0, sink) ∪ [stale_end(history), committed)`,history 取发布时刻(非分块 prefill 时 = `prompt_len` = L)。取回方最大目标 B = ⌊(L−1)/tpb⌋·tpb 需 `[stale_end(B), B)`;W ≡ 0 (mod tpb) 时二者恰在 `L mod tpb ∈ {0, tpb−1}` 时相差一块——窗口首块已被发布方丢弃,且 `stale_end` 随目标单调,往下走也救不回:`servable_blocks` 退到 sink 块独自能服务的边界(无 sink 时为 0),该请求本地算,正确性不受影响 | 页 |
 
@@ -421,53 +428,57 @@ partial                                             not named
 @dataclass(frozen=True)
 class FetchSource:
     name: str
-    backend: Fetches
-    hint_key: str | None        # 该后端认哪一个路由提示;None = 目的地唯一(store)
+    backend: Fetches | LandsOnHost   # 直写页的后端,或先落 host 的后端(后者是 store,hint_key 必为 None)
+    hint_key: str | None             # 该后端认哪一个路由提示;None = 目的地唯一(store)
 
 class KVTransferCoordinator:
     def __init__(self, sources: Sequence[FetchSource], publishers: Sequence[Publishes],
                  planner: Planner, reader: ResourceReader, effects: KVTransferEffects,
                  queue: EngineQueue, dist: Collective, *,
+                 unlaunched_timeout_s: float | None, landing_wait_timeout_s: float | None,
                  fetch_timeout_s: float | None = None, publish_timeout_s: float | None = None,
-                 unlaunched_timeout_s: float | None = 30.0, attention_dp: bool = False,
-                 plan_authority: PlanAuthority = PlanAuthority.VOTED, queue_budget: int = 64,
-                 gather: Callable[[Payload], list] | None = None): ...
+                 plan_authority: PlanAuthority = PlanAuthority.VOTED, queue_budget: int = 64): ...
 
-    # ---- 循环入口(每个 rank 每轮调用次数必须一致)----
-    def advance(self, candidates: Sequence[RequestView], now: float) -> None: ...
+    # ---- 循环入口(只有 advance 做集合通信:每个 rank 每轮恰调一次)----
+    def advance(self, candidates: Sequence[RequestView], now: float) -> int: ...  # 返回仍未决定(答 DEFER)的候选数
     def launch_reserved_fetches(self, queue: Sequence[RequestView], now: float | None = None) -> None: ...
-    def publish_committed_blocks(self, reqs: Sequence[RequestView], finished: Collection[int],
-                                 now: float | None = None) -> None: ...
+    def publish_committed_blocks(self, reqs: Sequence[RequestView], now: float | None = None) -> None: ...
 
     # ---- 调度器钩子(只读、非阻塞)----
     def plan_fetch(self, req: RequestView) -> FetchPlan | None | Defer: ...
 
     # ---- PP 的计划下发(OWNER 导出,FOLLOWER 采纳;见下文"齐")----
-    def export_plan_answers(self) -> list[tuple[int, tuple[int, str] | None]]: ...
-    def adopt_plan_answers(self, views: Sequence[RequestView], answers) -> None: ...
+    def export_plan_answers(self) -> PlanAnswers: ...  # [(request_id, (token_end, source) | None)]
+    def adopt_plan_answers(self, views: Sequence[RequestView], answers: PlanAnswers,
+                           now: float | None = None) -> int: ...  # 返回 views 中没得到答案、仍 DEFER 的数目
 
     # ---- 控制(不是入口)----
-    def notify_request_finished(self, req: RequestView) -> None: ...  # 释放门:未在飞的 fetch 到释放点;在飞的记录 hold 请求
-    def has_backend_work(self) -> bool: ...                    # pace_idle 与基准门控用
-    def inflight_request_ids(self) -> frozenset[int]: ... # 调度器的 protected_from_eviction 与释放门用
-    def status_dump(self) -> dict: ...                     # hang detector 用(今天就有)
+    def notify_request_finished(self, req: RequestView, now: float | None = None) -> bool: ...
+        # 释放门:True = 引擎现在可终止;False = 本层 hold 住、稍后由本层终止(或已终止)
+    def has_backend_work(self) -> bool: ...                 # 有后端在为本层工作:在飞交付或落地
+    def has_pending_work(self) -> bool: ...                 # 不等新请求也会有进展:空闲判定与 pace_idle 用
+    def inflight_request_ids(self) -> frozenset[int]: ...  # 后端仍可能碰其页的请求:调度器的驱逐保护与释放门用
+    def parked_request_ids(self) -> frozenset[int]: ...    # fetch 在飞、仍在跑的请求
+    def held_request_ids(self) -> frozenset[int]: ...      # 已结束、被 hold 的请求
+    def owned_requests(self) -> list[RequestView]: ...     # parked ∪ held;close 时释放
+    def status_dump(self) -> dict: ...
 ```
 
-`reader` 是本 rank 的资源视图(extent 与 chunk 从它取);`gather` 可替换 `dist.allgather`,供测试注入。`registry: ActiveRequestRegistry` 已不在签名里——请求以 `py_request_id` 为键记在协调层自己的表中。
+`reader` 是本 rank 的资源视图(extent 与 chunk 从它取);`dist` 是 `Collective` 协议,测试注入单 rank 伪件。请求以 `py_request_id` 为键记在协调层自己的表中。两个必填超时的缺省只在 `backends/config.py`(`KVTransferConfig`)一处,由装配传入。
 
 `advance` 的四个阶段,每个阶段只操作记录表:
 
-**收**
-- 对所有 `IN_FLIGHT` 记录的 attempt `poll`;fetch 记录按 §6.3 归并出本 rank 的 B。
-- 执行 `EngineQueue` 里后端排进来的任务,每轮有数量预算。
+**收**(`_poll_and_vote`)
+- 先执行 `EngineQueue` 里后端排进来的任务,每轮有数量预算。
+- 对所有 `IN_FLIGHT` 记录的 attempt `poll`,对 `STAGING` 记录 `poll` 其 `Landing`;fetch 记录按 §6.3 归并出本 rank 的 B。
+- 每条有话说的记录投一票(票型见"齐");投票的记录若已过 `deadline`,一并报为过期。已 `expired` 的记录不再投票:它只在本 rank 上结算,attempt 一结束就本地结算(`_end_expired_locally`:publish 按自己的结局结束,fetch 只出表)。
 
-**算**
-- 对 `candidates` 算本 rank 的计划答案(§7.2)。
-- 按 `now` 判定过期,置 `abandoned`。
+**算**(`_plan`)
+- 对 `candidates` 算本 rank 的计划答案(§7.2);`FOLLOWER` 不算。已有计划的记录(含 `launch_gave_up` 而对调度器答 `DEFER` 的)不重算:下一步由共识决定。
 
 **齐**(一次集合通信;三种 `PlanAuthority` 下每轮都发生,空闲轮也发生)
 - payload:`[(record_id, 票型, B)]`、过期的记录 id、`[(request_id, (token_end, source) | None | DEFER)]`;计划段只在 `VOTED` 下携带,其余模式为空列表。
-- 票型四种,fetch 与 publish 同一形状、同一归约:`UNLAUNCHED`(fetch 有计划、本 rank 未发起:页未预留或发起没成功)、`INFLIGHT`(本 rank 还有 attempt 在跑)、`FAILED`(本 rank 的 attempt 失败,或放弃发起 `launch_gave_up`,或同伴已发起而本 rank 未发起超过 `unlaunched_timeout_s`)、`TERMINAL(B)`(本 rank 全部 attempt 无失败结束;publish 的 `B=0`)。请求已结束的记录不投票:结局无跨 rank 效果,本 rank 一到 terminal 就本地落地。
+- 票型四种,fetch 与 publish 同一形状、同一归约:`UNLAUNCHED`(fetch 有计划、本 rank 的页里还没有 attempt:页未预留、发起没成功,或已落 host 等页)、`INFLIGHT`(本 rank 还有 attempt 或落地在跑)、`FAILED`(本 rank 的 attempt 或落地失败;放弃发起 `launch_gave_up`;同伴已发起而本 rank 未发起超过 `unlaunched_timeout_s`;等页或等落地内存超过 `landing_wait_timeout_s`;publish 有提交被拒 `rejected`)、`TERMINAL(B)`(本 rank 全部 attempt 无失败结束,B 为归并结果;publish 的 `B=0`)。请求已结束的记录照样投票,直到共识,使各 rank 同一轮终结请求:仍 `IN_FLIGHT` 的按 attempt 结局投(`_inflight_vote`:在跑则 `INFLIGHT`,任一 attempt Failed 则 `FAILED`,否则 `TERMINAL(归并 B)`),不在 `IN_FLIGHT` 的投 `TERMINAL`(fetch 带计划目标,`_finished_vote`;被拒的 publish 仍投 `FAILED`);只有过期的记录才不投票、本地结算。
 - 范围:`world`;ADP 下改为本 PP 组(今天 `_gen_consensus` 的规则)。
 - 到达归约(仍要求每条记录 `seen==n`),按序:任一 `INFLIGHT` → 本轮不落地(失败落地要 `quiesce`,不能压在活 attempt 上);否则任一 `FAILED` → 决定性失败,已 Delivered 的 rank 一样丢弃、退页、耗一次重试;否则任一 `UNLAUNCHED` → 本轮不落地(落地要每个 rank 的页都在);否则全 `TERMINAL`,取 `MIN(B)`,因为各 rank 持有的层组不同,`served` 不同;served short 时 `MIN(B)` 也是下次重试的 `retry_hint`。
 - 计划答案按 `PlanAuthority` 分三种:
@@ -476,19 +487,18 @@ class KVTransferCoordinator:
   - `FOLLOWER`(PP > 1 下的其余 rank,含 owner 的 TP 同伴):不算、不 probe;`adopt_plan_answers(views, answers)` 在 `to_scheduler_result` 之前采纳:`None` → 本地计算并释放 PLANNED 记录;`(token_end, source)` → `Planner.materialize(req, token_end, source)` 按**本 rank** 的层组与本地 reuse 深度重建计划写进记录(只接受 store 来源:路由来源的 hint 不在线上)。
   - 没有固有滞后:owner 第 R 轮 Stage 0 发起,follower 第 R 轮采纳、本地调度、同轮发起。只有 follower 预留失败才推到 R+1,中间那轮 owner `TERMINAL`、follower `UNLAUNCHED`,不落地。follower 尚未把请求当候选时收到的答案挂起到请求出现;请求结束即丢弃。失败共识在 owner 上同轮重置,下一轮重新导出。
 
-**用**
-- `LANDED` 的 fetch:`effects.unpark(...)`,attempt 的 `route.close()`。
-- `FAILED` 的 fetch:`quiesce` → `effects.give_back_fetch_pages(req)` → 有 `retries_left` 的回 `PLANNED` 并把 `served` 换算成重试提示,否则 `RELEASED`;`no_local_fallback` 的 `fail_requests`。
+**用**(`_apply`:先过期,再共识,再补问落地内存,最后写计划答案)
+- 任一 rank 报过期的记录置 `expired`:publish 只告警;仍在跑的请求的 fetch 立即 `fail_requests` 并按请求结束处理(在飞的 attempt 等结局再出表,不在活 attempt 下 `quiesce`)。
+- `LANDED` 的 fetch:`effects.unpark(...)`,attempt 的 `route.close()`,落地区立即释放。`STAGING` 的 TERMINAL 共识:记录转 `STAGED`,等调度器给页。
+- `FAILED` 的 fetch:`quiesce` → `effects.give_back_fetch_pages(req)` → 有 `retries_left` 的回 `PLANNED`,否则 `RELEASED`;`no_local_fallback` 的 `fail_requests`。重试提示只在 served 不全时是共识的 MIN(B)(`_apply_fetch_verdict`);决定性失败(任一 rank `FAILED`)不给提示,重试不设上限重新规划。未发起(`PLANNED` / `STAGED`)记录的失败共识同样耗一次重试或出表,只是没有释放点。
 - 到终态的 publish 记录:`quiesce` → `RELEASED`;请求已结束的 `effects.terminate_request`。
+- host-first 来源的计划此时立刻 `fetch_to_host`(被拒的每轮再问);写入本轮的计划答案,`plan_fetch` 随后只读它。
 
-> "RELEASED" 的读法见 §4.1 实现注:释放是事件(记录出表),不是可观察状态。
-- 写入本轮的计划答案,`plan_fetch` 随后只读它。
-
-`abandoned` 的记录随后按结局处理:普通 fetch 晚到的 `Delivered` 照常 `unpark`(数据不浪费);`no_local_fallback` 的过期即 `fail_requests`,晚到丢弃,保持今天 `kv_transfer_timeout_ms` 的语义;publish 过期时今天 `check_transfer_timeouts` 会让 ctx 发送失败,本设计相同。
+`expired` 的记录随后按结局处理:普通 fetch 的请求已在过期时失败,晚到的 `Delivered` 只释放记录,不 `unpark`;`no_local_fallback` 的过期同样 `fail_requests`;publish 过期只告警,publish 本身按自己的结局结束。
 
 ### 7.2 `Planner`
 
-**职责**:来源策略(取不取、问谁、取到哪)和归并(§6.3)。它是唯一**为了做决策而读请求内容**的地方;extent 与 chunk 的构造、命名在 `resource/`。文件 `disaggregation/remote_cache.py`(README §5 的名字;类名说它做什么)。
+**职责**:来源策略(取不取、问谁、取到哪)和归并(§6.3)。它是唯一**为了做决策而读请求内容**的地方;extent 与 chunk 的构造、命名在 `resource/`。文件 `disaggregation/remote_cache.py`(`2ea958f8817` README §5 的名字;新版 README 把远端策略放到 `pyexecutor/kv_cache/remote_policy.py`,本分支未搬,见 `KV_TRANSFER_README_AMENDMENTS.zh.md` A1;类名说它做什么)。
 
 ```python
 @dataclass(frozen=True)
@@ -499,7 +509,7 @@ class FetchPlan:
     no_local_fallback: bool                     # gen-init 为 True:失败只能 fail,不能本地重算
     group_plans: tuple[GroupPlan, ...]          # 每层组的 (GroupSpec, ordinals);fetch_extent 按它造 unit
     block_keys: tuple[bytes, ...]               # context_block_keys(req) 的快照
-    reuse_end: int                              # 计划时的本地命中末端(token 数)
+    reuse_end: int                              # 计划时的本地命中末端(块数;已裁到不超过 token_end // tpb)
     tokens_per_block: int
 
 DEFER = Defer()                                 # 单例:本轮别调度它,下轮再问
@@ -510,6 +520,7 @@ class Planner:
     def probe_query(self, req) -> tuple[bytes, tuple[bytes, ...]] | None: ...  # 该问 store 什么;None = 无可命名整块
     def decide(self, req, probe_answers, *, now: float, retry_hint=None) -> FetchPlan | None | Defer: ...
     def forget(self, req_id: int) -> None: ...  # 请求结束,丢掉它的 probe 计时
+    def materialize(self, req, token_end: int, source: str) -> FetchPlan: ...  # FOLLOWER:按本 rank 的层组与 reuse 重建 owner 的答案;只接受 store 来源
 
 def merge(plan: FetchPlan, served: frozenset[bytes]) -> int: ...            # §6.3:归并后的 B,也是重试提示
 def servable_blocks(answer: frozenset[bytes], keys: Sequence[bytes], specs: Sequence[GroupSpec],
@@ -526,7 +537,7 @@ probe 的等待只有一个预算:`probe_timeout_s`,按传给 `decide` 的 `now`
 |---|---|---|
 | 1 | 带 disagg 参数的 gen-init? | 短路:source = worker,token_end = prompt_len,no_local_fallback |
 | 2 | gen-first 的 context 请求,generation 侧还没就绪? | `DEFER`(今天 `prepare_context_schedulable` 的逻辑) |
-| 3 | 可命名整块数 > 本地命中块数? | `probe_context_reuse(req)` + `context_block_keys(req)` |
+| 3 | 可命名整块数 > 0?(重试时上限先取 `min(nameable, retry_hint // tpb)`) | `(prompt_len − 1) // tpb`;不与本地命中深度比较——决策只用各 rank 相同的输入(第 6 步),本地命中只裁 ask |
 | 4 | 有哪个后端值得问? | 按装配表顺序:请求带 `hint_key` 对应提示的 worker 后端;或 `probe` 答案非空的 store 后端。`probe` 答 `None`(后端还没查完,或答不了)则 `DEFER`,超过一个小预算后当 `None` |
 | 5 | token_end | worker:prompt 的整块末端;store:`servable_blocks`——**每个分页层组**在该边界所需的 unit(full attention 组 `[0, e)`,窗口组 sink 块加 `[stale_end(e·tpb), e)`)全在答案里的最大边界,以 `reuse_end = 0` 计(第 6 步);重试时重试提示先作候选上限,再判答案 |
 | 6 | 一致性 | 计划只用所有 rank 相同的输入(prompt、路由提示、probe 答案);本地命中深度各 rank 可能不同,只用它裁各组的询问(`group_plans`),裁到空仍是合法计划(契约允许 units 为空)。`servable_blocks` 因此不减本地前缀:store 缺、本地有的块也算缺(保守;store 全在 ⇒ 裁掉本地部分后仍全在) |
@@ -545,18 +556,17 @@ Coordinator 通过 effects 反向触达引擎,这是它对引擎的全部依赖�
 | `prepare_fetch_resources(reqs)` | 改名自 `prepare_gen_resources` | spec / draft 资源管理器的准备 |
 | `hold_for_transfer(reqs)` | 新 | 请求已结束但仍有记录在飞(publish 未 RELEASED,或 fetch 在飞):状态 → `KV_PUBLISH_IN_PROGRESS`(fetch hold 也置此值,§4.2 待决);释放 seq slot、spec 资源(今天 `AsyncTransferManager.start_transfer` 做的),对所有管理器 `release_index_slot`;页本身还锁着 |
 | `terminate_request(req)` | 沿用 | 最终释放 |
-| `stage_transfer_response(req, ...)` | 沿用 | ctx 侧响应 |
 | `fail_requests(reqs, reason)` / `fail_fatal(exc)` | 沿用 | |
 
 `unpark` 做四件事,不做第五件:
 
-1. 写游标。`token_end == prompt_len`(gen-init)直接写 `context_current_position`,像今天一样;否则 `_settle_context_cursor(req, token_end)`。前者不能用后者:它会触发 C++ 断言 `prepopulatedPromptLen < promptLen`。
+1. 写游标。`token_end == prompt_len`(gen-init)直接写 `context_current_position`,像今天一样;否则 `settle_context_cursor(req, max(token_end, num_committed_tokens), tpb)`——本地复用可能已越过 `token_end`,游标不回退到已提交之下。前者不能用后者:它会触发 C++ 断言 `prepopulatedPromptLen < promptLen`。
 2. 对**所有**资源管理器 `try_commit_blocks`。请求之后重入调度时会按 `num_committed_tokens` 重新落游标,正因为这一步提交了,两者才一致。
 3. 应用 `aux`(首 token、draft token、ctx_usage)。
 4. 置状态:`CONTEXT_INIT`,或 gen-init 的"已落地待激活"。
 5. **不**准备 seq slot 与 sampler:它们受 `max_num_sequences` 预算和 spec-decode 时序约束,留在引擎现有的批级钩子里。
 
-`ExecutorEffects`、`FetchSource.backend`、`EngineQueue`、`Collective` 都是 Protocol,`Planner` 的 `reader` 可替换,所以 Coordinator 能用假的 effects、假的 `Fetches`、假的 `dist` 做单元测试(§13)。
+`KVTransferEffects`、`FetchSource.backend`、`EngineQueue`、`Collective` 都是 Protocol,`Planner` 的 `reader` 可替换,所以 Coordinator 能用假的 effects、假的 `Fetches`、假的 `dist` 做单元测试(§13)。
 
 ### 7.4 后端装配与路由
 
@@ -593,7 +603,7 @@ Coordinator 通过 effects 反向触达引擎,这是它对引擎的全部依赖�
 | 3 | runtime `BlockRadixTree.match_keys(root_key, keys) -> ReuseMatch` | `_match_token_path` 去掉 token 的变体:沿 `next[key]` 走到第一个缺失,tokens 从 `Block.tokens` 取回,再走 `_prune_match(ssm_lc_id=None)`。**attention-only 剪枝**,SSM 快照由调用方单独核对 | children 本来就按 `BlockKey` 索引。若带 SSM 剪枝,匹配会被截到最近一个有快照的块 |
 | 4 | runtime `create_kv_cache(reuse_scope, input_tokens=None, *, reuse_keys=None, ...)` | 与 `input_tokens` 二选一,走同一个 `_setup_for_reuse` | 让应答 demand 复用现有 hold/lock 机制 |
 
-另外一处清理:`_settle_context_cursor` 里对 `py_connector_served_position` 的读取随 connector 删除。
+另外一处清理:`settle_context_cursor` 里对 `py_connector_served_position` 的读取随 connector 删除。
 
 **一条必须遵守的不变量**:context 侧**先 commit 再 publish,extent 与 chunk 用提交后的页**。提交时请求会放开窗口外的 stale 页,`allow_seq_rebasing` 还可能把页换成并发提交者的页;今天 `update_context_resources` 在 `_send_kv_async` 之前提交,正是这个顺序。
 
@@ -620,10 +630,10 @@ Coordinator 通过 effects 反向触达引擎,这是它对引擎的全部依赖�
 
 ### 9.2 disagg:context 侧发送(含分块 prefill)
 
-1. 每个 context step 之后 `publish_committed_blocks(reqs, finished, now)`。`update_context_resources` 已经提交了本 chunk。
+1. 每个 context step 之后 `publish_committed_blocks(reqs, now)`。`update_context_resources` 已经提交了本 chunk。
 2. Coordinator 从 `resource/` 取该请求的 `(extent, chunk)`。worker 后端实现了 `PlacesPieces`,每个 chunk 都收到 `publish(extent)` 与 `place(chunk)`;是否真的分块发由它决定。非最后一个 chunk 时请求状态不变。
 3. 最后一个 chunk 后请求结束,publish 记录仍在 `IN_FLIGHT`:`hold_for_transfer` → `KV_PUBLISH_IN_PROGRESS`,seq slot 与 spec 资源先还。这一步在同一轮的响应 pass 之前,`createResult` 才能照常附带 `contextPhaseParams`。
-4. generation 侧拉完 → `Delivered` → 释放点 `quiesce` → `RELEASED` → `stage_transfer_response` → `terminate_request`。过期则失败,与今天相同。
+4. generation 侧拉完 → `Delivered` → 释放点 `quiesce` → `RELEASED` → `terminate_request`(ctx 侧响应由引擎的 disagg 路径负责,不经本层的 effects)。过期则失败,与今天相同。
 
 ### 9.3 跨请求:从别的 worker 按内容取
 
@@ -644,8 +654,8 @@ Coordinator 通过 effects 反向触达引擎,这是它对引擎的全部依赖�
 
 ### 9.6 超时与取消
 
-- 过期,以及请求结束时 fetch 仍在飞,只把记录的 `abandoned` 置真(`notify_request_finished`);没有单独的 `abandon` 入口。契约无撤销,目的页可能仍在被写。
-- 请求**继续 parked**。`advance` 继续 poll;拿到结局后走正常路径(§7.1)。
+- 过期置记录 `expired`(任一 rank 看到即全体置);请求结束时 fetch 仍在飞,记录留在 `IN_FLIGHT` 等结局(`notify_request_finished`);没有单独的 `abandon` 入口。契约无撤销,目的页可能仍在被写。
+- 过期的 fetch 请求被 `fail_requests`;其页仍由记录持有(请求被 hold),`advance` 继续 poll,拿到结局后释放(§7.1)。
 - 响应路径今天按 `py_kv_transfer_timed_out` 分支;改后失败由 Coordinator 直接 `fail_requests`,响应路径不再需要这个分支。
 - 引擎线程上不调 `settle`;`quiesce` 只在释放点调。
 
@@ -756,7 +766,7 @@ class StreamsLayers(Protocol):
 三个测试面,不多不少:
 
 - **后端一致性套件**:属于 SPEC,不在本文。
-- **协调层状态机**:假的 `Fetches`(脚本化 `poll` 结局与 `quiesce` 答案)、记录调用的假 `ExecutorEffects`、假 `dist`、假 `ResourceReader`、假 `EngineQueue`;`advance` 的四个阶段可单独驱动;覆盖 §4.1 每条边、共识的 MIN/MAX 与 DEFER 规则、过期与晚到、`SubmissionRejected` 退页、重试一次、`pin_by_keys` 拒答。
+- **协调层状态机**:假的 `Fetches`(脚本化 `poll` 结局与 `quiesce` 答案)、记录调用的假 `KVTransferEffects`、假 `dist`、假 `ResourceReader`、假 `EngineQueue`;`advance` 的四个阶段可单独驱动;覆盖 §4.1 每条边、共识的 MIN/MAX 与 DEFER 规则、过期与晚到、`SubmissionRejected` 退页、重试一次、`pin_by_keys` 拒答。
 - **归并规则**:纯函数 `merge(plan, served) -> B`,合成 full / 窗口(含 sink)/ SSM 层组;价值最高、依赖为零。
 
 ---
@@ -787,7 +797,7 @@ class StreamsLayers(Protocol):
 | effects | 协调层反向调用引擎的一组回调,§7.3 |
 | EngineQueue | 后端把需要 KV v2 的工作排进来、协调层在引擎线程执行的队列 |
 | worker 后端 / store 后端 | 见 §1.1 |
-| blob 后端 | store 后端在代码里的落点:`backends/blob/backend.py::BlobStoreBackend` 只依赖 `backends/blob/store.py::BlobStore` 协议,同时实现 `Fetches` / `Publishes` / `RegistersPools`;驱动在 `backends/blob/drivers/` 下各一个模块(`mooncake.py`:连接配置、状态码翻译、注册表工厂;`memory.py`:进程内字典存储),经共用的 `blob/factory.py::build_blob_backend` 建后端。选项 `landing: device \| host`(缺省 `device`,mooncake 在 `protocol: tcp` 下缺省 `host`):`host` 形态是 `HostLandingBlobBackend`(`LandsOnHost`,组合一个 `BlobStoreBackend`),publish 经发布池 staged、fetch 先落到落地池再 `place`,KV 池不登记;`BackendHandle.landing` 与状态导出暴露解析后的值 |
+| blob 后端 | store 后端在代码里的落点:`backends/blob/backend.py::BlobStoreBackend` 只依赖 `backends/blob/store.py::BlobStore` 协议,同时实现 `Fetches` / `Publishes` / `RegistersPools`;驱动在 `backends/blob/drivers/` 下各一个模块(`mooncake.py`:连接配置、状态码翻译、注册表工厂;`memory.py`:进程内字典存储),经共用的 `blob/factory.py::build_blob_backend` 建后端。选项 `landing: device \| host`(缺省 `device`,mooncake 在 `protocol: tcp` 下缺省 `host`):`host` 形态是 `backends/blob/host_landing.py::HostLandingBlobBackend`(`LandsOnHost`,组合一个 `BlobStoreBackend`),publish 经发布池 staged、fetch 先落到落地池再 `place`,KV 池不登记;`BackendHandle.landing` 与状态导出暴露解析后的值 |
 | LandsOnHost / Landing | 后端能力:fetch 先落在后端自己的 host 内存,再由 `Landing.place(extent)` 搬进页;`Landing.poll / place / release` 是协调层见到的全部(`KV_TRANSFER_HOST_FIRST_FETCH_DESIGN.zh.md` §4) |
 | STAGING / STAGED | `LandsOnHost` fetch 的两个记录状态:落地在飞(无页) / 全 rank 落地、等调度器给页(§4.1) |
 | parked | 请求处于 `KV_FETCH_IN_PROGRESS`,不被调度 |
@@ -803,8 +813,8 @@ class StreamsLayers(Protocol):
 | 本地命中深度 | `probe_context_reuse(req)`,不占页 |
 | 层组的读法、窗口、sink | `impl.layer_grouping` + `kv_cache_manager_py_config.layers`,`kv_extractor` 已在读 |
 | 预留目的页 | `reserve_transfer_pages(req, token_end)`(§8.1 #1;gen-init 经别名 `prepare_disagg_gen_init(req)`);helix 用 `total_input_len_cp`,现有代码已处理 |
-| 每层组的目的页 / slot | `get_aggregated_page_indices(group, valid_only=False)`、`get_ssm_block_base_index(group)`、`_stale_block_range(group, token_end)` |
-| 落地后推进请求并提交 | 直接写游标或 `_settle_context_cursor(req, token_end, tpb)`(§7.3)+ `try_commit_blocks(req)`;`commit()` 自己推进 history |
+| 每层组的目的页 / slot | `get_aggregated_page_indices(group, valid_only=False)`、`get_ssm_block_base_index(group)`、`stale_block_range(group, token_end)` |
+| 落地后推进请求并提交 | 直接写游标或 `settle_context_cursor(req, token_end, tpb)`(§7.3)+ `try_commit_blocks(req)`;`commit()` 自己推进 history |
 | 退页 | `revert_allocate_context(req)` |
 | ctx 侧早释放 | `release_index_slot(req_id)`;seq slot / spec 资源管理器的 `free_resources` |
 | 布局指纹(store 命名用) | `resource/` 从 `pool_group_descs` 算 |
@@ -821,10 +831,10 @@ class StreamsLayers(Protocol):
 | pipelined 分块发送 | 保留:`publish_committed_blocks` 每步调用,worker 实现 `PlacesPieces` |
 | 子请求的投票 id | 保留:共识按记录 id |
 | `AsyncTransferManager.start_transfer` 释放 seq slot、spec 资源、draft 的 index slot | 保留:`hold_for_transfer` |
-| `pace_idle` / `poll_progress_when_idle` | 保留:循环层用 `has_backend_work()`;空闲路径也执行 `EngineQueue` |
+| `pace_idle` / `poll_progress_when_idle` | 保留:循环层用 `has_pending_work()`(在飞、等页、等共识都算);空闲路径也执行 `EngineQueue` |
 | 超时的 ADP allgather、`check_transfer_timeouts` 对 ctx 发送的超时 | 保留:并入共识;publish 记录有 deadline |
 | aux 通道(首 token、draft token、ctx_usage) | 保留:`CarriesAux`,经 `unpark` 交给引擎 |
-| 超时后晚到的数据 | gen-init 保持今天语义(过期即失败);普通 fetch 照常使用 |
+| 超时后晚到的数据 | gen-init 与普通 fetch 同样过期即 `fail_requests`;晚到的 `Delivered` 只释放记录(`_release_finished_fetch`),不 `unpark`(§7.1、§9.6) |
 | 同步传输模式 | 不支持(待定 → §11 #8) |
 | beam search | 与今天相同:分块发送要求 beam == 1 |
 | helix / CP | `prepare_disagg_gen_init` 已按 `total_input_len_cp` 处理;内容取回的 token_end 按全局长度 |

@@ -101,10 +101,12 @@ class KVTransferEffects(Protocol):
         ...
 
     def hold_for_transfer(self, requests: Sequence[RequestView]) -> None:
-        """Requests that ended while a transfer (either direction) is still in flight: state ->
-        ``KV_PUBLISH_IN_PROGRESS``; release seq slot and spec resources; keep the pages, which a
-        backend may still be reading or writing. ``terminate_request`` follows once every record
-        of the request is released."""
+        """Requests that ended while a record of theirs remains (a transfer in flight in either
+        direction, or a record waiting for the ranks' agreement): move the request to the
+        engine's "held for transfer" state (the engine side names it ``KV_PUBLISH_IN_PROGRESS``,
+        an alias of an existing state; a fetch hold uses the same value); release seq slot and
+        spec resources; keep the pages, which a backend may still be reading or writing.
+        ``terminate_request`` follows once every record of the request is released."""
         ...
 
     def terminate_request(self, request: RequestView) -> None:
@@ -122,11 +124,12 @@ class KVTransferEffects(Protocol):
 
 
 class EngineQueue(Protocol):
-    """Work a backend needs done on the engine thread (design §3.1 thread rule).
+    """Work a backend needs done on the engine thread.
 
     A backend ``post``s a callable from its own thread; the coordinator ``drain``s the queue at the
-    head of each ``advance`` under a per-round budget. The callable may only reach KV v2 through
-    ``resource/``.
+    head of each ``advance`` under a per-round budget, so the callable runs on the engine thread,
+    the only thread that may touch KV v2 (through the ``ResourceReader``). No backend in this
+    tree posts to it yet; the engine side provides one so the contract is complete.
     """
 
     def post(self, fn: Callable[[], None]) -> None: ...

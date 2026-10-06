@@ -15,9 +15,10 @@
 """The two read-only views the KV transfer coordination layer consumes (design §6.2, §7.1).
 
 ``RequestView`` is what the layer reads of a request; ``GroupSpec`` and ``ResourceReader`` are what
-it reads of this rank's cache. The engine side (``pyexecutor``) provides the request view (an
-``LlmRequest`` satisfies it structurally), ``resource/`` provides the reader, and tests pass a plain
-dataclass and a table. Nothing here imports the engine or the coordination layer.
+it reads of this rank's cache. The engine side (``pyexecutor``) provides the request view as
+``EngineRequestView``, a wrapper over an ``LlmRequest`` that adds the three attributes a request
+does not carry; ``resource/`` provides the reader; tests pass a plain dataclass and a table.
+Nothing here imports the engine or the coordination layer at run time.
 """
 
 from __future__ import annotations
@@ -29,16 +30,20 @@ from .backend import CacheKind
 from .cache_backend import CacheExtent
 
 if TYPE_CHECKING:
+    from ..remote_cache import FetchPlan
     from .backend import Chunk
 
 __all__ = ["GroupSpec", "RequestView", "ResourceReader"]
 
 
 class RequestView(Protocol):
-    """The subset of ``LlmRequest`` the coordination layer reads.
+    """The subset of ``LlmRequest`` the coordination layer reads, plus three attributes a request
+    does not carry.
 
-    Duck-typed: an ``LlmRequest`` satisfies it as-is, and tests pass a plain dataclass. The
-    coordination layer never writes to a request; every write goes through ``KVTransferEffects``.
+    Duck-typed: the engine passes ``EngineRequestView``, which wraps an ``LlmRequest`` and adds
+    ``is_gen_init``, ``is_gen_first_context`` and ``route_hints`` as constants; tests pass a plain
+    dataclass. The coordination layer never writes to a request; every write goes through
+    ``KVTransferEffects``.
     """
 
     @property
@@ -93,8 +98,7 @@ class GroupSpec:
 class ResourceReader(Protocol):
     """Read-only view of this rank's cache resources, for planning and for building extents.
 
-    Provided by ``resource/``; it is the only thing between the coordination layer and KV v2. The
-    ``plan`` argument type is ``remote_cache.FetchPlan``; it is left untyped here to avoid a cycle.
+    Provided by ``resource/``; it is the only thing between the coordination layer and KV v2.
     """
 
     @property
@@ -117,7 +121,7 @@ class ResourceReader(Protocol):
         ...
 
     def fetch_extent(
-        self, request: RequestView, plan: object
+        self, request: RequestView, plan: FetchPlan
     ) -> tuple[CacheExtent, frozenset[bytes]]:
         """The extent for a fetch the scheduler has already allocated pages for, and the names
         of the plan's units left out of it because the local cache committed them meanwhile

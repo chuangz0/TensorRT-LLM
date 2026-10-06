@@ -2932,8 +2932,8 @@ class PyExecutor:
                 self.disagg.prepare_context_schedulable(new_requests)
                 self.disagg.poll_gen_transfers()
                 if self.kv_transfer is not None:
-                    # Design §3.2 ①: loop head, before Stage 0 and before
-                    # any continue/break; every PP rank enters this collective once per round.
+                    # KV transfer loop head, before Stage 0 and before any
+                    # continue/break: every PP rank enters this collective once per round.
                     self.kv_transfer.advance_round(self.active_requests)
 
                 iter_stats = self._init_iter_stats_if_sampled(len(new_requests))
@@ -3648,8 +3648,8 @@ class PyExecutor:
                     # handling can terminate the request.
                     self._update_v2_context_resources(scheduled_requests)
                 if self.kv_transfer is not None:
-                    # Design §3.2 ④: the batch's forward is complete and
-                    # its context KV committed; offer the blocks before disagg may terminate.
+                    # The batch's forward is complete and its context KV
+                    # committed: offer the blocks before disagg may terminate.
                     self.kv_transfer.publish_committed_blocks(
                         scheduled_requests.context_requests)
                 if self.kv_cache_transceiver:
@@ -3982,7 +3982,7 @@ class PyExecutor:
         self.disagg.prepare_context_schedulable(new_requests)
         self.disagg.poll_gen_transfers()
         if self.kv_transfer is not None:
-            # Design §3.2 ①: loop head; this round's schedule sees last round's landings.
+            # KV transfer loop head: this round's schedule sees last round's landings.
             self.kv_transfer.advance_round(self.active_requests)
         self.disagg.check_transfer_timeouts()
 
@@ -4064,7 +4064,7 @@ class PyExecutor:
         scheduled_batch, scheduler_fitting_disagg_gen_init_requests, _ = self._schedule(
         )
         if self.kv_transfer is not None:
-            # Design §3.2 ③: start the fetches the scheduler reserved pages for.
+            # Start the fetches the scheduler reserved pages for.
             self.kv_transfer.launch_reserved_fetches(
                 self._kv_fetch_launch_queue)
 
@@ -4707,7 +4707,7 @@ class PyExecutor:
                         # handling can terminate the request.
                         self._update_v2_context_resources(scheduled_batch)
                     if self.kv_transfer is not None:
-                        # Design §3.2 ④: publish after the forward completed and the blocks were committed.
+                        # Publish after the forward completed and the blocks were committed.
                         self.kv_transfer.publish_committed_blocks(
                             scheduled_batch.context_requests)
                     self._send_kv_async(scheduled_batch.all_requests())
@@ -5550,7 +5550,7 @@ class PyExecutor:
                             iteration_id=self.iter_counter)
 
                     if self.kv_transfer is not None:
-                        # Design §3.2 ④: only previous_batch is committed and forward-complete here.
+                        # Only previous_batch is committed and forward-complete here.
                         self.kv_transfer.publish_committed_blocks(
                             self.previous_batch.scheduled_requests.
                             context_requests)

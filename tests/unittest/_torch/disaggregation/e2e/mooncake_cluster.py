@@ -27,6 +27,10 @@ from dataclasses import dataclass
 import pytest
 import yaml
 
+# Literal copies of ``backends.config.KV_TRANSFER_CONFIG_ENV`` and
+# ``assembly.KV_TRANSFER_STATUS_DUMP_ENV``: this module imports ``tensorrt_llm`` only inside
+# functions, so the e2e tests collect (and skip) without it; ``backends/test_config_registry.py``
+# pins the first literal to the constant.
 KV_TRANSFER_CONFIG_ENV = "TRTLLM_KV_TRANSFER_CONFIG"
 KV_TRANSFER_STATUS_DUMP_ENV = "TRTLLM_KV_TRANSFER_STATUS_DUMP"
 

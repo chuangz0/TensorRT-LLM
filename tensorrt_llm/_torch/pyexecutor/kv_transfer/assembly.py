@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Assembling the KV transfer layer onto one ``PyExecutor`` (design §7.4).
+"""Assembling the KV transfer layer onto one ``PyExecutor``.
 
 ``attach_kv_transfer`` runs once at creation when ``TRTLLM_KV_TRANSFER_CONFIG`` is set: it checks
 the engine is in scope, builds the resource reader and region resolver, names the model for the

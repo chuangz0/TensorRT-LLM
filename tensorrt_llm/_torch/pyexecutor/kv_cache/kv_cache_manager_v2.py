@@ -3786,8 +3786,7 @@ class KVCacheManagerV2(BaseResourceManager):
             history = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
             return history, history + get_draft_token_length(req) + self.num_extra_kv_tokens
         # Local reuse may already have declared history past token_end (a
-        # plan trimmed to an empty ask is legal, design §7.2 step 6), and
-        # history never decreases.
+        # plan trimmed to an empty ask is legal), and history never decreases.
         history = max(kv_cache.history_length, token_end)
         return history, history
 

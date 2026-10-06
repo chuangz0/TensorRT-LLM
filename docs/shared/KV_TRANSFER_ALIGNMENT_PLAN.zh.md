@@ -5,6 +5,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # 与 `origin/feat/kv-shared-draft` 对齐(v4:只做 store 侧)
 
+> 历史文档,保留当时的名字;现名见 `KV_TRANSFER_COORDINATOR_DESIGN.zh.md`。下文的 README 指 `2ea958f8817` 版;README 已于 `147ed68276e` 改版(代码组织 §5→§4),出入见 `KV_TRANSFER_README_AMENDMENTS.zh.md`。
+
 > 引擎侧对象已改名 `KVTransferHooks`(`pyexecutor/kv_transfer/hooks.py`,见 `KV_TRANSFER_SIMPLIFICATION_PLAN.zh.md` R0);下文的 `binding` 为当时名称,保留为历史。
 
 > 范围:`feat/mooncake-store-backend`(HEAD c0fd92e8d13 之后)向 `origin/feat/kv-shared-draft`(2ea958f8817,merge-base dcc95a8bf52)

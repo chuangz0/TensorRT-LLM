@@ -12,12 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The engine side of the KV transfer coordination layer's protocols (design §7.3, §12.2).
+"""The engine side of the KV transfer coordination layer's protocols.
 
 ``EngineRequestView`` is the ``RequestView`` over one ``LlmRequest``; ``PyExecutorKVTransferEffects``
 is the ``KVTransferEffects`` over one ``PyExecutor`` and the only place that writes a request's
 transfer state; ``EngineWorkQueue`` and ``EngineCollective`` complete the contract. The two state
-constants spell the coordination layer's states with the alias table of design §12.2.
+constants are the coordination layer's two request states, each an alias of an existing disagg
+state of ``LlmRequestState``.
 """
 
 from __future__ import annotations
@@ -140,7 +141,7 @@ class EngineCollective:
 
 
 class PyExecutorKVTransferEffects:
-    """``KVTransferEffects`` over a ``PyExecutor``, in the order of the design §7.3 table.
+    """``KVTransferEffects`` over a ``PyExecutor``.
 
     Stateless: which requests are parked or held is the coordinator's record table to answer.
     """
@@ -159,7 +160,8 @@ class PyExecutorKVTransferEffects:
     def unpark(self, request, token_end: int, no_local_fallback: bool, aux) -> None:
         """A fetch landed: settle the cursor at ``max(token_end, num_committed_tokens)``, commit,
         back to ``CONTEXT_INIT``. The maximum because local reuse may already exceed the
-        block-aligned target (design §7.2 step 6) and the cursor never moves below a commit.
+        block-aligned target (a plan trimmed to an empty ask is still a plan) and the cursor
+        never moves below a commit.
 
         Narrower than the protocol allows, by the scope guard: only the primary KV cache manager
         commits (no draft manager), ``aux`` has no consumer (no worker backend, so nothing rides
@@ -267,10 +269,10 @@ class PyExecutorKVTransferEffects:
 
     def _settle_landed_cursor(self, engine_request: LlmRequest, token_end: int) -> None:
         """Settle the context cursor at ``max(token_end, committed)``, the way a local reuse hit
-        is settled (design §7.3 step 1), and let the pages keep their size.
+        is settled, and let the pages keep their size.
 
         Fetched content always ends short of the prompt. Local reuse may already reach past
-        ``token_end`` (design §7.2 step 6: a plan trimmed to an empty ask is still legal); the
+        ``token_end`` (a plan trimmed to an empty ask is still a plan); the
         cursor never moves below what is committed, and the commit that follows is then a no-op
         for that part. The pages now hold real content and are committed next, so a later
         revert must not shrink them away."""

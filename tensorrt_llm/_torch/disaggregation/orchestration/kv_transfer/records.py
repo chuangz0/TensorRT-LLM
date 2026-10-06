@@ -105,10 +105,15 @@ class TransferRecord:
             scheduler's allocation.
         attempts: Every attempt so far; several per publish when sent in pieces, accumulating
             across tries on retry.
-        retries_left: Fetch only; a retry is allowed once when ``served`` came up short.
+        retries_left: Fetch only; how many more times the plan may be dropped and the request
+            planned again. Every failed verdict spends one, whatever its cause: a failed or short
+            delivery, a launch given up, or a wait that ran out (``landing_wait_timeout_s``,
+            ``unlaunched_timeout_s``). At zero the next failure releases the record and the
+            request computes locally.
         deadline: Monotonic time after which the record expires; ``None`` means no timeout. Set
-            when a fetch is launched or lands on the host, when a publish's first submission is
-            accepted, and at the request's end for a record kept to vote without one.
+            when a fetch is launched or starts landing on the host (cleared again once the
+            landing is complete; the placement sets its own), when a publish's first submission
+            is accepted, and at the request's end for a record kept to vote without one.
         expired: The deadline passed. The record no longer waits for the ranks' agreement: it is
             settled on this rank as soon as its own attempts are over.
         quiesce_refused: The backend could not vouch for the pages at the release point. The
@@ -124,11 +129,13 @@ class TransferRecord:
         launch_gave_up: Fetch only; this rank will not launch the current plan. The record votes
             ``FAILED`` every round until the ranks agree, and the scheduler is answered ``DEFER``
             meanwhile. Cleared when the plan is dropped for a retry.
-        peer_launched_at: Fetch only; when this rank, still unlaunched, first saw a vote other
-            than ``UNLAUNCHED`` for the same record. Bounds how long an unlaunched rank may hold
-            the others up (``unlaunched_timeout_s``). Cleared when this rank launches, when its
-            landing is accepted or complete (the wait for pages has its own clock), and when
-            the plan is dropped.
+        peer_launched_at: Fetch only; when this rank, voting ``UNLAUNCHED`` for the record (no
+            attempt of its own in the pages: pages not reserved, launch not started, or landed
+            on the host and waiting for pages), first saw another rank's vote that was not
+            ``UNLAUNCHED``. Bounds how long this rank may hold the others up
+            (``unlaunched_timeout_s``). Cleared when this rank starts its own attempt, when its
+            landing is accepted or marked complete, and when the plan is dropped; it starts
+            again if the peers move on while this rank still waits.
         landing: Host-first fetch only; the current try's ``Landing``, from ``fetch_to_host``
             until the coordinator releases it. Never among ``attempts``.
         committed_names: Fetch only; units the plan asked for that ``fetch_extent`` left out of

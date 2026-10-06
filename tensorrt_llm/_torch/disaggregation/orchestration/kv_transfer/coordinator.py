@@ -289,7 +289,7 @@ class KVTransferCoordinator:
         """Held requests this coordinator terminated before the engine's release gate asked about
         them; the gate is answered "not yours" once, so the engine does not terminate twice."""
 
-    # ---- loop entry points (each rank calls each the same number of times per round) ----
+    # ---- loop entry points (``advance`` is the one collective: once per rank per round) ----
 
     def advance(self, candidates: Sequence[RequestView], now: float) -> int:
         """Head of the loop: poll outcomes into votes, plan candidates, agree across ranks, apply.
@@ -1317,7 +1317,8 @@ class KVTransferCoordinator:
     def _release_landing(rec: TransferRecord) -> None:
         """Give a host-first landing back and forget what went with it. Idempotent; a no-op for a
         record without one. Called when the delivery is complete (after ``unpark``), when the
-        record leaves the table, and when the plan is dropped for a retry."""
+        record leaves the table, when the plan is dropped for a retry, and at the end of a
+        request whose landing is still on its way."""
         if rec.landing is not None:
             rec.landing.release()
         rec.landing = None

@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The Mooncake driver: ``type: mooncake`` as ``BlobStoreBackend`` over a
-``MooncakeDistributedStore``.
+"""The Mooncake driver: ``type: mooncake`` as the blob backend over a ``MooncakeDistributedStore``,
+in either of its shapes (``BlobStoreBackend`` for ``landing: device``, ``HostLandingBlobBackend``
+for ``landing: host``; over TCP the default is ``host``).
 
 Everything Mooncake-specific lives here: ``MooncakeStoreConfig`` (the connection options of a
 config entry), ``MooncakeBlobStore`` (the ``BlobStore`` over the bindings, the only place their

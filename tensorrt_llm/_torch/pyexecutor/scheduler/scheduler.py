@@ -90,7 +90,7 @@ class SchedulerOutput(
     empty list so existing V1 schedulers can keep constructing the original
     six-field output. ``fetch_launch_queue`` holds the context requests whose
     KV prefix the scheduler reserved pages for this iteration; the KV transfer
-    coordinator launches those fetches after scheduling (integration plan §5).
+    coordinator launches those fetches after scheduling.
     """
 
     __slots__ = ()

@@ -15,9 +15,11 @@
 """The KV transfer configuration file: which backends to assemble, and the coordinator's limits.
 
 The executor creator reads ``TRTLLM_KV_TRANSFER_CONFIG`` and hands the YAML path to the assembly,
-which loads it here (integration plan §8); this module reads no environment. The ``backends`` list
-is the assembly table of design §7.4: its order is the fetch priority, each entry names a
-registered backend type and carries that type's own settings unread. Nothing here imports a backend.
+which loads it here; this module reads no environment. The ``backends`` list is the assembly
+table: its order is the fetch priority, each entry names a registered backend type and carries
+that type's own settings unread. The timeouts have their one default each here; the assembly
+passes them to the coordinator and, for ``landing_wait_timeout_s``, to the backends. Nothing here
+imports a backend.
 """
 
 from __future__ import annotations

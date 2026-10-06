@@ -69,7 +69,9 @@ class FetchSource:
     """One fetch backend in the assembly table (design §7.4).
 
     Attributes:
-        name: Stable identifier; recorded on plans and attempts, and used as the allgather key.
+        name: Stable identifier; recorded on plans (``FetchPlan.source``) and attempts
+            (``AttemptRecord.source``), and what the coordinator maps back to the backend for
+            ``quiesce``. The ranks agree on records by ``(request_id, direction)``, not by it.
         backend: The backend itself: one that writes the caller's pages directly (``Fetches``)
             or one that lands in its own host memory first (``LandsOnHost``; a store, so
             ``hint_key`` is ``None``).

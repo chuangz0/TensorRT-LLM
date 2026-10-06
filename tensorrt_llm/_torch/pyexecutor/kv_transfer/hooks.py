@@ -12,27 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The KV transfer layer as the executor loop and the scheduler see it (design §3.2).
+"""The KV transfer layer as the executor loop and the scheduler see it.
 
 ``KVTransferHooks`` is the one object the loop calls, one method per engine loop hook point: each
 selects the requests the hook concerns, wraps them in ``EngineRequestView``, forwards to
 ``KVTransferCoordinator``, answers the release gate and the cancel path from the coordinator's
 record table, and owns the shutdown order. All logic lives here or below; the shared engine files
 hold one guarded call per hook.
-
-Known follow-ups:
-
-1. An empty-ask plan (local reuse already covers every nameable block) still costs one
-   park/unpark round, because the decision may not depend on rank-local reuse (design §7.2
-   step 6). Follow-up: a consensus-safe short-circuit.
-2. On a context-only worker the loop sleeps in ``_fetch_and_enqueue_requests`` once the last
-   context-only request has left ``active_requests``, so disagg's release and this layer's
-   ``LANDED`` record wait for the next wake. This is disagg's pre-existing idle-wake gap; it is
-   not widened here.
-3. Under ``VOTED`` planning, a request that has ended on one rank while another rank still
-   re-plans it after a failed try never reaches ``n`` plan answers (the finished rank plans
-   nothing), so the re-planning rank defers until its own request ends. Bounded by the request's
-   end, but a livelock in theory; a finished rank could answer ``None`` for the key instead.
 """
 
 from __future__ import annotations
@@ -117,7 +103,7 @@ class KVTransferHooks:
     # ---- loop entry points ----
 
     def advance_round(self, active_requests: Sequence[LlmRequest]) -> None:
-        """Loop head (design §3.2 step 1), once per round: pick the undecided candidates, then
+        """Loop head, once per round: pick the undecided candidates, then
         ``coordinator.advance`` reaps landed transfers and plans them. A follower plans nothing
         here; its undecided count is set when it adopts the owner's answers."""
         candidates = self._undecided_candidates(active_requests)
@@ -139,7 +125,7 @@ class KVTransferHooks:
         self._num_deferred_requests = self.coordinator.adopt_plan_answers(candidates, answers)
 
     def plan_fetch(self, request: LlmRequest):
-        """Scheduler hook (design §5): ``FetchPlan``, ``None`` or ``DEFER`` for ``request``.
+        """Scheduler hook: ``FetchPlan``, ``None`` or ``DEFER`` for ``request``.
 
         A request that is not a fetch candidate (``_is_fetch_candidate``) computes locally:
         ``None``.
@@ -149,14 +135,14 @@ class KVTransferHooks:
         return self.coordinator.plan_fetch(EngineRequestView(request))
 
     def launch_reserved_fetches(self, fetch_launch_queue: Sequence[LlmRequest]) -> None:
-        """After scheduling (design §3.2 step 3): start the fetches the scheduler reserved for."""
+        """After scheduling: start the fetches the scheduler reserved pages for."""
         if fetch_launch_queue:
             views = [EngineRequestView(request) for request in fetch_launch_queue]
             self.coordinator.launch_reserved_fetches(views, time.monotonic())
 
     def publish_committed_blocks(self, context_requests: Sequence[LlmRequest]) -> None:
-        """After a context step whose forward has completed and whose blocks are committed
-        (design §3.2 step 4): offer the blocks of requests whose prefill ended."""
+        """After a context step whose forward has completed and whose blocks are committed:
+        offer the blocks of requests whose prefill ended."""
         completed = self._publishable_completed_contexts(context_requests)
         if completed:
             self.coordinator.publish_committed_blocks(completed, now=time.monotonic())
@@ -164,7 +150,7 @@ class KVTransferHooks:
     # ---- release gate, cancel path, idle pacing ----
 
     def on_request_finished(self, request: LlmRequest) -> bool:
-        """The release gate (design §4.3): ``True`` when the engine may terminate the request
+        """The release gate: ``True`` when the engine may terminate the request
         now, ``False`` when this layer holds it and will terminate it later, or already has."""
         return self.coordinator.notify_request_finished(EngineRequestView(request))
 
@@ -276,7 +262,7 @@ class KVTransferHooks:
     def _undecided_candidates(
         self, active_requests: Sequence[LlmRequest]
     ) -> list[EngineRequestView]:
-        """Design §3.2 candidates: fetch candidates whose plan is not decided yet."""
+        """Fetch candidates whose plan is not decided yet."""
         candidates = []
         for request in active_requests:
             if not _is_fetch_candidate(request):

@@ -50,7 +50,7 @@ class ScheduleAction(enum.Enum):
 
 
 class FetchPathAction(enum.Enum):
-    """Answer of the KV transfer seam for one first-chunk context request (design §5)."""
+    """Answer of the KV transfer seam for one first-chunk context request."""
 
     NOT_A_FETCH = "not_a_fetch"  # ordinary context path
     DEFERRED = "deferred"  # the transfer layer has no answer yet; ask again next round
@@ -268,7 +268,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._prioritize_first_token_gen = (
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
         )
-        # Read-only hook of the KV transfer layer (design §5): asked once per first-chunk
+        # Read-only hook of the KV transfer layer: asked once per first-chunk
         # context request before any cache is prepared for it, and answering a plan, None
         # (compute locally) or its ``DEFER`` (skip this round). Duck-typed and attached by
         # the executor assembly; None keeps every request on the local compute path.
@@ -566,7 +566,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     )
                     deferred_behind_contributor = True
                     continue
-            # KV transfer seam (design §5): asked before any cache is prepared.
+            # KV transfer seam: asked before any cache is prepared.
             fetch_path = self._try_take_fetch_path(req)
             if fetch_path is FetchPathAction.RESERVED:
                 fetch_launch_queue.append(req)
@@ -641,7 +641,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             fetch_launch_queue,
         )
 
-    # ---- KV transfer seam (design §5) ----
+    # ---- KV transfer seam ----
 
     def _try_take_fetch_path(self, req: LlmRequest) -> FetchPathAction:
         """Ask the KV transfer hooks whether a pending context request fetches its prefix.
