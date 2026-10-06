@@ -71,13 +71,13 @@ record gives up on its plan and lets the ranks agree on a failure."""
 
 T = TypeVar("T")
 
-_DEFER_WIRE = "DEFER"
+_DEFER_ANSWER = "DEFER"
 _PlanAnswer = FetchPlan | None | Defer
-_PlanWire = tuple[int, str] | str | None
+_EncodedPlanAnswer = tuple[int, str] | str | None
 """A plan answer on the wire: ``(token_end, source)``, ``"DEFER"``, or ``None``."""
-PlanAnswers = list[tuple[int, _PlanWire]]
-"""Decided answers as the owner hands them to the followers: ``[(request_id, plan wire)]``, never
-``"DEFER"``. Built-in types only, so it rides in the pickled schedule."""
+PlanAnswers = list[tuple[int, _EncodedPlanAnswer]]
+"""Decided answers as the owner hands them to the followers: ``[(request_id, encoded answer)]``,
+never ``"DEFER"``. Built-in types only, so it rides in the pickled schedule."""
 
 
 class VoteKind(Enum):
@@ -107,23 +107,30 @@ class Vote(NamedTuple):
 _Verdict = tuple[int, int, bool]
 """``(MIN(B), MIN(retry_hint), failed)``: what the ranks agreed on for one record. Every rank votes
 ``retry_hint == B``, so the two minima agree; both are kept for the wire shape."""
-_Payload = tuple[list, list, list]
-"""``([(key, kind, B, hint)], [expired key], [(rid, plan wire)])``: one rank's word per round."""
 
 
-def _wire(answer: _PlanAnswer) -> _PlanWire:
+class _RoundMessage(NamedTuple):
+    """One rank's word per round: ``votes`` as ``[(key, kind, B, hint)]``, ``expired`` as
+    ``[key]``, ``plans`` as ``[(rid, encoded answer)]``. A plain 3-tuple on the wire."""
+
+    votes: list
+    expired: list
+    plans: list
+
+
+def _encode_plan_answer(answer: _PlanAnswer) -> _EncodedPlanAnswer:
     if answer is DEFER:
-        return _DEFER_WIRE
+        return _DEFER_ANSWER
     if answer is None:
         return None
     return (answer.token_end, answer.source)
 
 
-def _ballots_by_key(gathered: Sequence[_Payload]) -> dict[RecordKey, list[Vote]]:
+def _ballots_by_key(gathered: Sequence[_RoundMessage]) -> dict[RecordKey, list[Vote]]:
     """Every rank's vote on every record, in gathered order; keys come back as tuples."""
     ballots: dict[RecordKey, list[Vote]] = {}
-    for votes, _, _ in gathered:
-        for key, kind, b, hint in votes:
+    for message in gathered:
+        for key, kind, b, hint in message.votes:
             ballots.setdefault(tuple(key), []).append(Vote(VoteKind(kind), b, hint))
     return ballots
 
@@ -153,20 +160,22 @@ def _reduce_votes(ballots: Mapping[RecordKey, list[Vote]], n: int) -> dict[Recor
 
 
 def _reduce_plans(
-    gathered: Sequence[_Payload], answers: Mapping[int, _PlanAnswer]
+    gathered: Sequence[_RoundMessage], answers: Mapping[int, _PlanAnswer]
 ) -> dict[int, _PlanAnswer]:
     """Any DEFER -> DEFER; otherwise any disagreement on ``(token_end, source)`` -> None."""
     n = len(gathered)
-    wires: dict[int, list[_PlanWire]] = {}
-    for _, _, plans in gathered:
-        for rid, wire in plans:
-            wires.setdefault(rid, []).append(tuple(wire) if isinstance(wire, list) else wire)
+    encoded: dict[int, list[_EncodedPlanAnswer]] = {}
+    for message in gathered:
+        for rid, answer in message.plans:
+            encoded.setdefault(rid, []).append(
+                tuple(answer) if isinstance(answer, list) else answer
+            )
     consensus: dict[int, _PlanAnswer] = {}
     for rid, local in answers.items():
-        v = wires.get(rid, [])
-        if len(v) < n or _DEFER_WIRE in v:
+        v = encoded.get(rid, [])
+        if len(v) < n or _DEFER_ANSWER in v:
             consensus[rid] = DEFER
-        elif all(x == v[0] for x in v) and _wire(local) == v[0]:
+        elif all(x == v[0] for x in v) and _encode_plan_answer(local) == v[0]:
             consensus[rid] = local
         else:
             consensus[rid] = None
@@ -266,7 +275,7 @@ class KVTransferCoordinator:
         """Decided answers ``plan_fetch`` reads. A request with no entry is undecided (DEFER)."""
         self._answers_to_export: dict[int, FetchPlan | None] = {}
         """OWNER only: the answers the last ``advance`` decided, for ``export_plan_answers``."""
-        self._pending_answers: dict[int, _PlanWire] = {}
+        self._pending_answers: dict[int, _EncodedPlanAnswer] = {}
         """FOLLOWER only: adopted answers whose request is not a candidate here yet."""
         self._probe_answers: dict[int, dict[str, frozenset[bytes] | None]] = {}
         self._finished: set[int] = set()
@@ -282,14 +291,14 @@ class KVTransferCoordinator:
     # ---- loop entry points (each rank calls each the same number of times per round) ----
 
     def advance(self, candidates: Sequence[RequestView], now: float) -> int:
-        """Head of the loop: reap outcomes into votes, plan candidates, agree across ranks, apply.
+        """Head of the loop: poll outcomes into votes, plan candidates, agree across ranks, apply.
 
         Returns how many candidates are still undecided afterwards (``plan_fetch`` answers
         ``DEFER``): each is waiting on a store lookup, or on the ranks' agreement.
         """
-        votes, expired = self._reap(now)
+        votes, expired = self._poll_and_vote(now)
         answers = self._plan(candidates, now)
-        verdicts, expired, answers = self._sync(votes, expired, answers, now)
+        verdicts, expired, answers = self._agree(votes, expired, answers, now)
         self._apply(verdicts, expired, answers, now)
         return sum(1 for candidate in candidates if self.plan_fetch(candidate) is DEFER)
 
@@ -301,7 +310,7 @@ class KVTransferCoordinator:
         ready = []
         for req in queue:
             rec = self._records.get((req.py_request_id, "fetch"))
-            if rec is not None and self._is_launchable(rec):
+            if rec is not None and self._wants_pages_now(rec):
                 ready.append((req, rec))
         if not ready:
             return
@@ -332,7 +341,9 @@ class KVTransferCoordinator:
     def export_plan_answers(self) -> PlanAnswers:
         """OWNER, after ``advance``: the answers it decided this round, on the wire, for the
         followers' ``adopt_plan_answers``. Empty in any other mode."""
-        return [(rid, _wire(ans)) for rid, ans in sorted(self._answers_to_export.items())]
+        return [
+            (rid, _encode_plan_answer(ans)) for rid, ans in sorted(self._answers_to_export.items())
+        ]
 
     def adopt_plan_answers(
         self, views: Sequence[RequestView], answers: PlanAnswers, now: float | None = None
@@ -345,17 +356,17 @@ class KVTransferCoordinator:
         now = time.monotonic() if now is None else now
         by_rid = {view.py_request_id: view for view in views}
         self._pending_answers.update(answers)
-        for rid, wire in list(self._pending_answers.items()):
+        for rid, encoded in list(self._pending_answers.items()):
             view = by_rid.get(rid)
             if view is None:
                 continue
             del self._pending_answers[rid]
             self._requests[rid] = view
-            if wire is None:
-                self._decide(rid, None, now)
+            if encoded is None:
+                self._record_answer(rid, None, now)
             else:
-                token_end, source = wire
-                self._decide(rid, self._planner.materialize(view, token_end, source), now)
+                token_end, source = encoded
+                self._record_answer(rid, self._planner.materialize(view, token_end, source), now)
         answered = {rid for rid, _ in answers}
         return sum(1 for rid in by_rid if rid not in answered)
 
@@ -377,7 +388,7 @@ class KVTransferCoordinator:
         rec = self._records.get((rid, "fetch"))
         if rec is not None:
             if rec.state in (RecordState.PLANNED, RecordState.STAGED):
-                return rec.plan if self._is_launchable(rec) else DEFER
+                return rec.plan if self._wants_pages_now(rec) else DEFER
             if rec.state is RecordState.STAGING:
                 return DEFER
             return None
@@ -460,7 +471,7 @@ class KVTransferCoordinator:
 
     def has_inflight(self) -> bool:
         """Some backend is working for this coordinator: a delivery into pages, or a landing."""
-        return any(self._is_running(rec) for rec in self._records.values())
+        return any(self._backend_busy_on(rec) for rec in self._records.values())
 
     def has_pending_work(self) -> bool:
         """Something here will move without a new request: a backend is working, a fetch waits
@@ -468,8 +479,8 @@ class KVTransferCoordinator:
         agreement. The engine must not sleep on its request queue, and should yield briefly on
         an idle pass, while this is true."""
         return any(
-            self._is_running(rec)
-            or self._is_unlaunched_fetch(rec)
+            self._backend_busy_on(rec)
+            or self._idle_with_plan(rec)
             or rec.request_id in self._finished
             for rec in self._records.values()
         )
@@ -532,31 +543,35 @@ class KVTransferCoordinator:
             "finished_pending": sorted(self._finished),
         }
 
-    # ---- advance, phase 1: reap ----
+    # ---- advance, phase 1: poll and vote ----
 
-    def _reap(self, now: float) -> tuple[dict[RecordKey, Vote], list[RecordKey]]:
+    def _poll_and_vote(self, now: float) -> tuple[dict[RecordKey, Vote], list[RecordKey]]:
         """Poll every attempt in flight, then cast one vote per record that has a say this round.
-        An expired record casts none: it is rank-local and settles here as soon as its own
+        An expired record casts none: it is rank-local and ends here as soon as its own
         attempts are over. Every voting record past its deadline is reported expired, whatever
         its vote, so a peer that stopped voting cannot hold it forever."""
         self._queue.drain(self._queue_budget)
         votes: dict[RecordKey, Vote] = {}
         expired: list[RecordKey] = []
-        settled_locally: list[tuple[TransferRecord, Vote]] = []
+        ended_locally: list[tuple[TransferRecord, Vote]] = []
         for key, rec in self._records.items():
             vote = self._vote(rec, now)
             if vote is None:
                 continue
             if rec.expired:
                 if vote.kind is not VoteKind.INFLIGHT:
-                    settled_locally.append((rec, vote))
+                    ended_locally.append((rec, vote))
                 continue
             if self._deadline_passed(rec, now):
                 expired.append(key)
             votes[key] = vote
-        for rec, vote in settled_locally:
-            self._settle_locally(rec, vote)
+        self._end_expired_records(ended_locally)
         return votes, expired
+
+    def _end_expired_records(self, ended: Sequence[tuple[TransferRecord, Vote]]) -> None:
+        """After the vote: end every expired record whose attempts are over, on its own word."""
+        for rec, vote in ended:
+            self._end_expired_locally(rec, vote)
 
     def _vote(self, rec: TransferRecord, now: float) -> Vote | None:
         """This rank's word on one record, or ``None`` for a record with nothing to say: a
@@ -576,12 +591,12 @@ class KVTransferCoordinator:
             return self._finished_vote(rec)
         if rec.state is RecordState.STAGING:
             return self._landing_vote(rec)
-        if self._is_unlaunched_fetch(rec):
+        if self._idle_with_plan(rec):
             return self._unlaunched_vote(rec, now)
         return None
 
     @staticmethod
-    def _is_running(rec: TransferRecord) -> bool:
+    def _backend_busy_on(rec: TransferRecord) -> bool:
         """A backend is working for this record: attempts in the pages, or a landing on its way.
         A finished request's landing is given back at once, so its STAGING record runs nothing."""
         if rec.state is RecordState.STAGING:
@@ -675,7 +690,7 @@ class KVTransferCoordinator:
         return None if timeout is None else now + timeout
 
     @staticmethod
-    def _is_unlaunched_fetch(rec: TransferRecord) -> bool:
+    def _idle_with_plan(rec: TransferRecord) -> bool:
         """A fetch record with a plan and nothing running for it here: PLANNED (the pages are not
         reserved yet, the launch never started, or the landing memory was refused) or STAGED
         (landed on the host, the pages not reserved yet). Attempts of earlier tries may remain
@@ -686,7 +701,7 @@ class KVTransferCoordinator:
             and rec.plan is not None
         )
 
-    def _is_launchable(self, rec: TransferRecord) -> bool:
+    def _wants_pages_now(self, rec: TransferRecord) -> bool:
         """Whether the scheduler should reserve pages for the record: a device-direct plan not
         launched yet, or a host-first plan whose landing is complete. A host-first plan still
         PLANNED wants the backend's memory first, not pages."""
@@ -699,8 +714,8 @@ class KVTransferCoordinator:
     def _lands_on_host(self, rec: TransferRecord) -> bool:
         return rec.plan.source in self._host_sources
 
-    def _settle_locally(self, rec: TransferRecord, vote: Vote) -> None:
-        """An expired record whose attempts are over: settled on this rank's word alone. Its
+    def _end_expired_locally(self, rec: TransferRecord, vote: Vote) -> None:
+        """An expired record whose attempts are over: ended on this rank's word alone. Its
         request, for a fetch, already failed at the expiry."""
         if rec.direction == "publish":
             self._finish_publish(rec, failed=vote.kind is VoteKind.FAILED)
@@ -762,7 +777,7 @@ class KVTransferCoordinator:
 
     # ---- advance, phase 3: one collective ----
 
-    def _sync(
+    def _agree(
         self,
         votes: Mapping[RecordKey, Vote],
         expired: Sequence[RecordKey],
@@ -770,16 +785,24 @@ class KVTransferCoordinator:
         now: float,
     ) -> tuple[dict[RecordKey, _Verdict], list[RecordKey], dict[int, _PlanAnswer]]:
         voted = self._plan_authority is PlanAuthority.VOTED
-        payload: _Payload = (
-            [(key, vote.kind.value, vote.b, vote.hint) for key, vote in sorted(votes.items())],
-            sorted(expired),
-            [(rid, _wire(ans)) for rid, ans in sorted(answers.items())] if voted else [],
+        message = _RoundMessage(
+            votes=[
+                (key, vote.kind.value, vote.b, vote.hint) for key, vote in sorted(votes.items())
+            ],
+            expired=sorted(expired),
+            plans=(
+                [(rid, _encode_plan_answer(ans)) for rid, ans in sorted(answers.items())]
+                if voted
+                else []
+            ),
         )
-        gathered = self._dist.allgather(payload)
+        # A plain tuple goes out (no class tag in the pickle); a peer's word comes back as
+        # whatever 3-sequence the transport made of it.
+        gathered = [_RoundMessage._make(word) for word in self._dist.allgather(tuple(message))]
         ballots = _ballots_by_key(gathered)
         self._note_peer_launches(votes, ballots, now)
         verdicts = _reduce_votes(ballots, len(gathered))
-        expired_all = {tuple(key) for _, exp, _ in gathered for key in exp}
+        expired_all = {tuple(key) for word in gathered for key in word.expired}
         # An owner's answers are its own word; they reach the followers with the schedule.
         consensus = _reduce_plans(gathered, answers) if voted else dict(answers)
         return verdicts, sorted(expired_all), consensus
@@ -823,9 +846,9 @@ class KVTransferCoordinator:
             elif rec.request_id in self._finished:
                 # The request is gone; the agreement only says every rank releases it now.
                 self._release_finished_fetch(rec)
-            elif self._is_running(rec):
-                self._settle_fetch_verdict(rec, b, hint, failed, now)
-            elif self._is_unlaunched_fetch(rec):
+            elif self._backend_busy_on(rec):
+                self._apply_fetch_verdict(rec, b, hint, failed, now)
+            elif self._idle_with_plan(rec):
                 # An UNLAUNCHED vote blocks a landing, so the only verdict that reaches an
                 # unlaunched record is a failure: drop the plan without touching pages.
                 self._reset_for_replan(rec)
@@ -835,11 +858,11 @@ class KVTransferCoordinator:
         for rid, ans in answers.items():
             if ans is DEFER:
                 continue
-            self._decide(rid, ans, now)
+            self._record_answer(rid, ans, now)
             if self._plan_authority is PlanAuthority.OWNER:
                 self._answers_to_export[rid] = ans
 
-    def _decide(self, rid: int, ans: FetchPlan | None, now: float) -> None:
+    def _record_answer(self, rid: int, ans: FetchPlan | None, now: float) -> None:
         """Write a decided answer: ``None`` releases a planned record, a plan goes on the record
         (created if needed) and ``plan_fetch`` reads it from now on. A plan from a host-first
         source is started right here, since it needs no pages to begin; any other waits for the
@@ -857,11 +880,11 @@ class KVTransferCoordinator:
         rec.plan = ans
         rec.retry_hint = None
         if self._lands_on_host(rec):
-            self._fetch_to_host(rec, now)
+            self._start_host_landing(rec, now)
         else:
             rec.waiting_since = now
 
-    def _fetch_to_host(self, rec: TransferRecord, now: float) -> None:
+    def _start_host_landing(self, rec: TransferRecord, now: float) -> None:
         """Phase one of a host-first fetch: ask the backend to land the plan's units in its own
         memory. No page is involved, so a refusal costs nothing but time: the record stays
         PLANNED, its wait is clocked from the first refusal, and the next ``advance`` asks again.
@@ -892,10 +915,10 @@ class KVTransferCoordinator:
                 and rec.request_id not in self._finished
                 and self._lands_on_host(rec)
             ):
-                self._fetch_to_host(rec, now)
+                self._start_host_landing(rec, now)
 
     def _expire(self, rec: TransferRecord, now: float) -> None:
-        """Some rank saw the record's deadline pass: from now on this rank settles it alone, once
+        """Some rank saw the record's deadline pass: from now on this rank ends it alone, once
         its own attempts are over (never under a live attempt: quiesce would block the engine
         thread). A publish is a warning, not a request failure. A fetch fails its request, unless
         the request ended already and the record is only waiting for its outcome."""
@@ -905,34 +928,38 @@ class KVTransferCoordinator:
             # last piece is out and the store has had its full say.
             log = logger.warning if rec.extent.is_last else logger.debug
             log(
-                "request %d: kv publish past its deadline; settled here once its attempts end",
+                "request %d: kv publish past its deadline; ended here once its attempts are over",
                 rec.request_id,
             )
         elif rec.request_id not in self._finished:
             self._fail_expired_fetch(rec, now)
 
-    def _settle_fetch_verdict(
+    def _apply_fetch_verdict(
         self, rec: TransferRecord, b: int, hint: int, failed: bool, now: float
     ) -> None:
         if failed:
-            self._fetch_failed(rec, hint=None, reason="kv fetch failed")
+            self._fetch_failed_or_short(rec, hint=None, reason="kv fetch failed")
         elif b == rec.plan.token_end:
-            self._fetch_landed(rec, now)
+            if rec.state is RecordState.STAGING:
+                self._mark_staged(rec, now)
+            else:
+                self._land_in_pages(rec)
         else:
-            self._fetch_failed(rec, hint=hint, reason="kv fetch served short")
+            self._fetch_failed_or_short(rec, hint=hint, reason="kv fetch served short")
 
-    def _fetch_landed(self, rec: TransferRecord, now: float) -> None:
-        """The ranks agreed the delivery is complete. For a landing that is the host memory:
-        the record waits for pages (``STAGED``), on the wait clock alone. For a delivery into the
-        pages the request is unparked and the landing, if any, is given back at once: the copy
-        was complete before its outcome was reported, and the record itself stays until the
-        request ends."""
-        if rec.state is RecordState.STAGING:
-            rec.state = RecordState.STAGED
-            rec.waiting_since = now
-            rec.peer_launched_at = None
-            rec.deadline = None  # the placement sets its own
-            return
+    @staticmethod
+    def _mark_staged(rec: TransferRecord, now: float) -> None:
+        """The ranks agreed the landing in the host memory is complete: the record waits for
+        pages (``STAGED``), on the wait clock alone."""
+        rec.state = RecordState.STAGED
+        rec.waiting_since = now
+        rec.peer_launched_at = None
+        rec.deadline = None  # the placement sets its own
+
+    def _land_in_pages(self, rec: TransferRecord) -> None:
+        """The ranks agreed the delivery into the pages is complete: the request is unparked and
+        the landing, if any, is given back at once (the copy was complete before its outcome was
+        reported); the record itself stays until the request ends."""
         rec.state = RecordState.LANDED
         self._close_routes(rec)
         req = self._requests[rec.request_id]
@@ -940,29 +967,29 @@ class KVTransferCoordinator:
         self._effects.unpark(req, rec.plan.token_end, rec.plan.no_local_fallback, self._aux(rec))
         self._release_landing(rec)
 
-    def _fetch_failed(self, rec: TransferRecord, *, hint: int | None, reason: str) -> None:
+    def _fetch_failed_or_short(self, rec: TransferRecord, *, hint: int | None, reason: str) -> None:
         """The ranks agreed the delivery failed or came up short. A landing on its way to the
         host names no page: nothing to quiesce or give back, the landing goes and the plan is
-        retried or settled. A delivery into the pages passes the release point first."""
+        retried or given up. A delivery into the pages passes the release point first."""
         was_staging = rec.state is RecordState.STAGING
         rec.state = RecordState.FAILED
         if was_staging:
-            self._retry_or_settle(rec, hint=hint, reason=reason)
+            self._retry_or_give_up(rec, hint=hint, reason=reason)
             return
         if not self._quiesce(rec):
             return
         self._close_routes(rec)
         req = self._requests[rec.request_id]
         self._effects.give_back_fetch_pages([req])
-        self._retry_or_settle(rec, hint=hint, reason=reason)
+        self._retry_or_give_up(rec, hint=hint, reason=reason)
 
     def _reset_for_replan(self, rec: TransferRecord) -> None:
         """The ranks agreed the fetch failed while this rank never launched it: same next step as
         after a failed attempt, minus the release point (no attempt, no pages to give back)."""
         reason = "kv fetch launch given up" if rec.launch_gave_up else "kv fetch failed"
-        self._retry_or_settle(rec, hint=None, reason=reason)
+        self._retry_or_give_up(rec, hint=None, reason=reason)
 
-    def _retry_or_settle(self, rec: TransferRecord, *, hint: int | None, reason: str) -> None:
+    def _retry_or_give_up(self, rec: TransferRecord, *, hint: int | None, reason: str) -> None:
         """After a failure: a gen-init fetch fails its request; otherwise spend a retry and plan
         again next round, or, out of retries, compute the rest locally."""
         req = self._requests[rec.request_id]

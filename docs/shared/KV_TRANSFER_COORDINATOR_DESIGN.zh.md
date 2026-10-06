@@ -261,7 +261,7 @@ class TransferRecord:
 stateDiagram-v2
     [*] --> PLANNED: fetch 由 advance 的计划阶段写入,publish 由 publish_committed_blocks 建立
     PLANNED --> IN_FLIGHT: fetch 或 publish 返回 Attempt(device-direct)
-    PLANNED --> STAGING: LandsOnHost 来源:_decide 写下计划即 fetch_to_host,不占页
+    PLANNED --> STAGING: LandsOnHost 来源:_record_answer 写下计划即 fetch_to_host,不占页
     PLANNED --> RELEASED: 请求被取消(SubmissionRejected 见 §5:保留计划,下轮再发起)
     STAGING --> STAGED: 全 rank 落到后端 host 内存(共识 TERMINAL,B = token_end);等调度器给页
     STAGING --> FAILED: 任一 Failed,或 served 不全,或过期;释放落地区,不 quiesce、不退页

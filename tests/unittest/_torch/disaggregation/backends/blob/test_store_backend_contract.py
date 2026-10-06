@@ -449,4 +449,4 @@ def test_transfer_batch_size_bounds_one_store_call_not_one_delivery():
 
 def test_staged_put_batch_is_bounded_by_the_publish_pool_slot_count():
     with make_host_rank(publish_slots=3, transfer_batch_size=64) as rank:
-        assert rank.inner._put_batch == 3
+        assert rank.inner._put_batch_size == 3
