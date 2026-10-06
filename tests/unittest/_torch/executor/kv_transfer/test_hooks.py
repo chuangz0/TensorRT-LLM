@@ -1120,6 +1120,10 @@ class TestClose:
                 "peer_launched_at",
                 "has_landing",
                 "waiting_since",
+                "retries_left",
+                "consecutive_launch_failures",
+                "retry_hint",
+                "committed_names",
             }
         assert records[(1, "publish")]["state"] == "IN_FLIGHT"
         assert records[(2, "fetch")]["state"] == "IN_FLIGHT"

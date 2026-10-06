@@ -461,10 +461,12 @@ class KVTransferCoordinator:
     def parked_request_ids(self) -> frozenset[int]: ...    # fetch 在飞、仍在跑的请求
     def held_request_ids(self) -> frozenset[int]: ...      # 已结束、被 hold 的请求
     def owned_requests(self) -> list[RequestView]: ...     # parked ∪ held;close 时释放
-    def status_dump(self) -> dict: ...
+    def status_dump(self) -> dict: ...                     # JSON 可序列化的快照;关停时写入状态转储文件(见下)
 ```
 
 `reader` 是本 rank 的资源视图(extent 与 chunk 从它取);`dist` 是 `Collective` 协议,测试注入单 rank 伪件。请求以 `py_request_id` 为键记在协调层自己的表中。两个必填超时的缺省只在 `backends/config.py`(`KVTransferConfig`)一处,由装配传入。
+
+`status_dump` 给出 JSON 可序列化的快照:`plan_authority`;`records`,每条记录一项,带 `request_id`、`direction`、`state`、`try_index`、`attempts`、`outcomes`、`deadline`、`expired`、`token_end`、`launch_gave_up`、`peer_launched_at`、`has_landing`、`waiting_since`,以及重试簿记 `retries_left`、`consecutive_launch_failures`、`retry_hint` 和 `committed_names`(只给计数,名字是哈希);`decided_plans`(记住的计划答案数);`finished_pending`(已结束、尚未终止的请求)。关停时由 `pyexecutor/kv_transfer/hooks.py` 连同各后端的计数一起写成 JSON 文件。读者按键取值,给记录项加键是兼容变更。
 
 `advance` 的四个阶段,每个阶段只操作记录表:
 

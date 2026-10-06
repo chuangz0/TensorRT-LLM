@@ -530,6 +530,14 @@ class KVTransferCoordinator:
         return [self._requests[rid] for rid in sorted(owned) if rid in self._requests]
 
     def status_dump(self) -> dict:
+        """This coordinator's state as JSON-serializable values, for the status dump the hooks
+        write at shutdown: the plan authority, one entry per record, the plan answers still
+        remembered (``decided_plans``) and the finished requests not yet terminated
+        (``finished_pending``). A record entry carries its state and clocks plus the retry
+        bookkeeping (``retries_left``, ``consecutive_launch_failures``, ``retry_hint``) and how
+        many of the plan's units the local cache had committed by launch (``committed_names``;
+        the names themselves are hashes). Readers take entries by key, so an entry may gain
+        keys."""
         return {
             "plan_authority": self._plan_authority.value,
             "records": [
@@ -547,6 +555,10 @@ class KVTransferCoordinator:
                     "peer_launched_at": rec.peer_launched_at,
                     "has_landing": rec.landing is not None,
                     "waiting_since": rec.waiting_since,
+                    "retries_left": rec.retries_left,
+                    "consecutive_launch_failures": rec.consecutive_launch_failures,
+                    "retry_hint": rec.retry_hint,
+                    "committed_names": len(rec.committed_names),
                 }
                 for rec in self._records.values()
             ],

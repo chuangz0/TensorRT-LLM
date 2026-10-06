@@ -273,7 +273,8 @@ def test_unlaunched_clock_does_not_start_while_no_rank_has_launched(world):
     advance_all(world, rigs, [], 30.0)
     for rig in rigs:
         assert votes_of(rig) == [(KEY, "FAILED", 0)]
-        assert rig.record(1)["token_end"] is None and rig.fetch_record(1).retries_left == 0
+        rec = rig.record(1)
+        assert rec["token_end"] is None and rec["retries_left"] == 0
         assert rig.effects.calls == []  # nothing launched: nothing to give back or fail
 
 
@@ -323,7 +324,7 @@ def test_rank_unlaunched_past_the_timeout_votes_failed_and_every_rank_replans(wo
     for rig in rigs:
         rec = rig.record(1)
         assert rec["token_end"] is None and rec["peer_launched_at"] is None
-        assert rig.fetch_record(1).retries_left == 0
+        assert rec["retries_left"] == 0
         assert rig.coord.plan_fetch(req) is DEFER
 
     loop_advance_all(world, rigs, req, 12.0)
@@ -358,7 +359,7 @@ def test_rank_that_gives_up_launching_holds_no_one_and_fails_the_fetch_for_every
     for rig in rigs:
         rec = rig.record(1)
         assert rec["token_end"] is None and not rec["launch_gave_up"]
-        assert rig.fetch_record(1).retries_left == 0
+        assert rec["retries_left"] == 0
         assert rig.coord.plan_fetch(req) is DEFER and rig.effects.count("unpark") == 0
 
     # The retry runs into the same refusals: the next agreement settles on local compute.
@@ -394,7 +395,7 @@ def test_route_refused_on_one_rank_fails_the_fetch_for_every_rank(world):
     for rig in peers(rigs):
         assert rig.worker.count("quiesce") == 1 and rig.effects.count("give_back_fetch_pages") == 1
     for rig in rigs:
-        assert rig.fetch_record(1).retries_left == 0 and rig.coord.plan_fetch(req) is DEFER
+        assert rig.record(1)["retries_left"] == 0 and rig.coord.plan_fetch(req) is DEFER
 
 
 def test_a_given_up_rank_and_an_unlaunched_rank_agree_without_anyone_launching(world):
@@ -417,7 +418,7 @@ def test_a_given_up_rank_and_an_unlaunched_rank_agree_without_anyone_launching(w
         assert rig.worker.count("quiesce") == 0
         rec = rig.record(1)
         assert rec["token_end"] is None and not rec["launch_gave_up"]
-        assert rig.fetch_record(1).retries_left == 0
+        assert rec["retries_left"] == 0
         assert rig.coord.plan_fetch(req) is DEFER
 
 
@@ -746,7 +747,7 @@ def test_a_placed_rank_waits_for_a_rank_without_pages_and_a_wait_timeout_fails_b
         assert rig.host.releases() == 1
         rec = rig.record(1)
         assert rec["token_end"] is None and not rec["has_landing"]
-        assert rig.fetch_record(1).retries_left == 0
+        assert rec["retries_left"] == 0
         assert rig.coord.plan_fetch(req) is DEFER and rig.effects.count("fail_requests") == 0
 
 

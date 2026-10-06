@@ -7,6 +7,8 @@ asked to perform, and the calls each backend saw -- including the order of ``qui
 to ``give_back_fetch_pages`` (the release point, design §4.3).
 """
 
+import json
+
 import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
@@ -338,9 +340,7 @@ def test_transport_error_and_rejection_alternation_is_bounded(gen_init):
         rig.coord.launch_reserved_fetches([req], float(index))
         rec = rig.record(rid)
         assert rec["state"] == "PLANNED" and rec["token_end"] is not None
-        bookkeeping = rig.fetch_record(rid)
-        assert bookkeeping.consecutive_launch_failures == index + 1
-        assert bookkeeping.retries_left == 1
+        assert rec["consecutive_launch_failures"] == index + 1 and rec["retries_left"] == 1
     assert rig.effects.count("give_back_fetch_pages") == 3 and rig.worker.count("quiesce") == 0
     # At the cap the rank gives up: DEFER to the scheduler, nothing failed yet.
     assert rig.record(rid)["launch_gave_up"] and rig.coord.plan_fetch(req) is DEFER
@@ -355,8 +355,7 @@ def test_transport_error_and_rejection_alternation_is_bounded(gen_init):
     else:
         rec = rig.record(rid)
         assert rec["token_end"] is None and not rec["launch_gave_up"]
-        bookkeeping = rig.fetch_record(rid)
-        assert bookkeeping.retries_left == 0 and bookkeeping.consecutive_launch_failures == 0
+        assert rec["retries_left"] == 0 and rec["consecutive_launch_failures"] == 0
         assert rig.coord.plan_fetch(req) is DEFER  # planned afresh next round
         assert rig.effects.count("fail_requests") == 0
 
@@ -445,7 +444,7 @@ def test_route_refused_gives_up_and_settles_on_local_compute_after_two_agreement
     # First agreement: the retry is spent and the request is planned again, on the same route
     # (the planner knows nothing of the refusal) ...
     loop_advance(rig, req, 1.0)
-    assert rig.fetch_record(1).retries_left == 0 and rig.coord.plan_fetch(req) is DEFER
+    assert rig.record(1)["retries_left"] == 0 and rig.coord.plan_fetch(req) is DEFER
     rig.worker.open_route_errors.append(error)
     loop_advance(rig, req, 2.0)
     rig.coord.launch_reserved_fetches([req], 2.0)
@@ -478,19 +477,20 @@ def test_route_transport_error_keeps_the_plan_and_the_retry():
     req = worker_request()
     rig.worker.open_route_errors.append(RuntimeError("peer metadata fetch failed"))
     rig.coord.advance([req], 0.0)
+    plan = rig.coord.plan_fetch(req)
     rig.coord.launch_reserved_fetches([req], 0.0)
     assert rig.effects.names() == ["prepare_fetch_resources", "give_back_fetch_pages"]
     assert rig.worker.count("fetch") == 0 and rig.worker.count("quiesce") == 0
     # The record keeps its plan: the scheduler reserves for the same fetch again next round.
     rec = rig.record(1)
     assert rec["state"] == "PLANNED" and rec["attempts"] == 0 and rec["token_end"] == END
-    assert rig.coord.plan_fetch(req) is rig.fetch_record(1).plan
-    assert rig.fetch_record(1).retries_left == 1
+    assert rig.coord.plan_fetch(req) is plan and rec["retries_left"] == 1
 
     # The route works next round; a real failure afterwards still has its retry.
     rig.plan_and_launch(req, now=1.0).finish(Failed("later"))
     rig.coord.advance([], 2.0)
-    assert rig.record(1)["state"] == "PLANNED" and rig.fetch_record(1).retries_left == 0
+    rec = rig.record(1)
+    assert rec["state"] == "PLANNED" and rec["retries_left"] == 0
 
 
 def test_repeated_route_transport_errors_give_up_then_settle_on_local_compute():
@@ -651,8 +651,7 @@ def test_submission_rejected_gives_back_without_quiesce_or_retry_cost():
     rec = rig.record(1)
     assert rec["state"] == "PLANNED" and rec["token_end"] == END and rec["attempts"] == 0
     assert rig.coord.plan_fetch(req) is plan
-    assert rig.fetch_record(1).consecutive_launch_failures == 1
-    assert rig.fetch_record(1).retries_left == 1
+    assert rec["consecutive_launch_failures"] == 1 and rec["retries_left"] == 1
 
     # The retry budget is intact: a real failure afterwards still gets its one retry.
     rig.plan_and_launch(req, now=1.0).finish(Failed("later"))
@@ -1375,8 +1374,46 @@ def test_status_dump_shape():
             "peer_launched_at": None,
             "has_landing": False,
             "waiting_since": None,
+            "retries_left": 1,
+            "consecutive_launch_failures": 0,
+            "retry_hint": None,
+            "committed_names": 0,
         }
     ]
+
+
+def test_status_dump_reports_retry_bookkeeping_per_record():
+    """A record entry carries what reading a stuck fetch needs: the retries left, the hint the
+    next try is bounded by, the run of launches that never started, and how many of the plan's
+    units the local cache had committed by launch (a count: the names are hashes). The dump is
+    written as JSON at shutdown, so every value must survive ``json.dumps``."""
+    rig = Rig()
+    req = worker_request()
+    rig.reader.committed_blocks[1] = 2
+    attempt = rig.plan_and_launch(req)
+    rec = rig.record(1)
+    assert rec["retries_left"] == 1 and rec["consecutive_launch_failures"] == 0
+    assert rec["retry_hint"] is None and rec["committed_names"] == 2
+    json.dumps(rig.coord.status_dump())
+
+    # A short delivery: the retry is spent, the agreed boundary becomes the hint, and the
+    # committed names of the dropped try are forgotten.
+    attempt.deliver_all_but(*rig.reader.unit_names(req, [6]))
+    rig.coord.advance([], 1.0)
+    rec = rig.record(1)
+    assert rec["state"] == "PLANNED" and rec["token_end"] is None
+    assert rec["retries_left"] == 0 and rec["retry_hint"] == END - 4
+    assert rec["consecutive_launch_failures"] == 0 and rec["committed_names"] == 0
+
+    # Planned again within the hint, which the plan consumes; a rejected launch is counted
+    # while the retry budget stays where it was.
+    loop_advance(rig, req, 2.0)
+    rec = rig.record(1)
+    assert rec["token_end"] == END - 4 and rec["retry_hint"] is None
+    rig.worker.reject_next = 1
+    rig.coord.launch_reserved_fetches([req], 2.0)
+    rec = rig.record(1)
+    assert rec["consecutive_launch_failures"] == 1 and rec["retries_left"] == 0
 
 
 # ---- planning through the coordinator ----
@@ -1570,7 +1607,8 @@ def test_plan_fetch_answers_defer_defer_plan_none_none_along_the_host_first_path
     rig.coord.advance([], 1.0)
     plan = rig.coord.plan_fetch(req)  # STAGED: reserve pages for exactly this plan
     assert isinstance(plan, FetchPlan) and plan.token_end == END and plan.source == "host"
-    assert plan is rig.fetch_record(1).plan
+    rec = rig.record(1)
+    assert rec["state"] == "STAGED" and rec["token_end"] == plan.token_end
     attempt = rig.reserve_and_place(req, 1.0)
     assert rig.coord.plan_fetch(req) is None  # IN_FLIGHT: parked, out of the scheduler's reach
     attempt.deliver_all()
@@ -1585,7 +1623,7 @@ def test_refused_landing_keeps_the_plan_votes_unlaunched_and_is_asked_again_next
     rig.coord.advance([req], 0.0)
     rec = rig.record(1)
     assert rec["state"] == "PLANNED" and rec["token_end"] is not None and not rec["has_landing"]
-    assert rig.fetch_record(1).consecutive_launch_failures == 0  # not page back-pressure
+    assert rec["consecutive_launch_failures"] == 0  # not page back-pressure
     assert rec["waiting_since"] == 0.0
     assert rig.coord.plan_fetch(req) is DEFER and rig.effects.calls == []
 
@@ -1637,7 +1675,7 @@ def test_landing_that_fails_or_comes_up_short_is_released_and_replanned_without_
     assert rig.effects.count("unpark") == 0 and rig.effects.count("fail_requests") == 0
     rec = rig.record(1)
     assert rec["state"] == "PLANNED" and rec["token_end"] is None and not rec["has_landing"]
-    assert rig.fetch_record(1).retries_left == 0 and rig.coord.plan_fetch(req) is DEFER
+    assert rec["retries_left"] == 0 and rig.coord.plan_fetch(req) is DEFER
 
     rig.coord.advance([req], 2.0)  # replanned, and the new landing starts in the same round
     assert rig.host.count("fetch_to_host") == 2
@@ -1685,8 +1723,7 @@ def test_placement_served_short_quiesces_gives_back_and_releases_the_landing():
     assert landing.releases == 1 and rig.effects.count("unpark") == 0
     rec = rig.record(1)
     assert rec["state"] == "PLANNED" and rec["token_end"] is None and not rec["has_landing"]
-    bookkeeping = rig.fetch_record(1)
-    assert bookkeeping.retries_left == 0 and bookkeeping.retry_hint == END - 4
+    assert rec["retries_left"] == 0 and rec["retry_hint"] == END - 4
 
     rig.coord.advance([req], 4.0)  # the retry lands on the host afresh
     assert rig.host.count("fetch_to_host") == 2 and rig.record(1)["state"] == "STAGING"
@@ -1706,7 +1743,7 @@ def test_units_the_local_cache_committed_meanwhile_count_as_served(source):
     else:
         attempt = rig.plan_and_launch(req)
     assert extent_names(attempt.payload) == rig.reader.unit_names(req, range(2, 7))
-    assert rig.fetch_record(1).committed_names == rig.reader.unit_names(req, range(2))
+    assert rig.record(1)["committed_names"] == len(rig.reader.unit_names(req, range(2)))
     attempt.deliver_all()
     rig.coord.advance([], 3.0)
     assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", END)]
@@ -1740,7 +1777,7 @@ def test_units_the_reservation_has_no_page_for_make_the_delivery_short(source):
     else:
         attempt = rig.plan_and_launch(req)
     assert extent_names(attempt.payload) == rig.reader.unit_names(req, range(5))
-    assert rig.fetch_record(1).committed_names == frozenset()
+    assert rig.record(1)["committed_names"] == 0
     attempt.deliver_all()
     rig.coord.advance([], 3.0)
     assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", 20)]
@@ -1758,8 +1795,8 @@ def test_placement_refused_three_times_gives_up_and_the_agreement_replans():
     for index, now in enumerate((2.0, 3.0, 4.0)):
         assert isinstance(rig.coord.plan_fetch(req), FetchPlan)
         rig.coord.launch_reserved_fetches([req], now)
-        assert rig.record(1)["state"] == "STAGED"
-        assert rig.fetch_record(1).consecutive_launch_failures == index + 1
+        rec = rig.record(1)
+        assert rec["state"] == "STAGED" and rec["consecutive_launch_failures"] == index + 1
     assert rig.effects.count("give_back_fetch_pages") == 3  # page back-pressure, counted as such
     assert rig.record(1)["launch_gave_up"] and rig.coord.plan_fetch(req) is DEFER
     assert landing.releases == 0
@@ -1768,8 +1805,7 @@ def test_placement_refused_three_times_gives_up_and_the_agreement_replans():
     assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0)]
     rec = rig.record(1)
     assert landing.releases == 1 and not rec["has_landing"]
-    assert rec["state"] == "PLANNED" and rec["token_end"] is None
-    assert rig.fetch_record(1).retries_left == 0
+    assert rec["state"] == "PLANNED" and rec["token_end"] is None and rec["retries_left"] == 0
     assert rig.host.count("quiesce") == 0 and rig.effects.count("fail_requests") == 0
 
 
@@ -1860,8 +1896,7 @@ def test_reserve_wait_of_a_device_direct_plan_spends_a_retry_then_computes_local
     loop_advance(rig, req, 5.0)
     assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0)]
     rec = rig.record(1)
-    assert rec["token_end"] is None and rec["waiting_since"] is None
-    assert rig.fetch_record(1).retries_left == 0
+    assert rec["token_end"] is None and rec["waiting_since"] is None and rec["retries_left"] == 0
     assert rig.coord.plan_fetch(req) is DEFER and rig.effects.count("fail_requests") == 0
 
     loop_advance(rig, req, 6.0)  # planned afresh; the wait starts over
@@ -1887,8 +1922,7 @@ def test_landing_wait_timeout_spends_a_retry_at_each_wait_then_computes_locally(
     loop_advance(rig, req, 5.0)
     assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0)]
     rec = rig.record(1)
-    assert rec["token_end"] is None and rec["waiting_since"] is None
-    assert rig.fetch_record(1).retries_left == 0
+    assert rec["token_end"] is None and rec["waiting_since"] is None and rec["retries_left"] == 0
     assert rig.coord.plan_fetch(req) is DEFER and rig.effects.count("fail_requests") == 0
 
     rig.host.reject_next = 0

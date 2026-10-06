@@ -34,7 +34,6 @@ from disaggregation.base.cache_backend import (  # noqa: E402
 from disaggregation.base.views import GroupSpec  # noqa: E402
 from disaggregation.orchestration.kv_transfer.coordinator import KVTransferCoordinator  # noqa: E402
 from disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority  # noqa: E402
-from disaggregation.orchestration.kv_transfer.records import TransferRecord  # noqa: E402
 from disaggregation.remote_cache import (  # noqa: E402
     FetchPlan,
     FetchSource,
@@ -904,10 +903,6 @@ class Rig:
             if rec["request_id"] == rid and rec["direction"] == direction:
                 return rec
         return None
-
-    def fetch_record(self, rid: int) -> TransferRecord | None:
-        """The fetch ``TransferRecord`` itself, for the launch bookkeeping the dump leaves out."""
-        return self.coord._records.get((rid, "fetch"))
 
     def payloads(self) -> list:
         """Every payload this rank handed to its collective, in order."""

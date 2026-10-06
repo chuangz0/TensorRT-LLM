@@ -239,7 +239,7 @@ def test_follower_that_never_launches_resets_both_ranks_and_the_owner_exports_ag
     assert rigs[FOLLOWER].effects.count("give_back_fetch_pages") == 0
     for rig in rigs:
         assert rig.effects.count("unpark") == 0
-        assert rig.fetch_record(1).retries_left == 0
+        assert rig.record(1)["retries_left"] == 0
         assert rig.coord.plan_fetch(req) is DEFER  # planned again next round
 
     advance_all(world, rigs, req, 2.0 + UNLAUNCHED_TIMEOUT_S)  # the owner decides once more
