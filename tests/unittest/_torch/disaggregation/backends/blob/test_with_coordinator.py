@@ -14,6 +14,10 @@ import time
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch", "../../orchestration/kv_transfer"]
 from disaggregation.backends.blob.store import BlobStoreError  # noqa: E402
+from disaggregation.backends.config import (  # noqa: E402
+    DEFAULT_LANDING_WAIT_TIMEOUT_S,
+    DEFAULT_UNLAUNCHED_TIMEOUT_S,
+)
 from disaggregation.orchestration.kv_transfer.coordinator import KVTransferCoordinator  # noqa: E402
 from disaggregation.remote_cache import DEFER, FetchPlan, FetchSource, Planner  # noqa: E402
 from fakes import (  # noqa: E402
@@ -64,6 +68,8 @@ class Side:
             self.effects,
             self.queue,
             FakeCollective(),
+            unlaunched_timeout_s=DEFAULT_UNLAUNCHED_TIMEOUT_S,
+            landing_wait_timeout_s=DEFAULT_LANDING_WAIT_TIMEOUT_S,
         )
 
     @property
@@ -292,6 +298,8 @@ class HostSide(Side):
             self.effects,
             self.queue,
             FakeCollective(),
+            unlaunched_timeout_s=DEFAULT_UNLAUNCHED_TIMEOUT_S,
+            landing_wait_timeout_s=DEFAULT_LANDING_WAIT_TIMEOUT_S,
         )
 
 

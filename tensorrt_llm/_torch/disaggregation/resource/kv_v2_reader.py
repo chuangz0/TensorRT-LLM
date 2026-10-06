@@ -23,7 +23,7 @@ its methods alone; nothing outside ``resource/`` reads a page object or an addre
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 
@@ -33,6 +33,9 @@ from ..base.views import GroupSpec
 from .kv_extractor import build_page_table_from_manager
 from .naming import group_tag, units_for_group
 from .page import KVCachePageTable, MambaLayerGroup
+
+if TYPE_CHECKING:
+    from ..remote_cache import FetchPlan, GroupPlan
 
 __all__ = ["KVv2ResourceReader"]
 
@@ -93,7 +96,7 @@ class KVv2ResourceReader:
         """Always ready: the store path has no context request waiting on a generation side."""
         return True
 
-    def fetch_extent(self, request, plan) -> tuple[CacheExtent, frozenset[bytes]]:
+    def fetch_extent(self, request, plan: FetchPlan) -> tuple[CacheExtent, frozenset[bytes]]:
         """Units for the pages the scheduler reserved with ``reserve_transfer_pages``, and the
         names of the plan's blocks that reservation found committed locally.
 
@@ -108,18 +111,33 @@ class KVv2ResourceReader:
         committed_names: set[bytes] = set()
         for group_plan in plan.group_plans:
             page_indices = self._page_indices_by_ordinal(kv_cache, group_plan.spec.local_group)
-            to_fetch = []
-            for ordinal in group_plan.ordinals:
-                if ordinal < committed_blocks:
-                    if ordinal < len(plan.block_keys):
-                        committed_names.add(group_plan.spec.tag + plan.block_keys[ordinal])
-                elif ordinal < len(page_indices):
-                    to_fetch.append(ordinal)
-            units.extend(self._name_units(group_plan.spec, plan.block_keys, page_indices, to_fetch))
+            committed, fetchable = self._split_committed_and_fetchable(
+                group_plan, plan.block_keys, committed_blocks, len(page_indices)
+            )
+            committed_names.update(committed)
+            units.extend(
+                self._name_units(group_plan.spec, plan.block_keys, page_indices, fetchable)
+            )
         extent = CacheExtent(
             name=f"fetch:{request.py_request_id}".encode(), units=tuple(units), is_last=True
         )
         return extent, frozenset(committed_names)
+
+    @staticmethod
+    def _split_committed_and_fetchable(
+        group_plan: GroupPlan, block_keys: Sequence[bytes], committed_blocks: int, num_pages: int
+    ) -> tuple[list[bytes], list[int]]:
+        """Of one group's asked ordinals: the names of those committed locally already, and the
+        ordinals that have a page to fetch into. An ordinal with neither is left out."""
+        committed_names: list[bytes] = []
+        fetchable: list[int] = []
+        for ordinal in group_plan.ordinals:
+            if ordinal < committed_blocks:
+                if ordinal < len(block_keys):
+                    committed_names.append(group_plan.spec.tag + block_keys[ordinal])
+            elif ordinal < num_pages:
+                fetchable.append(ordinal)
+        return committed_names, fetchable
 
     def publish_extent_and_chunk(self, request) -> tuple[CacheExtent, None]:
         """Every committed full block the request still holds, in the pages it holds right now.

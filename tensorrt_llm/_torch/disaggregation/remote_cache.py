@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import chain
-from typing import TYPE_CHECKING, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Iterator, Mapping, NamedTuple, Sequence
 
 from .base.backend import CacheKind
 from .base.cache_backend import Fetches
@@ -201,6 +201,8 @@ def _merge(plan: FetchPlan, served: frozenset[bytes], groups: Sequence[GroupPlan
                 break
         if ok:
             return b
+    # Reached only by a plan whose ``reuse_end`` lies above ``token_end``, which ``_build`` never
+    # makes: no boundary was walked, nothing was asked for, and B is the local prefix end.
     return plan.reuse_end * plan.tokens_per_block
 
 
@@ -259,6 +261,17 @@ def servable_blocks(
         ):
             return e
     return 0
+
+
+class _SourceChoice(NamedTuple):
+    """What ``Planner._choose_source`` settled on: the source that can serve the request (``None``
+    when none can), its routing hint, the token target it serves up to, and whether a store
+    passed over has yet to answer its probe."""
+
+    source: FetchSource | None
+    hint: Mapping[str, object] | None
+    token_end: int
+    pending: bool
 
 
 class Planner:
@@ -346,11 +359,7 @@ class Planner:
         keys = tuple(self._reader.block_keys(req))
 
         if req.is_gen_init:
-            source = self._gen_init_source(req)
-            if source is None:
-                return None
-            hint = req.route_hints.get(source.hint_key) if source.hint_key is not None else None
-            return self._build(req.prompt_len, source, hint, True, reuse_end, keys)
+            return self._gen_init_plan(req, reuse_end, keys)
 
         if req.is_gen_first_context and not self._reader.gen_first_ready(req):
             return DEFER
@@ -359,24 +368,52 @@ class Planner:
         # The local reuse depth differs per rank, so it only trims the per-group asks (possibly
         # to nothing, which is still a legal plan) and never decides whether to fetch.
         nameable = (req.prompt_len - 1) // tpb
-        if nameable <= 0:
-            self.forget(req.py_request_id)
-            return None
         cap = nameable if retry_hint is None else min(nameable, retry_hint // tpb)
         if cap <= 0:
-            # A retry with nothing to aim for computes locally; no probe is worth waiting on.
+            # Nothing nameable to fetch, or a retry with nothing to aim for: compute locally; no
+            # probe is worth waiting on.
             self.forget(req.py_request_id)
             return None
 
-        chosen: FetchSource | None = None
-        hint = None
-        token_end = 0
+        choice = self._choose_source(req, probe_answers, cap, keys)
+        if choice.source is None:
+            if choice.pending and self._may_still_wait_for_probe(req.py_request_id, now):
+                return DEFER
+            self.forget(req.py_request_id)
+            return None
+
+        self.forget(req.py_request_id)
+        return self._build(choice.token_end, choice.source, choice.hint, False, reuse_end, keys)
+
+    def _gen_init_plan(
+        self, req: RequestView, reuse_end: int, keys: tuple[bytes, ...]
+    ) -> FetchPlan | None:
+        """A gen-init request's plan: the whole prompt from the context worker its hint names;
+        ``None`` (compute locally) when no routed source matches a hint it carries."""
+        source = self._gen_init_source(req)
+        if source is None:
+            return None
+        hint = req.route_hints.get(source.hint_key) if source.hint_key is not None else None
+        return self._build(req.prompt_len, source, hint, True, reuse_end, keys)
+
+    def _choose_source(
+        self,
+        req: RequestView,
+        probe_answers: Mapping[str, frozenset[bytes] | None],
+        cap: int,
+        keys: tuple[bytes, ...],
+    ) -> _SourceChoice:
+        """The first source in priority order that can serve the request, up to ``cap`` blocks.
+        A routed source serves when the request carries its hint; a store serves as far as its
+        probe answer reaches."""
+        tpb = self._tpb
         pending = False
         for source in self._sources:
             if source.hint_key is not None:
                 if source.hint_key in req.route_hints:
-                    chosen, hint, token_end = source, req.route_hints[source.hint_key], cap * tpb
-                    break
+                    return _SourceChoice(
+                        source, req.route_hints[source.hint_key], cap * tpb, pending
+                    )
                 continue
             answer = probe_answers.get(source.name)
             if answer is None:
@@ -384,19 +421,8 @@ class Planner:
                 continue
             end = servable_blocks(answer, keys, self._reader.group_specs(), cap, tpb)
             if end > 0:
-                chosen, token_end = source, end * tpb
-                break
-
-        if chosen is None:
-            if pending and self._may_still_wait_for_probe(req.py_request_id, now):
-                return DEFER
-            self.forget(req.py_request_id)
-            return None
-
-        self.forget(req.py_request_id)
-        if token_end <= 0:
-            return None
-        return self._build(token_end, chosen, hint, False, reuse_end, keys)
+                return _SourceChoice(source, None, end * tpb, pending)
+        return _SourceChoice(None, None, 0, pending)
 
     def materialize(self, req: RequestView, token_end: int, source: str) -> FetchPlan:
         """The plan another rank decided, built over this rank's own layer groups and reuse depth:

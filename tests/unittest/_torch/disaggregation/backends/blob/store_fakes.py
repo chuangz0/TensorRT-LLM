@@ -22,14 +22,12 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Sequence
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.backends.blob.backend import (  # noqa: E402
-    BlobStoreBackend,
-    BlobStoreConfig,
-    HostLandingBlobBackend,
-)
+from disaggregation.backends.blob.backend import BlobStoreBackend, BlobStoreConfig  # noqa: E402
 from disaggregation.backends.blob.drivers.memory import MemoryBlobStore  # noqa: E402
+from disaggregation.backends.blob.host_landing import HostLandingBlobBackend  # noqa: E402
 from disaggregation.backends.blob.staging import HostStagingPool  # noqa: E402
 from disaggregation.backends.blob.store import GetStatus, PutStatus  # noqa: E402
+from disaggregation.backends.config import DEFAULT_LANDING_WAIT_TIMEOUT_S  # noqa: E402
 from disaggregation.base.cache_backend import CacheExtent, Unit  # noqa: E402
 from disaggregation.base.region import Segment  # noqa: E402
 
@@ -505,7 +503,7 @@ def make_host_rank(
     publish_slots: int = 4,
     landing_slots: int = 4,
     slot_bytes: int = SLOT,
-    landing_wait_timeout_s: float | None = 30.0,
+    landing_wait_timeout_s: float | None = DEFAULT_LANDING_WAIT_TIMEOUT_S,
     arena_bytes: int = 1 << 16,
     unit_bytes: Callable[[bytes], int] | None = None,
     **config_overrides,

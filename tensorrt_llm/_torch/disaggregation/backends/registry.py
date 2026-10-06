@@ -31,7 +31,7 @@ from typing import Callable, Mapping, Optional, Sequence
 from ..base.cache_backend import Fetches, Publishes, RegistersPools
 from ..base.region import RegionResolver
 from ..orchestration.kv_transfer.interfaces import LandsOnHost
-from .config import BackendEntry, KVTransferConfig
+from .config import DEFAULT_LANDING_WAIT_TIMEOUT_S, BackendEntry, KVTransferConfig
 
 __all__ = [
     "BackendBuildContext",
@@ -72,7 +72,7 @@ class BackendBuildContext:
     device_index: Optional[int] = None
     unit_bytes_of: Optional[Callable[[bytes], int]] = None
     max_request_blocks: Optional[int] = None
-    landing_wait_timeout_s: Optional[float] = 30.0
+    landing_wait_timeout_s: Optional[float] = DEFAULT_LANDING_WAIT_TIMEOUT_S
 
 
 @dataclass(frozen=True)

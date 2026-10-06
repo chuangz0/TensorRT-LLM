@@ -3741,21 +3741,11 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None:
             return False
 
-        if token_end is None:
-            # prompt_len is the full incoming prompt length, robust to block
-            # reuse (which may leave a non-zero context_current_position).
-            # Helix requests carry the rank-local strided slice in prompt_len;
-            # the global ledger sizes off the full prompt instead.
-            history = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
-            target = history + get_draft_token_length(req) + self.num_extra_kv_tokens
-        else:
+        if token_end is not None:
             # Fetched content lands in these pages, so scratch slots are ruled
             # out for the same reason as on a gen-init receive.
             kv_cache.enable_swa_scratch_reuse = False
-            # Local reuse may already have declared history past token_end (a
-            # plan trimmed to an empty ask is legal, design §7.2 step 6), and
-            # history never decreases.
-            history = target = max(kv_cache.history_length, token_end)
+        history, target = self._transfer_history_and_target(req, kv_cache, token_end)
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
@@ -3781,6 +3771,25 @@ class KVCacheManagerV2(BaseResourceManager):
         ready.record(self._stream)
         self._disagg_receive_ready[req.py_request_id] = ready
         return True
+
+    def _transfer_history_and_target(
+        self, req: LlmRequest, kv_cache, token_end: int | None
+    ) -> tuple[int, int]:
+        """History to declare and capacity to reach for pages a transfer
+        fills: the whole prompt (plus draft tokens) for a gen-init receive,
+        ``token_end`` for a content fetch."""
+        if token_end is None:
+            # prompt_len is the full incoming prompt length, robust to block
+            # reuse (which may leave a non-zero context_current_position).
+            # Helix requests carry the rank-local strided slice in prompt_len;
+            # the global ledger sizes off the full prompt instead.
+            history = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
+            return history, history + get_draft_token_length(req) + self.num_extra_kv_tokens
+        # Local reuse may already have declared history past token_end (a
+        # plan trimmed to an empty ask is legal, design §7.2 step 6), and
+        # history never decreases.
+        history = max(kv_cache.history_length, token_end)
+        return history, history
 
     def context_block_keys(self, req: LlmRequest) -> list[bytes]:
         """Radix-tree key of every *full* prompt block, by block ordinal.

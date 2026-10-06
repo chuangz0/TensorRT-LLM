@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from ....base.region import Segment
-from ...config import BackendEntry
+from ...config import BackendEntry, strict_from_dict
 from ...registry import BackendBuildContext, BackendHandle
 from ..factory import build_blob_backend
 from ..store import BlobStoreError, GetStatus, PutStatus
@@ -129,10 +129,7 @@ class MooncakeStoreConfig:
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> MooncakeStoreConfig:
         """Build from a plain mapping, refusing keys this class does not know."""
-        unknown = sorted(set(raw) - cls.fields())
-        if unknown:
-            raise ValueError(f"unknown MooncakeStoreConfig keys: {unknown}")
-        return cls(**raw)
+        return strict_from_dict(cls, raw)
 
 
 def _default_hostname() -> str:

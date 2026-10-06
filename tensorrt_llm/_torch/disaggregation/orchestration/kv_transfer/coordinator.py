@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import time
 from enum import Enum
-from typing import Callable, Mapping, NamedTuple, Sequence, TypeVar
+from typing import TYPE_CHECKING, Callable, Mapping, NamedTuple, Sequence, TypeVar
 
 from ...base.cache_backend import (
     Attempt,
@@ -51,6 +51,9 @@ from .interfaces import (
     PlanAuthority,
 )
 from .records import AttemptRecord, RecordKey, RecordState, TransferRecord, is_failure
+
+if TYPE_CHECKING:
+    from ...base.backend import Chunk
 
 __all__ = [
     "DEFER",
@@ -200,12 +203,12 @@ class KVTransferCoordinator:
             disables.
         unlaunched_timeout_s: Longest this rank may stay unlaunched on a fetch another rank has
             already launched before it votes the fetch failed. ``None`` disables. Never starts
-            counting on a single rank.
+            counting on a single rank. Required: the default lives in ``KVTransferConfig``.
         landing_wait_timeout_s: Longest this rank waits for the scheduler's pages (from the
             plan's decision, or from landing on the host) or, host-first, for the backend's
             landing memory, before it votes the fetch failed. Counts on a single rank too, so a
             fetch the scheduler can never find pages for is given up and the request computes
-            locally instead of stalling. ``None`` disables.
+            locally instead of stalling. ``None`` disables. Required, as above.
         plan_authority: Who decides plan answers on this rank. ``VOTED``: planned here and
             reduced in the collective. ``OWNER``: planned here alone, not carried in the
             payload, handed out with ``export_plan_answers``. ``FOLLOWER``: never planned or
@@ -236,10 +239,10 @@ class KVTransferCoordinator:
         queue: EngineQueue,
         dist: Collective,
         *,
+        unlaunched_timeout_s: float | None,
+        landing_wait_timeout_s: float | None,
         fetch_timeout_s: float | None = None,
         publish_timeout_s: float | None = None,
-        unlaunched_timeout_s: float | None = 30.0,
-        landing_wait_timeout_s: float | None = 30.0,
         plan_authority: PlanAuthority = PlanAuthority.VOTED,
         queue_budget: int = 64,
     ) -> None:
@@ -424,11 +427,20 @@ class KVTransferCoordinator:
         publish = self._records.get((rid, "publish"))
         if publish is not None:
             self._end_publish_of_finished_request(publish, now)
-        if (rid, "fetch") in self._records or (rid, "publish") in self._records:
+        self._hold_or_finish(req)
+
+    def _hold_or_finish(self, req: RequestView) -> None:
+        """A finished request is held while any record of it remains; with none left it gets
+        its last word to the engine now."""
+        rid = req.py_request_id
+        if self._has_records_of(rid):
             self._held.add(rid)
             self._effects.hold_for_transfer([req])
-            return
-        self._finish_if_released(rid)
+        else:
+            self._finish_if_released(rid)
+
+    def _has_records_of(self, rid: int) -> bool:
+        return (rid, "fetch") in self._records or (rid, "publish") in self._records
 
     def _end_fetch_of_finished_request(self, rec: TransferRecord, now: float) -> None:
         """A delivery into the pages (``IN_FLIGHT``) is abandoned and released when its outcome
@@ -748,32 +760,41 @@ class KVTransferCoordinator:
         return answers
 
     def _probe(self, req: RequestView) -> None:
+        """Ask every store source the request has no answer from yet what it holds, and cache
+        each answer that is in on the request for the planner."""
         stores = [s for s in self._sources.values() if s.hint_key is None]
         if not stores:
             return
         cache = self._probe_answers.setdefault(req.py_request_id, {})
-        query = None
-        for source in stores:
-            if cache.get(source.name) is not None:
-                continue
-            if query is None:
-                query = self._planner.probe_query(req)
-                if query is None:
-                    return
-            name, units = query
-            # Broad on purpose, against CODING_GUIDELINES: the contract says a failing probe
-            # raises but leaves the type to the backend, and a store outage must not take the
-            # engine loop down. The answer stays pending, so the planner defers until its probe
-            # budget is spent and then plans without the store.
-            try:
-                answer = source.backend.probe(name, units)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("probe on %s failed, answer stays pending: %s", source.name, exc)
-                continue
+        unanswered = [s for s in stores if cache.get(s.name) is None]
+        if not unanswered:
+            return
+        query = self._planner.probe_query(req)
+        if query is None:
+            return
+        for source in unanswered:
+            answer = self._probe_one_source(source, query)
             # A pending answer (``None``) is not recorded: an absent entry means the same thing
             # to the planner, and the backend is asked again next round.
             if answer is not None:
                 cache[source.name] = answer
+
+    @staticmethod
+    def _probe_one_source(
+        source: FetchSource, query: tuple[bytes, tuple[bytes, ...]]
+    ) -> frozenset[bytes] | None:
+        """One store's answer to the probe query; ``None`` while it is pending, and after a
+        probe that raised: the answer then stays pending too."""
+        name, units = query
+        # Broad on purpose, against CODING_GUIDELINES: the contract says a failing probe
+        # raises but leaves the type to the backend, and a store outage must not take the
+        # engine loop down. The answer stays pending, so the planner defers until its probe
+        # budget is spent and then plans without the store.
+        try:
+            return source.backend.probe(name, units)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("probe on %s failed, answer stays pending: %s", source.name, exc)
+            return None
 
     # ---- advance, phase 3: one collective ----
 
@@ -829,11 +850,23 @@ class KVTransferCoordinator:
         answers: Mapping[int, _PlanAnswer],
         now: float,
     ) -> None:
+        """Write what the ranks agreed on to the records: expiries first, then verdicts; then
+        ask the backend again for the landing memory it refused to any host-first plan, and
+        record the decided answers."""
+        self._apply_expiries(expired, now)
+        self._apply_verdicts(verdicts, now)
+        self._retry_refused_landings(now)
+        self._apply_plan_answers(answers, now)
+
+    def _apply_expiries(self, expired: Sequence[RecordKey], now: float) -> None:
+        """Expire every record some rank saw past its deadline, once."""
         for key in expired:
             rec = self._records.get(key)
             if rec is not None and not rec.expired:
                 self._expire(rec, now)
 
+    def _apply_verdicts(self, verdicts: Mapping[RecordKey, _Verdict], now: float) -> None:
+        """End, land or re-plan every record the ranks reached a verdict on."""
         for key in sorted(verdicts):
             rec = self._records.get(key)
             if rec is None:
@@ -851,7 +884,8 @@ class KVTransferCoordinator:
                 # unlaunched record is a failure: drop the plan without touching pages.
                 self._reset_for_replan(rec)
 
-        self._retry_refused_landings(now)
+    def _apply_plan_answers(self, answers: Mapping[int, _PlanAnswer], now: float) -> None:
+        """Record every decided answer; an OWNER also keeps them for ``export_plan_answers``."""
         self._answers_to_export = {}
         for rid, ans in answers.items():
             if ans is DEFER:
@@ -1056,9 +1090,7 @@ class KVTransferCoordinator:
         A held request is terminated here, whatever its last transfer's outcome. A request that
         was never held owes the engine nothing: it terminates as usual through the release gate.
         """
-        if rid not in self._finished:
-            return
-        if (rid, "fetch") in self._records or (rid, "publish") in self._records:
+        if rid not in self._finished or self._has_records_of(rid):
             return
         req = self._requests.get(rid)
         if req is None:
@@ -1077,25 +1109,16 @@ class KVTransferCoordinator:
         return self._launch_one(req, rec, now)
 
     def _launch_one(self, req: RequestView, rec: TransferRecord, now: float) -> bool:
+        """Start the delivery of a device-direct plan into the pages the scheduler reserved;
+        False when the launch did not start and the pages went back."""
         plan = rec.plan
         rid = req.py_request_id
         source = self._sources[plan.source]
         extent, committed = self._reader.fetch_extent(req, plan)
         route = None
         if source.hint_key is not None and plan.hint is not None:
-            # Broad on purpose, against CODING_GUIDELINES: ``open_route`` raises the backend's own
-            # transport error for a hint that was fine but could not be prepared; that is worth
-            # trying again, and it must not escape and strand the other requests in the queue.
-            try:
-                route = source.backend.open_route(plan.hint)
-            except (ValueError, NotImplementedError) as exc:
-                # Bad hint, or a backend that cannot route: this plan can never work here.
-                logger.warning("request %d: route refused by %s: %s", rid, source.name, exc)
-                self._drop_launch(req, rec, give_up=True)
-                return False
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("request %d: route to %s failed: %s", rid, source.name, exc)
-                self._drop_launch(req, rec, give_up=False)
+            route = self._open_route_or_drop(req, rec, source)
+            if route is None:
                 return False
         try:
             attempt = source.backend.fetch(extent, route=route)
@@ -1109,6 +1132,28 @@ class KVTransferCoordinator:
             return False
         self._start_try(rec, attempt, extent, committed, source.name, route, now)
         return True
+
+    def _open_route_or_drop(
+        self, req: RequestView, rec: TransferRecord, source: FetchSource
+    ) -> Route | None:
+        """The route to the plan's hint, or ``None`` once the launch has been dropped: a refused
+        route means the plan can never work here (give up), a failed one is worth another try.
+        ``open_route`` itself always returns a ``Route``; a ``None`` from it would break the
+        contract."""
+        rid = req.py_request_id
+        # Broad on purpose, against CODING_GUIDELINES: ``open_route`` raises the backend's own
+        # transport error for a hint that was fine but could not be prepared; that is worth
+        # trying again, and it must not escape and strand the other requests in the queue.
+        try:
+            return source.backend.open_route(rec.plan.hint)
+        except (ValueError, NotImplementedError) as exc:
+            # Bad hint, or a backend that cannot route: this plan can never work here.
+            logger.warning("request %d: route refused by %s: %s", rid, source.name, exc)
+            self._drop_launch(req, rec, give_up=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("request %d: route to %s failed: %s", rid, source.name, exc)
+            self._drop_launch(req, rec, give_up=False)
+        return None
 
     def _place_one(self, req: RequestView, rec: TransferRecord, now: float) -> bool:
         """Phase two of a host-first fetch, once the scheduler reserved the pages: copy the
@@ -1169,6 +1214,8 @@ class KVTransferCoordinator:
             )
 
     def _publish_one(self, req: RequestView, now: float) -> None:
+        """Offer what the request committed to every publisher, on a publish record created on
+        first sight; the record goes IN_FLIGHT with the first submission a publisher accepts."""
         rid = req.py_request_id
         self._requests[rid] = req
         key = (rid, "publish")
@@ -1180,20 +1227,25 @@ class KVTransferCoordinator:
             return
         extent, chunk = self._reader.publish_extent_and_chunk(req)
         rec.extent = extent
+        self._submit_publish_pieces(rec, extent, chunk)
+        if rec.state is RecordState.PLANNED and rec.attempts:
+            # The deadline counts from the first submission a publisher accepted.
+            rec.state = RecordState.IN_FLIGHT
+            rec.deadline = self._deadline_for(rec, now)
+
+    def _submit_publish_pieces(
+        self, rec: TransferRecord, extent: CacheExtent, chunk: Chunk | None
+    ) -> None:
+        """Design §7.5: a publisher that places pieces works in series and hears every piece;
+        one that does not is offered the content once, on the last piece, and never has to read
+        ``is_last``."""
         for name, publisher in self._publishers.items():
-            # Design §7.5: a publisher that places pieces works in series and hears every piece;
-            # one that does not is offered the content once, on the last piece, and never has
-            # to read ``is_last``.
             if isinstance(publisher, PlacesPieces):
                 self._submit_publish(rec, name, publisher.publish, extent)
                 if chunk is not None:
                     self._submit_publish(rec, name, publisher.place, chunk)
             elif extent.is_last:
                 self._submit_publish(rec, name, publisher.publish, extent)
-        if rec.state is RecordState.PLANNED and rec.attempts:
-            # The deadline counts from the first submission a publisher accepted.
-            rec.state = RecordState.IN_FLIGHT
-            rec.deadline = self._deadline_for(rec, now)
 
     def _submit_publish(
         self, rec: TransferRecord, name: str, submit: Callable[[T], Attempt], arg: T

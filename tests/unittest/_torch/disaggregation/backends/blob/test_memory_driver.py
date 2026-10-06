@@ -8,12 +8,9 @@ import importlib
 import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.backends.blob.backend import (  # noqa: E402
-    BlobStoreBackend,
-    BlobStoreConfig,
-    HostLandingBlobBackend,
-)
+from disaggregation.backends.blob.backend import BlobStoreBackend, BlobStoreConfig  # noqa: E402
 from disaggregation.backends.blob.drivers.memory import MemoryBlobStore  # noqa: E402
+from disaggregation.backends.blob.host_landing import HostLandingBlobBackend  # noqa: E402
 from disaggregation.backends.blob.store import GetStatus, PutStatus  # noqa: E402
 from disaggregation.backends.config import BackendEntry, KVTransferConfig  # noqa: E402
 from disaggregation.backends.registry import (  # noqa: E402

@@ -19,10 +19,8 @@ import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch", "blob"]
 from disaggregation.backends import registry as registry_module  # noqa: E402
-from disaggregation.backends.blob.backend import (  # noqa: E402
-    BlobStoreBackend,
-    HostLandingBlobBackend,
-)
+from disaggregation.backends.blob.backend import BlobStoreBackend  # noqa: E402
+from disaggregation.backends.blob.host_landing import HostLandingBlobBackend  # noqa: E402
 from disaggregation.backends.config import (  # noqa: E402
     BACKEND_ROLES,
     KV_TRANSFER_CONFIG_ENV,

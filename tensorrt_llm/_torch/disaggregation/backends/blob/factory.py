@@ -32,7 +32,8 @@ from typing import Any, Callable, Collection, Mapping
 
 from ..config import BackendEntry
 from ..registry import BackendBuildContext, BackendHandle
-from .backend import BlobStoreBackend, BlobStoreConfig, HostLandingBlobBackend
+from .backend import BlobStoreBackend, BlobStoreConfig
+from .host_landing import HostLandingBlobBackend
 from .staging import HostStagingPool, open_pinned_staging_pool, plan_slot_geometry
 from .store import BlobStore
 

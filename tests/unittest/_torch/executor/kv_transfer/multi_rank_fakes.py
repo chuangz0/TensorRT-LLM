@@ -22,7 +22,10 @@ from engine_fakes import (
     make_executor,
 )
 
-from tensorrt_llm._torch.disaggregation.backends.config import BackendEntry
+from tensorrt_llm._torch.disaggregation.backends.config import (
+    DEFAULT_LANDING_WAIT_TIMEOUT_S,
+    BackendEntry,
+)
 from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
 from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.coordinator import (
     KVTransferCoordinator,
@@ -122,6 +125,7 @@ class RankRig:
             EngineCollective(self.dist, self.mapping),
             fetch_timeout_s=fetch_timeout_s,
             unlaunched_timeout_s=unlaunched_timeout_s,
+            landing_wait_timeout_s=DEFAULT_LANDING_WAIT_TIMEOUT_S,
             plan_authority=plan_authority,
         )
         handle = BackendHandle(

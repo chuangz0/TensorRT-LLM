@@ -34,7 +34,11 @@ from engine_fakes import (
     make_request,
 )
 
-from tensorrt_llm._torch.disaggregation.backends.config import BackendEntry
+from tensorrt_llm._torch.disaggregation.backends.config import (
+    DEFAULT_LANDING_WAIT_TIMEOUT_S,
+    DEFAULT_UNLAUNCHED_TIMEOUT_S,
+    BackendEntry,
+)
 from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
 from tensorrt_llm._torch.disaggregation.base.cache_backend import Failed
 from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.coordinator import (
@@ -95,6 +99,8 @@ class Rig:
             self.effects,
             EngineWorkQueue(),
             SingleRankCollective(),
+            unlaunched_timeout_s=DEFAULT_UNLAUNCHED_TIMEOUT_S,
+            landing_wait_timeout_s=DEFAULT_LANDING_WAIT_TIMEOUT_S,
             fetch_timeout_s=fetch_timeout_s,
             publish_timeout_s=publish_timeout_s,
         )

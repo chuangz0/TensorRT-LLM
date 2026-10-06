@@ -300,8 +300,8 @@ def test_two_model_identities_give_two_layout_fingerprints_through_the_assembly_
 
     assert fingerprint_for("meta-llama/Llama-3.1-8B") != fingerprint_for("mistralai/Mistral-7B")
     assert fingerprint_for("meta-llama/Llama-3.1-8B") == fingerprint_for("meta-llama/Llama-3.1-8B")
-    attach = inspect.getsource(attach_kv_transfer)
-    assert "model_identity=model_identity" in attach and "model=%r" in attach
+    assert "model_identity=model_identity" in inspect.getsource(assembly._build_resource_views)
+    assert "model=%r" in inspect.getsource(assembly._build_hooks)
 
 
 def test_the_failure_guard_closes_the_built_backends_and_nothing_on_success():

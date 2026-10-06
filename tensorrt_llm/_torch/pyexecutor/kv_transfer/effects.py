@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
 from tensorrt_llm.logger import logger
@@ -38,6 +39,8 @@ if TYPE_CHECKING:
     from ..py_executor import PyExecutor
 
 __all__ = [
+    # The two state aliases are exported for the tests, which pin their values; no module
+    # imports them.
     "KV_FETCH_IN_PROGRESS",
     "KV_PUBLISH_IN_PROGRESS",
     "EngineCollective",
@@ -68,7 +71,7 @@ class EngineRequestView:
 
     is_gen_init = False
     is_gen_first_context = False
-    route_hints: Mapping[str, Mapping[str, object]] = {}
+    route_hints: Mapping[str, Mapping[str, object]] = MappingProxyType({})
 
     def __init__(self, request: LlmRequest) -> None:
         self.request = request
@@ -168,24 +171,13 @@ class PyExecutorKVTransferEffects:
                 f"request {engine_request.py_request_id}: a gen-init landing has no place in "
                 "this assembly"
             )
-        kv_cache_manager = self._executor.kv_cache_manager
         self._check_history_declared(engine_request, token_end)
         # CONTEXT_INIT first: the C++ request only lets a context-phase request move its cursor.
         engine_request.state = LlmRequestState.CONTEXT_INIT
-        # Fetched content always ends short of the prompt, so the cursor is settled the way a
-        # local reuse hit is (design §7.3 step 1). Local reuse may already reach past
-        # ``token_end`` (design §7.2 step 6: a plan trimmed to an empty ask is still legal); the
-        # cursor never moves below what is committed, and the commit below is then a no-op for
-        # that part.
-        kv_cache = kv_cache_manager.kv_cache_map[engine_request.py_request_id]
-        settle_at = max(token_end, int(kv_cache.num_committed_tokens))
-        settle_context_cursor(engine_request, settle_at, kv_cache_manager.tokens_per_block)
-        # The pages now hold real content and are committed next; a later revert must not shrink
-        # them away.
-        engine_request.py_ctx_pre_resize_cap = None
+        self._settle_landed_cursor(engine_request, token_end)
         # Only the primary manager commits: a draft KV cache manager is refused at assembly, so
         # there is no paired pool whose commit would have to agree with this one.
-        kv_cache_manager.try_commit_blocks(engine_request)
+        self._executor.kv_cache_manager.try_commit_blocks(engine_request)
         self._warn_if_commit_fell_short(engine_request, token_end)
         logger.debug(
             "kv transfer: request %d landed at token_end=%d, cursor=%d",
@@ -272,6 +264,21 @@ class PyExecutorKVTransferEffects:
         executor._handle_errors(str(error), requests=None, charge_budget=False)
 
     # ---- helpers ----
+
+    def _settle_landed_cursor(self, engine_request: LlmRequest, token_end: int) -> None:
+        """Settle the context cursor at ``max(token_end, committed)``, the way a local reuse hit
+        is settled (design §7.3 step 1), and let the pages keep their size.
+
+        Fetched content always ends short of the prompt. Local reuse may already reach past
+        ``token_end`` (design §7.2 step 6: a plan trimmed to an empty ask is still legal); the
+        cursor never moves below what is committed, and the commit that follows is then a no-op
+        for that part. The pages now hold real content and are committed next, so a later
+        revert must not shrink them away."""
+        kv_cache_manager = self._executor.kv_cache_manager
+        kv_cache = kv_cache_manager.kv_cache_map[engine_request.py_request_id]
+        settle_at = max(token_end, int(kv_cache.num_committed_tokens))
+        settle_context_cursor(engine_request, settle_at, kv_cache_manager.tokens_per_block)
+        engine_request.py_ctx_pre_resize_cap = None
 
     def _check_history_declared(self, engine_request: LlmRequest, token_end: int) -> None:
         """The scheduler reserved the fetch with ``reserve_transfer_pages(token_end)``, which

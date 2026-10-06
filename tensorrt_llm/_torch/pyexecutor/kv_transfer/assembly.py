@@ -28,7 +28,7 @@ import json
 import logging
 import os
 import time
-from typing import TYPE_CHECKING, Callable, Sequence, TypeVar
+from typing import TYPE_CHECKING, Callable, NamedTuple, Sequence, TypeVar
 
 from tensorrt_llm.logger import logger
 
@@ -302,6 +302,91 @@ def _status_dump_path() -> str | None:
     return template.replace("{pid}", str(os.getpid()))
 
 
+class _ResourceViews(NamedTuple):
+    """This rank's KV cache as the transfer layer sees it: read by the coordinator through
+    ``reader``, addressed by the backends through ``resolver`` and ``build_context``."""
+
+    reader: KVv2ResourceReader
+    resolver: KVv2RegionResolver
+    model_identity: str
+    build_context: BackendBuildContext
+
+
+def _build_resource_views(executor: PyExecutor, config, mapping) -> _ResourceViews:
+    """Build the reader and the region resolver over the engine's KV cache manager, refusing a
+    model with a recurrent layer group, and gather what every backend factory needs from them."""
+    kv_cache_manager = executor.kv_cache_manager
+    page_table = build_page_table_from_manager(kv_cache_manager)
+    reader = KVv2ResourceReader(kv_cache_manager, page_table)
+    _check_layer_groups_are_paged(reader)
+    resolver = KVv2RegionResolver(page_table)
+    model_identity = model_identity_for(executor)
+    build_context = BackendBuildContext(
+        resolver=resolver,
+        layout_fingerprint=layout_fingerprint(
+            kv_cache_manager,
+            page_table,
+            parallel_shard=parallel_shard_tag(mapping),
+            model_identity=model_identity,
+        ),
+        max_unit_bytes=resolver.max_unit_bytes(),
+        device_index=executor.device_id,
+        unit_bytes_of=_unit_bytes_by_name(reader, resolver),
+        max_request_blocks=-(-executor.max_seq_len // reader.tokens_per_block),
+        landing_wait_timeout_s=config.landing_wait_timeout_s,
+    )
+    return _ResourceViews(reader, resolver, model_identity, build_context)
+
+
+def _build_hooks(
+    executor: PyExecutor,
+    config,
+    views: _ResourceViews,
+    backends: Sequence[BackendHandle],
+    *,
+    mapping,
+    started_at: float,
+) -> KVTransferHooks:
+    """Check the built backends fit the engine's parallelism, register the KV pools with those
+    that need it, build the coordinator over them, and attach the hooks to the executor and its
+    scheduler."""
+    _check_followers_can_rebuild_plans(mapping, backends)
+    _register_kv_pools(backends, views.resolver)
+    effects = PyExecutorKVTransferEffects(executor)
+    coordinator = build_coordinator(
+        config,
+        backends,
+        views.reader,
+        effects,
+        EngineWorkQueue(),
+        EngineCollective(executor.dist, mapping),
+        plan_authority=plan_authority_for(mapping),
+    )
+    install_log_forwarding()
+    hooks = KVTransferHooks(
+        executor,
+        coordinator,
+        effects,
+        backends,
+        config.backends,
+        close_timeout_s=config.close_timeout_s,
+        status_dump_path=_status_dump_path(),
+        started_at=started_at,
+        rank=mapping.rank,
+    )
+    executor.scheduler.kv_transfer_hooks = hooks
+    executor.kv_transfer = hooks
+    logger.info(
+        "KV transfer attached: backends=%s pools=%d model=%r layout=%s plan_authority=%s",
+        [(entry.name, entry.type, sorted(entry.roles)) for entry in config.backends],
+        len(views.resolver.pool_memory_spans()),
+        views.model_identity,
+        views.build_context.layout_fingerprint.hex(),
+        coordinator.plan_authority.value,
+    )
+    return hooks
+
+
 def attach_kv_transfer(
     executor: PyExecutor,
     config_path: str,
@@ -326,64 +411,11 @@ def attach_kv_transfer(
         max_beam_width=max_beam_width,
     )
     config = load_kv_transfer_config(config_path)
-
-    kv_cache_manager = executor.kv_cache_manager
-    page_table = build_page_table_from_manager(kv_cache_manager)
-    reader = KVv2ResourceReader(kv_cache_manager, page_table)
-    _check_layer_groups_are_paged(reader)
-    resolver = KVv2RegionResolver(page_table)
-    model_identity = model_identity_for(executor)
-    build_context = BackendBuildContext(
-        resolver=resolver,
-        layout_fingerprint=layout_fingerprint(
-            kv_cache_manager,
-            page_table,
-            parallel_shard=parallel_shard_tag(mapping),
-            model_identity=model_identity,
+    views = _build_resource_views(executor, config, mapping)
+    backends = build_backends(config, views.build_context)
+    return _closing_backends_on_failure(
+        backends,
+        lambda: _build_hooks(
+            executor, config, views, backends, mapping=mapping, started_at=started_at
         ),
-        max_unit_bytes=resolver.max_unit_bytes(),
-        device_index=executor.device_id,
-        unit_bytes_of=_unit_bytes_by_name(reader, resolver),
-        max_request_blocks=-(-executor.max_seq_len // reader.tokens_per_block),
-        landing_wait_timeout_s=config.landing_wait_timeout_s,
     )
-    backends = build_backends(config, build_context)
-
-    def attach_built_backends() -> KVTransferHooks:
-        _check_followers_can_rebuild_plans(mapping, backends)
-        _register_kv_pools(backends, resolver)
-        effects = PyExecutorKVTransferEffects(executor)
-        coordinator = build_coordinator(
-            config,
-            backends,
-            reader,
-            effects,
-            EngineWorkQueue(),
-            EngineCollective(executor.dist, mapping),
-            plan_authority=plan_authority_for(mapping),
-        )
-        install_log_forwarding()
-        hooks = KVTransferHooks(
-            executor,
-            coordinator,
-            effects,
-            backends,
-            config.backends,
-            close_timeout_s=config.close_timeout_s,
-            status_dump_path=_status_dump_path(),
-            started_at=started_at,
-            rank=mapping.rank,
-        )
-        executor.scheduler.kv_transfer_hooks = hooks
-        executor.kv_transfer = hooks
-        logger.info(
-            "KV transfer attached: backends=%s pools=%d model=%r layout=%s plan_authority=%s",
-            [(entry.name, entry.type, sorted(entry.roles)) for entry in config.backends],
-            len(resolver.pool_memory_spans()),
-            model_identity,
-            build_context.layout_fingerprint.hex(),
-            coordinator.plan_authority.value,
-        )
-        return hooks
-
-    return _closing_backends_on_failure(backends, attach_built_backends)

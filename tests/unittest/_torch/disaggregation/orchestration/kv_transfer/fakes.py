@@ -19,6 +19,10 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Mapping, Sequence
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
+from disaggregation.backends.config import (  # noqa: E402
+    DEFAULT_LANDING_WAIT_TIMEOUT_S,
+    DEFAULT_UNLAUNCHED_TIMEOUT_S,
+)
 from disaggregation.base.backend import CacheKind  # noqa: E402
 from disaggregation.base.cache_backend import (  # noqa: E402
     CacheExtent,
@@ -859,6 +863,8 @@ class Rig:
         self.queue = FakeEngineQueue()
         self.dist = dist if dist is not None else FakeCollective()
         self.planner = Planner(self.sources, self.reader, tpb, probe_timeout_s=probe_timeout_s)
+        coordinator_kwargs.setdefault("unlaunched_timeout_s", DEFAULT_UNLAUNCHED_TIMEOUT_S)
+        coordinator_kwargs.setdefault("landing_wait_timeout_s", DEFAULT_LANDING_WAIT_TIMEOUT_S)
         self.coord = KVTransferCoordinator(
             self.sources,
             self.publishers,

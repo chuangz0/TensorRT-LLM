@@ -24,10 +24,8 @@ import time
 import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.backends.blob.backend import (  # noqa: E402
-    BlobStoreBackend,
-    HostLandingBlobBackend,
-)
+from disaggregation.backends.blob.backend import BlobStoreBackend  # noqa: E402
+from disaggregation.backends.blob.host_landing import HostLandingBlobBackend  # noqa: E402
 from disaggregation.backends.blob.store import BlobStoreError  # noqa: E402
 from disaggregation.base.cache_backend import (  # noqa: E402
     Attempt,

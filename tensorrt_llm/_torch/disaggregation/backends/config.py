@@ -22,17 +22,21 @@ registered backend type and carries that type's own settings unread. Nothing her
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, TypeVar
 
 import yaml
 
 __all__ = [
     "BACKEND_ROLES",
+    "DEFAULT_LANDING_WAIT_TIMEOUT_S",
+    "DEFAULT_UNLAUNCHED_TIMEOUT_S",
     "KV_TRANSFER_CONFIG_ENV",
     "BackendEntry",
     "KVTransferConfig",
     "load_kv_transfer_config",
+    "strict_from_dict",
 ]
 
 KV_TRANSFER_CONFIG_ENV = "TRTLLM_KV_TRANSFER_CONFIG"
@@ -62,8 +66,24 @@ _DEFAULT_PUBLISH_TIMEOUT_S = 60.0
 # change left for a follow-up.
 _DEFAULT_PROBE_TIMEOUT_S = 1.0
 _DEFAULT_CLOSE_TIMEOUT_S = 30.0
-_DEFAULT_UNLAUNCHED_TIMEOUT_S = 30.0
-_DEFAULT_LANDING_WAIT_TIMEOUT_S = 30.0
+DEFAULT_UNLAUNCHED_TIMEOUT_S = 30.0
+"""The one default for ``unlaunched_timeout_s``; ``KVTransferConfig`` carries it and the assembly
+passes it on."""
+DEFAULT_LANDING_WAIT_TIMEOUT_S = 30.0
+"""The one default for ``landing_wait_timeout_s``; ``KVTransferConfig`` carries it and the
+assembly passes it on, to the coordinator and to the backends alike."""
+
+_Dataclass = TypeVar("_Dataclass")
+
+
+def strict_from_dict(cls: type[_Dataclass], raw: Mapping[str, Any]) -> _Dataclass:
+    """Build dataclass ``cls`` from a plain mapping, refusing keys it has no field for. A value
+    of the wrong type is a ``ValueError`` from ``cls`` like any other bad value."""
+    known = {f.name for f in dataclasses.fields(cls)}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ValueError(f"unknown {cls.__name__} keys: {unknown}")
+    return cls(**raw)
 
 
 @dataclass(frozen=True)
@@ -147,8 +167,8 @@ class KVTransferConfig:
     backends: tuple[BackendEntry, ...]
     fetch_timeout_s: float | None = _DEFAULT_FETCH_TIMEOUT_S
     publish_timeout_s: float | None = _DEFAULT_PUBLISH_TIMEOUT_S
-    unlaunched_timeout_s: float | None = _DEFAULT_UNLAUNCHED_TIMEOUT_S
-    landing_wait_timeout_s: float | None = _DEFAULT_LANDING_WAIT_TIMEOUT_S
+    unlaunched_timeout_s: float | None = DEFAULT_UNLAUNCHED_TIMEOUT_S
+    landing_wait_timeout_s: float | None = DEFAULT_LANDING_WAIT_TIMEOUT_S
     probe_timeout_s: float = _DEFAULT_PROBE_TIMEOUT_S
     close_timeout_s: float = _DEFAULT_CLOSE_TIMEOUT_S
 
