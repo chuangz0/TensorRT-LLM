@@ -73,7 +73,7 @@ class KVv2RegionResolver:
 
 
 def parallel_shard_tag(mapping) -> str:
-    """Which slice of the model's KV heads this rank's units hold, for ``layout_fingerprint``.
+    """Which slice of the model's KV state this rank's units hold, for ``layout_fingerprint``.
 
     A rank that holds every head, whether it runs alone (TP=1) or as an attention-DP replica,
     gets the one shared tag, so such workers share store entries. Under tensor parallelism each
@@ -81,27 +81,40 @@ def parallel_shard_tag(mapping) -> str:
     layout, never take each other's place in a store. The tag is a rank index, not a head range:
     the page table exposes the per-rank head count (``kv_head_num_per_rank``) but not which
     heads, so when a model has fewer KV heads than TP ranks the duplicated heads get different
-    tags and give up a share they could have had.
+    tags and give up a share they could have had. Under context parallelism each rank holds its
+    own slice of the sequence as well, so the tag names that too.
     """
     if mapping.tp_size == 1 or mapping.enable_attention_dp:
-        return "heads=all"
-    return f"heads={mapping.tp_rank}/{mapping.tp_size}"
+        heads = "heads=all"
+    else:
+        heads = f"heads={mapping.tp_rank}/{mapping.tp_size}"
+    if mapping.cp_size > 1:
+        return f"{heads};cp={mapping.cp_rank}/{mapping.cp_size}"
+    return heads
 
 
 def layout_fingerprint(
-    kv_cache_manager, page_table: KVCachePageTable | None = None, *, parallel_shard: str = ""
+    kv_cache_manager,
+    page_table: KVCachePageTable | None = None,
+    *,
+    parallel_shard: str = "",
+    model_identity: str = "",
 ) -> bytes:
     """Digest of the memory layout a unit's bytes assume (design appendix B).
 
     Covers block geometry, per-pool slot width, which layers and roles share a slot and in what
-    order, head count and dtype, and the ``parallel_shard`` tag (``parallel_shard_tag``) that
-    names which heads this rank holds. Base addresses are left out on purpose: they differ
-    between two processes whose bytes mean the same thing.
+    order, head count and dtype, the ``parallel_shard`` tag (``parallel_shard_tag``) that names
+    which heads this rank holds, and ``model_identity``, which names the model the bytes belong
+    to (the checkpoint path and revision, say, or a digest of its config): two models of one
+    geometry would otherwise read each other's pages under one namespace. An empty identity
+    means unknown, and such models then share keys. Base addresses are left out on purpose: they
+    differ between two processes whose bytes mean the same thing.
     """
     page_table = (
         page_table if page_table is not None else build_page_table_from_manager(kv_cache_manager)
     )
     digest = hashlib.blake2b(digest_size=16)
+    digest.update(f"model={model_identity};".encode())
     digest.update(f"parallel_shard={parallel_shard};".encode())
     digest.update(f"tokens_per_block={page_table.tokens_per_block};".encode())
     digest.update(f"dtype={getattr(kv_cache_manager, 'dtype', None)};".encode())

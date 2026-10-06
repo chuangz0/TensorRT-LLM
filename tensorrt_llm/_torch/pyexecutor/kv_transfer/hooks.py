@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The KV transfer layer as the executor loop and the scheduler see it (design §3.2, plan §4).
+"""The KV transfer layer as the executor loop and the scheduler see it (design §3.2).
 
 ``KVTransferHooks`` is the one object the loop calls, one method per engine loop hook point: each
 selects the requests the hook concerns, wraps them in ``EngineRequestView``, forwards to
@@ -29,6 +29,10 @@ Known follow-ups:
    context-only request has left ``active_requests``, so disagg's release and this layer's
    ``LANDED`` record wait for the next wake. This is disagg's pre-existing idle-wake gap; it is
    not widened here.
+3. Under ``VOTED`` planning, a request that has ended on one rank while another rank still
+   re-plans it after a failed try never reaches ``n`` plan answers (the finished rank plans
+   nothing), so the re-planning rank defers until its own request ends. Bounded by the request's
+   end, but a livelock in theory; a finished rank could answer ``None`` for the key instead.
 """
 
 from __future__ import annotations
@@ -64,7 +68,7 @@ _CONTEXT_INIT_STATE_VALUE = LlmRequestState.CONTEXT_INIT.value
 
 
 class KVTransferHooks:
-    """One call per hook point of plan §5; see the naming table of plan §4.
+    """One call per hook point of the engine loop.
 
     Args:
         executor: The engine; read for its request lists and its resource release.
@@ -137,7 +141,8 @@ class KVTransferHooks:
     def plan_fetch(self, request: LlmRequest):
         """Scheduler hook (design §5): ``FetchPlan``, ``None`` or ``DEFER`` for ``request``.
 
-        A request that is not a fetch candidate (plan §9 rule 3) computes locally: ``None``.
+        A request that is not a fetch candidate (``_is_fetch_candidate``) computes locally:
+        ``None``.
         """
         if not _is_fetch_candidate(request):
             return None
@@ -151,7 +156,7 @@ class KVTransferHooks:
 
     def publish_committed_blocks(self, context_requests: Sequence[LlmRequest]) -> None:
         """After a context step whose forward has completed and whose blocks are committed
-        (design §3.2 step 4, plan §5 #3-#4): offer the blocks of requests whose prefill ended."""
+        (design §3.2 step 4): offer the blocks of requests whose prefill ended."""
         completed = self._publishable_completed_contexts(context_requests)
         if completed:
             self.coordinator.publish_committed_blocks(completed, now=time.monotonic())
@@ -159,10 +164,9 @@ class KVTransferHooks:
     # ---- release gate, cancel path, idle pacing ----
 
     def on_request_finished(self, request: LlmRequest) -> bool:
-        """The release gate (design §4.3, plan §9): ``True`` when the engine may terminate the
-        request now, ``False`` when this layer holds it and will terminate it later."""
-        self.coordinator.notify_request_finished(EngineRequestView(request))
-        return request.py_request_id not in self.coordinator.held_request_ids()
+        """The release gate (design §4.3): ``True`` when the engine may terminate the request
+        now, ``False`` when this layer holds it and will terminate it later, or already has."""
+        return self.coordinator.notify_request_finished(EngineRequestView(request))
 
     def is_tracking(self, request: LlmRequest) -> bool:
         """Whether this layer owns the request right now: parked for a fetch, or held after it
@@ -174,20 +178,25 @@ class KVTransferHooks:
             or request_id in self.coordinator.held_request_ids()
         )
 
-    def has_transfer_in_flight(self) -> bool:
-        return self.coordinator.has_inflight()
+    def has_pending_work(self) -> bool:
+        """Whether this layer will make progress without a new request: a transfer in flight, a
+        fetch waiting for pages, or a finished request held until the ranks agree. The loop must
+        not block on its request queue while this is true."""
+        return self.coordinator.has_pending_work()
 
     def inflight_request_ids(self) -> frozenset[int]:
-        """Requests whose pages a backend may still read or write. They stay schedulable, but the
-        scheduler must neither evict nor recompute-pause them (``schedule_request``'s
+        """Requests whose pages a backend may still read or write: a transfer in flight, or a
+        backend that refused to vouch for the pages at the release point. They stay schedulable,
+        but the scheduler must neither evict nor recompute-pause them (``schedule_request``'s
         ``protected_from_eviction_request_ids``), and the engine must not free them behind the
         release gate."""
         return self.coordinator.inflight_request_ids()
 
     def pace_idle(self) -> None:
-        """An idle loop pass that only a backend can unblock (a transfer in flight, or a lookup a
-        request is deferred on) yields briefly instead of spinning through the probe budget."""
-        if self._num_deferred_requests or self.coordinator.has_inflight():
+        """An idle loop pass that only this layer's clocks can unblock (a transfer in flight, a
+        lookup a request is deferred on, a fetch waiting for pages, a held request waiting for
+        the ranks) yields briefly instead of spinning through the budgets."""
+        if self._num_deferred_requests or self.coordinator.has_pending_work():
             time.sleep(_IDLE_BACKEND_WAIT_S)
 
     # ---- shutdown ----
@@ -212,7 +221,7 @@ class KVTransferHooks:
 
     def close(self) -> None:
         """Stop the backends within ``close_timeout_s``, free every request this layer still holds
-        or has parked, then write the status dump (plan §5 #9, §9).
+        or has parked, then write the status dump.
 
         When the backends do not stop in time, a request whose transfer record is still in flight
         keeps its pages: a backend that may still be writing them must not see them freed. Its
@@ -280,10 +289,10 @@ class KVTransferHooks:
     def _publishable_completed_contexts(
         self, context_requests: Sequence[LlmRequest]
     ) -> list[EngineRequestView]:
-        """Plan §9 rule 4: prefill ended, pages present and active on the GPU (a failed request
-        has none; a suspended cache has left the GPU and the store must not read it), not
-        generation-only (its prefix was published by the context worker that computed it), not
-        dummy. A request that finished with its first token still publishes."""
+        """Prefill ended, pages present and active on the GPU (a failed request has none; a
+        suspended cache has left the GPU and the store must not read it), not generation-only
+        (its prefix was published by the context worker that computed it), not dummy. A request
+        that finished with its first token still publishes."""
         kv_cache_manager = self._executor.kv_cache_manager
         completed = []
         for request in context_requests:
@@ -299,8 +308,8 @@ class KVTransferHooks:
 
 
 def _is_fetch_candidate(request: LlmRequest) -> bool:
-    """Plan §9 rule 3: exactly ``CONTEXT_INIT`` (not ``DISAGG_CONTEXT_INIT_AND_TRANS``), first
-    chunk, not dummy, not gen-init (never in ``CONTEXT_INIT``; the explicit fallback of rule 1)."""
+    """Exactly ``CONTEXT_INIT`` (not ``DISAGG_CONTEXT_INIT_AND_TRANS``), first chunk, not dummy,
+    not gen-init (never in ``CONTEXT_INIT``; gen-init receives belong to the disagg transceiver)."""
     return (
         request.state_value == _CONTEXT_INIT_STATE_VALUE
         and request.is_first_context_chunk

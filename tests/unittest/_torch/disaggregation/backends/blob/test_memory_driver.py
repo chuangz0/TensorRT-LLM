@@ -14,7 +14,7 @@ from disaggregation.backends.blob.backend import (  # noqa: E402
     HostLandingBlobBackend,
 )
 from disaggregation.backends.blob.drivers.memory import MemoryBlobStore  # noqa: E402
-from disaggregation.backends.blob.store import GetStatus  # noqa: E402
+from disaggregation.backends.blob.store import GetStatus, PutStatus  # noqa: E402
 from disaggregation.backends.config import BackendEntry, KVTransferConfig  # noqa: E402
 from disaggregation.backends.registry import (  # noqa: E402
     BackendBuildContext,
@@ -85,6 +85,19 @@ def test_backend_over_the_memory_store_round_trips_and_probes():
         assert backend.probe(b"n", [b"u", b"never"]) == frozenset({b"u"})
     finally:
         backend.close()
+
+
+def test_put_of_a_held_key_keeps_the_first_object_and_answers_stored():
+    """As a Mooncake master does, so the fakes built on this store race like the real one."""
+    store = MemoryBlobStore()
+    arena = MemoryArena(128)
+    store.register_span(arena.address, arena.size)
+    first, second = arena.carve(32), arena.carve(32)
+    write([first], pattern(1, 32))
+    write([second], pattern(2, 32))
+    assert store.put(["k"], [[first]]) == [PutStatus.STORED]
+    assert store.put(["k"], [[second]]) == [PutStatus.STORED]
+    assert store.objects["k"] == pattern(1, 32)
 
 
 def test_get_of_an_unknown_key_is_a_miss_that_leaves_the_destination_alone():

@@ -6,7 +6,7 @@ A ``PyExecutor`` built with ``object.__new__`` and the attributes the effects re
 ``KVTransferCoordinator`` and ``Planner``, and fakes for the reader and the backends. Covered:
 every effect of design §7.3 in table order; the two alias states; the release gate's five cases
 A-E of plan §9 (E synthesized: the disagg send never comes back); the dummy bypass; ``is_tracking``
-on the cancel path; ``has_transfer_in_flight`` for idle detection; ``pace_idle``; ``close()`` order
+on the cancel path; ``has_pending_work`` for idle detection; ``pace_idle``; ``close()`` order
 and its timeout against a hanging backend; and the status dump's JSON schema.
 """
 
@@ -288,7 +288,7 @@ class TestParkForFetch:
         assert rig.coord.parked_request_ids() == {1}
         assert rig.coord.held_request_ids() == frozenset()
         assert rig.hooks.is_tracking(req)
-        assert rig.hooks.has_transfer_in_flight()
+        assert rig.hooks.has_pending_work()
         # prepare_fetch_resources went first, with the engine request, not the view.
         rig.executor._prepare_disagg_gen_resources.assert_called_once()
         (prepared,), _ = rig.executor._prepare_disagg_gen_resources.call_args
@@ -317,7 +317,7 @@ class TestUnpark:
         assert rig.kv.calls == [("try_commit_blocks", 1)]
         assert rig.kv.kv_cache_map[1].num_committed_tokens == 96
         assert not rig.hooks.is_tracking(req)
-        assert not rig.hooks.has_transfer_in_flight()
+        assert not rig.hooks.has_pending_work()
         assert rig.hooks.plan_fetch(req) is None  # decided: compute the rest locally
         # A landed fetch record reaches its release point when the request ends (design §4.3).
         assert [r["state"] for r in rig.records()] == ["LANDED"]
@@ -439,10 +439,25 @@ class TestGiveBackFetchPages:
 
 
 class TestPrepareFetchResources:
-    def test_forwards_engine_requests_to_the_gen_init_preparation(self, rig):
+    def test_forwards_engine_requests_to_the_gen_init_preparation_without_the_latch(self, rig):
         a, b = make_request(1, 100), make_request(2, 100)
         rig.effects.prepare_fetch_resources([EngineRequestView(a), EngineRequestView(b)])
-        rig.executor._prepare_disagg_gen_resources.assert_called_once_with([a, b])
+        rig.executor._prepare_disagg_gen_resources.assert_called_once_with(
+            [a, b], latch_cached_tokens=False
+        )
+
+    def test_the_engine_preparation_leaves_cached_tokens_to_the_first_forward_for_a_fetch(self):
+        """``cached_tokens`` is written once. Latched at launch it would report the local reuse
+        depth; left alone, the first forward after the landing reports the fetched depth. A
+        gen-init request, which never runs a context forward here, is latched as before."""
+        executor = SimpleNamespace(resource_manager=SimpleNamespace(resource_managers={}))
+        fetched, gen_init = make_request(1, 100), make_request(2, 100)
+        PyExecutor._prepare_disagg_gen_resources(executor, [fetched], latch_cached_tokens=False)
+        PyExecutor._prepare_disagg_gen_resources(executor, [gen_init])
+        fetched.cached_tokens = 96  # what the context forward writes after the landing
+        gen_init.cached_tokens = 96
+        assert fetched.cached_tokens == 96
+        assert gen_init.cached_tokens == gen_init.prepopulated_prompt_len
 
 
 class TestHoldForTransfer:
@@ -460,7 +475,7 @@ class TestHoldForTransfer:
         assert 1 in rig.kv.kv_cache_map  # the pages stay for the backend
         assert rig.kv.count("free_resources") == 0
         assert rig.hooks.is_tracking(req)
-        assert rig.hooks.has_transfer_in_flight()
+        assert rig.hooks.has_pending_work()
         assert rig.reader.forgotten == []  # forgotten once the held request is terminated
 
     def test_hold_reads_nothing_of_disagg_and_tolerates_slots_already_released(self, rig):
@@ -492,6 +507,16 @@ class TestTerminateRequest:
         rig.effects.terminate_request(EngineRequestView(req))
         rig.executor._do_terminate_request.assert_called_once_with(req)
 
+    def test_goes_through_the_pp_termination_handler_when_the_engine_has_one(self, rig):
+        """Under disaggregated PP every termination must pass the ranks' ring, or one rank frees
+        the request while its peers still count on it."""
+        handler = Mock()
+        rig.executor._disagg_pp_termination_handler = handler
+        req = make_request(1, 100)
+        rig.effects.terminate_request(EngineRequestView(req))
+        handler.terminate.assert_called_once_with(req)
+        rig.executor._do_terminate_request.assert_not_called()
+
 
 class TestFailRequests:
     def test_fail_requests_uses_the_request_scoped_error_path(self, rig):
@@ -501,16 +526,15 @@ class TestFailRequests:
             "kv fetch failed", requests=[a, b], charge_budget=False
         )
 
-    def test_fail_fatal_marks_the_executor_and_fails_collectively(self, rig):
+    def test_fail_fatal_marks_the_executor_and_takes_the_rank_local_fatal_path(self, rig):
+        """A refused quiesce is observed by one rank; the collective-aligned fatal path is for
+        a fatal every rank agreed on, and would enter a gather the peers are not in."""
         rig.effects.fail_fatal(RuntimeError("cannot vouch for memory"))
         assert rig.executor.is_shutdown is True
         assert isinstance(rig.executor._fatal_error, RuntimeError)
         assert "cannot vouch for memory" in str(rig.executor._fatal_error)
         rig.executor._handle_errors.assert_called_once_with(
-            "cannot vouch for memory",
-            requests=None,
-            charge_budget=False,
-            fatal_is_collective_aligned=True,
+            "cannot vouch for memory", requests=None, charge_budget=False
         )
 
     def test_quiesce_refusal_reaches_fail_fatal(self, rig):
@@ -621,13 +645,13 @@ class TestReleaseGate:
 
         assert rig.terminations() == 0
         assert req.state == KV_PUBLISH_IN_PROGRESS
-        assert rig.hooks.is_tracking(req) and rig.hooks.has_transfer_in_flight()
+        assert rig.hooks.is_tracking(req) and rig.hooks.has_pending_work()
         rig.advance()  # still in flight
         assert rig.terminations() == 0
         attempt.deliver_all()
         rig.advance()
         rig.executor._do_terminate_request.assert_called_once_with(req)
-        assert not rig.hooks.is_tracking(req) and not rig.hooks.has_transfer_in_flight()
+        assert not rig.hooks.is_tracking(req) and not rig.hooks.has_pending_work()
         assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
 
     def test_case_b_publish_failure_still_terminates_the_finished_request_once(self, rig, caplog):
@@ -707,15 +731,15 @@ class TestReleaseGate:
         for _ in range(3):
             rig.advance()
         assert rig.terminations() == 1
-        assert not rig.hooks.is_tracking(req) and not rig.hooks.has_transfer_in_flight()
+        assert not rig.hooks.is_tracking(req) and not rig.hooks.has_pending_work()
         assert rig.records() == []
         assert rig.coord.tracked_requests() == []
         assert rig.coord.status_dump()["finished_pending"] == []
 
-    def test_publish_rejected_outright_terminates_exactly_once(self, rig):
-        """Every publisher refused the request's blocks and the request then finished: nothing is
-        in flight, nothing is held, and the engine's own ``_terminate_request`` is the one
-        termination."""
+    def test_publish_rejected_outright_is_held_one_round_then_terminated_exactly_once(self, rig):
+        """Every publisher refused the request's blocks here, but a peer's may have taken them:
+        the record votes once so the ranks agree, and the layer terminates the request with the
+        agreement, exactly once."""
         req = make_request(1, 100)
         finish_prefill(req)
         rig.kv.kv_cache_map[1] = FakeKVCache(history_length=100)
@@ -724,7 +748,9 @@ class TestReleaseGate:
         assert rig.publisher.attempts == []
 
         rig.executor._terminate_request(req)
+        assert rig.terminations() == 0 and rig.coord.held_request_ids() == {1}
 
+        rig.advance()
         rig.executor._do_terminate_request.assert_called_once_with(req)
         assert rig.records() == [] and not rig.hooks.is_tracking(req)
         assert rig.coord.status_dump()["finished_pending"] == []
@@ -759,13 +785,17 @@ class TestReleaseGate:
         assert req.context_current_position == 0  # never unparked
         assert rig.records() == [] and not rig.hooks.is_tracking(req)
 
-    def test_request_finished_with_a_plan_but_no_launch_terminates_now(self, rig):
+    def test_request_finished_with_a_plan_but_no_launch_is_terminated_with_the_agreement(self, rig):
+        """No pages here, but a peer may have launched the same plan: the record votes once so
+        every rank terminates the request in the same round."""
         req = make_request(1, 100)
         rig.plan(req)
         assert rig.records()[0]["state"] == "PLANNED"
         rig.executor._terminate_request(req)
+        assert rig.terminations() == 0 and rig.coord.held_request_ids() == {1}
+        rig.advance()
         rig.executor._do_terminate_request.assert_called_once_with(req)
-        assert rig.records() == []
+        assert rig.records() == [] and rig.store.count("quiesce") == 0
 
     def test_dummy_requests_bypass_the_gate(self, rig):
         req = make_request(1, 100)
@@ -826,22 +856,22 @@ class TestCancelAndIdle:
         assert rig.hooks.inflight_request_ids() == {1}
         assert rig.executor._try_cancel_request(req) is True
 
-    def test_has_transfer_in_flight_reports_fetches_and_publishes(self, rig):
-        assert rig.hooks.has_transfer_in_flight() is False
+    def test_has_pending_work_reports_fetches_and_publishes(self, rig):
+        assert rig.hooks.has_pending_work() is False
         req = make_request(1, 100)
-        rig.plan(req)  # planned, not launched
-        assert rig.hooks.has_transfer_in_flight() is False
+        rig.plan(req)  # planned, not launched: waiting for pages on this layer's clock
+        assert rig.hooks.has_pending_work() is True
         rig.reserve(req, 96)
         attempt = rig.launch(req)
-        assert rig.hooks.has_transfer_in_flight() is True
+        assert rig.hooks.has_pending_work() is True
         attempt.deliver_all()
         rig.advance(req)
-        assert rig.hooks.has_transfer_in_flight() is False
+        assert rig.hooks.has_pending_work() is False
         pub = rig.publish(req)
-        assert rig.hooks.has_transfer_in_flight() is True
+        assert rig.hooks.has_pending_work() is True
         pub.deliver_all()
         rig.advance()
-        assert rig.hooks.has_transfer_in_flight() is False
+        assert rig.hooks.has_pending_work() is False
 
     def test_pace_idle_sleeps_only_when_a_backend_can_make_progress(self, monkeypatch):
         sleeps = []
@@ -863,6 +893,27 @@ class TestCancelAndIdle:
         rig2.store.attempts[-1].deliver_all()
         rig2.advance(req2)
         rig2.hooks.pace_idle()
+        assert sleeps == [0.001, 0.001]
+
+    def test_pace_idle_sleeps_while_a_fetch_waits_for_pages_or_a_request_is_held(self, monkeypatch):
+        """A planned fetch the scheduler finds no pages for, and a finished request held until
+        the ranks agree, both move on this layer's clocks alone: the loop must not spin through
+        them at full speed (the deadlock detector would count a thousand passes in a second)."""
+        sleeps = []
+        monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
+        rig = Rig()
+        req = make_request(1, 100)
+        rig.plan(req)  # planned, waiting for pages the scheduler never finds
+        assert rig.hooks.has_pending_work() is True
+        rig.hooks.pace_idle()
+        assert sleeps == [0.001]
+        rig.executor._terminate_request(req)  # held until the agreement, one round away
+        assert rig.hooks.has_pending_work() is True
+        rig.hooks.pace_idle()
+        assert sleeps == [0.001, 0.001]
+        rig.advance()
+        assert rig.terminations() == 1 and not rig.hooks.has_pending_work()
+        rig.hooks.pace_idle()
         assert sleeps == [0.001, 0.001]
 
     def test_candidates_are_first_chunk_context_init_non_dummy_only(self, rig):
@@ -1011,7 +1062,7 @@ class TestClose:
                 "attempts",
                 "outcomes",
                 "deadline",
-                "abandoned",
+                "expired",
                 "token_end",
                 "launch_gave_up",
                 "peer_launched_at",
@@ -1080,13 +1131,17 @@ class TestHeldRequestFailurePaths:
             rig.advance()
         assert rig.terminations() == 1
 
-    def test_publish_expiry_on_a_held_request_warns_and_terminates_once(self, monkeypatch, caplog):
+    def test_publish_expiry_on_a_held_request_warns_and_terminates_once_on_the_outcome(
+        self, monkeypatch, caplog
+    ):
+        """Past the deadline the attempt may still be writing the store; it is never quiesced
+        while live. The warning is given, the hold stays, and the outcome settles the record."""
         now = [5000.0]
         monkeypatch.setattr(time, "monotonic", lambda: now[0])
         rig = Rig(publish_timeout_s=10.0)
         rig.wire_engine_error_path()
         req = make_request(1, 100)
-        rig.publish(req)  # deadline: 5010
+        attempt = rig.publish(req)  # deadline: 5010
         rig.executor._terminate_request(req)
         assert rig.coord.held_request_ids() == {1}
         now[0] += 9.0
@@ -1098,7 +1153,13 @@ class TestHeldRequestFailurePaths:
             rig.advance()
 
         rig.executor._handle_errors.assert_not_called()
-        assert any("kv publish timed out" in r.getMessage() for r in caplog.records)
+        assert any("kv publish past its deadline" in r.getMessage() for r in caplog.records)
+        assert rig.terminations() == 0 and rig.publisher.count("quiesce") == 0
+        assert rig.coord.held_request_ids() == {1}
+        assert [r["expired"] for r in rig.records()] == [True]
+
+        attempt.deliver_all()
+        rig.advance()
         rig.executor._do_terminate_request.assert_called_once_with(req)
         assert rig.coord.held_request_ids() == frozenset()
         assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
@@ -1182,10 +1243,13 @@ class TestRejectedSubmissions:
         rig = Rig(publish_timeout_s=10.0)
         rig.wire_engine_error_path()
         req = make_request(1, 100)
-        rig.publish(req)
+        attempt = rig.publish(req)
         now[0] += 11.0
         rig.advance()
         rig.executor._handle_errors.assert_not_called()
+        assert [r["expired"] for r in rig.records()] == [True]  # the warning is the only word
+        attempt.deliver_all()
+        rig.advance()
         assert rig.records() == []
         rig.executor._terminate_request(req)  # ends normally later
         assert rig.terminations() == 1
@@ -1229,6 +1293,34 @@ class TestEngineErrorPathWithParkedRequests:
             dump = json.load(f)
         assert dump["coordinator"]["finished_pending"] == [1]
         assert [r["state"] for r in dump["coordinator"]["records"]] == ["IN_FLIGHT"]
+
+
+class TestDeferredEngineTermination:
+    """Under attention DP the engine defers a failed request's termination to a later lockstep
+    flush (``_handle_errors`` buffers it). The layer may have terminated the held request on
+    its outcome by then; the late ``_terminate_request`` must not free it a second time."""
+
+    def test_late_gate_after_the_layer_terminated_does_not_terminate_twice(self, monkeypatch):
+        now = [5000.0]
+        monkeypatch.setattr(time, "monotonic", lambda: now[0])
+        rig = Rig(fetch_timeout_s=10.0)  # the ``_handle_errors`` mock defers: it terminates nothing
+        req = make_request(1, 100)
+        rig.executor.active_requests = [req]
+        plan, attempt = rig.plan_reserve_launch(req)
+        now[0] += 10.5
+        rig.advance(req)
+        rig.executor._handle_errors.assert_called_once()
+        assert rig.coord.held_request_ids() == {1} and req.state == KV_PUBLISH_IN_PROGRESS
+
+        attempt.deliver_all()
+        rig.advance()
+        rig.executor._do_terminate_request.assert_called_once_with(req)
+        assert not rig.hooks.is_tracking(req)
+
+        rig.executor._terminate_request(req)  # the deferred flush reaches the gate now
+        rig.executor._do_terminate_request.assert_called_once_with(req)
+        assert rig.hooks.on_request_finished(req) is True  # and once only: a fresh id after
+        assert rig.terminations() == 1
 
 
 class TestRecomputePauseProtection:
@@ -1295,8 +1387,12 @@ class TestCancelWhileParked:
         rig.advance(req)  # given back, planned again (retry budget)
         assert req.state == CONTEXT_INIT and not rig.hooks.is_tracking(req)
         assert self._cancel_pass(rig, req) is True
+        # The PLANNED retry record votes once more so the ranks release it together; the layer
+        # then terminates the request it held meanwhile.
+        assert rig.terminations() == 0 and rig.coord.held_request_ids() == {1}
+        rig.advance()
         rig.executor._do_terminate_request.assert_called_once_with(req)
-        assert rig.records() == []  # the PLANNED retry record is released with the request
+        assert rig.records() == []
         assert rig.coord.status_dump()["finished_pending"] == []
 
 
@@ -1407,7 +1503,7 @@ class TestHostFirstSchedulerSeam:
         assert rig.store.count("fetch_to_host") == 1 and rig.hooks.plan_fetch(req) is DEFER
         assert rig.kv.count("reserve_transfer_pages") == 0
         assert req.state == CONTEXT_INIT and not rig.hooks.is_tracking(req)
-        assert rig.hooks.has_transfer_in_flight()  # a landing paces the idle loop ...
+        assert rig.hooks.has_pending_work()  # a landing paces the idle loop ...
         assert rig.hooks.inflight_request_ids() == frozenset()  # ... but protects no page
         assert [r["state"] for r in rig.records()] == ["STAGING"]
         assert rig.executor._try_cancel_request(req) is True  # not parked: cancellable
@@ -1444,15 +1540,19 @@ class TestHostFirstSchedulerSeam:
         assert landing.releases == 1 and not rig.hooks.is_tracking(req)
         assert [r["state"] for r in rig.records()] == ["LANDED"]
 
-    def test_request_finished_while_staging_is_not_held_and_releases_at_once(self):
+    def test_request_finished_while_staging_releases_the_landing_at_once_then_terminates(self):
+        """The landing names no page and goes now; the record stays one round to vote so every
+        rank terminates the request together, and the layer terminates it with the agreement."""
         rig = Rig(host_first=True)
         req = make_request(1, 100)
         rig.advance(req)
         landing = rig.store.landings[0]
         rig.executor._terminate_request(req)
-        rig.executor._do_terminate_request.assert_called_once_with(req)  # not held
-        assert rig.coord.held_request_ids() == frozenset()
-        assert landing.releases == 1 and rig.records() == []
-        assert rig.reader.forgotten == [1]
+        assert rig.terminations() == 0 and rig.coord.held_request_ids() == {1}
+        assert landing.releases == 1 and not rig.coord.has_inflight()
+        assert rig.hooks.has_pending_work()  # held: the loop must not sleep on its queue
+        rig.advance()
+        rig.executor._do_terminate_request.assert_called_once_with(req)
+        assert rig.records() == [] and rig.reader.forgotten == [1]
         rig.advance()
         assert rig.terminations() == 1

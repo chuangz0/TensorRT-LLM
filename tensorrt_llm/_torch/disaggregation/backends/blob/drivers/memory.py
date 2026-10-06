@@ -38,7 +38,8 @@ class MemoryBlobStore:
     """``BlobStore`` over a dictionary. ``objects`` and ``registered`` are open for tests to read.
 
     Segments must lie inside a registered span, as they must for a store that reaches memory over
-    a transport; a key whose segments do not is ``FAILED`` and nothing is copied.
+    a transport; a key whose segments do not is ``FAILED`` and nothing is copied. A put of a key
+    already held keeps the first object and still answers ``STORED``, as a Mooncake master does.
     """
 
     def __init__(self) -> None:
@@ -68,7 +69,7 @@ class MemoryBlobStore:
                 continue
             data = b"".join(ctypes.string_at(address, size) for address, size in segments)
             with self._lock:
-                self.objects[key] = data
+                self.objects.setdefault(key, data)
             results.append(PutStatus.STORED)
         return results
 

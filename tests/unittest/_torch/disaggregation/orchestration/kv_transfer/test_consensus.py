@@ -8,7 +8,8 @@ Covers the one reduction of design §7.1 "齐" over the four vote kinds: an INFL
 the round, then any FAILED is decisive for every rank, then an UNLAUNCHED vote holds a landing,
 else the landing takes MIN(B) and MIN(hint). Plan answers become DEFER if any rank defers, None
 on any disagreement about ``(token_end, source)``, the plan when identical. A record of a
-finished request casts no vote and settles on its own rank.
+finished request keeps voting until the ranks agree, so every rank terminates the request in
+the same round; a record past its deadline is rank-local and settles on its own outcome.
 """
 
 import pytest
@@ -194,8 +195,17 @@ def test_gen_init_expiry_on_one_rank_fails_every_rank(world):
         rig.coord.launch_fetches([req], 5.0 if rank == DIVERGENT else 0.0)
     advance_all(world, rigs, [], 10.0)
     for rig in rigs:
+        # Every rank fails the request in this round; the pages stay held while the attempt may
+        # still write them, and no attempt is quiesced while live.
         assert rig.effects.only("fail_requests") == [((req,), "kv fetch timed out")]
-        assert rig.records() == []
+        assert rig.effects.count("hold_for_transfer") == 1 and rig.worker.count("quiesce") == 0
+        assert rig.record(7)["state"] == "IN_FLIGHT" and rig.record(7)["expired"]
+    for rig in rigs:
+        rig.worker.attempts[-1].deliver_all()
+    advance_all(world, rigs, [], 11.0)
+    for rig in rigs:
+        assert rig.records() == [] and rig.effects.count("terminate_request") == 1
+        assert rig.effects.count("unpark") == 0
 
 
 def test_finished_request_crossing_its_deadline_on_one_rank_fails_nothing(world):
@@ -206,13 +216,16 @@ def test_finished_request_crossing_its_deadline_on_one_rank_fails_nothing(world)
         rig.coord.launch_fetches([req], 5.0 if rank == DIVERGENT else 0.0)  # deadlines 15 / 10
     attempts = [rig.worker.attempts[-1] for rig in rigs]
     for rig in rigs:
-        rig.coord.notify_request_finished(req)
+        rig.coord.notify_request_finished(req, 6.0)
     advance_all(world, rigs, [], 10.0)  # the full ranks are past their deadline, rank 1 is not
-    for rig in rigs:
+    for rank, rig in enumerate(rigs):
         assert rig.effects.count("give_back_fetch_pages") == 0
         assert rig.effects.count("fail_requests") == 0
-        assert rig.record(1)["state"] == "IN_FLIGHT"
-        assert rig.payloads()[-1][:2] == ([], [])  # a finished request neither votes nor expires
+        # A finished fetch still votes; the full ranks report the expiry, and the broadcast
+        # makes every rank's record rank-local from here on.
+        assert votes_of(rig) == [(KEY, "INFLIGHT", 0, 0)]
+        assert rig.payloads()[-1][1] == ([] if rank == DIVERGENT else [KEY])
+        assert rig.record(1)["state"] == "IN_FLIGHT" and rig.record(1)["expired"]
     for a in attempts:
         a.deliver_all()
     advance_all(world, rigs, [], 11.0)
@@ -243,16 +256,23 @@ def test_retry_after_min_b_lands_on_every_rank(world):
 
 
 def test_unlaunched_clock_does_not_start_while_no_rank_has_launched(world):
-    rigs = make_rigs(world)
+    """No peer has launched, so the unlaunched clock never starts; the wait for pages is
+    bounded by every rank's own wait clock instead, and runs out on all of them alike."""
+    rigs = make_rigs(world, landing_wait_timeout_s=30.0)
     req = worker_request()
     advance_all(world, rigs, [req], 0.0)
     advance_all(world, rigs, [], 1.0)  # nobody could reserve pages this round
-    advance_all(world, rigs, [], 1e6)
+    advance_all(world, rigs, [], 29.9)
     for rig in rigs:
         assert votes_of(rig) == [(KEY, "UNLAUNCHED", 0, 0)]
         assert rig.fetch_record(1).peer_launched_at is None
         assert isinstance(rig.coord.plan_fetch(req), FetchPlan)  # still waiting for pages
         assert rig.effects.count("fail_requests") == 0
+    advance_all(world, rigs, [], 30.0)
+    for rig in rigs:
+        assert votes_of(rig) == [(KEY, "FAILED", 0, 0)]
+        assert rig.fetch_record(1).plan is None and rig.fetch_record(1).retries_left == 0
+        assert rig.effects.calls == []  # nothing launched: nothing to give back or fail
 
 
 def test_unlaunched_rank_holds_the_landing_until_it_launches_too(world):
@@ -409,7 +429,7 @@ def test_expiry_on_a_launched_rank_fails_and_releases_the_unlaunched_rank_at_onc
     laggard = rigs[DIVERGENT]
     assert laggard.records() == [] and laggard.effects.count("hold_for_transfer") == 0
     for rig in peers(rigs):
-        assert rig.record(1)["state"] == "IN_FLIGHT" and rig.record(1)["abandoned"] is True
+        assert rig.record(1)["state"] == "IN_FLIGHT" and rig.record(1)["expired"]
         assert rig.effects.count("hold_for_transfer") == 1 and rig.coord.has_inflight()
 
     for a in running:
@@ -489,20 +509,76 @@ def test_publish_rejected_piece_on_one_rank_waits_for_every_running_publish(worl
         assert rig.effects.calls == []  # the request is still running: nothing to tell it
 
 
-def test_publish_of_a_finished_request_settles_on_its_rank_without_the_others(world):
+def test_publish_rejected_on_one_rank_fails_the_publish_on_every_rank(world):
+    """Rank 1's publisher refused the blocks: the store is missing its layer group, so the
+    publish has failed for every rank. Its FAILED vote is cast at once and lands as soon as the
+    peers' attempts are over, instead of waiting for rank 1's request to end."""
+    rigs = make_publishing_rigs(world)
+    req = FakeRequest(3, prompt_len=29)
+    rigs[DIVERGENT].publishers[0].reject_methods.update({"publish", "place"})
+    for rig in rigs:
+        rig.coord.publish_committed_blocks([req], now=0.0)
+    assert rigs[DIVERGENT].publishers[0].attempts == []
+    advance_all(world, rigs, [], 1.0)
+    assert votes_of(rigs[DIVERGENT]) == [((3, "publish"), "FAILED", 0, 0)]
+    for rig in peers(rigs):  # still running: no verdict quiesces under them
+        assert votes_of(rig) == [((3, "publish"), "INFLIGHT", 0, 0)]
+        assert rig.record(3, "publish")["state"] == "IN_FLIGHT"
+    for rig in peers(rigs):
+        rig.publishers[0].attempts[0].deliver_all()
+    advance_all(world, rigs, [], 2.0)
+    for rig in rigs:
+        assert rig.records() == [] and rig.effects.calls == []  # running: a warning only
+    assert all(rig.publishers[0].count("quiesce") == 1 for rig in peers(rigs))
+    assert rigs[DIVERGENT].publishers[0].count("quiesce") == 0
+
+
+def test_publish_of_a_finished_request_terminates_on_every_rank_in_the_same_round(world):
+    """The publishes end in different rounds; the held request is terminated nowhere until
+    every rank's has, then everywhere at once, so the ranks free the pages in step."""
     rigs = make_publishing_rigs(world)
     req = FakeRequest(3, prompt_len=29)
     for rig in rigs:
         rig.coord.publish_committed_blocks([req], now=0.0)
-        rig.coord.notify_request_finished(req)
+        rig.coord.notify_request_finished(req, 0.0)
         assert rig.effects.names() == ["hold_for_transfer"]
     rigs[0].publishers[0].attempts[0].deliver_all()
     advance_all(world, rigs, [], 1.0)
-    assert rigs[0].records() == [] and votes_of(rigs[0]) == []
-    assert rigs[0].effects.names() == ["hold_for_transfer", "terminate_request"]
+    assert votes_of(rigs[0]) == [((3, "publish"), "TERMINAL", 0, 0)]
     for rig in rigs[1:]:
+        assert votes_of(rig) == [((3, "publish"), "INFLIGHT", 0, 0)]
+    for rig in rigs:
         assert rig.record(3, "publish")["state"] == "IN_FLIGHT"
         assert rig.effects.count("terminate_request") == 0
+    for rig in rigs[1:]:
+        for attempt in rig.publishers[0].attempts:
+            attempt.deliver_all()
+    advance_all(world, rigs, [], 2.0)
+    for rig in rigs:
+        assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
+        assert rig.records() == [] and rig.publishers[0].count("quiesce") == 1
+
+
+def test_publish_verdict_reaches_a_rank_whose_request_has_not_ended_yet():
+    """Two ranks whose requests end in different rounds: the agreement releases both publish
+    records at once; the rank already finished is terminated here, the other has nothing to
+    hold once its request ends and terminates as usual."""
+    world = LockstepWorld(2)
+    rigs = make_publishing_rigs(world)
+    req = FakeRequest(3, prompt_len=29)
+    for rig in rigs:
+        rig.coord.publish_committed_blocks([req], now=0.0)
+        for attempt in rig.publishers[0].attempts:
+            attempt.deliver_all()
+    rigs[0].coord.notify_request_finished(req, 0.5)
+    assert rigs[0].effects.names() == ["hold_for_transfer"]
+    advance_all(world, rigs, [], 1.0)
+    assert rigs[0].effects.names() == ["hold_for_transfer", "terminate_request"]
+    assert rigs[1].effects.names() == []
+    for rig in rigs:
+        assert rig.records() == [] and rig.publishers[0].count("quiesce") == 1
+    assert rigs[1].coord.notify_request_finished(req, 2.0) is True
+    assert rigs[1].effects.names() == []
 
 
 # ---- plan answers ----
@@ -668,6 +744,36 @@ def test_a_placed_rank_waits_for_a_rank_without_pages_and_a_wait_timeout_fails_b
         assert rig.coord.plan_fetch(req) is DEFER and rig.effects.count("fail_requests") == 0
 
 
+def test_staged_ranks_wait_on_the_landing_clock_not_the_unlaunched_clock():
+    """Rank 1 was refused landing memory while rank 0 landed, so its unlaunched clock started;
+    once its landing is granted and both are STAGED, that clock is off: two ranks waiting for
+    pages alike are bounded by ``landing_wait_timeout_s``, not by ``unlaunched_timeout_s``."""
+    world = LockstepWorld(2)
+    rigs = make_host_rigs(world, landing_wait_timeout_s=30.0)
+    req = host_request()
+    rigs[DIVERGENT].host.reject_next = 1
+    advance_all(world, rigs, [req], 0.0)
+    rigs[0].host.landings[-1].deliver_all()
+    loop_advance_all(world, rigs, req, 1.0)  # rank 1's clock starts here, and it is granted
+    assert rigs[DIVERGENT].record(1)["state"] == "STAGING"
+    assert rigs[DIVERGENT].fetch_record(1).peer_launched_at is None
+    rigs[DIVERGENT].host.landings[-1].deliver_all()
+    advance_all(world, rigs, [], 2.0)
+    for rig in rigs:
+        assert rig.record(1)["state"] == "STAGED" and rig.fetch_record(1).peer_launched_at is None
+
+    advance_all(world, rigs, [], 2.0 + UNLAUNCHED_TIMEOUT_S)  # no pages anywhere
+    for rig in rigs:
+        assert votes_of(rig) == [(KEY, "UNLAUNCHED", 0, 0)]
+        assert (
+            rig.record(1)["state"] == "STAGED" and rig.effects.count("give_back_fetch_pages") == 0
+        )
+    advance_all(world, rigs, [], 2.0 + 30.0)  # 30 s since both were staged
+    for rig in rigs:
+        assert votes_of(rig) == [(KEY, "FAILED", 0, 0)]
+        assert rig.fetch_record(1).plan is None and rig.host.releases() == 1
+
+
 def test_a_rank_refused_landing_memory_holds_the_landing_of_the_others(world):
     rigs = make_host_rigs(world)
     req = host_request()
@@ -700,7 +806,7 @@ def test_expiry_while_placing_on_one_rank_fails_every_rank(world):
     for rig in peers(rigs):  # nothing in the pages: released at once, not held
         assert rig.records() == [] and rig.effects.count("hold_for_transfer") == 0
     laggard = rigs[DIVERGENT]
-    assert laggard.record(1)["state"] == "IN_FLIGHT" and laggard.record(1)["abandoned"]
+    assert laggard.record(1)["state"] == "IN_FLIGHT" and laggard.record(1)["expired"]
     assert laggard.effects.count("hold_for_transfer") == 1
     laggard.host.attempts[-1].deliver_all()
     advance_all(world, rigs, [], 13.0)

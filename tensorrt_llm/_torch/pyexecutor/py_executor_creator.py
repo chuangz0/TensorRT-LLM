@@ -1203,7 +1203,7 @@ def _create_py_executor(
         logger.info(f"LLM Args:\n{llm_args}")
 
     if os.environ.get("TRTLLM_KV_TRANSFER_CONFIG"):
-        # Plan §5 #13, design §7.4: assemble the KV transfer layer once, before the loop starts.
+        # Assemble the KV transfer layer once, before the loop starts.
         from .kv_transfer.assembly import attach_kv_transfer
         attach_kv_transfer(py_executor,
                            os.environ["TRTLLM_KV_TRANSFER_CONFIG"],

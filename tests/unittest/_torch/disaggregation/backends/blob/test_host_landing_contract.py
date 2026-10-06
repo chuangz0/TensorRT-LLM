@@ -151,6 +151,29 @@ def test_place_of_a_unit_the_landing_did_not_serve_fails_without_touching_memory
         landing.release()
 
 
+def test_place_of_a_unit_whose_pages_differ_in_size_from_the_landed_bytes_fails():
+    """A landing remembers each unit's byte size; a placement whose pages for that unit add up to
+    another size is refused before anything moves, rather than scattering a 64 B object over 80 B
+    of pages."""
+    store = FakeBlobStore()
+    direct, theirs = _published(store, 1)
+    with direct, make_host_rank(store) as rank:
+        (a,) = _mirror(rank, theirs)
+        landing = rank.land([a])
+        rank.resolver.add(1, 0, 32, 48)  # the same name resolving to 80 B of pages elsewhere
+        wider = Unit(name=a.name, local_group=1, local=0)
+        rank.fill(wider, 0xEE)
+        outcome = landing.place(extent([wider])).poll()  # decided at submission
+        assert isinstance(outcome, Failed)
+        assert f"unit {a.name.hex()} landed as 64 B but resolves to 80 B" in outcome.reason
+        assert rank.landing_copier.copies == [] and rank.read(wider) == bytes([0xEE]) * 80
+        assert rank.backend.counters.failed_attempts == 1
+        assert rank.backend.landings_held() == 1  # still placeable, at the size it landed with
+        assert rank.place(landing, [a]) == Delivered(frozenset({a.name}))
+        landing.release()
+        assert rank.free_landing_slots() == 4
+
+
 def test_place_before_the_landing_has_content_is_rejected():
     with make_host_rank() as rank:
         a = rank.unit(0, 0, UNIT)
@@ -329,23 +352,52 @@ def test_release_while_the_get_is_in_flight_returns_the_slots_after_it():
         assert rank.read(a) == bytes([0xEE]) * UNIT
 
 
+def test_release_during_an_in_flight_placement_returns_slots_after_the_copy():
+    """The slots are the copy's source: a release while a placement is still copying out of
+    them takes effect once the copy has landed, not before, so the pool cannot hand them to the
+    next landing mid-copy."""
+    store = FakeBlobStore()
+    direct, theirs = _published(store, 1)
+    with direct, make_host_rank(store, landing_slots=1) as rank:
+        (a,) = _mirror(rank, theirs)
+        landing = rank.land([a])
+        rank.landing_copier.block("copy")
+        placing = landing.place(extent([a]))
+        rank.landing_copier.wait_entered(1)  # the worker is inside the copy
+        start = time.monotonic()
+        landing.release()
+        assert time.monotonic() - start < 0.5  # did not wait for the copy
+        assert rank.free_landing_slots() == 0  # the copy still reads the slot
+        with pytest.raises(SubmissionRejected, match="no content"):
+            landing.place(extent([a]))  # released: nothing more may be placed
+        waiting = rank.backend.fetch_to_host(b"next", [a.name])  # wants the one slot
+        assert waiting.poll() is None
+        rank.landing_copier.unblock()
+        assert rank.finish(placing) == Delivered(frozenset({a.name}))
+        assert rank.read(a) == pattern(1, UNIT)
+        # The slot came back after the copy and went to the queued landing, nowhere earlier.
+        wait_until(lambda: waiting.poll() is not None, what="the next landing")
+        assert waiting.poll() == Delivered(frozenset({a.name}))
+        assert rank.backend.landings_held() == 1  # ``waiting``; the released one is gone
+        waiting.release()
+        assert rank.free_landing_slots() == 1
+
+
 def test_queue_wait_past_the_bound_fails_the_landing_and_dequeues_it():
     store = FakeBlobStore()
     direct, theirs = _published(store, 2)
-    with direct, make_host_rank(store, landing_slots=1, landing_wait_timeout_s=0.05) as rank:
+    with direct, make_host_rank(store, landing_slots=1, landing_wait_timeout_s=30.0) as rank:
         a, b = _mirror(rank, theirs)
         first = rank.land([a])
         second = rank.backend.fetch_to_host(b"b", [b.name])
         assert second.poll() is None
-        time.sleep(0.1)
+        second.enqueued_at -= 31.0  # queued "half a minute ago": past the bound
         outcome = second.poll()  # the bound is checked here, on the caller's clock
-        assert isinstance(outcome, Failed) and "waited" in outcome.reason
+        assert isinstance(outcome, Failed) and "waited 30 s" in outcome.reason
         assert rank.backend.counters.failed_attempts == 0  # a wait, not a store failure
         lookups = rank.store.count("holds")
-        first.release()
-        time.sleep(0.05)
-        assert rank.store.count("holds") == lookups  # the failed landing was not dispatched
-        assert rank.free_landing_slots() == 1
+        first.release()  # the slot comes back; a dispatch would take it at once, on this thread
+        assert rank.free_landing_slots() == 1 and rank.store.count("holds") == lookups
         second.release()  # nothing to give back; no error
 
 

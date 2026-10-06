@@ -88,6 +88,7 @@ def test_launch_opens_route_fetches_and_parks():
     rig = Rig()
     req = worker_request()
     attempt = rig.plan_and_launch(req)
+    assert rig.fetch_record(1).waiting_since is None  # the wait for pages ended at the launch
     assert rig.effects.names() == ["prepare_fetch_resources", "park_for_fetch"]
     assert rig.effects.only("park_for_fetch") == [((req,),)]
     assert [m for m, _ in rig.worker.calls] == ["open_route", "fetch"]
@@ -180,7 +181,7 @@ def test_request_end_while_in_flight_abandons_then_releases_on_outcome(late):
     # request so its pages stay put until the backend is done with them.
     assert rig.worker.count("quiesce") == 0
     rec = rig.record(1)
-    assert rec["state"] == "IN_FLIGHT" and rec["abandoned"] is True
+    assert rec["state"] == "IN_FLIGHT"
     assert rig.worker.routes[0].closed == 0
     assert rig.effects.names()[-1:] == ["hold_for_transfer"]
     assert rig.effects.only("hold_for_transfer") == [((req,),)]
@@ -355,19 +356,25 @@ def test_transport_error_and_rejection_alternation_is_bounded(gen_init):
         assert rig.effects.count("fail_requests") == 0
 
 
-def test_quiesce_false_at_request_end_is_fatal_and_keeps_the_record():
+def test_quiesce_false_at_release_gate_holds_the_request():
+    """The backend cannot vouch for the pages: fatal, and the request is held so the engine does
+    not free them; the poisoned record is never asked about again and never released."""
     rig = Rig()
     req = worker_request()
     attempt = rig.plan_and_launch(req)
     attempt.deliver_all()
     rig.coord.advance([], 1.0)
     rig.worker.quiesce_answers.append(False)
-    rig.coord.notify_request_finished(req)
+    assert rig.coord.notify_request_finished(req, 2.0) is False
     assert rig.effects.count("fail_fatal") == 1
-    assert rig.effects.count("hold_for_transfer") == 0
+    assert rig.effects.only("hold_for_transfer") == [((req,),)]
     assert rig.effects.count("terminate_request") == 0
     assert rig.record(1)["state"] == "LANDED"
+    assert rig.coord.held_request_ids() == {1} and rig.coord.inflight_request_ids() == {1}
     assert rig.coord.status_dump()["finished_pending"] == [1]
+    rig.coord.advance([], 3.0)
+    assert rig.worker.count("quiesce") == 1 and rig.effects.count("terminate_request") == 0
+    assert rig.record(1)["state"] == "LANDED" and rig.payloads()[-1][0] == []
 
 
 # ---- open_route failures ----
@@ -549,6 +556,13 @@ def test_quiesce_false_is_fatal_and_pages_are_not_given_back():
     assert rig.effects.count("give_back_fetch_pages") == 0
     assert rig.record(1)["state"] == "FAILED"
     assert rig.worker.routes[0].closed == 0
+    # The refusal is final: the request's end holds the request without asking the backend
+    # again or making the engine fatal twice.
+    assert rig.coord.notify_request_finished(req, 2.0) is False
+    assert rig.worker.count("quiesce") == 1 and rig.effects.count("fail_fatal") == 1
+    assert rig.effects.names()[-1:] == ["hold_for_transfer"]
+    rig.coord.advance([], 3.0)
+    assert rig.worker.count("quiesce") == 1 and rig.effects.count("terminate_request") == 0
 
 
 # ---- SubmissionRejected ----
@@ -582,7 +596,9 @@ def test_submission_rejected_gives_back_without_quiesce_or_retry_cost():
 # ---- expiry ----
 
 
-def test_gen_init_expiry_fails_the_request():
+def test_gen_init_expiry_fails_the_request_and_holds_its_pages_until_the_outcome():
+    """A gen-init fetch expires like any other: the request fails now, the pages stay held
+    while the attempt may still write them, and the late outcome only releases."""
     rig = Rig(fetch_timeout_s=10.0)
     req = FakeRequest(7, prompt_len=30, is_gen_init=True, route_hints={"ctx": {"peer": "c"}})
     attempt = rig.plan_and_launch(req, now=0.0)
@@ -590,14 +606,17 @@ def test_gen_init_expiry_fails_the_request():
     rig.coord.advance([], 9.9)
     assert rig.effects.count("fail_requests") == 0
     rig.coord.advance([], 10.0)
-    q, gb = quiesce_indices(rig.trace), effect_indices(rig.trace, "give_back_fetch_pages")
-    assert len(q) == 1 and q[0] < gb[0]
+    assert rig.worker.count("quiesce") == 0 and rig.effects.count("give_back_fetch_pages") == 0
+    assert rig.effects.names()[-2:] == ["fail_requests", "hold_for_transfer"]
     assert rig.effects.only("fail_requests") == [((req,), "kv fetch timed out")]
-    assert rig.records() == [] and rig.coord.plan_fetch(req) is None
-    # A late delivery is dropped.
+    rec = rig.record(7)
+    assert rec["state"] == "IN_FLIGHT" and rec["expired"]
+    # The late delivery lands nothing: the release point, then the held request is terminated.
     attempt.deliver_all()
     rig.coord.advance([], 11.0)
-    assert rig.effects.count("unpark") == 0
+    assert rig.worker.count("quiesce") == 1 and rig.effects.count("unpark") == 0
+    assert rig.effects.names()[-1:] == ["terminate_request"]
+    assert rig.records() == [] and rig.coord.plan_fetch(req) is DEFER
 
 
 def test_gen_init_failure_does_not_retry():
@@ -625,7 +644,7 @@ def test_normal_fetch_expiry_fails_the_request_and_holds_its_pages_until_the_out
     attempt = rig.plan_and_launch(req, now=0.0)
     rig.coord.advance([], 10.0)
     rec = rig.record(1)
-    assert rec["state"] == "IN_FLIGHT" and rec["abandoned"] is True
+    assert rec["state"] == "IN_FLIGHT" and rec["expired"]
     assert rig.effects.names() == [
         "prepare_fetch_resources",
         "park_for_fetch",
@@ -647,7 +666,7 @@ def test_no_timeout_means_no_deadline():
     rig.plan_and_launch(req, now=0.0)
     rig.coord.advance([], 1e9)
     rec = rig.record(1)
-    assert rec["deadline"] is None and rec["abandoned"] is False
+    assert rec["deadline"] is None and rec["expired"] is False
 
 
 # ---- publish ----
@@ -717,30 +736,107 @@ def test_publish_failure_after_request_end_terminates_the_held_request():
     assert rig.records() == []
 
 
-def test_publish_expiry_terminates_the_held_request():
+def test_publish_expiry_warns_and_waits_for_the_outcome():
+    """A publish past its deadline is never quiesced under its live attempt: the record is
+    marked expired, and the outcome settles it on this rank alone."""
     pub = FakePublishes()
     rig = Rig(publishers=[pub], publish_timeout_s=5.0)
     req = FakeRequest(3, prompt_len=29)
     rig.coord.publish_committed_blocks([req], now=0.0)
-    rig.coord.notify_request_finished(req)
+    rig.coord.notify_request_finished(req, 0.0)
     rig.coord.advance([], 5.0)
+    assert rig.effects.names() == ["hold_for_transfer"]
+    assert pub.count("quiesce") == 0
+    rec = rig.record(3, "publish")
+    assert rec["state"] == "IN_FLIGHT" and rec["expired"]
+    rig.coord.advance([], 6.0)
+    assert rig.payloads()[-1] == ([], [], [])  # expired: no longer the ranks' business
+    pub.attempts[0].deliver_all()
+    rig.coord.advance([], 7.0)
     assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
     assert rig.effects.count("fail_requests") == 0
     assert pub.count("quiesce") == 1 and rig.records() == []
 
 
-def test_publish_rejected_outright_owes_the_finished_request_nothing():
+def test_publish_deadline_counts_from_the_first_accepted_submission():
+    pub = FakePublishes()
+    rig = Rig(publishers=[pub], publish_timeout_s=5.0)
+    req = FakeRequest(3, prompt_len=29)
+    rig.reader.script_publish(req, [(range(0, 4), False, None), (range(4, 7), True, None)])
+    rig.coord.publish_committed_blocks([req], now=0.0)  # a plain publisher hears only the last
+    assert rig.record(3, "publish")["deadline"] is None
+    rig.coord.publish_committed_blocks([req], now=3.0)
+    assert rig.record(3, "publish")["deadline"] == 8.0
+    rig.coord.advance([], 7.9)
+    assert rig.record(3, "publish")["expired"] is False
+    rig.coord.advance([], 8.0)
+    assert rig.record(3, "publish")["expired"] is True
+
+
+def test_publish_rejected_outright_votes_failed_and_terminates_with_the_agreement():
+    """Nothing escaped here, but a peer's publish may be in flight and the store is missing
+    this rank's part: the record stays to vote FAILED, and the request is terminated with the
+    agreement, in the same round everywhere."""
     pub = FakePublishes()
     rig = Rig(publishers=[pub])
     req = FakeRequest(3, prompt_len=29)
     pub.reject_next = 1
     rig.coord.publish_committed_blocks([req], now=0.0)
-    rig.coord.notify_request_finished(req)
+    assert rig.coord.notify_request_finished(req, 0.0) is False
     assert pub.attempts == [] and pub.count("quiesce") == 0  # nothing escaped, nothing to quiesce
-    # Nothing was ever offered: not held, so the engine terminates it through its own release
-    # gate; the record is gone.
-    assert rig.effects.calls == []
+    assert rig.effects.names() == ["hold_for_transfer"]
+    assert rig.record(3, "publish")["state"] == "PLANNED"
+    rig.coord.advance([], 1.0)
+    assert rig.payloads()[-1][0] == [((3, "publish"), "FAILED", 0, 0)]
+    assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
+    assert pub.count("quiesce") == 0
     assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
+
+
+def test_publish_rejected_while_the_request_runs_votes_failed_and_is_released():
+    """A running request's refused publish does not wait for its end: it votes FAILED, so a
+    peer's in-flight publish is failed too instead of waiting on this rank's silence."""
+    pub = FakePublishes()
+    rig = Rig(publishers=[pub])
+    req = FakeRequest(3, prompt_len=29)
+    pub.reject_next = 1
+    rig.coord.publish_committed_blocks([req], now=0.0)
+    rig.coord.advance([], 1.0)
+    assert rig.payloads()[-1][0] == [((3, "publish"), "FAILED", 0, 0)]
+    assert rig.records() == [] and rig.effects.calls == []  # a warning is the only word
+    assert rig.coord.notify_request_finished(req, 2.0) is True
+
+
+def test_publish_never_submitted_owes_the_finished_request_nothing():
+    """A plain publisher hears only the last piece; a request cancelled before it has nothing
+    in flight on any rank, so the record goes at once and the engine terminates as usual."""
+    pub = FakePublishes()
+    rig = Rig(publishers=[pub])
+    req = FakeRequest(3, prompt_len=29)
+    rig.reader.script_publish(req, [(range(0, 4), False, None), (range(4, 7), True, None)])
+    rig.coord.publish_committed_blocks([req], now=0.0)
+    assert rig.coord.notify_request_finished(req, 1.0) is True
+    assert rig.effects.calls == [] and pub.calls == []
+    assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
+
+
+def test_quiesce_false_publish_record_is_not_released_without_quiesce():
+    """A publish whose backend refused to vouch for the pages keeps its record and its pages:
+    the request's end does not release it, and nothing is agreed on it again."""
+    pub = FakePublishes()
+    rig = Rig(publishers=[pub])
+    req = FakeRequest(3, prompt_len=29)
+    rig.coord.publish_committed_blocks([req], now=0.0)
+    pub.attempts[0].deliver_all()
+    pub.quiesce_answers.append(False)
+    rig.coord.advance([], 1.0)
+    assert rig.effects.only("fail_fatal") and rig.record(3, "publish")["state"] == "LANDED"
+    assert rig.coord.inflight_request_ids() == {3}
+    assert rig.coord.notify_request_finished(req, 2.0) is False
+    assert rig.effects.names() == ["fail_fatal", "hold_for_transfer"]
+    rig.coord.advance([], 3.0)
+    assert pub.count("quiesce") == 1 and rig.record(3, "publish")["state"] == "LANDED"
+    assert rig.effects.count("terminate_request") == 0
 
 
 def test_partial_publish_rejection_terminates_the_held_request_at_next_reap():
@@ -797,7 +893,9 @@ def test_failed_intermediate_piece_is_reported_before_is_last():
     assert rig.effects.calls == []  # request still running: nothing to tell the engine yet
 
 
-def test_publish_deadline_expires_with_terminal_intermediate_pieces():
+def test_publish_with_terminal_intermediate_pieces_settles_when_the_request_ends():
+    """No piece was ever the last one: the record stays in flight (more pieces may come) past
+    its deadline too; the request's end says no more will, and the pieces so far settle it."""
     placing = FakePlacingPublishes()
     rig = Rig(publishers=[placing], publish_timeout_s=5.0)
     req = FakeRequest(3, prompt_len=29)
@@ -810,9 +908,13 @@ def test_publish_deadline_expires_with_terminal_intermediate_pieces():
     rig.coord.advance([], 4.0)
     assert rig.record(3, "publish")["state"] == "IN_FLIGHT"  # every piece so far landed, not last
     rig.coord.advance([], 5.0)
-    # Timed out: quiesced and released although no piece was ever the last one.
-    assert placing.count("quiesce") == 1 and rig.records() == []
+    assert rig.record(3, "publish")["expired"] and placing.count("quiesce") == 0
     assert rig.effects.calls == []  # request still running: the warning is the only word
+    rig.coord.notify_request_finished(req, 6.0)
+    assert rig.effects.names() == ["hold_for_transfer"]
+    rig.coord.advance([], 7.0)
+    assert placing.count("quiesce") == 1 and rig.records() == []
+    assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
 
 
 def test_publish_rejected_while_fetch_in_flight_terminates_once_the_fetch_releases():
@@ -822,14 +924,15 @@ def test_publish_rejected_while_fetch_in_flight_terminates_once_the_fetch_releas
     attempt = rig.plan_and_launch(req)
     pub.reject_next = 1
     rig.coord.publish_committed_blocks([req], now=1.0)
-    rig.coord.notify_request_finished(req)
-    # The publish verdict waits: the fetch still names the pages.
+    rig.coord.notify_request_finished(req, 1.0)
+    # Both records wait for the agreement: the fetch still names the pages, the refused
+    # publish votes FAILED meanwhile.
     assert rig.effects.names()[-1:] == ["hold_for_transfer"]
     assert rig.effects.count("fail_requests") == 0
-    assert rig.record(1, "publish") is None and rig.record(1)["abandoned"] is True
+    assert rig.record(1, "publish")["state"] == "PLANNED" and rig.record(1)["state"] == "IN_FLIGHT"
     attempt.deliver_all()
     rig.coord.advance([], 2.0)
-    assert rig.worker.count("quiesce") == 1
+    assert rig.worker.count("quiesce") == 1 and pub.count("quiesce") == 0
     assert rig.effects.names()[-1:] == ["terminate_request"]
     assert rig.effects.count("fail_requests") == 0
     assert rig.effects.count("unpark") == 0
@@ -1044,6 +1147,24 @@ def test_peer_not_reporting_an_arrival_keeps_it_in_flight():
     assert rig.record(1)["state"] == "IN_FLIGHT" and rig.effects.count("unpark") == 0
 
 
+def test_consensus_wait_is_bounded_by_fetch_timeout():
+    """Two ranks; the peer's request is gone and it casts no vote on the record any more. The
+    delivered rank waits for the agreement until its deadline, then fails the request and
+    settles the record on its own word instead of waiting forever."""
+    rig = Rig(dist=PeerGather(lambda local: ([], [], local[2])), fetch_timeout_s=10.0)
+    req = worker_request()
+    rig.plan_and_launch(req, now=0.0).deliver_all()
+    rig.coord.advance([], 9.0)
+    assert rig.record(1)["state"] == "IN_FLIGHT" and rig.effects.count("fail_requests") == 0
+    rig.coord.advance([], 10.0)
+    assert rig.effects.only("fail_requests") == [((req,), "kv fetch timed out")]
+    assert rig.record(1)["expired"] and rig.effects.names()[-1:] == ["hold_for_transfer"]
+    rig.coord.advance([], 11.0)  # the outcome is in: nothing more to wait for
+    assert rig.payloads()[-1][0] == []
+    assert rig.worker.count("quiesce") == 1 and rig.effects.count("unpark") == 0
+    assert rig.effects.names()[-1:] == ["terminate_request"] and rig.records() == []
+
+
 def test_status_dump_shape():
     rig = Rig(fetch_timeout_s=10.0)
     req = worker_request()
@@ -1059,7 +1180,7 @@ def test_status_dump_shape():
             "attempts": 1,
             "outcomes": [],
             "deadline": 11.0,
-            "abandoned": False,
+            "expired": False,
             "token_end": END,
             "launch_gave_up": False,
             "peer_launched_at": None,
@@ -1461,24 +1582,83 @@ def test_staging_expiry_fails_the_request_and_releases_the_landing_at_once():
     assert landing.releases == 1 and rig.effects.names() == ["fail_requests"]
 
 
-def test_request_ending_while_staging_is_not_held_and_releases_the_landing_at_once():
+@pytest.mark.parametrize("stage", ["STAGING", "STAGED"])
+def test_request_ending_before_placement_releases_the_landing_and_votes_until_agreed(stage):
+    """The landing names no page and goes at once; the record stays one more round to vote
+    TERMINAL at the plan's target, so that a peer still delivering lands on its own word and
+    every rank terminates the request in the same round."""
     rig = host_rig()
     req = host_request()
-    landing = rig.plan_and_land(req)
-    rig.coord.notify_request_finished(req)
-    assert rig.effects.calls == [] and rig.coord.held_request_ids() == frozenset()
-    assert landing.releases == 1 and rig.records() == []
-    assert rig.host.count("quiesce") == 0  # nothing ever touched the pages
-    assert rig.coord.status_dump()["finished_pending"] == []
+    landing = land_and_stage(rig, req) if stage == "STAGED" else rig.plan_and_land(req)
+    assert rig.coord.notify_request_finished(req, 2.0) is False
+    assert landing.releases == 1 and rig.host.count("quiesce") == 0
+    assert rig.effects.names() == ["hold_for_transfer"]
+    rec = rig.record(1)
+    assert rec["state"] == stage and rec["has_landing"] is False
+    assert rig.coord.has_inflight() is False  # nothing runs for it any more
+    rig.coord.advance([], 3.0)
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", END, END)]
+    assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
+    assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
 
 
-def test_request_ending_while_staged_releases_the_landing_at_once():
-    rig = host_rig()
-    req = host_request()
-    landing = land_and_stage(rig, req)
-    rig.coord.notify_request_finished(req)
-    assert landing.releases == 1 and rig.records() == [] and rig.effects.calls == []
-    assert rig.host.count("quiesce") == 0  # nothing ever touched the pages
+def test_request_ending_while_planned_is_terminated_with_the_agreement():
+    """A planned fetch never launched here: no pages, nothing to quiesce; the record votes once
+    so a peer that did launch is not left without a verdict."""
+    rig = Rig()
+    req = worker_request()
+    rig.coord.advance([req], 0.0)
+    assert rig.coord.notify_request_finished(req, 1.0) is False
+    assert rig.effects.names() == ["hold_for_transfer"]
+    rig.coord.advance([], 2.0)
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", END, END)]
+    assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
+    assert rig.records() == [] and rig.worker.count("quiesce") == 0
+
+
+def test_request_failed_by_the_coordinator_answers_the_late_release_gate_once():
+    """The engine may terminate a failed request later than the failure (deferred under
+    attention DP); the coordinator, having terminated the held request itself meanwhile, tells
+    the gate once that the request is not the engine's to terminate again."""
+    rig = Rig(fetch_timeout_s=10.0)
+    req = worker_request()
+    attempt = rig.plan_and_launch(req, now=0.0)
+    rig.coord.advance([], 10.0)  # fails the request; the effects here never call the gate back
+    assert rig.effects.names()[-2:] == ["fail_requests", "hold_for_transfer"]
+    attempt.deliver_all()
+    rig.coord.advance([], 11.0)
+    assert rig.effects.only("terminate_request") == [(req,)]
+    assert rig.coord.notify_request_finished(req, 12.0) is False  # the engine's late gate
+    assert rig.coord.notify_request_finished(req, 13.0) is True  # a fresh request of that id
+    assert rig.effects.count("terminate_request") == 1
+
+
+def test_reserve_wait_of_a_device_direct_plan_spends_a_retry_then_computes_locally():
+    """The scheduler never finds pages for the plan (``launch_fetches`` is never called): the
+    wait is clocked from the plan's decision, the fetch is given up at the wait timeout, the
+    retry waits once more, and the request computes locally; the scheduler is never stalled."""
+    rig = Rig(landing_wait_timeout_s=5.0)
+    req = worker_request()
+    rig.coord.advance([req], 0.0)
+    assert isinstance(rig.coord.plan_fetch(req), FetchPlan)
+    assert rig.fetch_record(1).waiting_since == 0.0
+    loop_advance(rig, req, 4.9)
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "UNLAUNCHED", 0, 0)]
+    loop_advance(rig, req, 5.0)
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0, 0)]
+    rec = rig.fetch_record(1)
+    assert rec.retries_left == 0 and rec.plan is None and rec.waiting_since is None
+    assert rig.coord.plan_fetch(req) is DEFER and rig.effects.count("fail_requests") == 0
+
+    loop_advance(rig, req, 6.0)  # planned afresh; the wait starts over
+    assert isinstance(rig.coord.plan_fetch(req), FetchPlan)
+    assert rig.fetch_record(1).waiting_since == 6.0
+    loop_advance(rig, req, 10.9)
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "UNLAUNCHED", 0, 0)]
+    loop_advance(rig, req, 11.0)
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0, 0)]
+    assert rig.records() == [] and rig.coord.plan_fetch(req) is None
+    assert rig.effects.calls == [] and rig.worker.count("quiesce") == 0
 
 
 def test_landing_wait_timeout_spends_a_retry_at_each_wait_then_computes_locally():

@@ -106,10 +106,13 @@ class TransferRecord:
         attempts: Every attempt so far; several per publish when sent in pieces, accumulating
             across tries on retry.
         retries_left: Fetch only; a retry is allowed once when ``served`` came up short.
-        deadline: Monotonic time after which the record is expired; ``None`` means no timeout.
-        abandoned: Expired or cancelled. The transfer itself cannot be stopped; the record is
-            still polled to its outcome and then released. Fetch: suppresses further expiry;
-            publish: informational only, the deadline still fires.
+        deadline: Monotonic time after which the record expires; ``None`` means no timeout. Set
+            when a fetch is launched or lands on the host, when a publish's first submission is
+            accepted, and at the request's end for a record kept to vote without one.
+        expired: The deadline passed. The record no longer waits for the ranks' agreement: it is
+            settled on this rank as soon as its own attempts are over.
+        quiesce_refused: The backend could not vouch for the pages at the release point. The
+            engine is fatal; the record stays so the pages are never handed out again.
         retry_hint: Fetch only; the block boundary the next try may aim for at most: the merged
             B (``remote_cache.merge``) of the try whose ``served`` came up short.
         rejected: Publish only; some submission of this record raised ``SubmissionRejected``.
@@ -123,16 +126,19 @@ class TransferRecord:
             meanwhile. Cleared when the plan is dropped for a retry.
         peer_launched_at: Fetch only; when this rank, still unlaunched, first saw a vote other
             than ``UNLAUNCHED`` for the same record. Bounds how long an unlaunched rank may hold
-            the others up (``unlaunched_timeout_s``). Cleared when this rank launches or the plan
-            is dropped.
+            the others up (``unlaunched_timeout_s``). Cleared when this rank launches, when its
+            landing is accepted or complete (the wait for pages has its own clock), and when
+            the plan is dropped.
         landing: Host-first fetch only; the current try's ``Landing``, from ``fetch_to_host``
             until the coordinator releases it. Never among ``attempts``.
         committed_names: Fetch only; units the plan asked for that ``fetch_extent`` left out of
             the launched extent because the local cache had committed them meanwhile. They count
             as served when the delivery is merged.
-        waiting_since: Host-first fetch only; when this rank started waiting for something the
-            backend or the scheduler has yet to give: the landing memory (``fetch_to_host``
-            refused) or the pages (``STAGED``). Bounded by ``landing_wait_timeout_s``.
+        waiting_since: Fetch only; when this rank started waiting for something the scheduler
+            or the backend has yet to give: the pages (from the plan's decision for a
+            device-direct fetch, from ``STAGED`` for a host-first one) or the landing memory
+            (``fetch_to_host`` refused). Bounded by ``landing_wait_timeout_s``; cleared when
+            the wait ends.
     """
 
     request_id: int
@@ -143,7 +149,8 @@ class TransferRecord:
     attempts: list[AttemptRecord] = field(default_factory=list)
     retries_left: int = 1
     deadline: float | None = None
-    abandoned: bool = False
+    expired: bool = False
+    quiesce_refused: bool = False
     retry_hint: int | None = None
     rejected: bool = False
     consecutive_launch_failures: int = 0

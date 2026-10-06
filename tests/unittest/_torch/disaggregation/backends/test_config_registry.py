@@ -111,7 +111,7 @@ def test_plan_section_8_example_loads(tmp_path):
     assert not set(entry.options) & {"name", "type", "hint_key", "roles"}
 
 
-def test_minimal_entry_defaults_to_both_roles_and_no_timeouts(tmp_path):
+def test_minimal_entry_defaults_to_both_roles_and_finite_timeouts(tmp_path):
     config = load(
         tmp_path,
         """
@@ -120,10 +120,11 @@ def test_minimal_entry_defaults_to_both_roles_and_no_timeouts(tmp_path):
             type: fake
         """,
     )
-    assert config.fetch_timeout_s is None and config.publish_timeout_s is None
-    assert config.unlaunched_timeout_s == 30.0  # finite by default, unlike the fetch deadline
+    # Every wait on a peer or a store is bounded by default; ``null`` must be asked for.
+    assert config.fetch_timeout_s == 30.0 and config.publish_timeout_s == 60.0
+    assert config.unlaunched_timeout_s == 30.0
     assert config.landing_wait_timeout_s == 30.0
-    assert config.probe_timeout_s == 0.05
+    assert config.probe_timeout_s == 1.0
     assert config.backends[0].roles == frozenset(BACKEND_ROLES)
     assert config.backends[0].options == {}
 
@@ -433,11 +434,22 @@ def mooncake_module(monkeypatch):
     def open_fake(config):
         store = FakeBlobStore()
         store.opened_with = config
+        store.memcpy_env_at_open = os.environ.get("MC_STORE_MEMCPY")
         opened.append(store)
         return store
 
     monkeypatch.setattr(driver.MooncakeBlobStore, "open", open_fake)
     return factory, opened
+
+
+@pytest.fixture(autouse=True)
+def _memcpy_env_unset(monkeypatch):
+    """Every test starts with ``MC_STORE_MEMCPY`` unset and ends with it as it was: building a
+    device-landing mooncake entry sets the variable when it is unset, and that must not leak
+    between tests. (A bare ``delenv`` of an absent variable records nothing to restore, hence the
+    set-then-delete.)"""
+    monkeypatch.setenv("MC_STORE_MEMCPY", "placeholder")
+    monkeypatch.delenv("MC_STORE_MEMCPY")
 
 
 MOONCAKE_OPTIONS = dict(
@@ -643,13 +655,13 @@ def test_mooncake_host_landing_needs_the_assembly_to_size_units(mooncake_module)
 def test_mooncake_refuses_the_memcpy_bypass_when_it_would_register_gpu_memory(
     mooncake_module, monkeypatch, value
 ):
-    """``MC_STORE_MEMCPY`` makes the Mooncake client ``memcpy`` local objects, which crashes on the
-    GPU pools a ``landing: device`` backend registers. The client reads any value but the
-    spellings of "off" as on, and so does the guard. Refused before a store is opened."""
+    """A ``landing: device`` backend registers GPU pools and keeps the client's memcpy bypass off
+    for them (older clients memcpy'd such spans). The client reads any value but the spellings
+    of "off" as on, and so does the guard. Refused before a store is opened."""
     _, opened = mooncake_module
     monkeypatch.setenv("MC_STORE_MEMCPY", value)
     config = KVTransferConfig(backends=(entry("store", "mooncake", **MOONCAKE_OPTIONS),))
-    with pytest.raises(ValueError, match="MC_STORE_MEMCPY.*landing: host"):
+    with pytest.raises(ValueError, match=f"MC_STORE_MEMCPY={value!r}.*landing: host"):
         build_backends(config, make_context())
     assert opened == []
 
@@ -662,30 +674,70 @@ def test_mooncake_refuses_the_memcpy_bypass_for_explicit_device_over_tcp(
     config = KVTransferConfig(
         backends=(entry("store", "mooncake", landing="device", **TCP_OPTIONS),)
     )
-    with pytest.raises(ValueError, match="MC_STORE_MEMCPY"):
+    with pytest.raises(ValueError, match="MC_STORE_MEMCPY='1'.*set MC_STORE_MEMCPY=0"):
         build_backends(config, make_context())
     assert opened == []
 
 
-@pytest.mark.parametrize("value", [None, "0", "false", "OFF", "no"])
-def test_mooncake_allows_the_memcpy_bypass_when_it_is_off(mooncake_module, monkeypatch, value):
-    if value is None:
-        monkeypatch.delenv("MC_STORE_MEMCPY", raising=False)
-    else:
-        monkeypatch.setenv("MC_STORE_MEMCPY", value)
+@pytest.mark.parametrize(
+    "options",
+    [MOONCAKE_OPTIONS, {**TCP_OPTIONS, "landing": "device"}],
+    ids=["rdma-default-device", "tcp-explicit-device"],
+)
+def test_mooncake_device_landing_with_env_unset_pins_the_bypass_off(
+    mooncake_module, caplog, options
+):
+    """Unset, ``MC_STORE_MEMCPY`` is decided by the client from the transports it loaded, not by
+    the entry's ``protocol`` (an RDMA entry on a host without a reachable HCA comes up TCP-only
+    and would turn the bypass on). A device-landing entry therefore sets the variable to off
+    itself, before the store is opened, says so, and the setting outlives the build."""
+    _, opened = mooncake_module
+    assert "MC_STORE_MEMCPY" not in os.environ
+    config = KVTransferConfig(backends=(entry("store", "mooncake", **options),))
+    with caplog.at_level(logging.INFO):
+        handles = build_backends(config, make_context())
+    try:
+        assert opened[0].memcpy_env_at_open == "0"
+        assert os.environ["MC_STORE_MEMCPY"] == "0"
+        assert handles[0].landing == "device"
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert any("MC_STORE_MEMCPY unset; set to 0" in m for m in messages), messages
+    finally:
+        close_backends(handles)
+
+
+@pytest.mark.parametrize("value", ["0", "false", "OFF", "no"])
+def test_mooncake_leaves_an_explicit_off_value_as_it_is(mooncake_module, monkeypatch, value):
+    _, opened = mooncake_module
+    monkeypatch.setenv("MC_STORE_MEMCPY", value)
     config = KVTransferConfig(backends=(entry("store", "mooncake", **MOONCAKE_OPTIONS),))
     close_backends(build_backends(config, make_context()))
+    assert opened[0].memcpy_env_at_open == value and os.environ["MC_STORE_MEMCPY"] == value
 
 
-@pytest.mark.parametrize("options", [TCP_OPTIONS, {**MOONCAKE_OPTIONS, "landing": "host"}])
-def test_mooncake_allows_the_memcpy_bypass_when_landing_on_host(
-    mooncake_module, fake_pools, monkeypatch, options
+@pytest.mark.parametrize(
+    "value, options",
+    [
+        ("1", TCP_OPTIONS),
+        ("1", {**MOONCAKE_OPTIONS, "landing": "host"}),
+        (None, TCP_OPTIONS),
+        (None, {**MOONCAKE_OPTIONS, "landing": "host"}),
+    ],
+    ids=["tcp-on", "rdma-on", "tcp-unset", "rdma-unset"],
+)
+def test_mooncake_host_landing_leaves_the_bypass_to_the_client(
+    mooncake_module, fake_pools, monkeypatch, value, options
 ):
     """The guard reads the resolved landing: an unset ``landing`` over TCP is ``host``, and host
-    landing registers pinned host memory only, which the bypass copies correctly."""
-    monkeypatch.setenv("MC_STORE_MEMCPY", "1")
+    landing registers pinned host memory only, which the bypass copies correctly. There the
+    variable is neither refused nor set: left on, or left unset for the client to decide."""
+    _, opened = mooncake_module
+    if value is not None:
+        monkeypatch.setenv("MC_STORE_MEMCPY", value)
     config = KVTransferConfig(backends=(entry("store", "mooncake", **options),))
     close_backends(build_backends(config, make_context()))
+    assert opened[0].memcpy_env_at_open == value
+    assert os.environ.get("MC_STORE_MEMCPY") == value
 
 
 # ---- refusals before the store is opened ----

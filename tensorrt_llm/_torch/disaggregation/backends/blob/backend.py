@@ -140,8 +140,16 @@ class BlobStoreConfig:
     probe_ttl_s: float = 30.0
 
     def __post_init__(self) -> None:
-        if not self.namespace:
-            raise ValueError("namespace must not be empty")
+        if not isinstance(self.namespace, str) or not self.namespace:
+            raise ValueError(f"namespace must be a non-empty string, got {self.namespace!r}")
+        for name in (
+            "transfer_batch_size",
+            "max_inflight_ops",
+            "num_workers",
+            "staging_buffer_bytes",
+            "landing_buffer_bytes",
+        ):
+            _require_int(name, getattr(self, name))
         for name in ("transfer_batch_size", "max_inflight_ops", "num_workers"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be > 0")
@@ -151,8 +159,12 @@ class BlobStoreConfig:
             for name in ("staging_buffer_bytes", "landing_buffer_bytes"):
                 if getattr(self, name) <= 0:
                     raise ValueError(f"{name} must be > 0 when landing is 'host'")
-        if self.max_landed_units is not None and self.max_landed_units <= 0:
-            raise ValueError("max_landed_units must be > 0")
+        if self.max_landed_units is not None:
+            _require_int("max_landed_units", self.max_landed_units)
+            if self.max_landed_units <= 0:
+                raise ValueError("max_landed_units must be > 0")
+        if isinstance(self.probe_ttl_s, bool) or not isinstance(self.probe_ttl_s, (int, float)):
+            raise ValueError(f"probe_ttl_s must be a number, got {self.probe_ttl_s!r}")
         if self.probe_ttl_s <= 0:
             raise ValueError("probe_ttl_s must be > 0")
 
@@ -167,11 +179,19 @@ class BlobStoreConfig:
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> BlobStoreConfig:
-        """Build from a plain mapping, refusing keys this class does not know."""
+        """Build from a plain mapping, refusing keys this class does not know. A value of the
+        wrong type is a ``ValueError`` like any other bad value."""
         unknown = sorted(set(raw) - cls.fields())
         if unknown:
             raise ValueError(f"unknown BlobStoreConfig keys: {unknown}")
         return cls(**raw)
+
+
+def _require_int(name: str, value: Any) -> None:
+    """A YAML ``true`` or ``"4"`` where a count or byte size belongs is a config error, not a
+    ``TypeError`` from the first comparison that meets it."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
 
 
 @dataclass
@@ -183,6 +203,8 @@ class StoreCounters:
     publish_stored: int = 0
     publish_raced: int = 0
     """Units the store declined and then turned out to hold: another publisher got there first."""
+    publish_declined: int = 0
+    """Units the store declined and does not hold: it chose not to take them (no room, say)."""
     publish_present: int = 0
     probe_hits: int = 0
     probe_misses: int = 0
@@ -285,9 +307,12 @@ class BlobStoreBackend:
         self._resolve = resolver
         self._keys = KeyScheme(config.namespace, layout_fingerprint)
         self._staging = staging if config.lands_on_host else None
-        self._batch = config.transfer_batch_size
+        self._put_batch = config.transfer_batch_size
+        """Units per put call. Each unit of a staged put holds a publish-pool slot for the call,
+        so the pool's slot count bounds it too; lookups have no slot and use
+        ``transfer_batch_size`` as is."""
         if self._staging is not None:
-            self._batch = min(self._batch, self._staging.num_slots)
+            self._put_batch = min(self._put_batch, self._staging.num_slots)
         self._lock = threading.Lock()
         self._registrations: list[_Registration] = []
         self._pending: set[tuple[int, int]] = set()
@@ -317,6 +342,8 @@ class BlobStoreBackend:
             raise ValueError(f"size must be > 0, got {size}")
         span = (address, size)
         with self._lock:
+            if self._closed:
+                raise RuntimeError("store backend is closed")
             # The store call runs outside the lock, so the span is reserved across it: a
             # concurrent duplicate must be refused before it reaches the store, where its own
             # registration or cleanup could tear down the winner's.
@@ -349,12 +376,17 @@ class BlobStoreBackend:
             reg.closing = True
         try:
             self._store.unregister_span(reg.address, reg.size)
-        finally:
+        except BaseException:
             # A close that raised has not closed: the handle stays live and may be retried.
-            reg.closing = False
+            with self._lock:
+                reg.closing = False
+            raise
         with self._lock:
+            reg.closing = False
             reg.live = False
-            self._registrations.remove(reg)
+            # ``close`` may have taken the list meanwhile; it leaves a closing handle to us.
+            if reg in self._registrations:
+                self._registrations.remove(reg)
 
     def _unregistered(self, segments: Sequence[Segment]) -> Optional[Segment]:
         """The first segment not inside one live registration, if any. Caller holds the lock."""
@@ -438,7 +470,10 @@ class BlobStoreBackend:
         self._pool.shutdown(wait=True)
         self._lookups.shutdown(wait=True)
         with self._lock:
-            live, self._registrations = self._registrations, []
+            # A handle another thread is closing right now is left to that thread, so the store
+            # is not asked to unregister the same span twice.
+            live = [reg for reg in self._registrations if not reg.closing]
+            self._registrations = []
         for reg in live:
             reg.live = False
             try:
@@ -477,13 +512,24 @@ class BlobStoreBackend:
         run: _Work,
         check: Callable[[Sequence[_Task]], Optional[str]],
     ) -> Attempt:
-        """Resolve ``extent``'s units, let ``check`` refuse them (its reason fails the attempt
-        before anything moves), then hand ``run`` to a worker under the in-flight bound. An empty
-        extent is delivered at once; a closed backend refuses with ``SubmissionRejected``."""
+        """``admit_delivery`` then ``launch_delivery``: resolve ``extent``'s units, let ``check``
+        refuse them, and hand ``run`` to a worker when they pass."""
+        attempt, tasks = self.admit_delivery(extent, check)
+        if tasks is not None:
+            self.launch_delivery(attempt, run, tasks)
+        return attempt
+
+    def admit_delivery(
+        self, extent: CacheExtent, check: Callable[[Sequence[_Task]], Optional[str]]
+    ) -> tuple[_StoreAttempt, Optional[list[_Task]]]:
+        """Resolve ``extent``'s units and let ``check`` refuse them. Returns the attempt and the
+        tasks to launch, or the attempt already finished and ``None`` when nothing will run: an
+        empty extent is delivered at once, a refused one fails before anything moves. A closed
+        backend refuses with ``SubmissionRejected``."""
         attempt = _StoreAttempt()
         if not extent.units:
             attempt.finish(Delivered(frozenset()))
-            return attempt
+            return attempt, None
         with self._lock:
             if self._closed:
                 raise SubmissionRejected("store backend is closed")
@@ -492,9 +538,22 @@ class BlobStoreBackend:
                 problem = check(tasks)
         if problem is not None:
             self._fail(attempt, problem)
-            return attempt
-        self._launch(attempt, run, tasks)
-        return attempt
+            return attempt, None
+        return attempt, tasks
+
+    def launch_delivery(self, attempt: _StoreAttempt, run: _Work, tasks: Sequence[_Task]) -> None:
+        """Take an in-flight slot and hand ``run`` to a worker; refuse with ``SubmissionRejected``
+        when either is unavailable, in which case ``run`` never runs. The attempt reaches an
+        outcome on the worker, through ``_run``."""
+        if not self._inflight.acquire(blocking=False):
+            raise SubmissionRejected(
+                f"{self._config.max_inflight_ops} deliveries already in flight"
+            )
+        try:
+            self._pool.submit(self._run, attempt, run, tasks)
+        except RuntimeError as exc:
+            self._inflight.release()
+            raise SubmissionRejected(str(exc)) from exc
 
     def read_present_batches(
         self,
@@ -517,19 +576,6 @@ class BlobStoreBackend:
         with self._lock:
             self.counters.failed_attempts += 1
         logger.warning("blob store [%s]: delivery failed: %s", self._store.describe(), reason)
-
-    def _launch(self, attempt: _StoreAttempt, run: _Work, tasks: Sequence[_Task]) -> None:
-        """Take an in-flight slot and hand ``run`` to a worker; refuse when either is unavailable.
-        The attempt reaches an outcome on the worker, through ``_run``."""
-        if not self._inflight.acquire(blocking=False):
-            raise SubmissionRejected(
-                f"{self._config.max_inflight_ops} deliveries already in flight"
-            )
-        try:
-            self._pool.submit(self._run, attempt, run, tasks)
-        except RuntimeError as exc:
-            self._inflight.release()
-            raise SubmissionRejected(str(exc)) from exc
 
     def _check_destinations(self, tasks: Sequence[_Task]) -> Optional[str]:
         """Whether the store can reach every unit: inside a registration on the device path, or
@@ -644,7 +690,7 @@ class BlobStoreBackend:
     def _do_publish(self, attempt: _StoreAttempt, tasks: Sequence[_Task]) -> Outcome:
         served: set[bytes] = set()
         pending: list[_Task] = []
-        for batch in _batched(tasks, self._batch):
+        for batch in _batched(tasks, self._config.transfer_batch_size):
             try:
                 present = self._holds([task.key for task in batch])
             except BlobStoreError as exc:
@@ -658,7 +704,7 @@ class BlobStoreBackend:
         with self._lock:
             self.counters.publish_present += len(tasks) - len(pending)
         if self._staging is None:
-            for batch in _batched(pending, self._batch):
+            for batch in _batched(pending, self._put_batch):
                 taken, problem = self._put(batch, [t.segments for t in batch])
                 if problem is not None:
                     return Failed(problem)
@@ -694,7 +740,9 @@ class BlobStoreBackend:
         self._staging.sync()
         if last:
             attempt.quiet.set()
-        for batch, batch_slots in zip(_batched(group, self._batch), _batched(slots, self._batch)):
+        for batch, batch_slots in zip(
+            _batched(group, self._put_batch), _batched(slots, self._put_batch)
+        ):
             taken, problem = self._put(
                 batch,
                 [
@@ -745,6 +793,7 @@ class BlobStoreBackend:
                 )
         with self._lock:
             self.counters.publish_raced += len(raced)
+            self.counters.publish_declined += len(declined) - len(raced)
         return stored + raced, None
 
     def _holds_with_retry(self, keys: Sequence[str]) -> Sequence[bool]:
@@ -769,7 +818,7 @@ class BlobStoreBackend:
     def _lookup(self, entry: _Probe, units: Sequence[bytes]) -> None:
         held: set[bytes] = set()
         try:
-            for batch in _batched(units, self._batch):
+            for batch in _batched(units, self._config.transfer_batch_size):
                 present = self._holds_with_retry([self._keys.key(u) for u in batch])
                 held.update(u for u, is_held in zip(batch, present) if is_held)
             with self._lock:
@@ -832,6 +881,14 @@ class _LandingUnit:
     total: int
 
 
+@dataclass(frozen=True)
+class _SlotContent:
+    """Where a unit the get delivered whole now sits: its slot, and how many bytes of it."""
+
+    slot: int
+    total: int
+
+
 class _Landing:
     """One host-first landing: the ``Landing`` a ``HostLandingBlobBackend`` hands out.
 
@@ -840,8 +897,10 @@ class _Landing:
     ``LANDED``: ``poll`` has an outcome; on ``Delivered`` the slots hold the served units until
     ``release``. ``RELEASED``: holds nothing, does nothing. ``release`` is non-blocking and runs
     on the caller's thread: it dequeues a queued landing, asks a landing one to give its slots
-    back when its get returns, gives a landed one's slots back at once, and does nothing after the
-    backend has closed (the pool is being torn down and the workers are stopping).
+    back when its get returns, gives a landed one's slots back at once unless a placement is
+    still copying out of them (then the last placement to finish gives them back), and does
+    nothing after the backend has closed (the pool is being torn down and the workers are
+    stopping).
     """
 
     QUEUED, LANDING, LANDED, RELEASED = "queued", "landing", "landed", "released"
@@ -857,8 +916,11 @@ class _Landing:
         self._state = self.QUEUED
         self._outcome: Optional[Outcome] = None
         self._slots: list[int] = []
-        self._served: dict[bytes, int] = {}
-        """Unit name -> the slot holding its bytes, for units the get delivered whole."""
+        self._served: dict[bytes, _SlotContent] = {}
+        """Unit name -> where its bytes sit, for units the get delivered whole."""
+        self._placing = 0
+        """Placements that may still read the slots; counted up in ``place``, down when the copy
+        has landed or the placement was refused at submission."""
         self._release_requested = False
 
     # -- Landing --
@@ -882,13 +944,24 @@ class _Landing:
     def place(self, extent: CacheExtent) -> Attempt:
         """Copy the units of ``extent`` out of their slots into the units' own segments, on a
         worker and its copy stream; ``Delivered`` after the copies have landed. Only units this
-        landing delivered may be asked for; nothing is touched otherwise."""
+        landing delivered may be asked for, each at the size it landed with; nothing is touched
+        otherwise. The slots stay held until the copy is done, whatever ``release`` says
+        meanwhile."""
         with self._lock:
-            landed = self._state is self.LANDED and isinstance(self._outcome, Delivered)
-            content = dict(self._served) if landed else None
-        if content is None:
-            raise SubmissionRejected("the landing has no content to place")
-        return self._backend._place(extent, content)
+            placeable = (
+                self._state is self.LANDED
+                and isinstance(self._outcome, Delivered)
+                and not self._release_requested
+            )
+            if not placeable:
+                raise SubmissionRejected("the landing has no content to place")
+            content = dict(self._served)
+            self._placing += 1
+        try:
+            return self._backend._place(extent, content, self._placement_done)
+        except BaseException:
+            self._placement_done()
+            raise
 
     def release(self) -> None:
         with self._lock:
@@ -902,7 +975,7 @@ class _Landing:
                     # Popped by a granting thread that has yet to call ``slots_granted``.
                     self._release_requested = True
                 return
-            if self._state is self.LANDING:
+            if self._state is self.LANDING or self._placing:
                 self._release_requested = True
                 return
             slots = self._give_up_slots_locked()
@@ -910,9 +983,10 @@ class _Landing:
 
     def release_for_close(self) -> None:
         """``release`` as the closing backend calls it, after the pool refused every queued
-        landing: a get still in flight returns its slots when it ends, held slots go back now."""
+        landing: a get or a placement still in flight returns the slots when it ends, held slots
+        go back now."""
         with self._lock:
-            if self._state is self.LANDING:
+            if self._state is self.LANDING or self._placing:
                 self._release_requested = True
                 return
             if self._state is self.QUEUED:
@@ -973,6 +1047,15 @@ class _Landing:
             slots = self._give_up_slots_locked() if done_with_slots else []
         if isinstance(outcome, Failed):
             self._backend._count_failed(outcome.reason)
+        self._give_back(slots)
+
+    def _placement_done(self) -> None:
+        """One placement no longer reads the slots (its copy landed, or it was refused before a
+        worker took it). The last one out honours a release asked for while it ran."""
+        with self._lock:
+            self._placing -= 1
+            give_back = self._placing == 0 and self._release_requested
+            slots = self._give_up_slots_locked() if give_back else []
         self._give_back(slots)
 
     def _give_back(self, slots: list[int]) -> None:
@@ -1094,21 +1177,22 @@ class HostLandingBlobBackend:
         """Queue a landing of ``units``: one slot each, then ``holds`` and ``get`` on a worker.
         Non-blocking. A unit no slot can hold, or more units than the pool has slots, fails the
         landing at once (a wiring or sizing error, not back-pressure)."""
+        landing_units, problem = self._size_units(units)
+        landing = _Landing(self, name, landing_units)
         with self._lock:
             if self._closed:
                 raise SubmissionRejected("store backend is closed")
-        landing_units, problem = self._size_units(units)
-        landing = _Landing(self, name, landing_units)
+            # Tracked under the same lock as the closed check: ``close`` releases the landings it
+            # finds here, so none may slip in behind it.
+            if units and problem is None:
+                self._landings.add(landing)
         if not units:
             landing.deliver_empty()
-            return landing
-        if problem is not None:
+        elif problem is not None:
             self._count_failed(problem)
             landing.slots_refused(problem)
-            return landing
-        with self._lock:
-            self._landings.add(landing)
-        self.landing_pool.enqueue(landing, len(landing_units))
+        else:
+            self.landing_pool.enqueue(landing, len(landing_units))
         return landing
 
     def _size_units(self, units: Sequence[bytes]) -> tuple[list[_LandingUnit], Optional[str]]:
@@ -1143,10 +1227,13 @@ class HostLandingBlobBackend:
     # ---- for _Landing ----
 
     def _land(
-        self, units: Sequence[_LandingUnit], slots: Sequence[int], served: dict[bytes, int]
+        self,
+        units: Sequence[_LandingUnit],
+        slots: Sequence[int],
+        served: dict[bytes, _SlotContent],
     ) -> Outcome:
         """Worker: fetch ``units`` into ``slots``, one batch at a time, recording in ``served``
-        which slot holds each unit that arrived whole."""
+        where each unit that arrived whole now sits."""
         by_key = {unit.key: slot for unit, slot in zip(units, slots)}
         tasks = [
             _Task(unit.name, unit.key, ((self.landing_pool.slot_address(slot), unit.total),))
@@ -1158,24 +1245,48 @@ class HostLandingBlobBackend:
         if problem is not None:
             return Failed(problem)
         for task in got:
-            served[task.name] = by_key[task.key]
+            served[task.name] = _SlotContent(by_key[task.key], task.total)
         return Delivered(frozenset(served))
 
-    def _place(self, extent: CacheExtent, content: Mapping[bytes, int]) -> Attempt:
-        """Engine thread: resolve the extent's units, check each is among ``content`` (unit name
-        -> slot), then hand the scatter to a worker under the inner backend's in-flight bound."""
+    def _place(
+        self,
+        extent: CacheExtent,
+        content: Mapping[bytes, _SlotContent],
+        done: Callable[[], None],
+    ) -> Attempt:
+        """Engine thread: resolve the extent's units, check each is among ``content`` at the size
+        it landed with, then hand the scatter to a worker under the inner backend's in-flight
+        bound. ``done`` is called exactly once, when the scatter has run or will never run; a
+        refusal raised from here leaves that to the caller."""
         with self._lock:
             if self._closed:
                 raise SubmissionRejected("store backend is closed")
 
         def all_landed(tasks: Sequence[_Task]) -> Optional[str]:
             missing = sum(1 for task in tasks if task.name not in content)
-            return f"{missing} of {len(tasks)} units were not landed" if missing else None
+            if missing:
+                return f"{missing} of {len(tasks)} units were not landed"
+            for task in tasks:
+                landed = content[task.name].total
+                if task.total != landed:
+                    return (
+                        f"unit {task.name.hex()} landed as {landed} B but resolves to "
+                        f"{task.total} B"
+                    )
+            return None
 
         def scatter(attempt: _StoreAttempt, tasks: Sequence[_Task]) -> Outcome:
-            return self._scatter([(content[task.name], task) for task in tasks])
+            try:
+                return self._scatter([(content[task.name].slot, task) for task in tasks])
+            finally:
+                done()
 
-        return self._inner.submit_delivery(extent, scatter, all_landed)
+        attempt, tasks = self._inner.admit_delivery(extent, all_landed)
+        if tasks is None:
+            done()
+            return attempt
+        self._inner.launch_delivery(attempt, scatter, tasks)
+        return attempt
 
     def _scatter(self, pairs: Sequence[tuple[int, _Task]]) -> Outcome:
         """Worker: copy each unit out of its slot into its segments, then wait for the copies.

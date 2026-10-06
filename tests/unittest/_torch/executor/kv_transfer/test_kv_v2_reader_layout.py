@@ -451,6 +451,11 @@ class TestLayout:
             Mapping(world_size=2, tp_size=2, rank=r, enable_attention_dp=True) for r in range(2)
         ]
         assert [parallel_shard_tag(m) for m in adp_ranks] == ["heads=all", "heads=all"]
+        # Context parallelism splits the sequence: each rank's slice is named too.
+        cp_ranks = [Mapping(world_size=2, cp_size=2, rank=r) for r in range(2)]
+        assert [parallel_shard_tag(m) for m in cp_ranks] == ["heads=all;cp=0/2", "heads=all;cp=1/2"]
+        tp_cp = Mapping(world_size=4, tp_size=2, cp_size=2, rank=3)
+        assert parallel_shard_tag(tp_cp) == f"heads={tp_cp.tp_rank}/2;cp={tp_cp.cp_rank}/2"
 
     def test_fingerprint_separates_tp_shards_and_shares_attention_dp_replicas(self, manager):
         """Two TP ranks hold byte-identical layouts of different heads: their fingerprints must
@@ -467,6 +472,29 @@ class TestLayout:
         )
         assert by_tag[""] == layout_fingerprint(manager, page_table) == layout_fingerprint(manager)
         assert len(set(by_tag.values())) == 4
+
+    def test_fingerprint_separates_models_of_one_geometry_by_identity(self, manager):
+        """Two models with identical KV geometry must not read each other's pages: the model
+        identity the assembly passes is part of the digest. Unknown (empty) is the default and
+        is what every call without the argument gets."""
+        page_table = build_page_table_from_manager(manager)
+        unknown = layout_fingerprint(manager, page_table)
+        assert unknown == layout_fingerprint(manager, page_table, model_identity="")
+        by_model = {
+            name: layout_fingerprint(manager, page_table, model_identity=name)
+            for name in ("meta-llama/Llama-3.1-8B@main", "mistralai/Mistral-7B-v0.3@main")
+        }
+        assert len({unknown, *by_model.values()}) == 3
+        assert by_model["meta-llama/Llama-3.1-8B@main"] == layout_fingerprint(
+            manager, page_table, model_identity="meta-llama/Llama-3.1-8B@main"
+        )
+        # Identity and shard tag are independent dimensions of the key.
+        assert layout_fingerprint(
+            manager, page_table, parallel_shard="heads=0/2", model_identity="m"
+        ) not in {
+            by_model["meta-llama/Llama-3.1-8B@main"],
+            layout_fingerprint(manager, page_table, parallel_shard="heads=0/2"),
+        }
 
     def test_resolver_spans_and_segments(self, manager):
         page_table = build_page_table_from_manager(manager)

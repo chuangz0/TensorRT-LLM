@@ -70,11 +70,24 @@ def test_configs_are_frozen():
         ({"landing": "host", "staging_buffer_bytes": 0}, "staging_buffer_bytes"),
         ({"landing": "host", "landing_buffer_bytes": 0}, "landing_buffer_bytes"),
         ({"max_landed_units": 0}, "max_landed_units"),
+        # The wrong type is a bad value too, not a TypeError from the first comparison.
+        ({"namespace": 7}, "namespace must be a non-empty string"),
+        ({"transfer_batch_size": "4"}, "transfer_batch_size must be an integer"),
+        ({"num_workers": 2.0}, "num_workers must be an integer"),
+        ({"num_workers": True}, "num_workers must be an integer"),
+        ({"staging_buffer_bytes": "512M"}, "staging_buffer_bytes must be an integer"),
+        ({"max_landed_units": "3"}, "max_landed_units must be an integer"),
+        ({"probe_ttl_s": "1"}, "probe_ttl_s must be a number"),
     ],
 )
 def test_backend_config_rejects_bad_values_naming_the_field(overrides, needle):
     with pytest.raises(ValueError, match=needle):
         BlobStoreConfig(**overrides)
+
+
+def test_backend_from_dict_reports_a_wrongly_typed_value_as_a_value_error():
+    with pytest.raises(ValueError, match="num_workers must be an integer, got '2'"):
+        BlobStoreConfig.from_dict({"num_workers": "2"})
 
 
 def test_backend_config_leaves_pool_budgets_unchecked_when_landing_on_device():

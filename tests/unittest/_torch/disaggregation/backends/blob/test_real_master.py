@@ -204,9 +204,11 @@ def test_a_unit_of_one_20_mib_segment_round_trips_whole(store):
 
 def test_putting_a_key_the_store_already_holds_keeps_the_first_object(store):
     """A canary for the driver's put translation, for the one case the backend meets in practice:
-    a key another publisher stored first. The master answers ``0`` and keeps the first object;
-    ``drivers/mooncake.py`` documents that and translates ``0`` as ``STORED``. A master that
-    starts answering otherwise fails here, which is the cue to revisit that translation."""
+    a key another publisher stored first. The client reports such a put as ``0`` (the master's
+    ``OBJECT_ALREADY_EXISTS`` never reaches Python) and the first object is kept, so the driver
+    reads it as ``STORED``; it still translates ``-705`` as ``DECLINED`` should a client ever
+    pass it through. A client that starts answering otherwise fails here, which is the cue to
+    check that ``drivers/mooncake.py`` still reads a duplicate put correctly."""
     with _rank(store) as rank:
         first, second = rank.unit(0, 0, 64), rank.unit(0, 1, 64)
         rank.write(first, pattern(3, 64))
@@ -217,8 +219,8 @@ def test_putting_a_key_the_store_already_holds_keeps_the_first_object(store):
         ((address, size),) = rank.segments(second)
         (status,) = store.raw.batch_put_from_multi_buffers([key], [[address]], [[size]])
         assert status == 0, (
-            f"duplicate put answered {status}; revisit the DECLINED translation in "
-            "drivers/mooncake.py"
+            f"duplicate put answered {status}: the client no longer reports it as success; "
+            "check how drivers/mooncake.py reads a duplicate put"
         )
         assert store.raw.get_size(key) == 64
         rank.resolver.add(1, 0, 64)

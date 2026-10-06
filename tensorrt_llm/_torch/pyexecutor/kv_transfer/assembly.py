@@ -12,21 +12,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Assembling the KV transfer layer onto one ``PyExecutor`` (design §7.4, plan §7-§9).
+"""Assembling the KV transfer layer onto one ``PyExecutor`` (design §7.4).
 
 ``attach_kv_transfer`` runs once at creation when ``TRTLLM_KV_TRANSFER_CONFIG`` is set: it checks
-the engine is in scope, builds the resource reader and region resolver, builds the configured
-backends and registers the KV pools with those that need it, builds the coordinator, forwards the
-import-light layers' stdlib logging to the TRT-LLM logger, and attaches the ``KVTransferHooks``
-to the executor and its scheduler.
+the engine is in scope, builds the resource reader and region resolver, names the model for the
+store's namespace, builds the configured backends and registers the KV pools with those that
+need it, builds the coordinator, forwards the import-light layers' stdlib logging to the TRT-LLM
+logger, and attaches the ``KVTransferHooks`` to the executor and its scheduler.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import time
-from typing import TYPE_CHECKING, Callable, Sequence
+from typing import TYPE_CHECKING, Callable, Sequence, TypeVar
 
 from tensorrt_llm.logger import logger
 
@@ -60,6 +62,7 @@ __all__ = [
     "attach_kv_transfer",
     "check_engine_supports_kv_transfer",
     "install_log_forwarding",
+    "model_identity_for",
     "plan_authority_for",
 ]
 
@@ -116,7 +119,7 @@ def check_engine_supports_kv_transfer(
     kv_connector_manager,
     max_beam_width: int,
 ) -> None:
-    """The scope guard of plan §1 item 7: raise ``ValueError`` naming the first unmet condition."""
+    """The scope guard: raise ``ValueError`` naming the first unmet condition."""
     from ..scheduler.scheduler_v2 import KVCacheV2Scheduler
 
     kv_cache_manager = executor.kv_cache_manager
@@ -149,7 +152,7 @@ def check_engine_supports_kv_transfer(
 
 
 def plan_authority_for(mapping) -> PlanAuthority:
-    """Who plans on this rank, from the loop the engine runs (multi-rank plan S4).
+    """Who plans on this rank, from the loop the engine runs.
 
     Without pipeline parallelism every rank runs the scheduler and the answers are voted. With
     it, the rank that calls ``_schedule`` in ``_pp_schedule_and_propagate`` owns the answers:
@@ -169,6 +172,58 @@ def plan_authority_for(mapping) -> PlanAuthority:
     if mapping.rank == 0 or (mapping.pp_rank == 0 and schedules_for_its_replica):
         return PlanAuthority.OWNER
     return PlanAuthority.FOLLOWER
+
+
+_CONFIG_KEYS_NOT_PART_OF_THE_MODEL = ("transformers_version", "_name_or_path", "_commit_hash")
+"""Keys of a Hugging Face config that change without the model changing."""
+
+
+def _pretrained_config_of(executor: PyExecutor):
+    """The Hugging Face config behind the engine's model, or ``None`` on an engine without one."""
+    model = getattr(getattr(executor, "model_engine", None), "model", None)
+    return getattr(getattr(model, "model_config", None), "pretrained_config", None)
+
+
+def _digest_of_config(config) -> str:
+    """A stable digest of a Hugging Face config's contents, naming the model when its path
+    does not."""
+    contents = {
+        key: value
+        for key, value in config.to_dict().items()
+        if key not in _CONFIG_KEYS_NOT_PART_OF_THE_MODEL
+    }
+    serialized = json.dumps(contents, sort_keys=True, default=str).encode()
+    return hashlib.blake2b(serialized, digest_size=8).hexdigest()
+
+
+def model_identity_for(executor: PyExecutor) -> str:
+    """What names the model whose bytes the store holds, for the layout fingerprint: two models
+    of one KV geometry must not read each other's pages under one namespace.
+
+    A checkpoint the config knows the commit hash of (a hub revision) is named by the last
+    component of its name or path plus that hash, so nodes with different ``HF_HOME`` snapshot
+    paths agree on it. One without a commit hash is named by its name or path as given: the
+    identity is then per path, so nodes that should share a store must share the checkpoint
+    layout, or the backend must be given an explicit namespace. Without a name, the
+    architecture plus a digest of the config. An engine without a model config gives the empty
+    identity, which the fingerprint treats as unknown: such models share keys, so it is warned
+    about.
+    """
+    config = _pretrained_config_of(executor)
+    if config is None:
+        logger.warning(
+            "KV transfer: the engine has no model config; the store namespace does not name "
+            "the model"
+        )
+        return ""
+    name = getattr(config, "_name_or_path", None) or ""
+    commit = getattr(config, "_commit_hash", None)
+    if name and commit:
+        return f"{os.path.basename(os.path.normpath(name))}@{commit}"
+    if name:
+        return name
+    architecture = (getattr(config, "architectures", None) or ["unknown"])[0]
+    return f"{architecture}#{_digest_of_config(config)}"
 
 
 def _check_layer_groups_are_paged(reader: KVv2ResourceReader) -> None:
@@ -192,7 +247,6 @@ def _check_followers_can_rebuild_plans(mapping, backends: Sequence[BackendHandle
     """Under PP the followers rebuild every plan from ``(token_end, source)`` alone; a routed
     backend's plan also needs the request's hint, which is not on the wire."""
     if mapping.pp_size > 1 and any(handle.hint_key is not None for handle in backends):
-        close_backends(backends)
         _refuse(
             "PP>1 with a routed (hint) backend: a follower cannot rebuild a routed plan from "
             "(token_end, source)"
@@ -201,12 +255,21 @@ def _check_followers_can_rebuild_plans(mapping, backends: Sequence[BackendHandle
 
 def _register_kv_pools(backends: Sequence[BackendHandle], resolver: KVv2RegionResolver) -> None:
     """Hand every KV pool to each backend whose transport needs it registered."""
+    for handle in backends:
+        if handle.pool_registrar is None:
+            continue
+        for address, size in resolver.pool_memory_spans():
+            handle.pool_registrar.register_pool(address, size)
+
+
+T = TypeVar("T")
+
+
+def _closing_backends_on_failure(backends: Sequence[BackendHandle], assemble: Callable[[], T]) -> T:
+    """Run the assembly steps that follow ``build_backends``; a failure in any of them closes
+    the built backends before it propagates, so no transport thread outlives a refused engine."""
     try:
-        for handle in backends:
-            if handle.pool_registrar is None:
-                continue
-            for address, size in resolver.pool_memory_spans():
-                handle.pool_registrar.register_pool(address, size)
+        return assemble()
     except Exception:
         close_backends(backends)
         raise
@@ -269,10 +332,14 @@ def attach_kv_transfer(
     reader = KVv2ResourceReader(kv_cache_manager, page_table)
     _check_layer_groups_are_paged(reader)
     resolver = KVv2RegionResolver(page_table)
+    model_identity = model_identity_for(executor)
     build_context = BackendBuildContext(
         resolver=resolver,
         layout_fingerprint=layout_fingerprint(
-            kv_cache_manager, page_table, parallel_shard=parallel_shard_tag(mapping)
+            kv_cache_manager,
+            page_table,
+            parallel_shard=parallel_shard_tag(mapping),
+            model_identity=model_identity,
         ),
         max_unit_bytes=resolver.max_unit_bytes(),
         device_index=executor.device_id,
@@ -281,38 +348,42 @@ def attach_kv_transfer(
         landing_wait_timeout_s=config.landing_wait_timeout_s,
     )
     backends = build_backends(config, build_context)
-    _check_followers_can_rebuild_plans(mapping, backends)
-    _register_kv_pools(backends, resolver)
 
-    effects = PyExecutorKVTransferEffects(executor)
-    coordinator = build_coordinator(
-        config,
-        backends,
-        reader,
-        effects,
-        EngineWorkQueue(),
-        EngineDist(executor.dist, mapping),
-        plan_authority=plan_authority_for(mapping),
-    )
-    install_log_forwarding()
-    hooks = KVTransferHooks(
-        executor,
-        coordinator,
-        effects,
-        backends,
-        config.backends,
-        close_timeout_s=config.close_timeout_s,
-        status_dump_path=_status_dump_path(),
-        started_at=started_at,
-        rank=mapping.rank,
-    )
-    executor.scheduler.kv_transfer_planner = hooks
-    executor.kv_transfer = hooks
-    logger.info(
-        "KV transfer attached: backends=%s pools=%d layout=%s plan_authority=%s",
-        [(entry.name, entry.type, sorted(entry.roles)) for entry in config.backends],
-        len(resolver.pool_memory_spans()),
-        build_context.layout_fingerprint.hex(),
-        coordinator.plan_authority.value,
-    )
-    return hooks
+    def attach_built_backends() -> KVTransferHooks:
+        _check_followers_can_rebuild_plans(mapping, backends)
+        _register_kv_pools(backends, resolver)
+        effects = PyExecutorKVTransferEffects(executor)
+        coordinator = build_coordinator(
+            config,
+            backends,
+            reader,
+            effects,
+            EngineWorkQueue(),
+            EngineDist(executor.dist, mapping),
+            plan_authority=plan_authority_for(mapping),
+        )
+        install_log_forwarding()
+        hooks = KVTransferHooks(
+            executor,
+            coordinator,
+            effects,
+            backends,
+            config.backends,
+            close_timeout_s=config.close_timeout_s,
+            status_dump_path=_status_dump_path(),
+            started_at=started_at,
+            rank=mapping.rank,
+        )
+        executor.scheduler.kv_transfer_hooks = hooks
+        executor.kv_transfer = hooks
+        logger.info(
+            "KV transfer attached: backends=%s pools=%d model=%r layout=%s plan_authority=%s",
+            [(entry.name, entry.type, sorted(entry.roles)) for entry in config.backends],
+            len(resolver.pool_memory_spans()),
+            model_identity,
+            build_context.layout_fingerprint.hex(),
+            coordinator.plan_authority.value,
+        )
+        return hooks
+
+    return _closing_backends_on_failure(backends, attach_built_backends)

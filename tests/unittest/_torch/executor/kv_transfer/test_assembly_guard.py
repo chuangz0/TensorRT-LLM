@@ -7,21 +7,26 @@ feature does not host; ``attach_kv_transfer`` refuses a malformed config file be
 anything; ``install_log_forwarding`` puts one forwarding handler on the layers' stdlib logger.
 """
 
+import inspect
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 from engine_fakes import FakeFetches
+from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
 from tensorrt_llm._torch.disaggregation.base.backend import CacheKind
 from tensorrt_llm._torch.disaggregation.base.views import GroupSpec
 from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority
+from tensorrt_llm._torch.disaggregation.resource.region import layout_fingerprint
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_transfer import assembly
 from tensorrt_llm._torch.pyexecutor.kv_transfer.assembly import (
     attach_kv_transfer,
     check_engine_supports_kv_transfer,
+    model_identity_for,
     plan_authority_for,
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
@@ -209,18 +214,207 @@ def _handle(name: str, hint_key, closed: list) -> BackendHandle:
     )
 
 
-def test_pp_refuses_a_routed_backend_and_closes_what_was_built():
+def test_pp_refuses_a_routed_backend():
     """A follower rebuilds plans from ``(token_end, source)``; a routed backend's plan also
     needs the request's hint, which the schedule does not carry."""
-    closed = []
-    handles = [_handle("store", None, closed), _handle("worker", "ctx", closed)]
+    handles = [_handle("store", None, []), _handle("worker", "ctx", [])]
     with pytest.raises(ValueError, match="PP>1 with a routed \\(hint\\) backend"):
         assembly._check_followers_can_rebuild_plans(in_scope_mapping(pp_size=2), handles)
-    assert closed == ["store", "worker"]
-
     assembly._check_followers_can_rebuild_plans(in_scope_mapping(pp_size=1), handles)
     assembly._check_followers_can_rebuild_plans(in_scope_mapping(pp_size=2), handles[:1])
-    assert closed == ["store", "worker"]  # accepted configurations close nothing
+
+
+def executor_with_model(pretrained_config) -> SimpleNamespace:
+    """The attribute path ``model_identity_for`` walks on a real executor."""
+    model_config = SimpleNamespace(pretrained_config=pretrained_config)
+    return SimpleNamespace(
+        model_engine=SimpleNamespace(model=SimpleNamespace(model_config=model_config))
+    )
+
+
+def test_model_identity_names_the_checkpoint_by_path_or_by_revision():
+    """Without a commit hash the identity is the path as given (per path); with one, the last
+    path component plus the hash, the same on every node whatever its ``HF_HOME``."""
+    config = PretrainedConfig(architectures=["LlamaForCausalLM"])
+    config._name_or_path = "meta-llama/Llama-3.1-8B"
+    assert model_identity_for(executor_with_model(config)) == "meta-llama/Llama-3.1-8B"
+    config._commit_hash = "0e9e39f"
+    assert model_identity_for(executor_with_model(config)) == "Llama-3.1-8B@0e9e39f"
+
+    def snapshot_under(hf_home: str) -> PretrainedConfig:
+        snapshot = PretrainedConfig(architectures=["LlamaForCausalLM"])
+        snapshot._name_or_path = (
+            f"{hf_home}/hub/models--meta-llama--Llama-3.1-8B/snapshots/0e9e39f/"
+        )
+        snapshot._commit_hash = "0e9e39f"
+        return snapshot
+
+    node_a = model_identity_for(executor_with_model(snapshot_under("/home/a/.cache/huggingface")))
+    node_b = model_identity_for(executor_with_model(snapshot_under("/srv/hf")))
+    assert node_a == node_b == "0e9e39f@0e9e39f"
+
+
+def test_model_identity_without_a_name_digests_the_config():
+    """No checkpoint path: the architecture plus a digest of the config tells two models apart,
+    and ignores the keys that change without the model changing."""
+    small = PretrainedConfig(architectures=["LlamaForCausalLM"], hidden_size=16)
+    large = PretrainedConfig(architectures=["LlamaForCausalLM"], hidden_size=32)
+    small_again = PretrainedConfig(architectures=["LlamaForCausalLM"], hidden_size=16)
+    small_again.transformers_version = "0.0.0"
+    identities = [model_identity_for(executor_with_model(c)) for c in (small, large, small_again)]
+    assert all(identity.startswith("LlamaForCausalLM#") for identity in identities)
+    assert identities[0] != identities[1] and identities[0] == identities[2]
+
+
+def test_model_identity_is_unknown_on_an_engine_without_a_model_config():
+    assert model_identity_for(in_scope_executor()) == ""
+
+
+def test_two_model_identities_give_two_layout_fingerprints_through_the_assembly_path():
+    """What the assembly feeds ``layout_fingerprint`` keeps two models of one KV geometry apart
+    in the store; the page table and manager here are the minimum the digest reads."""
+    page_table = SimpleNamespace(
+        tokens_per_block=32,
+        pool_groups=[SimpleNamespace(pools=[SimpleNamespace(slot_bytes=4096)])],
+        layer_groups=[
+            SimpleNamespace(
+                pool_group_idx=0,
+                kv_head_num_per_rank=8,
+                sliding_window_size=None,
+                local_layers=[SimpleNamespace(global_layer_id=0)],
+                pool_views=[
+                    SimpleNamespace(
+                        pool_idx=0, pool_role=("key", "value"), buffer_entries=np.zeros(2, np.int64)
+                    )
+                ],
+            )
+        ],
+    )
+    manager = SimpleNamespace(dtype="bf16", head_dim=128)
+
+    def fingerprint_for(name: str) -> bytes:
+        config = PretrainedConfig(architectures=["LlamaForCausalLM"])
+        config._name_or_path = name
+        identity = model_identity_for(executor_with_model(config))
+        return layout_fingerprint(manager, page_table, model_identity=identity)
+
+    assert fingerprint_for("meta-llama/Llama-3.1-8B") != fingerprint_for("mistralai/Mistral-7B")
+    assert fingerprint_for("meta-llama/Llama-3.1-8B") == fingerprint_for("meta-llama/Llama-3.1-8B")
+    attach = inspect.getsource(attach_kv_transfer)
+    assert "model_identity=model_identity" in attach and "model=%r" in attach
+
+
+def test_the_failure_guard_closes_the_built_backends_and_nothing_on_success():
+    closed = []
+    handles = [_handle("store", None, closed), _handle("worker", "ctx", closed)]
+
+    def refuse():
+        raise ValueError("coordinator refused")
+
+    with pytest.raises(ValueError, match="coordinator refused"):
+        assembly._closing_backends_on_failure(handles, refuse)
+    assert closed == ["store", "worker"]
+    assert assembly._closing_backends_on_failure(handles, lambda: "hooks") == "hooks"
+    assert closed == ["store", "worker"]
+
+
+class _FakeReader:
+    """The slice of ``KVv2ResourceReader`` the assembly reads before and after ``build_backends``."""
+
+    tokens_per_block = 32
+
+    def __init__(self, *args) -> None:
+        pass
+
+    def group_specs(self):
+        return (GroupSpec(0, CacheKind.PAGED, b"\0" * 8),)
+
+
+class _FakeResolver:
+    def __init__(self, *args) -> None:
+        pass
+
+    def pool_memory_spans(self):
+        return [(0x1000, 4096)]
+
+    def max_unit_bytes(self) -> int:
+        return 4096
+
+    def __call__(self, local_group: int, local: int):
+        return [(0x1000, 4096)]
+
+
+def attachable_executor() -> PyExecutor:
+    """An in-scope executor with the attributes the assembly reads past the scope guard."""
+    executor = in_scope_executor()
+    executor.device_id = 0
+    executor.max_seq_len = 1024
+    executor.dist = SimpleNamespace(allgather=None, pp_allgather=None)
+    return executor
+
+
+def attach_over_fakes(monkeypatch, tmp_path, executor, *, build_backends, build_coordinator):
+    """Run ``attach_kv_transfer`` with every KV v2 prerequisite faked, so that what happens
+    around ``build_backends`` is the real assembly code."""
+    monkeypatch.setattr(assembly, "build_page_table_from_manager", lambda manager: object())
+    monkeypatch.setattr(assembly, "KVv2ResourceReader", _FakeReader)
+    monkeypatch.setattr(assembly, "KVv2RegionResolver", _FakeResolver)
+    monkeypatch.setattr(assembly, "layout_fingerprint", lambda *args, **kwargs: b"\xfe" * 16)
+    monkeypatch.setattr(assembly, "parallel_shard_tag", lambda mapping: "heads=all")
+    monkeypatch.setattr(assembly, "build_backends", build_backends)
+    monkeypatch.setattr(assembly, "build_coordinator", build_coordinator)
+    config_path = tmp_path / "kv_transfer.yaml"
+    config_path.write_text("backends:\n  - {name: store, type: fake}\n")
+    attach_kv_transfer(
+        executor,
+        str(config_path),
+        mapping=in_scope_mapping(world_size=1),  # ``EngineDist`` sizes its group from this
+        spec_config=None,
+        kv_connector_manager=None,
+        max_beam_width=1,
+    )
+
+
+def test_a_build_backends_that_raises_closes_nothing(monkeypatch, tmp_path):
+    """Nothing was built: there is nothing to close, and the error is the backend's own."""
+    calls = []
+
+    def build_backends(config, build_context):
+        calls.append("build raised")
+        raise ValueError("store unreachable")
+
+    def never(*args, **kwargs):
+        raise AssertionError("the coordinator must not be built after a failed build")
+
+    executor = attachable_executor()
+    with pytest.raises(ValueError, match="store unreachable"):
+        attach_over_fakes(
+            monkeypatch, tmp_path, executor, build_backends=build_backends, build_coordinator=never
+        )
+    assert calls == ["build raised"]
+    assert executor.kv_transfer is None and not hasattr(executor.scheduler, "kv_transfer_hooks")
+
+
+def test_a_failure_after_build_backends_closes_what_was_built(monkeypatch, tmp_path):
+    """The backends were built; a later step (here the coordinator) refusing must close them
+    before the error leaves ``attach_kv_transfer``, and the executor keeps no hooks."""
+    closed = []
+    handles = [_handle("store", None, closed), _handle("worker", None, closed)]
+
+    def refuse(*args, **kwargs):
+        raise ValueError("coordinator refused")
+
+    executor = attachable_executor()
+    with pytest.raises(ValueError, match="coordinator refused"):
+        attach_over_fakes(
+            monkeypatch,
+            tmp_path,
+            executor,
+            build_backends=lambda config, build_context: handles,
+            build_coordinator=refuse,
+        )
+    assert closed == ["store", "worker"]
+    assert executor.kv_transfer is None and not hasattr(executor.scheduler, "kv_transfer_hooks")
 
 
 def test_attach_refuses_a_malformed_config_before_building_anything(tmp_path):
@@ -237,7 +431,7 @@ def test_attach_refuses_a_malformed_config_before_building_anything(tmp_path):
             max_beam_width=1,
         )
     assert executor.kv_transfer is None
-    assert not hasattr(executor.scheduler, "kv_transfer_planner")
+    assert not hasattr(executor.scheduler, "kv_transfer_hooks")
 
 
 def test_attach_refuses_an_out_of_scope_engine_before_reading_the_config(tmp_path):

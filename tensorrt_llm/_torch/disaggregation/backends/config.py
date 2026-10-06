@@ -42,6 +42,9 @@ BACKEND_ROLES = ("fetch", "publish")
 """What a backend entry may be used for. A backend with both roles fetches and publishes."""
 
 _ENTRY_KEYS = ("name", "type", "hint_key", "roles")
+# The coordinator's clocks. Every wait on another rank, on the scheduler's pages or on a store has
+# a finite default, so a peer that stopped voting or a store that stopped answering cannot park a
+# request forever; a ``None`` must be asked for explicitly where it is allowed.
 _COORDINATOR_KEYS = (
     "fetch_timeout_s",
     "publish_timeout_s",
@@ -50,7 +53,14 @@ _COORDINATOR_KEYS = (
     "probe_timeout_s",
     "close_timeout_s",
 )
-_DEFAULT_PROBE_TIMEOUT_S = 0.05
+_DEFAULT_FETCH_TIMEOUT_S = 30.0
+_DEFAULT_PUBLISH_TIMEOUT_S = 60.0
+# Wall-clock, measured on the loop clock from a request's first deferral. A store's existence
+# lookup is one RPC per request and runs on the master under the load of every rank's probes, and
+# the ranks' clocks are not aligned to the round; 50 ms made loaded stores look empty. A budget
+# counted in rounds instead of seconds would be independent of the clock skew; that is a design
+# change left for a follow-up.
+_DEFAULT_PROBE_TIMEOUT_S = 1.0
 _DEFAULT_CLOSE_TIMEOUT_S = 30.0
 _DEFAULT_UNLAUNCHED_TIMEOUT_S = 30.0
 _DEFAULT_LANDING_WAIT_TIMEOUT_S = 30.0
@@ -111,24 +121,32 @@ class KVTransferConfig:
 
     Attributes:
         backends: In fetch priority order.
-        fetch_timeout_s: Deadline for a fetch from launch; ``None`` disables.
-        publish_timeout_s: Deadline for a publish from first submission; ``None`` disables.
+        fetch_timeout_s: Deadline for a fetch from its launch, and for a fetch record kept at
+            its request's end until the ranks agree on it. Past it the request fails and the
+            rank stops waiting for its peers. ``None`` disables and must be given explicitly.
+        publish_timeout_s: Deadline for a publish from its first accepted submission, and for a
+            publish record kept at its request's end until the ranks agree on it. Past it the
+            rank warns and stops waiting for its peers; the publish still settles on its own
+            outcome. ``None`` disables and must be given explicitly.
         unlaunched_timeout_s: Longest a rank may leave a fetch unlaunched (its pages not
             reserved) after another rank has launched it, before the ranks give the fetch up
             and plan again. Independent of ``fetch_timeout_s``; ``None`` disables and must be
             given explicitly.
-        landing_wait_timeout_s: Host-first fetches only. Longest a rank waits for the backend's
-            landing memory (``fetch_to_host`` refused) or, once landed, for the scheduler's
-            pages, before it votes the fetch failed so that the ranks give it up, release the
-            landing and plan again. ``None`` disables and must be given explicitly.
-        probe_timeout_s: Longest a request waits for a store lookup before it computes locally.
+        landing_wait_timeout_s: Longest a rank waits for the scheduler's pages for a planned
+            fetch (from the plan's decision, or from landing on the host) or, host-first, for
+            the backend's landing memory (``fetch_to_host`` refused), before it votes the fetch
+            failed so that the ranks give it up, release the landing and plan again; out of
+            retries the request computes locally. ``None`` disables and must be given
+            explicitly.
+        probe_timeout_s: Longest a request waits for a store lookup before it plans without
+            the store (wall-clock, from its first deferral).
         close_timeout_s: Longest ``close`` waits for the backends to finish before it gives them
             up and releases the requests they were holding.
     """
 
     backends: tuple[BackendEntry, ...]
-    fetch_timeout_s: float | None = None
-    publish_timeout_s: float | None = None
+    fetch_timeout_s: float | None = _DEFAULT_FETCH_TIMEOUT_S
+    publish_timeout_s: float | None = _DEFAULT_PUBLISH_TIMEOUT_S
     unlaunched_timeout_s: float | None = _DEFAULT_UNLAUNCHED_TIMEOUT_S
     landing_wait_timeout_s: float | None = _DEFAULT_LANDING_WAIT_TIMEOUT_S
     probe_timeout_s: float = _DEFAULT_PROBE_TIMEOUT_S

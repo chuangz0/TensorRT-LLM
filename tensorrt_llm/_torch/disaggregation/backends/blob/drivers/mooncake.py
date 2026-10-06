@@ -38,6 +38,8 @@ from ..store import BlobStoreError, GetStatus, PutStatus
 __all__ = [
     "DEFAULT_METADATA_SERVER",
     "LEASE_EXPIRED",
+    "NO_AVAILABLE_HANDLE",
+    "OBJECT_ALREADY_EXISTS",
     "OBJECT_NOT_FOUND",
     "MooncakeBlobStore",
     "MooncakeStoreConfig",
@@ -57,9 +59,26 @@ LEASE_EXPIRED = -707
 The bytes have been written all the same; only the check after them failed. A second get takes
 a fresh lease, so the driver asks once more for such keys."""
 
+OBJECT_ALREADY_EXISTS = -705
+"""Mooncake's code for a put of a key the store already holds. The client reports such a put as
+``0`` and the store keeps the first object (observed against a real master), so this code is
+translated for completeness: it means declined, not failed."""
+
+NO_AVAILABLE_HANDLE = -200
+"""Status a put answers when the store has no room for the object; nothing is written."""
+
+_PUT_DECLINED = frozenset({OBJECT_ALREADY_EXISTS, NO_AVAILABLE_HANDLE})
+"""Put statuses that mean the store chose not to hold the key, not that the call went wrong."""
+
 MEMCPY_BYPASS_ENV = "MC_STORE_MEMCPY"
-"""Mooncake client switch that copies with ``memcpy`` instead of the transfer engine whenever the
-object lives in this process's own segment. Safe over host memory only: a GPU span crashes it."""
+"""Mooncake client switch that copies an object living in this process's own segment without the
+transfer engine: older clients with a plain ``memcpy`` whatever the memory, newer ones by where
+the pointer lives. Unset, the client turns it on whenever TCP is the only transport it loaded;
+``_keep_memcpy_bypass_off_over_device_memory`` says what this driver does about it."""
+
+_MEMCPY_BYPASS_OFF = ("0", "false", "no", "off")
+"""The values the client reads as "off", compared lowercase with nothing trimmed; any other value
+is on."""
 
 _DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200
 _DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024
@@ -132,21 +151,25 @@ def _split(buffers: Sequence[Sequence[Segment]]) -> tuple[list[list[int]], list[
 class MooncakeBlobStore:
     """``BlobStore`` over a ``MooncakeDistributedStore``: translates its status codes.
 
-    The bindings answer integers, never raise. ``batch_is_exist`` answers ``1`` present, ``0``
-    absent, negative for a lookup that failed. A get answers the bytes read per key, or a negative
-    code with the destination untouched: ``OBJECT_NOT_FOUND`` for a key not there, other codes
-    (``-600`` / ``-800`` when the buffers do not add up to the object) for a key it could not
-    read. A put answers ``0`` per key it stored; the bindings publish no table for the other codes,
-    so every non-zero put status is ``DECLINED`` and the raw code goes to the debug log. A put of
-    a key the store already holds also answers ``0`` and keeps the first object (observed against
-    a real master, see ``test_real_master.py``), so a publish that lost a race reads as ``STORED``
-    rather than ``DECLINED``; the backend is correct either way because it asks ``holds`` before
-    every put. One ``DECLINED`` worth knowing: a master started with ``--memory_allocator=cachelib``
-    stores an object as one allocation of at most one slab (16 MiB minus 16 bytes) and answers
-    ``-600`` for a unit whose segments add up to more, however they are cut; the default
-    ``offset`` allocator has no such cap (both observed against a real master, see
-    ``test_real_master.py``). An answer of the wrong length from any batch call raises
-    ``BlobStoreError``.
+    The bindings answer integers, never raise; the codes are Mooncake's ``ErrorCode``
+    (``mooncake-store/include/types.h``). ``batch_is_exist`` answers ``1`` present, ``0`` absent,
+    negative for a lookup that failed. A get answers the bytes read per key, or a negative code
+    with the destination untouched: ``OBJECT_NOT_FOUND`` for a key not there, other codes
+    (``INVALID_PARAMS`` -600 / ``TRANSFER_FAIL`` -800 when the buffers do not add up to the
+    object) for a key it could not read. A put answers ``0`` per key it stored;
+    ``OBJECT_ALREADY_EXISTS`` and ``NO_AVAILABLE_HANDLE`` mean the store chose not to hold the
+    key and are ``DECLINED``, which the backend follows with a lookup; any other code
+    (``INVALID_PARAMS`` -600, ``TRANSFER_FAIL`` -800, ``RPC_FAIL`` -900, ``INTERNAL_ERROR`` -1,
+    ...) means the key could not be written and is ``FAILED``, which fails the publish.
+
+    Two behaviours observed against a real master (``test_real_master.py``): a put of a key the
+    store already holds answers ``0`` and keeps the first object, so a publish that lost a race
+    usually reads as ``STORED`` rather than ``DECLINED`` (the backend is correct either way,
+    because it asks ``holds`` before every put); and a master started with
+    ``--memory_allocator=cachelib`` stores an object as one allocation of at most one slab (16 MiB
+    minus 16 bytes) and answers ``INVALID_PARAMS`` for a unit whose segments add up to more,
+    however they are cut, where the default ``offset`` allocator has no such cap. An answer of
+    the wrong length from any batch call raises ``BlobStoreError``.
     """
 
     def __init__(self, client: Any, config: MooncakeStoreConfig) -> None:
@@ -224,10 +247,16 @@ class MooncakeBlobStore:
         ptrs, sizes = _split(buffers)
         statuses = self._client.batch_put_from_multi_buffers(list(keys), ptrs, sizes)
         self._check_count("batch_put_from_multi_buffers", statuses, keys)
-        declined = sorted({status for status in statuses if status != 0})
-        if declined:
-            logger.debug("%s: put declined with statuses %s", self.describe(), declined)
-        return [PutStatus.STORED if status == 0 else PutStatus.DECLINED for status in statuses]
+        return [self._put_status(key, status) for key, status in zip(keys, statuses)]
+
+    def _put_status(self, key: str, status: int) -> PutStatus:
+        if status == 0:
+            return PutStatus.STORED
+        if status in _PUT_DECLINED:
+            logger.debug("%s: put of %s declined with status %d", self.describe(), key, status)
+            return PutStatus.DECLINED
+        logger.warning("%s: put of %s failed with status %d", self.describe(), key, status)
+        return PutStatus.FAILED
 
     def get(self, keys: Sequence[str], buffers: Sequence[Sequence[Segment]]) -> Sequence[GetStatus]:
         statuses = list(self._batch_get(keys, buffers))
@@ -271,21 +300,12 @@ class MooncakeBlobStore:
             logger.warning("%s: close answered status %d", self.describe(), status)
 
 
-def _memcpy_bypass_enabled() -> bool:
-    """Whether ``MC_STORE_MEMCPY`` turns the memcpy bypass on, read the way the Mooncake client
-    reads it: unset and the exact spellings of "off" mean off, any other value (including one
-    with surrounding whitespace) means on."""
-    value = os.environ.get(MEMCPY_BYPASS_ENV)
-    if value is None:
-        return False
-    return value.lower() not in ("0", "false", "no", "off")
-
-
 def _resolve_landing(entry: BackendEntry) -> BackendEntry:
     """The entry with its ``landing`` decided: over TCP an unset ``landing`` becomes ``host``,
     because the transfer engine's TCP path reaches GPU memory only through a synchronous copy
     per 64 KB chunk, while RDMA writes GPU memory directly and keeps the ``device`` default. An
-    explicit ``device`` over TCP is allowed with a warning."""
+    explicit ``device`` over TCP is allowed with a warning (and with the memcpy bypass kept off,
+    see ``_keep_memcpy_bypass_off_over_device_memory``)."""
     protocol = entry.options.get("protocol", MooncakeStoreConfig.protocol)
     landing = entry.options.get("landing")
     if protocol != "tcp":
@@ -306,23 +326,39 @@ def _resolve_landing(entry: BackendEntry) -> BackendEntry:
     return entry
 
 
-def _refuse_memcpy_bypass_over_device_memory(entry: BackendEntry) -> None:
-    """With ``landing: device`` the backend registers the KV pools, which live on the GPU; the
-    bypass would ``memcpy`` them and crash the process. ``landing: host`` registers pinned host
-    memory only, so the bypass is harmless there. Reads the resolved ``landing``."""
-    if entry.options.get("landing", "device") != "device" or not _memcpy_bypass_enabled():
+def _keep_memcpy_bypass_off_over_device_memory(entry: BackendEntry) -> None:
+    """With ``landing: device`` the backend registers the KV pools, which live on the GPU. Older
+    Mooncake clients served the memcpy bypass with a plain ``memcpy`` even for such spans; this
+    backend keeps the bypass off for the device landing whatever the client, and refuses an
+    explicit on. Left unset, the variable is decided by the client from the transports it
+    actually loaded (on when only TCP came up, which an RDMA entry without a reachable HCA does
+    too), not from the entry's ``protocol``; so an unset variable is set to off here, before
+    ``setup`` reads it. The variable is process-wide and is set only when unset. ``landing:
+    host`` registers pinned host memory only, where the bypass is a harmless fast path, and is
+    left to the client. Reads the resolved ``landing``."""
+    if entry.options.get("landing", "device") != "device":
+        return
+    value = os.environ.get(MEMCPY_BYPASS_ENV)
+    if value is None:
+        logger.info(
+            "backend %r: %s unset; set to 0 for landing: device", entry.name, MEMCPY_BYPASS_ENV
+        )
+        os.environ[MEMCPY_BYPASS_ENV] = "0"
+        return
+    if value.lower() in _MEMCPY_BYPASS_OFF:
         return
     raise ValueError(
-        f"backend {entry.name!r}: {MEMCPY_BYPASS_ENV}={os.environ[MEMCPY_BYPASS_ENV]!r} makes the "
-        "Mooncake client memcpy local objects, which crashes on the GPU memory this backend "
-        "registers; unset it or set landing: host"
+        f"backend {entry.name!r}: {MEMCPY_BYPASS_ENV}={value!r} turns the Mooncake client's "
+        "memcpy bypass on, which this backend keeps off for landing: device (it registers GPU "
+        f"memory, and older clients memcpy'd such spans); set {MEMCPY_BYPASS_ENV}=0 or use "
+        "landing: host"
     )
 
 
 def build_mooncake_backend(entry: BackendEntry, context: BackendBuildContext) -> BackendHandle:
     """Factory for ``type: mooncake``."""
     entry = _resolve_landing(entry)
-    _refuse_memcpy_bypass_over_device_memory(entry)
+    _keep_memcpy_bypass_off_over_device_memory(entry)
     return build_blob_backend(
         entry,
         context,

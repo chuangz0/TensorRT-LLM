@@ -17,6 +17,7 @@ import textwrap
 import pytest
 
 from tensorrt_llm._torch.pyexecutor import py_executor, py_executor_creator
+from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import PyExecutorKVTransferEffects
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import scheduler_v2
 
@@ -70,13 +71,14 @@ def test_schedule_hands_the_fetch_launch_queue_to_the_executor():
 
 
 def test_schedule_protects_requests_with_a_transfer_in_flight_from_eviction():
+    text = source_of(PyExecutor._protected_from_eviction_ids)
+    ordered(text, GUARD, "return self.kv_transfer.inflight_request_ids()", "return frozenset()")
     text = source_of(PyExecutor._schedule)
     ordered(
         text,
-        GUARD,
-        "protected_from_eviction_request_ids=self.kv_transfer.",
-        "inflight_request_ids()",
+        "protected = self._protected_from_eviction_ids()",
         "self.scheduler.schedule_request(",
+        "protected_from_eviction_request_ids=protected)",
     )
     text = source_of(PyExecutor._terminate_recompute_paused_requests)
     ordered(text, GUARD, "self.kv_transfer.inflight_request_ids()", "continue")
@@ -136,9 +138,8 @@ def test_pp_loop_advances_at_the_head_launches_after_stage_0_and_paces_idle():
         "self._pad_attention_dp_dummy_request()",
         "self._pp_schedule_and_propagate(microbatch_id)",
         "if self.dist.rank != 0:",
-        GUARD,
-        "protected_from_eviction_request_ids=self.",
-        "kv_transfer.inflight_request_ids()",
+        "protected = self._protected_from_eviction_ids()",
+        "protected_from_eviction_request_ids=protected)",
         "self.disagg.revert_deferred_gen_init(",
         GUARD,
         "self.kv_transfer.launch_reserved_fetches( self._kv_fetch_launch_queue if self.dist.rank "
@@ -196,9 +197,10 @@ def test_release_gate_precedes_everything_that_frees_the_request():
     """The gate is the first ``kv_transfer`` statement of ``_terminate_request`` and nothing
     before it terminates. The KV connector block ahead of it only defers: both of its early
     returns re-enter ``_terminate_request`` later (``_finish_connector_load_termination``,
-    ``_release_transfer``), so the gate still runs for every termination. The layer's own deferred
-    release goes straight to ``_do_terminate_request`` (plan §9), so a connector statement after
-    the gate would be skipped for a held request: the connector block stays ahead of it."""
+    ``_release_transfer``), so the gate still runs for every termination. The layer's own
+    deferred release (``effects.terminate_request``) takes the exits after the gate without
+    re-entering it, so a connector statement after the gate would be skipped for a held
+    request: the connector block stays ahead of it."""
     source = textwrap.dedent(inspect.getsource(PyExecutor._terminate_request))
     body = ast.parse(source).body[0].body
     statements = [ast.unparse(statement) for statement in body]
@@ -217,6 +219,24 @@ def test_release_gate_precedes_everything_that_frees_the_request():
         assert terminator not in before, f"{terminator} runs before the release gate"
         assert terminator in after
     assert "kv_connector_manager" not in after, "connector deferral after the gate is skipped"
+
+
+def test_deferred_release_takes_the_same_exits_as_the_statements_after_the_gate():
+    """A held request is terminated by the layer through ``effects.terminate_request``, which
+    must choose between the pipeline-parallel termination handler and ``_do_terminate_request``
+    exactly as ``_terminate_request`` does after its gate; otherwise a held request under PP
+    would be freed on one rank while its peers wait for the ring."""
+    gate_exits = source_of(PyExecutor._terminate_request).split("on_request_finished")[1]
+    effect = source_of(PyExecutorKVTransferEffects.terminate_request)
+    for text in (gate_exits, effect):
+        ordered(
+            text,
+            "_disagg_pp_termination_handler",
+            "is not None",
+            "is_dummy_request",
+            ".terminate(",
+            "_do_terminate_request(",
+        )
 
 
 def test_cancel_asks_is_tracking_before_the_transceiver():
@@ -240,7 +260,7 @@ def test_idle_detection_counts_a_transfer_in_flight_as_live():
         "not self.is_shutdown",
         "not self._has_pending_connector_transfers()",
         GUARD,
-        "self.kv_transfer.has_transfer_in_flight()",
+        "self.kv_transfer.has_pending_work()",
     )
 
 
@@ -307,4 +327,4 @@ def test_scheduler_asks_the_planner_after_the_prefix_probe_and_before_any_cache_
         "budget.peft_pages_needed(req)",
         "self._try_schedule_context(",
     )
-    assert "kv_transfer_planner = None" in source_of(scheduler_v2.KVCacheV2Scheduler.__init__)
+    assert "kv_transfer_hooks = None" in source_of(scheduler_v2.KVCacheV2Scheduler.__init__)

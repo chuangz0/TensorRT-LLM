@@ -15,6 +15,8 @@ __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.backends.blob.drivers import mooncake as driver_module  # noqa: E402
 from disaggregation.backends.blob.drivers.mooncake import (  # noqa: E402
     LEASE_EXPIRED,
+    NO_AVAILABLE_HANDLE,
+    OBJECT_ALREADY_EXISTS,
     OBJECT_NOT_FOUND,
     MooncakeBlobStore,
     MooncakeStoreConfig,
@@ -111,8 +113,11 @@ def test_get_retries_the_lease_once_only():
     assert len(store.raw.calls) == 2
 
 
-def test_put_zero_is_stored_and_any_other_status_is_declined_with_the_codes_logged(caplog):
-    store = _store(batch_put_from_multi_buffers=[0, -1, -704])
+def test_put_translates_stored_declined_and_failed_codes(caplog):
+    """``0`` is stored. ``OBJECT_ALREADY_EXISTS`` and ``NO_AVAILABLE_HANDLE`` mean the store chose
+    not to hold the key: declined, logged at debug. Any other code is a key that could not be
+    written: failed, logged at warning. A wrong count raises."""
+    store = _store(batch_put_from_multi_buffers=[0, OBJECT_ALREADY_EXISTS, NO_AVAILABLE_HANDLE])
     with caplog.at_level(logging.DEBUG, logger=driver_module.__name__):
         assert store.put(KEYS, BUFFERS) == [
             PutStatus.STORED,
@@ -121,8 +126,18 @@ def test_put_zero_is_stored_and_any_other_status_is_declined_with_the_codes_logg
         ]
     (call,) = store.raw.calls
     assert call[1][0] == KEYS and call[1][1] == [[0x1000], [0x2000, 0x2100], [0x3000]]
-    (record,) = [r for r in caplog.records if "put declined" in r.getMessage()]
-    assert record.levelno == logging.DEBUG and "[-704, -1]" in record.getMessage()
+    declined = [r for r in caplog.records if "declined" in r.getMessage()]
+    assert [r.levelno for r in declined] == [logging.DEBUG, logging.DEBUG]
+    assert "put of k1 declined with status -705" in declined[0].getMessage()
+    assert "put of k2 declined with status -200" in declined[1].getMessage()
+    for code in (-1, -600, -704, -800, -900, 1):
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger=driver_module.__name__):
+            assert _store(batch_put_from_multi_buffers=[code]).put(KEYS[:1], BUFFERS[:1]) == [
+                PutStatus.FAILED
+            ]
+        (record,) = [r for r in caplog.records if "put of k0 failed" in r.getMessage()]
+        assert record.levelno == logging.WARNING and f"status {code}" in record.getMessage()
     with pytest.raises(BlobStoreError, match="batch_put_from_multi_buffers answered 1 of 3"):
         _store(batch_put_from_multi_buffers=[0]).put(KEYS, BUFFERS)
 

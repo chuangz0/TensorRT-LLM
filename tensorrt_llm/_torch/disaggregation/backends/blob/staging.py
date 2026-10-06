@@ -141,7 +141,7 @@ class HostStagingPool:
             while len(self._free) < count:
                 if self._shutdown:
                     raise RuntimeError("staging pool is shut down")
-                self._cond.wait(timeout=1.0)
+                self._cond.wait()  # ``release`` and ``shutdown`` both notify
             if self._shutdown:
                 raise RuntimeError("staging pool is shut down")
             return self._take(count)

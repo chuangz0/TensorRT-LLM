@@ -108,6 +108,8 @@ def test_publish_where_the_store_declines_a_unit_is_not_served_not_failed():
         outcome = rank.finish(rank.backend.publish(extent([a, b])))
         assert outcome == Delivered(frozenset())
         assert rank.backend.counters.publish_stored == 0
+        assert rank.backend.counters.publish_declined == 2  # declined and not held
+        assert rank.backend.counters.publish_raced == 0
         assert rank.backend.counters.failed_attempts == 0
         assert rank.store.objects == {}
 
@@ -165,6 +167,7 @@ def test_declined_put_for_a_unit_another_publisher_made_present_counts_as_taken(
         assert outcome == Delivered(frozenset({first.name, second.name}))
         assert a.backend.counters.publish_stored == 1  # ``second``, written by us
         assert a.backend.counters.publish_raced == 1  # ``first``, held thanks to ``b``
+        assert a.backend.counters.publish_declined == 0  # a race is not a refusal
         assert a.backend.counters.failed_attempts == 0
         assert a.store.objects[a.key(first)] == pattern(1, 64)
 
@@ -301,7 +304,8 @@ def test_get_answering_the_wrong_count_is_failed():
 
 
 def test_short_read_is_failed_not_served():
-    # A name that matches but a destination another size: SPEC §5.2 inv. 1b.
+    # A name that matches but a destination another size: SPEC §5.2 inv. 1b. What the
+    # destination holds after the failure is undefined (§5.2 inv. 3) and not asserted.
     store = FakeBlobStore()
     a = make_rank(store)
     b = make_rank(store)
@@ -320,10 +324,8 @@ def test_short_read_is_failed_not_served():
         ub = b.unit(0, 0, 32)  # smaller destination: the object does not fit
         a.write(ua, pattern(1, 64))
         assert isinstance(a.finish(a.backend.publish(extent([ua]))), Delivered)
-        b.fill(ub, 0xEE)
         outcome = b.finish(b.backend.fetch(extent([ub])))
         assert isinstance(outcome, Failed)
-        assert b.read(ub) == bytes([0xEE]) * 32
 
 
 def test_failure_in_a_later_batch_fails_the_whole_attempt():

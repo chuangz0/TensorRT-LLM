@@ -168,6 +168,11 @@ class FakeAttempt:
         self._outcome = outcome
         self.polls = 0
 
+    @property
+    def is_live(self) -> bool:
+        """No outcome yet: a ``quiesce`` on it would block a real backend's caller."""
+        return self._outcome is None
+
     def poll(self) -> Outcome | None:
         self.polls += 1
         return self._outcome
@@ -196,6 +201,13 @@ class FakeAuxAttempt(FakeAttempt):
         return dict(self._aux)
 
 
+def check_quiesce_is_not_under_a_live_attempt(backend_name: str, attempts: tuple) -> None:
+    """A real backend's ``quiesce`` waits for the attempt to end, on the engine thread; the
+    coordinator must only ask once every attempt has its outcome."""
+    live = [a for a in attempts if getattr(a, "is_live", False)]
+    assert not live, f"{backend_name}.quiesce asked under {len(live)} live attempt(s)"
+
+
 class FakeFetches:
     """Scripted ``Fetches``.
 
@@ -203,6 +215,8 @@ class FakeFetches:
       outcome)`` scripts by the exact unit-name set of the extent (checked first). A scripted value
       may be an ``Outcome``, ``None`` (in flight), or a callable ``extent -> Outcome``.
     * ``quiesce_answers`` is consumed one per ``quiesce`` call; ``True`` once exhausted.
+    * ``strict_quiesce`` makes ``quiesce`` fail the test when asked about an attempt that has no
+      outcome yet.
     * ``probe_answers`` is consumed one per ``probe`` call, else ``probe_default``. An ``Exception``
       instance is raised instead of returned.
     * ``reject_next`` makes that many upcoming ``fetch`` calls raise ``SubmissionRejected``.
@@ -220,11 +234,13 @@ class FakeFetches:
         single_destination: bool = False,
         probe_default: frozenset[bytes] | None = None,
         trace: list | None = None,
+        strict_quiesce: bool = False,
     ) -> None:
         self.name = name
         self.single_destination = single_destination
         self.probe_default = probe_default
         self.trace = trace
+        self.strict_quiesce = strict_quiesce
         self.calls: list[tuple[str, tuple]] = []
         self.attempts: list[FakeAttempt] = []
         self.routes: list[FakeRoute] = []
@@ -272,6 +288,8 @@ class FakeFetches:
 
     def quiesce(self, attempts: Iterable) -> bool:
         attempts = tuple(attempts)
+        if self.strict_quiesce:
+            check_quiesce_is_not_under_a_live_attempt(self.name, attempts)
         answer = self.quiesce_answers.popleft() if self.quiesce_answers else True
         self.calls.append(("quiesce", (attempts, answer)))
         if self.trace is not None:
@@ -307,9 +325,12 @@ class FakeFetches:
 class FakePublishes:
     """Scripted ``Publishes``; same scripting knobs as ``FakeFetches`` where they apply."""
 
-    def __init__(self, *, name: str = "pub", trace: list | None = None) -> None:
+    def __init__(
+        self, *, name: str = "pub", trace: list | None = None, strict_quiesce: bool = False
+    ) -> None:
         self.name = name
         self.trace = trace
+        self.strict_quiesce = strict_quiesce
         self.calls: list[tuple[str, tuple]] = []
         self.attempts: list[FakeAttempt] = []
         self.quiesce_answers: deque[bool] = deque()
@@ -331,6 +352,8 @@ class FakePublishes:
 
     def quiesce(self, attempts: Iterable) -> bool:
         attempts = tuple(attempts)
+        if self.strict_quiesce:
+            check_quiesce_is_not_under_a_live_attempt(self.name, attempts)
         answer = self.quiesce_answers.popleft() if self.quiesce_answers else True
         self.calls.append(("quiesce", (attempts, answer)))
         if self.trace is not None:
@@ -413,11 +436,17 @@ class FakeLandsOnHost:
     """
 
     def __init__(
-        self, *, name: str = "host", probe_default="all", trace: list | None = None
+        self,
+        *,
+        name: str = "host",
+        probe_default="all",
+        trace: list | None = None,
+        strict_quiesce: bool = False,
     ) -> None:
         self.name = name
         self.probe_default = probe_default
         self.trace = trace
+        self.strict_quiesce = strict_quiesce
         self.calls: list[tuple[str, tuple]] = []
         self.landings: list[FakeLanding] = []
         self.attempts: list[FakeAttempt] = []
@@ -461,6 +490,8 @@ class FakeLandsOnHost:
 
     def quiesce(self, attempts: Iterable) -> bool:
         attempts = tuple(attempts)
+        if self.strict_quiesce:
+            check_quiesce_is_not_under_a_live_attempt(self.name, attempts)
         answer = self.quiesce_answers.popleft() if self.quiesce_answers else True
         self.calls.append(("quiesce", (attempts, answer)))
         if self.trace is not None:
@@ -785,11 +816,12 @@ class Rig:
 
     Sources are ``worker`` (hint key ``"ctx"``) followed by ``store`` (no hint key) unless
     ``sources`` is given; ``host`` is a ``FakeLandsOnHost`` store that holds every prompt. ``trace``
-    interleaves backend ``quiesce`` calls with effects. The
-    collective is ``FakeDist`` unless a ``dist`` (``LockstepGather``, ``PeerGather``) is given;
-    ``payloads()`` lists what this rank sent either way. ``probe_timeout_s`` is measured on the
-    ``now`` tests pass to ``advance``: with the default, a request deferred at 0.0 and 1.0 is
-    planned without the store at 2.0.
+    interleaves backend ``quiesce`` calls with effects. Every backend, publishers included, is
+    strict about ``quiesce``: asking under a live attempt fails the test. The collective is
+    ``FakeDist`` unless a ``dist`` (``LockstepGather``, ``PeerGather``) is given; ``payloads()``
+    lists what this rank sent either way. ``probe_timeout_s`` is measured on the ``now`` tests
+    pass to ``advance``: with the default, a request deferred at 0.0 and 1.0 is planned without
+    the store at 2.0.
     """
 
     def __init__(
@@ -807,9 +839,11 @@ class Rig:
         """Plans as read by ``plan_and_launch`` before launching (unreadable afterwards)."""
         self.trace: list = []
         self.reader = FakeReader(groups=groups, tokens_per_block=tpb)
-        self.worker = FakeFetches(name="worker", trace=self.trace)
-        self.store = FakeFetches(name="store", single_destination=True, trace=self.trace)
-        self.host = FakeLandsOnHost(name="host", trace=self.trace)
+        self.worker = FakeFetches(name="worker", trace=self.trace, strict_quiesce=True)
+        self.store = FakeFetches(
+            name="store", single_destination=True, trace=self.trace, strict_quiesce=True
+        )
+        self.host = FakeLandsOnHost(name="host", trace=self.trace, strict_quiesce=True)
         table = {
             "worker": FetchSource("worker", self.worker, "ctx"),
             "store": FetchSource("store", self.store, None),
@@ -820,6 +854,7 @@ class Rig:
         for p in self.publishers:
             if getattr(p, "trace", None) is None:
                 p.trace = self.trace
+            p.strict_quiesce = True
         self.effects = RecordingEffects(trace=self.trace)
         self.queue = FakeEngineQueue()
         self.dist = dist if dist is not None else FakeDist()

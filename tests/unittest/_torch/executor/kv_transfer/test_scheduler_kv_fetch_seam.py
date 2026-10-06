@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """U3 (integration plan §5 #10-#12, §11): the KV fetch seam of ``KVCacheV2Scheduler``.
 
-The scheduler asks a duck-typed ``kv_transfer_planner`` about every first-chunk context request
+The scheduler asks a duck-typed ``kv_transfer_hooks`` about every first-chunk context request
 before it prepares any cache for it. ``DEFER`` skips the request this round at no cost; a plan
 reserves pages with ``reserve_transfer_pages(req, token_end)`` and puts the request on
 ``fetch_launch_queue`` outside the forward-pass budget; ``None`` takes the ordinary path. The two
@@ -180,7 +180,7 @@ class FakePlan:
 
 
 class FakePlanner:
-    """Duck-typed ``kv_transfer_planner``: ``DEFER`` is its own sentinel, compared by identity."""
+    """Duck-typed ``kv_transfer_hooks``: ``DEFER`` is its own sentinel, compared by identity."""
 
     DEFER = object()
 
@@ -213,7 +213,7 @@ def test_scheduler_output_has_an_empty_fetch_launch_queue_by_default():
 def test_without_a_planner_every_context_request_takes_the_normal_path():
     mgr = make_kv_cache_manager()
     sched = make_scheduler(mgr)
-    assert sched.kv_transfer_planner is None
+    assert sched.kv_transfer_hooks is None
     req = make_ctx_request(1, 100)
     out = sched.schedule_request([req], set())
     assert ids(out.context_requests) == [1]
@@ -223,7 +223,7 @@ def test_without_a_planner_every_context_request_takes_the_normal_path():
 
 
 # ---------------------------------------------------------------------------------------------
-# DEFER / plan / SKIP / None
+# DEFER / plan / None
 # ---------------------------------------------------------------------------------------------
 
 
@@ -231,7 +231,7 @@ def test_defer_skips_the_request_this_round_without_preparing_a_cache():
     mgr = make_kv_cache_manager()
     sched = make_scheduler(mgr)
     planner = FakePlanner({1: FakePlanner.DEFER})
-    sched.kv_transfer_planner = planner
+    sched.kv_transfer_hooks = planner
     deferred, other = make_ctx_request(1, 100), make_ctx_request(2, 100)
 
     out = sched.schedule_request([deferred, other], set())
@@ -250,7 +250,7 @@ def test_plan_reserves_pages_to_token_end_and_queues_the_request_for_launch():
     mgr = make_kv_cache_manager()
     sched = make_scheduler(mgr)
     planner = FakePlanner({1: FakePlan(token_end=96)})
-    sched.kv_transfer_planner = planner
+    sched.kv_transfer_hooks = planner
     req = make_ctx_request(1, 100)
 
     out = sched.schedule_request([req], set())
@@ -270,7 +270,7 @@ def test_planned_request_is_exempt_from_the_request_and_token_budgets():
     # Room for exactly one request and exactly the other request's tokens.
     sched = make_scheduler(mgr, max_batch_size=1, max_num_tokens=100)
     planner = FakePlanner({1: FakePlan(token_end=64)})
-    sched.kv_transfer_planner = planner
+    sched.kv_transfer_hooks = planner
     fetching, normal = make_ctx_request(1, 100), make_ctx_request(2, 100)
 
     out = sched.schedule_request([fetching, normal], set())
@@ -284,7 +284,7 @@ def test_failed_reservation_skips_the_request_and_drops_its_cache():
     mgr = make_kv_cache_manager(reserve_transfer_pages_fn=lambda req, token_end=None: False)
     sched = make_scheduler(mgr)
     planner = FakePlanner({1: FakePlan(token_end=64)})
-    sched.kv_transfer_planner = planner
+    sched.kv_transfer_hooks = planner
     req = make_ctx_request(1, 100)
     req.context_current_position = 32  # a reuse match the failed reservation left behind
     mgr.kv_cache_map[1]  # the cache it created
@@ -304,7 +304,7 @@ def test_failed_reservation_skips_the_request_and_drops_its_cache():
 def test_failed_reservation_without_a_cache_only_rewinds():
     mgr = make_kv_cache_manager(reserve_transfer_pages_fn=lambda req, token_end=None: False)
     sched = make_scheduler(mgr)
-    sched.kv_transfer_planner = FakePlanner({1: FakePlan(token_end=64)})
+    sched.kv_transfer_hooks = FakePlanner({1: FakePlan(token_end=64)})
     req = make_ctx_request(1, 100)
 
     out = sched.schedule_request([req], set())
@@ -318,7 +318,7 @@ def test_none_answer_takes_the_normal_context_path():
     mgr = make_kv_cache_manager()
     sched = make_scheduler(mgr)
     planner = FakePlanner({1: None})
-    sched.kv_transfer_planner = planner
+    sched.kv_transfer_hooks = planner
     req = make_ctx_request(1, 100)
 
     out = sched.schedule_request([req], set())
@@ -334,13 +334,71 @@ def test_planner_is_asked_once_per_request_per_round():
     mgr = make_kv_cache_manager()
     sched = make_scheduler(mgr)
     planner = FakePlanner({1: None, 2: FakePlanner.DEFER, 3: FakePlan(token_end=32)})
-    sched.kv_transfer_planner = planner
+    sched.kv_transfer_hooks = planner
     reqs = [make_ctx_request(i, 100) for i in (1, 2, 3)]
     sched.schedule_request(reqs, set())
     assert sorted(planner.asked) == [1, 2, 3]
     planner.asked.clear()
     sched.schedule_request(reqs, set())
     assert sorted(planner.asked) == [1, 2, 3]  # a deferred request is asked again next round
+
+
+# ---------------------------------------------------------------------------------------------
+# The deadlock detector
+# ---------------------------------------------------------------------------------------------
+
+ROUNDS_PAST_THE_STALL_LIMIT = KVCacheV2Scheduler._DEADLOCK_STALL_ITERS + 1
+
+
+def test_a_request_deferred_by_the_transfer_layer_is_not_a_scheduling_stall():
+    """A deferred request waits on the transfer layer (a store lookup, a landing, the ranks'
+    agreement), each bounded by that layer's own clocks: progress in the making, not a stall."""
+    mgr = make_kv_cache_manager()
+    sched = make_scheduler(mgr)
+    sched.kv_transfer_hooks = FakePlanner({1: FakePlanner.DEFER})
+    req = make_ctx_request(1, 100)
+    for _ in range(ROUNDS_PAST_THE_STALL_LIMIT):
+        out = sched.schedule_request([req], set())
+    assert out.context_requests == [] and out.fetch_launch_queue == []
+    assert sched._stalled_schedules == 0
+
+
+def test_a_reserved_fetch_is_progress_for_the_deadlock_detector():
+    mgr = make_kv_cache_manager()
+    sched = make_scheduler(mgr)
+    sched.kv_transfer_hooks = FakePlanner({1: FakePlan(token_end=64)})
+    req = make_ctx_request(1, 100)
+    for _ in range(ROUNDS_PAST_THE_STALL_LIMIT):
+        out = sched.schedule_request([req], set())
+    assert ids(out.fetch_launch_queue) == [1] and sched._stalled_schedules == 0
+
+
+def test_a_fetch_reservation_that_finds_no_pages_is_not_a_scheduling_stall_either():
+    """A planned fetch the scheduler finds no pages for is bounded by the transfer layer's wait
+    clock (tens of seconds), after which the fetch is given up and the request computes locally;
+    the detector's thousand full-speed passes would fire within a second, long before that."""
+    mgr = make_kv_cache_manager(reserve_transfer_pages_fn=lambda req, token_end=None: False)
+    sched = make_scheduler(mgr)
+    sched.kv_transfer_hooks = FakePlanner({1: FakePlan(token_end=64)})
+    req = make_ctx_request(1, 100)
+    for _ in range(ROUNDS_PAST_THE_STALL_LIMIT):
+        out = sched.schedule_request([req], set())
+    assert out.fetch_launch_queue == [] and out.context_requests == []
+    assert sched._stalled_schedules == 0
+
+
+def test_pool_exhaustion_is_detected_once_the_request_is_back_on_the_local_path():
+    """When the transfer layer has given a fetch up (``None``: compute locally), a context
+    admission that keeps failing is the stall the detector exists for, exactly as without the
+    seam."""
+    mgr = make_kv_cache_manager()
+    mgr.prepare_context.side_effect = lambda req, reuse_limit=None: False
+    sched = make_scheduler(mgr)
+    sched.kv_transfer_hooks = FakePlanner({1: None})
+    req = make_ctx_request(1, 100)
+    with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+        for _ in range(ROUNDS_PAST_THE_STALL_LIMIT):
+            sched.schedule_request([req], set())
 
 
 # ---------------------------------------------------------------------------------------------
@@ -366,7 +424,7 @@ def test_dummy_request_with_a_planner_attached_is_scheduled_normally():
     mgr = make_kv_cache_manager()
     sched = make_scheduler(mgr)
     planner = FilteringPlanner({1: FakePlan(token_end=64), 2: FakePlan(token_end=64)})
-    sched.kv_transfer_planner = planner
+    sched.kv_transfer_hooks = planner
     dummy = make_ctx_request(1, 100)
     dummy.is_dummy_request = True
     real = make_ctx_request(2, 100)
@@ -460,7 +518,7 @@ def test_context_chunk_continuation_is_asked_and_takes_the_normal_path():
     mgr = make_kv_cache_manager()
     sched = make_scheduler(mgr)
     planner = FakePlanner()
-    sched.kv_transfer_planner = planner
+    sched.kv_transfer_hooks = planner
     continuation = make_ctx_request(1, 100, is_first_context_chunk=False)
     continuation.context_remaining_length = 40
 
@@ -475,7 +533,7 @@ def test_disagg_gen_init_request_never_reaches_the_planner():
     mgr = make_kv_cache_manager()
     sched = make_scheduler(mgr)
     planner = FakePlanner()
-    sched.kv_transfer_planner = planner
+    sched.kv_transfer_hooks = planner
     gen_init = make_disagg_gen_init_request(1, 100)
     out = sched.schedule_request([gen_init], set())
     assert planner.asked == []
@@ -487,7 +545,7 @@ def test_generation_request_is_not_asked():
     mgr = make_kv_cache_manager()
     sched = make_scheduler(mgr)
     planner = FakePlanner()
-    sched.kv_transfer_planner = planner
+    sched.kv_transfer_hooks = planner
     out = sched.schedule_request([make_gen_request(1)], set())
     assert planner.asked == []
     assert ids(out.generation_requests) == [1]
@@ -507,7 +565,7 @@ def test_exhausted_chunk_token_budget_skips_the_request_before_the_planner_is_as
         ctx_chunk_config=(ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, TPB),
     )
     planner = FakePlanner({2: FakePlan(token_end=64)})
-    sched.kv_transfer_planner = planner
+    sched.kv_transfer_hooks = planner
     gen, ctx = make_gen_request(1), make_ctx_request(2, 100)
 
     out = sched.schedule_request([gen, ctx], set())
@@ -531,7 +589,7 @@ def test_contributed_first_block_skips_the_duplicate_before_the_planner_is_asked
     sched = make_scheduler(mgr)
     assert sched._prefix_skip_enabled
     planner = FakePlanner({1: None, 2: FakePlan(token_end=64)})
-    sched.kv_transfer_planner = planner
+    sched.kv_transfer_hooks = planner
     first, duplicate = make_ctx_request(1, 100), make_ctx_request(2, 100)
 
     out = sched.schedule_request([first, duplicate], set())
@@ -561,7 +619,7 @@ def test_planner_is_asked_after_the_prefix_probe_but_before_any_cache_work():
             order.append(("plan_fetch", req.py_request_id))
             return super().plan_fetch(req)
 
-    sched.kv_transfer_planner = OrderedPlanner({1: FakePlanner.DEFER, 2: None})
+    sched.kv_transfer_hooks = OrderedPlanner({1: FakePlanner.DEFER, 2: None})
     reqs = [make_ctx_request(1, 100), make_ctx_request(2, 100)]
     sched.schedule_request(reqs, set())
     assert order == [

@@ -241,10 +241,10 @@ def test_slot_exhaustion_waits_then_proceeds():
         rank.write(b, pattern(2, 32))
         held = rank.publish_pool.acquire(1)  # someone else has the only slot
         attempt = rank.backend.publish(extent([a, b]))
-        # One slot bounds the batch to one unit, so the lookup is two calls; then the worker
-        # parks in ``acquire`` until the slot comes back. (``close`` would wake it with a failed
-        # delivery instead; see ``test_close_wakes_a_worker_parked_for_a_slot``.)
-        wait_until(lambda: rank.store.count("holds") == 2)
+        # The lookup needs no slot and is one call; then the worker parks in ``acquire`` until
+        # the slot comes back. (``close`` would wake it with a failed delivery instead; see
+        # ``test_close_wakes_a_worker_parked_for_a_slot``.)
+        wait_until(lambda: rank.store.count("holds") == 1)
         time.sleep(0.05)
         assert attempt.poll() is None and rank.publish_copier.copies == []
         rank.publish_pool.release(held)

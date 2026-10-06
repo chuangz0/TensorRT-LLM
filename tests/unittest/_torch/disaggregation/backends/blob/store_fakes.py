@@ -467,9 +467,12 @@ class Rank:
         return self
 
     def __exit__(self, *exc) -> None:
-        unblock = getattr(self.store, "unblock", None)  # a real store has no gate
-        if unblock is not None:
-            unblock()
+        # Every gate is opened first, so a test that fails with a worker parked behind one ends
+        # in a failure report rather than a ``close`` that waits for that worker forever.
+        for gated in (self.store, self.publish_copier, self.landing_copier):
+            unblock = getattr(gated, "unblock", None)  # a real store has no gate
+            if unblock is not None:
+                unblock()
         self.backend.close()
 
 

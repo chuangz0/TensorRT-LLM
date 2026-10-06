@@ -48,7 +48,7 @@ __all__ = [
 
 # Both aliases lie outside the V2 scheduler's schedulable range. The disagg transceiver writes
 # the same two values for its own transfers; which layer owns a request in one of them is decided
-# by each layer's own record table (plan §9 rule 5), never by reading the state.
+# by each layer's own record table, never by reading the state.
 KV_FETCH_IN_PROGRESS = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
 """A context request whose KV prefix is being fetched; the scheduler does not touch it."""
 KV_PUBLISH_IN_PROGRESS = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
@@ -170,8 +170,7 @@ class PyExecutorKVTransferEffects:
             )
         kv_cache_manager = self._executor.kv_cache_manager
         self._check_history_declared(engine_request, token_end)
-        # CONTEXT_INIT first: the C++ request only lets a context-phase request move its cursor
-        # (plan §10 #1).
+        # CONTEXT_INIT first: the C++ request only lets a context-phase request move its cursor.
         engine_request.state = LlmRequestState.CONTEXT_INIT
         # Fetched content always ends short of the prompt, so the cursor is settled the way a
         # local reuse hit is (design §7.3 step 1). Local reuse may already reach past
@@ -182,7 +181,7 @@ class PyExecutorKVTransferEffects:
         settle_at = max(token_end, int(kv_cache.num_committed_tokens))
         settle_context_cursor(engine_request, settle_at, kv_cache_manager.tokens_per_block)
         # The pages now hold real content and are committed next; a later revert must not shrink
-        # them away (plan §10 #11).
+        # them away.
         engine_request.py_ctx_pre_resize_cap = None
         # Only the primary manager commits: a draft KV cache manager is refused at assembly, so
         # there is no paired pool whose commit would have to agree with this one.
@@ -199,12 +198,12 @@ class PyExecutorKVTransferEffects:
         """Revert the pages the scheduler reserved for a fetch; back to ``CONTEXT_INIT``.
 
         A cache that survives the revert with history declared to the fetch target but no data
-        in its pages is dropped, so the request re-enters as a fresh first chunk (plan §10 #13).
+        in its pages is dropped, so the request re-enters as a fresh first chunk.
         """
         engine_requests = [_engine_request(request) for request in requests]
         kv_cache_manager = self._executor.kv_cache_manager
         # CONTEXT_INIT first, as in ``unpark``: reverting and rewinding move the context cursor,
-        # which the C++ request only allows in the context phase (plan §10 #1).
+        # which the C++ request only allows in the context phase.
         for engine_request in engine_requests:
             engine_request.state = LlmRequestState.CONTEXT_INIT
         self._executor._revert_ctx_alloc(engine_requests)
@@ -218,16 +217,18 @@ class PyExecutorKVTransferEffects:
         )
 
     def prepare_fetch_resources(self, requests: Sequence) -> None:
-        """Prepare the non-KV resource managers, as for a gen-init receive."""
+        """Prepare the non-KV resource managers, as for a gen-init receive, without latching
+        ``cached_tokens``: the request returns to the context path once the fetch lands, and its
+        first forward latches the fetched depth (``cached_tokens`` is written once)."""
         self._executor._prepare_disagg_gen_resources(
-            [_engine_request(request) for request in requests]
+            [_engine_request(request) for request in requests], latch_cached_tokens=False
         )
 
     def hold_for_transfer(self, requests: Sequence) -> None:
         """A finished request with a transfer in flight: keep its pages, release the rest.
 
-        Reads nothing of the disagg transfer manager (plan §9): a seq slot the disagg send already
-        released is a no-op to release again, and ``release_index_slot`` is idempotent. The pages
+        Reads nothing of the disagg transfer manager: a seq slot the disagg send already released
+        is a no-op to release again, and ``release_index_slot`` is idempotent. The pages
         themselves stay allocated for the transfer.
         """
         for request in requests:
@@ -239,11 +240,17 @@ class PyExecutorKVTransferEffects:
     def terminate_request(self, request) -> None:
         """Final release of a held request once every transfer of it is done.
 
-        Goes straight to ``_do_terminate_request``: the request has already left
-        ``active_requests`` (only unfinished requests are kept there), and re-entering
-        ``_terminate_request`` would ask the release gate again (plan §9).
+        Takes the two exits ``_terminate_request`` has after its release gate, without
+        re-entering it (the gate would be asked again): the pipeline-parallel termination
+        handler when the engine has one, so the ranks free the request in lockstep, else
+        ``_do_terminate_request``. Dummy requests never reach the gate, so none is held.
         """
-        self._executor._do_terminate_request(_engine_request(request))
+        engine_request = _engine_request(request)
+        handler = self._executor._disagg_pp_termination_handler
+        if handler is not None and not engine_request.is_dummy_request:
+            handler.terminate(engine_request)
+        else:
+            self._executor._do_terminate_request(engine_request)
 
     def fail_requests(self, requests: Sequence, reason: str) -> None:
         """Fail requests through the engine's error path.
@@ -255,12 +262,14 @@ class PyExecutorKVTransferEffects:
         self._executor._handle_errors(reason, requests=engine_requests, charge_budget=False)
 
     def fail_fatal(self, error: BaseException) -> None:
+        """A rank-local fatal: one backend on this rank could not vouch for its memory. The
+        engine's rank-local fatal path fails every active request and, under multi-rank
+        attention DP, raises to tear this rank down instead of entering a collective its peers
+        are not in (``fatal_is_collective_aligned`` is for a fatal every rank agreed on)."""
         executor = self._executor
         executor._fatal_error = RuntimeError(f"Fatal error: {error}")
         executor.is_shutdown = True
-        executor._handle_errors(
-            str(error), requests=None, charge_budget=False, fatal_is_collective_aligned=True
-        )
+        executor._handle_errors(str(error), requests=None, charge_budget=False)
 
     # ---- helpers ----
 
@@ -276,7 +285,7 @@ class PyExecutorKVTransferEffects:
 
     def _warn_if_commit_fell_short(self, engine_request: LlmRequest, token_end: int) -> None:
         """A commit short of ``token_end`` makes the scheduler re-settle the cursor at the local
-        reuse depth and recompute the fetched pages: slow but correct (plan §10 #14)."""
+        reuse depth and recompute the fetched pages: slow but correct."""
         kv_cache = self._executor.kv_cache_manager.kv_cache_map.get(engine_request.py_request_id)
         committed = 0 if kv_cache is None else int(kv_cache.num_committed_tokens)
         if committed < token_end:

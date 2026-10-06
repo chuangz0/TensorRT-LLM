@@ -184,14 +184,21 @@ class KVTransferCoordinator:
         effects: The engine's side effects.
         queue: Work backends post for the engine thread.
         dist: The collective over the ranks that plan together; one ``allgather`` per ``advance``.
-        fetch_timeout_s: Deadline for a fetch, from launch. ``None`` disables.
-        publish_timeout_s: Deadline for a publish, from its first submission. ``None`` disables.
+        fetch_timeout_s: Deadline for a fetch, from launch (or from landing on the host), and
+            for a fetch record kept at its request's end to vote. Past it the request fails and
+            this rank stops waiting for the others. ``None`` disables.
+        publish_timeout_s: Deadline for a publish, from its first accepted submission, and for
+            a publish record kept at its request's end to vote. Past it this rank warns and
+            stops waiting for the others; the record still settles on its own outcome. ``None``
+            disables.
         unlaunched_timeout_s: Longest this rank may stay unlaunched on a fetch another rank has
             already launched before it votes the fetch failed. ``None`` disables. Never starts
             counting on a single rank.
-        landing_wait_timeout_s: Host-first fetches only. Longest this rank waits for the
-            backend's landing memory or, once landed, for the scheduler's pages before it votes
-            the fetch failed. Counts on a single rank too. ``None`` disables.
+        landing_wait_timeout_s: Longest this rank waits for the scheduler's pages (from the
+            plan's decision, or from landing on the host) or, host-first, for the backend's
+            landing memory, before it votes the fetch failed. Counts on a single rank too, so a
+            fetch the scheduler can never find pages for is given up and the request computes
+            locally instead of stalling. ``None`` disables.
         plan_authority: Who decides plan answers on this rank. ``VOTED``: planned here and
             reduced in the collective. ``OWNER``: planned here alone, not carried in the
             payload, handed out with ``export_plan_answers``. ``FOLLOWER``: never planned or
@@ -203,6 +210,13 @@ class KVTransferCoordinator:
     fetch records reach their release point and per-request state is dropped. Landings still
     held when the engine shuts down (``hooks.close`` frees parked and held requests only) are
     released by the backend's own ``close``.
+
+    A record of a finished request keeps taking part in the round until the ranks agree on it,
+    so that every rank terminates the request in the same round; a record past its deadline is
+    rank-local instead and settles here as soon as its own attempts are over. A publish past its
+    deadline whose attempt is still live stays ``IN_FLIGHT`` (it is never quiesced under a live
+    attempt), so ``inflight_request_ids`` stays non-empty and the scheduler's deadlock detector
+    is off for that time: the intended trade for never blocking the engine thread.
     """
 
     def __init__(
@@ -258,6 +272,12 @@ class KVTransferCoordinator:
         self._finished: set[int] = set()
         self._held: set[int] = set()
         """Finished requests the engine was told to hold; each owes a ``terminate_request``."""
+        self._finished_by_gate: set[int] = set()
+        """Finished requests the engine's release gate reported; the others were failed here and
+        the gate has yet to ask about them."""
+        self._terminated_before_gate: set[int] = set()
+        """Held requests this coordinator terminated before the engine's release gate asked about
+        them; the gate is answered "not yours" once, so the engine does not terminate twice."""
 
     # ---- loop entry points (each rank calls each the same number of times per round) ----
 
@@ -367,13 +387,21 @@ class KVTransferCoordinator:
 
     # ---- control ----
 
-    def notify_request_finished(self, req: RequestView) -> None:
-        """The request ended. A fetch not in flight in the pages reaches its release point now;
-        one still in flight there is abandoned and released when its outcome arrives (never
-        quiesced here: that would block the engine thread on a transfer), and holds the request
-        so the pages stay put until the backend is done with them. A landing still on its way to
-        the backend's memory (``STAGING``) names no page: it is released at once, outcome or
-        not, as ``Landing.release`` allows."""
+    def notify_request_finished(self, req: RequestView, now: float | None = None) -> bool:
+        """The engine's release gate: the request ended. Returns whether the engine may terminate
+        it now: ``False`` while this coordinator holds it (it terminates the request itself once
+        every record of it is gone), and ``False`` once for a request this coordinator failed and
+        already terminated before the gate asked."""
+        rid = req.py_request_id
+        if rid in self._terminated_before_gate:
+            self._terminated_before_gate.discard(rid)
+            return False
+        self._finished_by_gate.add(rid)
+        self._finish_request(req, time.monotonic() if now is None else now)
+        return rid not in self._held
+
+    def _finish_request(self, req: RequestView, now: float) -> None:
+        """What a request's end does to its records; the request is held while any remains."""
         rid = req.py_request_id
         if rid in self._finished:
             return
@@ -381,41 +409,81 @@ class KVTransferCoordinator:
         self._requests[rid] = req
         fetch = self._records.get((rid, "fetch"))
         if fetch is not None:
-            if fetch.state is RecordState.IN_FLIGHT:
-                fetch.abandoned = True
-            else:
-                # Attempts on a PLANNED, STAGING or STAGED record belong to an earlier try that
-                # was quiesced when it failed; only a LANDED (or fatally FAILED) record owes one.
-                quiesce_due = fetch.attempts and fetch.state in (
-                    RecordState.LANDED,
-                    RecordState.FAILED,
-                )
-                if quiesce_due and not self._quiesce(fetch):
-                    return
-                self._close_routes(fetch)
-                self._release(fetch)
+            self._end_fetch_of_finished_request(fetch, now)
         publish = self._records.get((rid, "publish"))
-        if publish is not None and publish.state is not RecordState.IN_FLIGHT:
-            # Nothing is in flight for it: released now. A publish every publisher refused was
-            # warned about at submission and owes the engine nothing more.
-            self._release(publish)
+        if publish is not None:
+            self._end_publish_of_finished_request(publish, now)
         if (rid, "fetch") in self._records or (rid, "publish") in self._records:
             self._held.add(rid)
             self._effects.hold_for_transfer([req])
             return
         self._finish_if_released(rid)
 
+    def _end_fetch_of_finished_request(self, rec: TransferRecord, now: float) -> None:
+        """A delivery into the pages (``IN_FLIGHT``) is abandoned and released when its outcome
+        arrives, never quiesced here: that would block the engine thread on a transfer. One that
+        ended (``LANDED``, fatally ``FAILED``) reaches its release point now. Anything else names
+        no page: its landing, if any, goes at once (``Landing.release`` allows it before the
+        outcome); the record itself goes too if it is rank-local already (expired), else it
+        stays to vote until the ranks agree, so that every rank terminates the request in the
+        same round."""
+        if rec.state is RecordState.IN_FLIGHT:
+            return
+        if rec.state in (RecordState.LANDED, RecordState.FAILED):
+            if self._quiesce(rec):
+                self._close_routes(rec)
+                self._release(rec)
+            return
+        self._release_landing(rec)
+        if rec.expired:
+            self._release(rec)
+        else:
+            self._bound_wait_for_verdict(rec, now)
+
+    def _end_publish_of_finished_request(self, rec: TransferRecord, now: float) -> None:
+        """A publish in flight settles on its outcome. One nothing was ever submitted for is
+        released now: no rank submitted either, since every rank offers the same pieces. One
+        some publisher refused stays to vote FAILED until the ranks agree: a peer's may be in
+        flight, and the store is missing this rank's part. A ``LANDED`` or ``FAILED`` record
+        still here did not pass its release point (the backend refused to vouch for the pages)
+        and stays."""
+        if rec.state is RecordState.PLANNED and not rec.attempts and not rec.rejected:
+            self._release(rec)
+            return
+        self._bound_wait_for_verdict(rec, now)
+
+    def _bound_wait_for_verdict(self, rec: TransferRecord, now: float) -> None:
+        """A record kept at its request's end waits for the ranks under a deadline, like any
+        other, so a peer that stopped voting cannot hold the request forever."""
+        if rec.deadline is None:
+            rec.deadline = self._deadline_for(rec, now)
+
     def has_inflight(self) -> bool:
         """Some backend is working for this coordinator: a delivery into pages, or a landing."""
         return any(self._is_running(rec) for rec in self._records.values())
 
-    def inflight_request_ids(self) -> frozenset[int]:
-        """Requests with a record still ``IN_FLIGHT``: a backend may still touch their pages."""
-        return frozenset(
-            rec.request_id for rec in self._records.values() if rec.state is RecordState.IN_FLIGHT
+    def has_pending_work(self) -> bool:
+        """Something here will move without a new request: a backend is working, a fetch waits
+        for the scheduler's pages, or a record of a finished request waits for the ranks'
+        agreement. The engine must not sleep on its request queue, and should yield briefly on
+        an idle pass, while this is true."""
+        return any(
+            self._is_running(rec)
+            or self._is_unlaunched_fetch(rec)
+            or rec.request_id in self._finished
+            for rec in self._records.values()
         )
 
-    # ---- what the engine's release gate and cancel path read (design §4.3, plan §9 rule 5) ----
+    def inflight_request_ids(self) -> frozenset[int]:
+        """Requests whose pages a backend may still touch: a record ``IN_FLIGHT``, or one whose
+        backend refused to vouch for the pages at the release point."""
+        return frozenset(
+            rec.request_id
+            for rec in self._records.values()
+            if rec.state is RecordState.IN_FLIGHT or rec.quiesce_refused
+        )
+
+    # ---- what the engine's release gate and cancel path read (design §4.3) ----
 
     def parked_request_ids(self) -> frozenset[int]:
         """Running requests whose fetch is in flight: out of the scheduler's reach until it lands
@@ -429,8 +497,9 @@ class KVTransferCoordinator:
         )
 
     def held_request_ids(self) -> frozenset[int]:
-        """Finished requests held while a transfer still touches their pages; each is terminated
-        by this coordinator through ``terminate_request`` once every record of it is gone."""
+        """Finished requests held while a transfer still touches their pages or a record of
+        theirs still waits for the ranks' agreement; each is terminated by this coordinator
+        through ``terminate_request`` once every record of it is gone."""
         return frozenset(self._held)
 
     def tracked_requests(self) -> list[RequestView]:
@@ -450,7 +519,7 @@ class KVTransferCoordinator:
                     "attempts": len(rec.attempts),
                     "outcomes": [type(a.outcome).__name__ for a in rec.attempts if a.outcome],
                     "deadline": rec.deadline,
-                    "abandoned": rec.abandoned,
+                    "expired": rec.expired,
                     "token_end": rec.plan.token_end if rec.plan else None,
                     "launch_gave_up": rec.launch_gave_up,
                     "peer_launched_at": rec.peer_launched_at,
@@ -466,46 +535,58 @@ class KVTransferCoordinator:
     # ---- advance, phase 1: reap ----
 
     def _reap(self, now: float) -> tuple[dict[RecordKey, Vote], list[RecordKey]]:
-        """Poll every attempt in flight, then cast one vote per record that takes part in the
-        round. A record of a finished request casts none: its outcome has no effect on the other
-        ranks, which may already have released their record or never created it, so it settles
-        here as soon as this rank's attempts are over."""
+        """Poll every attempt in flight, then cast one vote per record that has a say this round.
+        An expired record casts none: it is rank-local and settles here as soon as its own
+        attempts are over. Every voting record past its deadline is reported expired, whatever
+        its vote, so a peer that stopped voting cannot hold it forever."""
         self._queue.drain(self._queue_budget)
         votes: dict[RecordKey, Vote] = {}
         expired: list[RecordKey] = []
         settled_locally: list[tuple[TransferRecord, Vote]] = []
         for key, rec in self._records.items():
-            if rec.state is RecordState.IN_FLIGHT:
-                self._poll(rec)
-                vote = self._inflight_vote(rec)
-            elif rec.state is RecordState.STAGING:
-                vote = self._landing_vote(rec)
-            elif self._is_unlaunched_fetch(rec):
-                vote = self._unlaunched_vote(rec, now)
-            else:
+            vote = self._vote(rec, now)
+            if vote is None:
                 continue
-            if vote.kind is VoteKind.INFLIGHT and self._deadline_passed(rec, now):
+            if rec.expired:
+                if vote.kind is not VoteKind.INFLIGHT:
+                    settled_locally.append((rec, vote))
+                continue
+            if self._deadline_passed(rec, now):
                 expired.append(key)
-            if self._is_voting(rec):
-                votes[key] = vote
-            elif rec.state is RecordState.IN_FLIGHT and vote.kind is not VoteKind.INFLIGHT:
-                settled_locally.append((rec, vote))
+            votes[key] = vote
         for rec, vote in settled_locally:
-            self._settle_finished_record(rec, vote)
+            self._settle_locally(rec, vote)
         return votes, expired
 
-    def _is_voting(self, rec: TransferRecord) -> bool:
-        """The plan's predicate: a record takes part in the round unless its request is finished,
-        and only while something runs for it or it is planned and waiting to launch."""
-        return rec.request_id not in self._finished and (
-            self._is_running(rec) or self._is_unlaunched_fetch(rec)
-        )
+    def _vote(self, rec: TransferRecord, now: float) -> Vote | None:
+        """This rank's word on one record, or ``None`` for a record with nothing to say: a
+        publish not submitted yet, a fetch landed in the pages and waiting for its request's
+        end, or a record whose pages the backend refused to vouch for (nothing is agreed on a
+        poisoned page; the engine is fatal)."""
+        if rec.quiesce_refused:
+            return None
+        if rec.state is RecordState.IN_FLIGHT:
+            self._poll(rec)
+            return self._inflight_vote(rec)
+        if rec.direction == "publish" and rec.rejected:
+            # Nothing of this rank's part reached the store: the publish has failed for every
+            # rank, whether its request still runs or has ended.
+            return Vote(VoteKind.FAILED)
+        if rec.request_id in self._finished:
+            return self._finished_vote(rec)
+        if rec.state is RecordState.STAGING:
+            return self._landing_vote(rec)
+        if self._is_unlaunched_fetch(rec):
+            return self._unlaunched_vote(rec, now)
+        return None
 
     @staticmethod
     def _is_running(rec: TransferRecord) -> bool:
         """A backend is working for this record: attempts in the pages, or a landing on its way.
-        A STAGING record always belongs to a running request: the request's end releases it."""
-        return rec.state in (RecordState.IN_FLIGHT, RecordState.STAGING)
+        A finished request's landing is given back at once, so its STAGING record runs nothing."""
+        if rec.state is RecordState.STAGING:
+            return rec.landing is not None
+        return rec.state is RecordState.IN_FLIGHT
 
     @staticmethod
     def _poll(rec: TransferRecord) -> None:
@@ -513,18 +594,17 @@ class KVTransferCoordinator:
             if a.outcome is None:
                 a.outcome = a.attempt.poll()
 
-    @staticmethod
-    def _inflight_vote(rec: TransferRecord) -> Vote:
+    def _inflight_vote(self, rec: TransferRecord) -> Vote:
         """INFLIGHT while any attempt of this rank is still running, so that a verdict never
         quiesces under a live attempt; once every attempt has its outcome, FAILED or TERMINAL."""
         if not rec.is_terminal():
             return Vote(VoteKind.INFLIGHT)
         if rec.direction == "publish":
-            # A pipelined publish has failed if any piece did or was refused; it lands only once
-            # the last piece has been offered.
+            # A pipelined publish has failed if any piece did or was refused; it lands once the
+            # last piece has been offered, or once its request ended: no more pieces come then.
             if rec.rejected or rec.any_failed():
                 return Vote(VoteKind.FAILED)
-            if rec.extent.is_last:
+            if rec.extent.is_last or rec.request_id in self._finished:
                 return Vote(VoteKind.TERMINAL)
             return Vote(VoteKind.INFLIGHT)
         if rec.any_failed():
@@ -535,6 +615,16 @@ class KVTransferCoordinator:
         # counts as arrived.
         b = merge(rec.plan, rec.merged_served() | rec.committed_names)
         return Vote(VoteKind.TERMINAL, b, b)
+
+    @staticmethod
+    def _finished_vote(rec: TransferRecord) -> Vote:
+        """A record of a finished request with nothing running in the pages here: TERMINAL, so
+        that it holds no rank up and fails none. A fetch votes its plan's target, so a peer still
+        delivering lands on its own word; without a plan (dropped after a failed try) no peer is
+        delivering, and B does not matter."""
+        if rec.direction == "fetch" and rec.plan is not None:
+            return Vote(VoteKind.TERMINAL, rec.plan.token_end, rec.plan.token_end)
+        return Vote(VoteKind.TERMINAL)
 
     @staticmethod
     def _landing_vote(rec: TransferRecord) -> Vote:
@@ -551,8 +641,9 @@ class KVTransferCoordinator:
 
     def _unlaunched_vote(self, rec: TransferRecord, now: float) -> Vote:
         """A planned record without an attempt here: UNLAUNCHED holds the others until this rank
-        gets what it waits for (pages; for a host-first fetch, the landing memory or the pages),
-        FAILED once it gave up launching or waited too long by either clock."""
+        gets what it waits for (the scheduler's pages; for a host-first fetch, the landing memory
+        first), FAILED once it gave up launching or waited too long by either clock: the peers'
+        (``unlaunched_timeout_s``) or its own (``landing_wait_timeout_s``)."""
         if (
             rec.launch_gave_up
             or self._unlaunched_too_long(rec, now)
@@ -577,11 +668,11 @@ class KVTransferCoordinator:
 
     @staticmethod
     def _deadline_passed(rec: TransferRecord, now: float) -> bool:
-        # An abandoned fetch has already had its expiry (or its request ended) and is only
-        # waiting for its outcome; abandoning a publish changes nothing about its deadline,
-        # since the deadline is what fails the request the publish is holding (design §7.1).
-        already_expired = rec.direction == "fetch" and rec.abandoned
-        return rec.deadline is not None and now >= rec.deadline and not already_expired
+        return rec.deadline is not None and now >= rec.deadline
+
+    def _deadline_for(self, rec: TransferRecord, now: float) -> float | None:
+        timeout = self._fetch_timeout_s if rec.direction == "fetch" else self._publish_timeout_s
+        return None if timeout is None else now + timeout
 
     @staticmethod
     def _is_unlaunched_fetch(rec: TransferRecord) -> bool:
@@ -608,12 +699,13 @@ class KVTransferCoordinator:
     def _lands_on_host(self, rec: TransferRecord) -> bool:
         return rec.plan.source in self._host_sources
 
-    def _settle_finished_record(self, rec: TransferRecord, vote: Vote) -> None:
-        if rec.direction == "fetch":
-            self._release_finished_fetch(rec)
+    def _settle_locally(self, rec: TransferRecord, vote: Vote) -> None:
+        """An expired record whose attempts are over: settled on this rank's word alone. Its
+        request, for a fetch, already failed at the expiry."""
+        if rec.direction == "publish":
+            self._finish_publish(rec, failed=vote.kind is VoteKind.FAILED)
         else:
-            failed = vote.kind is VoteKind.FAILED
-            self._finish_publish(rec, failed=failed, reason="kv publish failed")
+            self._release_finished_fetch(rec)
 
     # ---- advance, phase 2: plan ----
 
@@ -718,22 +810,21 @@ class KVTransferCoordinator:
     ) -> None:
         for key in expired:
             rec = self._records.get(key)
-            if rec is None:
-                continue
-            if self._is_running(rec):
-                self._expire_inflight(rec)
-            elif self._is_unlaunched_fetch(rec):
-                # Another rank's attempt expired while this rank never launched: nothing is in
-                # flight here, so the request fails now and its record goes with it.
-                self._fail_unlaunched_fetch(rec, reason="kv fetch timed out")
+            if rec is not None and not rec.expired:
+                self._expire(rec, now)
 
         for key in sorted(verdicts):
             rec = self._records.get(key)
             if rec is None:
                 continue
             b, hint, failed = verdicts[key]
-            if self._is_running(rec):
-                self._settle_inflight(rec, b, hint, failed, now)
+            if rec.direction == "publish":
+                self._finish_publish(rec, failed=failed)
+            elif rec.request_id in self._finished:
+                # The request is gone; the agreement only says every rank releases it now.
+                self._release_finished_fetch(rec)
+            elif self._is_running(rec):
+                self._settle_fetch_verdict(rec, b, hint, failed, now)
             elif self._is_unlaunched_fetch(rec):
                 # An UNLAUNCHED vote blocks a landing, so the only verdict that reaches an
                 # unlaunched record is a failure: drop the plan without touching pages.
@@ -751,7 +842,8 @@ class KVTransferCoordinator:
     def _decide(self, rid: int, ans: FetchPlan | None, now: float) -> None:
         """Write a decided answer: ``None`` releases a planned record, a plan goes on the record
         (created if needed) and ``plan_fetch`` reads it from now on. A plan from a host-first
-        source is started right here, since it needs no pages to begin."""
+        source is started right here, since it needs no pages to begin; any other waits for the
+        scheduler's pages from now, on the wait clock."""
         self._plans[rid] = ans
         key = (rid, "fetch")
         rec = self._records.get(key)
@@ -766,6 +858,8 @@ class KVTransferCoordinator:
         rec.retry_hint = None
         if self._lands_on_host(rec):
             self._fetch_to_host(rec, now)
+        else:
+            rec.waiting_since = now
 
     def _fetch_to_host(self, rec: TransferRecord, now: float) -> None:
         """Phase one of a host-first fetch: ask the backend to land the plan's units in its own
@@ -784,8 +878,9 @@ class KVTransferCoordinator:
             return
         rec.landing = landing
         rec.waiting_since = None
+        rec.peer_launched_at = None
         rec.state = RecordState.STAGING
-        rec.deadline = None if self._fetch_timeout_s is None else now + self._fetch_timeout_s
+        rec.deadline = self._deadline_for(rec, now)
 
     def _retry_refused_landings(self, now: float) -> None:
         """Ask again for the landing memory of every host-first plan the backend refused."""
@@ -794,29 +889,32 @@ class KVTransferCoordinator:
                 rec.direction == "fetch"
                 and rec.state is RecordState.PLANNED
                 and rec.plan is not None
+                and rec.request_id not in self._finished
                 and self._lands_on_host(rec)
             ):
                 self._fetch_to_host(rec, now)
 
-    def _expire_inflight(self, rec: TransferRecord) -> None:
-        if rec.direction == "fetch" and rec.request_id in self._finished:
-            # Already abandoned by the request's end; its outcome settles it. A publish of a
-            # finished request is different: its expiry is what fails the held request.
-            return
-        rec.abandoned = True
+    def _expire(self, rec: TransferRecord, now: float) -> None:
+        """Some rank saw the record's deadline pass: from now on this rank settles it alone, once
+        its own attempts are over (never under a live attempt: quiesce would block the engine
+        thread). A publish is a warning, not a request failure. A fetch fails its request, unless
+        the request ended already and the record is only waiting for its outcome."""
+        rec.expired = True
         if rec.direction == "publish":
-            self._finish_publish(rec, failed=True, reason="kv publish timed out")
-        elif rec.plan.no_local_fallback:
-            self._fetch_failed(rec, hint=None, reason="kv fetch timed out")
-        else:
-            self._fail_expired_fetch(rec)
+            # A long chunked prefill is still offering pieces: not worth a warning until the
+            # last piece is out and the store has had its full say.
+            log = logger.warning if rec.extent.is_last else logger.debug
+            log(
+                "request %d: kv publish past its deadline; settled here once its attempts end",
+                rec.request_id,
+            )
+        elif rec.request_id not in self._finished:
+            self._fail_expired_fetch(rec, now)
 
-    def _settle_inflight(
+    def _settle_fetch_verdict(
         self, rec: TransferRecord, b: int, hint: int, failed: bool, now: float
     ) -> None:
-        if rec.direction == "publish":
-            self._finish_publish(rec, failed=failed, reason="kv publish failed")
-        elif failed:
+        if failed:
             self._fetch_failed(rec, hint=None, reason="kv fetch failed")
         elif b == rec.plan.token_end:
             self._fetch_landed(rec, now)
@@ -825,15 +923,14 @@ class KVTransferCoordinator:
 
     def _fetch_landed(self, rec: TransferRecord, now: float) -> None:
         """The ranks agreed the delivery is complete. For a landing that is the host memory:
-        the record waits for pages (``STAGED``). For a delivery into the pages the request is
-        unparked and the landing, if any, is given back at once: the copy was complete before
-        its outcome was reported, and the record itself stays until the request ends."""
-        if rec.request_id in self._finished:
-            self._release_finished_fetch(rec)
-            return
+        the record waits for pages (``STAGED``), on the wait clock alone. For a delivery into the
+        pages the request is unparked and the landing, if any, is given back at once: the copy
+        was complete before its outcome was reported, and the record itself stays until the
+        request ends."""
         if rec.state is RecordState.STAGING:
             rec.state = RecordState.STAGED
             rec.waiting_since = now
+            rec.peer_launched_at = None
             rec.deadline = None  # the placement sets its own
             return
         rec.state = RecordState.LANDED
@@ -847,9 +944,6 @@ class KVTransferCoordinator:
         """The ranks agreed the delivery failed or came up short. A landing on its way to the
         host names no page: nothing to quiesce or give back, the landing goes and the plan is
         retried or settled. A delivery into the pages passes the release point first."""
-        if rec.request_id in self._finished:
-            self._release_finished_fetch(rec)
-            return
         was_staging = rec.state is RecordState.STAGING
         rec.state = RecordState.FAILED
         if was_staging:
@@ -892,48 +986,42 @@ class KVTransferCoordinator:
             self._release(rec)
             self._plans[rec.request_id] = None
 
-    def _fail_unlaunched_fetch(self, rec: TransferRecord, *, reason: str) -> None:
-        req = self._requests[rec.request_id]
-        self._release(rec)
-        self._plans[rec.request_id] = None
-        self._effects.fail_requests([req], reason)
-
-    def _fail_expired_fetch(self, rec: TransferRecord) -> None:
-        """A normal fetch past its deadline: fail the request now.
+    def _fail_expired_fetch(self, rec: TransferRecord, now: float) -> None:
+        """A fetch of a running request past its deadline: fail the request now.
 
         A hung store must not park a request forever, so the wait is bounded by the deadline
         and the request fails. A delivery into the pages cannot give them back yet: the backend
         may still be writing them, so the record stays in flight and the request is held until
-        the outcome arrives (or ``close``); the late outcome then only releases. A landing on
-        its way to the host names no page, so it is released with the record at once.
+        the outcome arrives (or ``close``); the late outcome then only releases. A record with
+        nothing in the pages (planned, landing on the host, landed there) goes at once.
         """
         req = self._requests[rec.request_id]
         self._effects.fail_requests([req], "kv fetch timed out")
         # The engine ends a failed request through its release gate, which notifies this
         # coordinator; the call is repeated here so the hold does not depend on the engine.
-        self.notify_request_finished(req)
+        self._finish_request(req, now)
 
     def _release_finished_fetch(self, rec: TransferRecord) -> None:
-        """A fetch whose request ended while it was in flight: its outcome is moot. Quiesce,
-        release; no ``unpark`` and no ``give_back`` for a request that is gone. The held request
-        is terminated once nothing else of it is in flight."""
-        if not self._quiesce(rec):
+        """A fetch whose request ended: its outcome is moot. Pass the release point if the
+        current try touched the pages, release; no ``unpark`` and no ``give_back`` for a request
+        that is gone. The held request is terminated once nothing else of it remains."""
+        if self._owes_quiesce(rec) and not self._quiesce(rec):
             return
         self._close_routes(rec)
         self._release(rec)
         self._finish_if_released(rec.request_id)
 
-    def _finish_publish(self, rec: TransferRecord, *, failed: bool, reason: str) -> None:
+    def _finish_publish(self, rec: TransferRecord, *, failed: bool) -> None:
         """A publish reached its end. A failure is a warning, never a request failure: a
         running request keeps running, and a finished one already has its response."""
         rec.state = RecordState.FAILED if failed else RecordState.LANDED
-        if not self._quiesce(rec):
+        if self._owes_quiesce(rec) and not self._quiesce(rec):
             return
         self._release(rec)
         rid = rec.request_id
         if failed:
             when = "after the request ended" if rid in self._finished else "while still running"
-            logger.warning("request %d: %s %s", rid, reason, when)
+            logger.warning("request %d: kv publish failed %s", rid, when)
         self._finish_if_released(rid)
 
     def _finish_if_released(self, rid: int) -> None:
@@ -950,6 +1038,8 @@ class KVTransferCoordinator:
         if req is None:
             logger.warning("request %d finished with no request object on record", rid)
         elif rid in self._held:
+            if rid not in self._finished_by_gate:
+                self._terminated_before_gate.add(rid)
             self._effects.terminate_request(req)
         self._forget_request(rid)
 
@@ -1030,7 +1120,7 @@ class KVTransferCoordinator:
         rec.committed_names = committed
         rec.attempts.append(AttemptRecord(attempt, try_index=try_index, source=source, route=route))
         rec.state = RecordState.IN_FLIGHT
-        rec.deadline = None if self._fetch_timeout_s is None else now + self._fetch_timeout_s
+        rec.deadline = self._deadline_for(rec, now)
 
     def _drop_launch(self, req: RequestView, rec: TransferRecord, *, give_up: bool) -> None:
         """A launch that never started: give the pages back, keep the plan and the retry budget.
@@ -1058,8 +1148,7 @@ class KVTransferCoordinator:
         key = (rid, "publish")
         rec = self._records.get(key)
         if rec is None:
-            deadline = None if self._publish_timeout_s is None else now + self._publish_timeout_s
-            rec = TransferRecord(rid, "publish", RecordState.PLANNED, deadline=deadline)
+            rec = TransferRecord(rid, "publish", RecordState.PLANNED)
             self._records[key] = rec
         elif rec.state not in (RecordState.PLANNED, RecordState.IN_FLIGHT):
             return
@@ -1075,8 +1164,10 @@ class KVTransferCoordinator:
                     self._submit_publish(rec, name, publisher.place, chunk)
             elif extent.is_last:
                 self._submit_publish(rec, name, publisher.publish, extent)
-        if rec.attempts:
+        if rec.state is RecordState.PLANNED and rec.attempts:
+            # The deadline counts from the first submission a publisher accepted.
             rec.state = RecordState.IN_FLIGHT
+            rec.deadline = self._deadline_for(rec, now)
 
     def _submit_publish(
         self, rec: TransferRecord, name: str, submit: Callable[[T], Attempt], arg: T
@@ -1091,15 +1182,30 @@ class KVTransferCoordinator:
 
     # ---- record bookkeeping ----
 
+    @staticmethod
+    def _owes_quiesce(rec: TransferRecord) -> bool:
+        """Whether the current try's attempts touched the pages and were not vouched for yet. A
+        fetch quiesces each failed try as it fails, so only a try in flight, landed, or fatally
+        failed owes one; a publish has a single try."""
+        if not rec.current_try_attempts():
+            return False
+        if rec.direction == "publish":
+            return True
+        return rec.state in (RecordState.IN_FLIGHT, RecordState.LANDED, RecordState.FAILED)
+
     def _quiesce(self, rec: TransferRecord) -> bool:
-        """The release point. False means the backend cannot vouch for the memory. Design §4.3
-        would keep the pages out of use until the deadline; this tightens that to the engine's
-        existing poison path (fatal) and leaves retry-until-deadline as a follow-up."""
+        """The release point. False means the backend cannot vouch for the memory: the engine is
+        made fatal and the record stays, so the pages are never handed out again (design §4.3
+        would retry until the deadline; the fatal path is what the engine has). A refusal is
+        final: the backend is not asked again, and the engine is not made fatal twice."""
+        if rec.quiesce_refused:
+            return False
         by_backend: dict[str, list[Attempt]] = {}
         for a in rec.current_try_attempts():
             by_backend.setdefault(a.source, []).append(a.attempt)
         for name, attempts in by_backend.items():
             if not self._backends[name].quiesce(attempts):
+                rec.quiesce_refused = True
                 self._effects.fail_fatal(
                     RuntimeError(
                         f"backend {name} cannot confirm memory of request {rec.request_id} "
@@ -1149,6 +1255,7 @@ class KVTransferCoordinator:
         self._pending_answers.pop(rid, None)
         self._probe_answers.pop(rid, None)
         self._finished.discard(rid)
+        self._finished_by_gate.discard(rid)
         self._held.discard(rid)
         self._planner.forget(rid)
         self._reader.forget_request(rid)

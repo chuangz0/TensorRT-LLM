@@ -53,7 +53,8 @@ class FetchPathAction(enum.Enum):
     """Answer of the KV transfer seam for one first-chunk context request (design §5)."""
 
     NOT_A_FETCH = "not_a_fetch"  # ordinary context path
-    SKIP = "skip"  # deferred or reservation failed; ask again next round
+    DEFERRED = "deferred"  # the transfer layer has no answer yet; ask again next round
+    RESERVE_FAILED = "reserve_failed"  # no pages for the fetch; ask again next round
     RESERVED = "reserved"  # pages reserved; the coordinator launches the fetch
 
 
@@ -267,12 +268,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._prioritize_first_token_gen = (
             os.environ.get("TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN", "0") == "1"
         )
-        # Read-only hook of the KV transfer coordinator (design §5, plan §5 #10): asked
-        # once per first-chunk context request before any cache is prepared for it, and
-        # answering a plan, None (compute locally) or its ``DEFER`` (skip this round).
-        # Duck-typed and attached by the executor assembly; None keeps every request
-        # on the local compute path.
-        self.kv_transfer_planner = None
+        # Read-only hook of the KV transfer layer (design §5): asked once per first-chunk
+        # context request before any cache is prepared for it, and answering a plan, None
+        # (compute locally) or its ``DEFER`` (skip this round). Duck-typed and attached by
+        # the executor assembly; None keeps every request on the local compute path.
+        self.kv_transfer_hooks = None
         # Set per ``schedule_request`` call; see its docstring.
         self._protected_from_eviction_request_ids: frozenset[int] = frozenset()
 
@@ -373,6 +373,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         req_it_end = len(requests_list)
         recompute_pause_state = _RecomputePauseState(req_it_end)
         req_it = 0
+        waiting_on_kv_transfer = False
 
         # Context requests are always deferred to a second phase so that
         # generation requests are fully accounted for in the budget before
@@ -565,11 +566,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                     )
                     deferred_behind_contributor = True
                     continue
-            # KV transfer seam (design §5, plan §5 #10): asked before any cache is prepared.
+            # KV transfer seam (design §5): asked before any cache is prepared.
             fetch_path = self._try_take_fetch_path(req)
             if fetch_path is FetchPathAction.RESERVED:
                 fetch_launch_queue.append(req)
             if fetch_path is not FetchPathAction.NOT_A_FETCH:
+                waiting_on_kv_transfer = True
                 continue
             peft_pages = budget.peft_pages_needed(req)
             if peft_pages is None:
@@ -605,6 +607,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
 
+        # A request on the KV transfer path is progress in the making, whatever it waits for:
+        # a store lookup, a landing, the ranks' agreement, or pages for a planned fetch. Each
+        # wait is bounded by that layer's own clocks, after which the request computes locally
+        # and a true pool exhaustion shows up here as before. A steady stream of new fetch
+        # candidates can keep deferring the detector by up to two wait budgets per request
+        # (one per try); that is acceptable, since every one of them returns to the local path.
         self._detect_deadlock(
             active_requests,
             inflight_request_ids,
@@ -618,6 +626,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 or evicted
                 or recompute_paused
                 or deferred_behind_contributor
+                or waiting_on_kv_transfer
             ),
         )
 
@@ -635,29 +644,35 @@ class KVCacheV2Scheduler(RequestScheduler):
     # ---- KV transfer seam (design §5) ----
 
     def _try_take_fetch_path(self, req: LlmRequest) -> FetchPathAction:
-        """Ask the KV transfer planner whether a pending context request fetches its prefix.
+        """Ask the KV transfer hooks whether a pending context request fetches its prefix.
 
-        The planner owns the candidate rule (first chunk, not dummy, not disagg);
-        it answers ``None`` for anything else. ``NOT_A_FETCH``: no planner, not a
+        The hooks own the candidate rule (first chunk, not dummy, not disagg); they
+        answer ``None`` for anything else. ``NOT_A_FETCH``: no hooks, not a
         candidate, or "compute locally"; the request takes the ordinary context
-        path. ``SKIP``: deferred this round, or the reservation failed; the request
-        stays in ``CONTEXT_INIT`` and is asked again next round. ``RESERVED``: pages
-        reserved up to the plan's target; the request goes to the fetch launch
+        path. ``DEFERRED``: the transfer layer has no answer yet; ``RESERVE_FAILED``:
+        no pages for the fetch. Either way the request stays in ``CONTEXT_INIT`` and
+        is asked again next round, and neither is a stall for the deadlock detector:
+        the transfer layer bounds both waits and gives the fetch up. ``RESERVED``:
+        pages reserved up to the plan's target; the request goes to the fetch launch
         queue and, like a disagg gen-init, joins neither the request nor the token
         budget of this forward pass.
         """
-        planner = self.kv_transfer_planner
-        if planner is None:
+        hooks = self.kv_transfer_hooks
+        if hooks is None:
             return FetchPathAction.NOT_A_FETCH
-        plan = planner.plan_fetch(req)
-        if plan is planner.DEFER:
-            return FetchPathAction.SKIP
+        plan = hooks.plan_fetch(req)
+        if plan is hooks.DEFER:
+            logger.debug(
+                "Deferring context request %s: its KV transfer plan is not decided yet",
+                req.py_request_id,
+            )
+            return FetchPathAction.DEFERRED
         if plan is None:
             return FetchPathAction.NOT_A_FETCH
         return self._try_reserve_fetch_pages(req, plan)
 
     def _try_reserve_fetch_pages(self, req: LlmRequest, plan: "FetchPlan") -> FetchPathAction:
-        """Reserve pages up to ``plan.token_end`` for a content fetch (plan §5 #11).
+        """Reserve pages up to ``plan.token_end`` for a content fetch.
 
         The same allocation as a disagg generation init, with the fetch target in
         place of the prompt length. A failed reservation must not retain the
@@ -674,7 +689,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         if req.py_request_id in self.kv_cache_manager.kv_cache_map:
             self.kv_cache_manager.free_resources(req)
         rewind_context_after_cache_drop(req, self.tokens_per_block)
-        return FetchPathAction.SKIP
+        return FetchPathAction.RESERVE_FAILED
 
     def _is_first_chunk_context(self, req: LlmRequest) -> bool:
         return req.state_value == self._context_init_state_value and req.is_first_context_chunk
