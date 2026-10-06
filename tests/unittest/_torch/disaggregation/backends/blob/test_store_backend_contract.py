@@ -38,6 +38,9 @@ from store_fakes import (  # noqa: E402
     wait_until,
 )
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ---- protocols ----
 
 
@@ -156,6 +159,68 @@ def test_registration_close_is_idempotent_and_by_handle():
             rank.backend.register_pool(other.address, other.size)
         live.close()
         assert rank.store.count("unregister_span") == 2
+
+
+def test_register_pool_during_close_is_refused():
+    """``close`` is under way, waiting for a delivery in flight; a registration asked for
+    meanwhile is refused as on a closed backend and reaches neither the store nor the table,
+    so ``close`` leaves nothing registered behind it."""
+    with make_rank() as rank:
+        u = rank.unit(0, 0, 8)
+        rank.store.block("put")
+        attempt = rank.backend.publish(extent([u]))
+        rank.store.wait_entered(3)  # register, holds, put parked
+        closer = threading.Thread(target=rank.backend.close)
+        closer.start()
+        time.sleep(0.05)
+        assert closer.is_alive()  # waiting for the worker inside the store call
+        other = MemoryArena(64)
+        with pytest.raises(RuntimeError, match="closed"):
+            rank.backend.register_pool(other.address, other.size)
+        rank.store.unblock()
+        closer.join(5)
+        assert not closer.is_alive()
+        assert isinstance(attempt.poll(), Delivered)
+        assert rank.store.count("register_span") == 1  # the pool's own, at construction
+        assert rank.store.count("unregister_span") == 1  # undone by close
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="register_pool appends a registration whose store call outlived close without "
+    "undoing or refusing it",
+)
+def test_registration_in_flight_when_close_runs_is_undone_or_refused():
+    """A registration whose store call is still running when ``close`` runs: once the store
+    answers, the registration is either refused or undone (whether ``close`` returned at once
+    or waited for it). A closed backend leaves nothing registered, or the transport keeps memory
+    the caller believes it owns again."""
+    with make_rank() as rank:
+        other = MemoryArena(64)
+        rank.store.block("register_span")
+        answers = []
+
+        def register():
+            try:
+                answers.append(rank.backend.register_pool(other.address, other.size))
+            except RuntimeError as exc:
+                answers.append(exc)
+
+        registrar = threading.Thread(target=register)
+        registrar.start()
+        rank.store.wait_entered(2)  # the pool's own registration, then this one, parked
+        closer = threading.Thread(target=rank.backend.close)
+        closer.start()
+        time.sleep(0.05)  # close either returns at once or waits for the parked registration
+        rank.store.unblock()
+        registrar.join(5)
+        closer.join(5)
+        assert not registrar.is_alive() and not closer.is_alive() and len(answers) == 1
+        assert rank.store.count("register_span") == 2
+        refused = isinstance(answers[0], RuntimeError)
+        assert refused or rank.store.count("unregister_span") == 2, (
+            "a registration completed on a closed backend and was never undone"
+        )
 
 
 def test_registration_close_that_raises_has_not_closed():
@@ -448,5 +513,13 @@ def test_transfer_batch_size_bounds_one_store_call_not_one_delivery():
 
 
 def test_staged_put_batch_is_bounded_by_the_publish_pool_slot_count():
+    """A staged put holds a publish-pool slot per unit for the length of the call, so with
+    fewer slots than ``transfer_batch_size`` the store is asked in rounds of the slot count."""
     with make_host_rank(publish_slots=3, transfer_batch_size=64) as rank:
-        assert rank.inner._put_batch_size == 3
+        units = [rank.unit(0, i, 8) for i in range(5)]
+        outcome = rank.finish(rank.backend.publish(extent(units)))
+        assert outcome == Delivered(frozenset(u.name for u in units))
+        puts = [args[0] for m, args in rank.store.calls if m == "put"]
+        assert [len(keys) for keys in puts] == [3, 2]
+        lookups = [args[0] for m, args in rank.store.calls if m == "holds"]
+        assert [len(keys) for keys in lookups] == [5]  # lookups hold no slot

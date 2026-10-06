@@ -267,13 +267,13 @@ def test_unlaunched_clock_does_not_start_while_no_rank_has_launched(world):
     advance_all(world, rigs, [], 29.9)
     for rig in rigs:
         assert votes_of(rig) == [(KEY, "UNLAUNCHED", 0)]
-        assert rig.fetch_record(1).peer_launched_at is None
+        assert rig.record(1)["peer_launched_at"] is None
         assert isinstance(rig.coord.plan_fetch(req), FetchPlan)  # still waiting for pages
         assert rig.effects.count("fail_requests") == 0
     advance_all(world, rigs, [], 30.0)
     for rig in rigs:
         assert votes_of(rig) == [(KEY, "FAILED", 0)]
-        assert rig.fetch_record(1).plan is None and rig.fetch_record(1).retries_left == 0
+        assert rig.record(1)["token_end"] is None and rig.fetch_record(1).retries_left == 0
         assert rig.effects.calls == []  # nothing launched: nothing to give back or fail
 
 
@@ -288,12 +288,12 @@ def test_unlaunched_rank_holds_the_landing_until_it_launches_too(world):
     for rig in peers(rigs):
         assert votes_of(rig) == [(KEY, "TERMINAL", END)]
         assert rig.effects.count("unpark") == 0 and rig.record(1)["state"] == "IN_FLIGHT"
-        assert rig.fetch_record(1).peer_launched_at is None
+        assert rig.record(1)["peer_launched_at"] is None
     assert votes_of(rigs[DIVERGENT]) == [(KEY, "UNLAUNCHED", 0)]
-    assert rigs[DIVERGENT].fetch_record(1).peer_launched_at == 1.0  # from the peers' first vote
+    assert rigs[DIVERGENT].record(1)["peer_launched_at"] == 1.0  # from the peers' first vote
 
     late = launch_on(rigs[DIVERGENT], req, 2.0)
-    assert rigs[DIVERGENT].fetch_record(1).peer_launched_at is None
+    assert rigs[DIVERGENT].record(1)["peer_launched_at"] is None
     late.deliver_all()
     advance_all(world, rigs, [], 3.0)
     for rig in rigs:
@@ -321,8 +321,9 @@ def test_rank_unlaunched_past_the_timeout_votes_failed_and_every_rank_replans(wo
     assert rigs[DIVERGENT].worker.count("quiesce") == 0
     assert rigs[DIVERGENT].effects.count("give_back_fetch_pages") == 0
     for rig in rigs:
-        rec = rig.fetch_record(1)
-        assert rec.retries_left == 0 and rec.plan is None and rec.peer_launched_at is None
+        rec = rig.record(1)
+        assert rec["token_end"] is None and rec["peer_launched_at"] is None
+        assert rig.fetch_record(1).retries_left == 0
         assert rig.coord.plan_fetch(req) is DEFER
 
     loop_advance_all(world, rigs, req, 12.0)
@@ -343,7 +344,7 @@ def test_rank_that_gives_up_launching_holds_no_one_and_fails_the_fetch_for_every
         advance_all(world, rigs, [], now)
         for rig in peers(rigs):  # the running attempts are not disturbed
             assert rig.record(1)["state"] == "IN_FLIGHT" and rig.worker.count("quiesce") == 0
-    assert laggard.fetch_record(1).launch_gave_up and laggard.coord.plan_fetch(req) is DEFER
+    assert laggard.record(1)["launch_gave_up"] and laggard.coord.plan_fetch(req) is DEFER
     assert laggard.effects.count("give_back_fetch_pages") == 3
     assert votes_of(laggard) == [(KEY, "FAILED", 0)]
     laggard.coord.launch_reserved_fetches([req], 4.0)  # the scheduler queue may still name it
@@ -355,8 +356,9 @@ def test_rank_that_gives_up_launching_holds_no_one_and_fails_the_fetch_for_every
     for rig in peers(rigs):
         assert rig.worker.count("quiesce") == 1 and rig.effects.count("give_back_fetch_pages") == 1
     for rig in rigs:
-        rec = rig.fetch_record(1)
-        assert rec.retries_left == 0 and rec.plan is None and not rec.launch_gave_up
+        rec = rig.record(1)
+        assert rec["token_end"] is None and not rec["launch_gave_up"]
+        assert rig.fetch_record(1).retries_left == 0
         assert rig.coord.plan_fetch(req) is DEFER and rig.effects.count("unpark") == 0
 
     # The retry runs into the same refusals: the next agreement settles on local compute.
@@ -382,7 +384,7 @@ def test_route_refused_on_one_rank_fails_the_fetch_for_every_rank(world):
     laggard = rigs[DIVERGENT]
     laggard.worker.open_route_errors.append(ValueError("bad hint"))
     laggard.coord.launch_reserved_fetches([req], 0.0)
-    assert laggard.fetch_record(1).launch_gave_up and laggard.coord.plan_fetch(req) is DEFER
+    assert laggard.record(1)["launch_gave_up"] and laggard.coord.plan_fetch(req) is DEFER
     loop_advance_all(world, rigs, req, 1.0)
     for rig in peers(rigs):  # in flight: nothing lands yet
         assert rig.record(1)["state"] == "IN_FLIGHT" and rig.worker.count("quiesce") == 0
@@ -403,7 +405,7 @@ def test_a_given_up_rank_and_an_unlaunched_rank_agree_without_anyone_launching(w
     advance_all(world, rigs, [req], 0.0)
     for rig in peers(rigs):
         rig.coord.launch_reserved_fetches([req], 0.0)
-        assert rig.fetch_record(1).launch_gave_up
+        assert rig.record(1)["launch_gave_up"]
     # Rank 1 never launched: an UNLAUNCHED vote does not hold a failure back.
     loop_advance_all(world, rigs, req, 1.0)
     for rig in peers(rigs):
@@ -413,8 +415,9 @@ def test_a_given_up_rank_and_an_unlaunched_rank_agree_without_anyone_launching(w
     assert rigs[DIVERGENT].effects.count("give_back_fetch_pages") == 0
     for rig in rigs:
         assert rig.worker.count("quiesce") == 0
-        rec = rig.fetch_record(1)
-        assert rec.retries_left == 0 and rec.plan is None and not rec.launch_gave_up
+        rec = rig.record(1)
+        assert rec["token_end"] is None and not rec["launch_gave_up"]
+        assert rig.fetch_record(1).retries_left == 0
         assert rig.coord.plan_fetch(req) is DEFER
 
 
@@ -741,8 +744,9 @@ def test_a_placed_rank_waits_for_a_rank_without_pages_and_a_wait_timeout_fails_b
     )
     for rig in rigs:
         assert rig.host.releases() == 1
-        rec = rig.fetch_record(1)
-        assert rec.retries_left == 0 and rec.plan is None and rec.landing is None
+        rec = rig.record(1)
+        assert rec["token_end"] is None and not rec["has_landing"]
+        assert rig.fetch_record(1).retries_left == 0
         assert rig.coord.plan_fetch(req) is DEFER and rig.effects.count("fail_requests") == 0
 
 
@@ -758,11 +762,11 @@ def test_staged_ranks_wait_on_the_landing_clock_not_the_unlaunched_clock():
     rigs[0].host.landings[-1].deliver_all()
     loop_advance_all(world, rigs, req, 1.0)  # rank 1's clock starts here, and it is granted
     assert rigs[DIVERGENT].record(1)["state"] == "STAGING"
-    assert rigs[DIVERGENT].fetch_record(1).peer_launched_at is None
+    assert rigs[DIVERGENT].record(1)["peer_launched_at"] is None
     rigs[DIVERGENT].host.landings[-1].deliver_all()
     advance_all(world, rigs, [], 2.0)
     for rig in rigs:
-        assert rig.record(1)["state"] == "STAGED" and rig.fetch_record(1).peer_launched_at is None
+        assert rig.record(1)["state"] == "STAGED" and rig.record(1)["peer_launched_at"] is None
 
     advance_all(world, rigs, [], 2.0 + UNLAUNCHED_TIMEOUT_S)  # no pages anywhere
     for rig in rigs:
@@ -773,7 +777,7 @@ def test_staged_ranks_wait_on_the_landing_clock_not_the_unlaunched_clock():
     advance_all(world, rigs, [], 2.0 + 30.0)  # 30 s since both were staged
     for rig in rigs:
         assert votes_of(rig) == [(KEY, "FAILED", 0)]
-        assert rig.fetch_record(1).plan is None and rig.host.releases() == 1
+        assert rig.record(1)["token_end"] is None and rig.host.releases() == 1
 
 
 def test_a_rank_refused_landing_memory_holds_the_landing_of_the_others(world):

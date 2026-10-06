@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The assembly's scope guard (integration plan §1 item 7) and the coordinator it builds.
+"""The assembly's scope guard and the coordinator it builds.
 
 ``check_engine_supports_kv_transfer`` refuses, with a reason, every engine configuration this
 feature does not host; ``attach_kv_transfer`` refuses a malformed config file before it builds

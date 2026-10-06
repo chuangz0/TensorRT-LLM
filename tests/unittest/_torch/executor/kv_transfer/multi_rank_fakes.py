@@ -31,7 +31,6 @@ from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.coordinator im
     KVTransferCoordinator,
 )
 from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.records import TransferRecord
 from tensorrt_llm._torch.disaggregation.remote_cache import FetchPlan, FetchSource, Planner
 from tensorrt_llm._torch.disaggregation.resource.region import parallel_shard_tag
 from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import (
@@ -89,7 +88,9 @@ class RankRig:
     ``schedule_round`` standing in for what the engine loop and the V2 scheduler do per round.
 
     ``unlaunched_timeout_s``, ``fetch_timeout_s`` and ``plan_authority`` go to the coordinator;
-    the store answers every probe and every fetch stays in flight until ``deliver_all``.
+    the store answers every probe and every fetch stays in flight until ``deliver_all``. The
+    executor's ``_free_request_resources`` frees the fake cache, so an eviction is observable in
+    ``kv.kv_cache_map``.
     """
 
     def __init__(
@@ -146,16 +147,26 @@ class RankRig:
             close_timeout_s=5.0,
         )
         self.executor.kv_transfer = self.hooks
+        self.executor._free_request_resources.side_effect = self.kv.free_resources
 
     # -- one round of the loop on this rank --
 
-    def schedule_round(self, active: Sequence[LlmRequest], *, adopt=None) -> None:
+    def schedule_round(
+        self, active: Sequence[LlmRequest], *, adopt=None, recompute_pause: Sequence = ()
+    ) -> None:
         """``advance_round``, then, for every request the coordinator planned, reserve its pages
         the way the scheduler's ``reserve_transfer_pages`` does and launch the fetch.
 
         ``adopt`` plays Stage 0 for a follower: called after ``advance_round`` with the active
         requests, it must return the owner's exported answers, which are adopted before the
         local scheduling below.
+
+        ``recompute_pause`` plays pool pressure: the requests torn down for a recompute this
+        round, handed unfiltered to the executor's own teardown
+        (``_terminate_recompute_paused_requests``). This rig does not model the scheduler's
+        protected-set filter (the scheduler seam tests cover it); what keeps a request a
+        transfer still touches out of the teardown here is the executor's own guard, which
+        reads ``inflight_request_ids`` itself.
         """
         self.hooks.advance_round(list(active))
         if adopt is not None:
@@ -166,6 +177,10 @@ class RankRig:
             if isinstance(plan, FetchPlan) and self.reserve(request, plan.token_end):
                 launch_queue.append(request)
         self.hooks.launch_reserved_fetches(launch_queue)
+        if recompute_pause:
+            self.executor._terminate_recompute_paused_requests(
+                SimpleNamespace(recompute_paused_requests=list(recompute_pause))
+            )
 
     def reserve(self, request: LlmRequest, token_end: int) -> bool:
         if not self.kv.reserve_transfer_pages(request, token_end):
@@ -197,9 +212,11 @@ class RankRig:
     def records(self) -> list[dict]:
         return self.coord.status_dump()["records"]
 
-    def fetch_record(self, request_id: int) -> TransferRecord | None:
-        """The fetch ``TransferRecord`` itself, for the launch bookkeeping the dump leaves out."""
-        return self.coord._records.get((request_id, "fetch"))
+    def record(self, request_id: int, direction: str = "fetch") -> dict | None:
+        for rec in self.records():
+            if rec["request_id"] == request_id and rec["direction"] == direction:
+                return rec
+        return None
 
     def published_unit_names(self) -> frozenset[bytes]:
         return frozenset(

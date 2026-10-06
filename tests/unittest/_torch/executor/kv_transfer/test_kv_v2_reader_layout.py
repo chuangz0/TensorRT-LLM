@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""U1 (integration plan §7, §11): the KV v2 wrapper changes and ``resource/kv_v2_*`` against a
-real ``KVCacheManagerV2`` (2 layers, 4 KV heads, tpb 32, 2048 tokens of pool).
+"""The KV v2 wrapper changes and ``resource/kv_v2_*`` against a real ``KVCacheManagerV2``
+(2 layers, 4 KV heads, tpb 32, 2048 tokens of pool).
 
 ``context_block_keys`` count, determinism and divergence; ``reserve_transfer_pages(token_end)``
 declaring history to the fetch target; the fetch extent naming exactly the nameable blocks the
@@ -124,7 +124,7 @@ def reader(manager):
 
 
 # ---------------------------------------------------------------------------------------------
-# context_block_keys (plan §7 #2)
+# context_block_keys
 # ---------------------------------------------------------------------------------------------
 
 
@@ -176,7 +176,7 @@ class TestContextBlockKeys:
 
 
 # ---------------------------------------------------------------------------------------------
-# reserve_transfer_pages(token_end) (plan §7 #1)
+# reserve_transfer_pages(token_end)
 # ---------------------------------------------------------------------------------------------
 
 
@@ -230,10 +230,39 @@ class TestPrepareDisaggGenInitTokenEnd:
         assert manager.prepare_disagg_gen_init(gen_init)
         assert manager._fresh_pages_filled.get(2)
 
+    def test_reserving_again_keeps_the_cache_and_never_lowers_its_history(self, manager):
+        """The scheduler may ask again for a request that already has a cache (its launch did
+        not go through and the pages were kept, or the plan was retried at another target):
+        every reservation finds the same cache and leaves the request a first chunk at position
+        0. The same target changes nothing; a lower one keeps the history (it never decreases);
+        a higher one raises it and grows the pages."""
+        request = make_request(1, prompt_tokens(1))
+        assert manager.reserve_transfer_pages(request, 128)
+        kv_cache = manager.kv_cache_map[1]
+        pages = list(kv_cache.get_aggregated_page_indices(0, valid_only=False))
+
+        assert manager.reserve_transfer_pages(request, 128)  # the same target
+        assert manager.kv_cache_map[1] is kv_cache
+        assert manager.get_history_length(request) == 128
+        assert list(kv_cache.get_aggregated_page_indices(0, valid_only=False)) == pages
+
+        assert manager.reserve_transfer_pages(request, 64)  # a lower target
+        assert manager.kv_cache_map[1] is kv_cache
+        assert manager.get_history_length(request) == 128
+        assert list(kv_cache.get_aggregated_page_indices(0, valid_only=False)) == pages
+
+        assert manager.reserve_transfer_pages(request, 192)  # a higher target
+        assert manager.kv_cache_map[1] is kv_cache
+        assert manager.get_history_length(request) == 192
+        grown = list(kv_cache.get_aggregated_page_indices(0, valid_only=False))
+        assert grown[: len(pages)] == pages and len(grown) >= 192 // TPB
+        assert all(p != BAD_PAGE_INDEX for p in grown[: 192 // TPB])
+        assert request.context_current_position == 0 and request.is_first_context_chunk
+
     def test_revert_after_a_fetch_reservation_drops_the_cache(self, manager):
-        """Plan §7 #1 verification: the reservation grew the cache from nothing to ``token_end``
-        with history declared there; reverting cannot shrink below the history, so the cache is
-        dropped and the request re-enters as a fresh first chunk."""
+        """The reservation grew the cache from nothing to ``token_end`` with history declared
+        there; reverting cannot shrink below the history, so the cache is dropped and the
+        request re-enters as a fresh first chunk."""
         request = make_request(1, prompt_tokens(1))
         assert manager.reserve_transfer_pages(request, 128)
         assert manager.revert_allocate_context(request) is False
@@ -546,7 +575,7 @@ class TestLayout:
 
 
 # ---------------------------------------------------------------------------------------------
-# release_index_slot idempotence (plan §7 #3)
+# release_index_slot idempotence
 # ---------------------------------------------------------------------------------------------
 
 

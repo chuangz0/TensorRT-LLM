@@ -1,18 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""U2 (integration plan §9, §11): the engine-side effects and the loop hooks.
+"""The engine-side effects and the loop hooks.
 
 A ``PyExecutor`` built with ``object.__new__`` and the attributes the effects read, a real
 ``KVTransferCoordinator`` and ``Planner``, and fakes for the reader and the backends. Covered:
 every effect of design §7.3 in table order; the two alias states; the release gate's five cases
-A-E of plan §9 (E synthesized: the disagg send never comes back); the dummy bypass; ``owns``
-on the cancel path; ``has_pending_work`` for idle detection; ``pace_idle``; ``close()`` order
-and its timeout against a hanging backend; and the status dump's JSON schema.
+A-E (E synthesized: the disagg send never comes back); the dummy bypass; ``owns`` on the cancel
+path; ``has_pending_work`` for idle detection; ``pace_idle``; ``close()`` order and its timeout
+against a hanging backend; and the status dump's JSON schema.
 """
 
 import json
 import threading
 import time
+import types
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -319,7 +320,7 @@ class TestUnpark:
         assert req.context_current_position == plan.token_end == 96
         assert req.context_remaining_length == 4
         assert req.context_chunk_size == 4  # settled chunk spans to the prompt end
-        assert req.py_ctx_pre_resize_cap is None  # plan §10 #11
+        assert req.py_ctx_pre_resize_cap is None  # the pages keep their size
         assert rig.kv.calls == [("try_commit_blocks", 1)]
         assert rig.kv.kv_cache_map[1].num_committed_tokens == 96
         assert not rig.hooks.owns(req)
@@ -368,7 +369,7 @@ class TestUnpark:
     def test_short_commit_warns_and_continues(self, rig, effects_logger):
         req = make_request(1, 100)
         plan, attempt = rig.plan_reserve_launch(req)
-        rig.kv.commit_to[1] = 64  # plan §10 #14
+        rig.kv.commit_to[1] = 64  # the commit falls short of the fetch target
         attempt.deliver_all()
         rig.advance(req)
         assert req.state == CONTEXT_INIT and req.context_current_position == 96
@@ -405,7 +406,7 @@ class TestGiveBackFetchPages:
         assert plan2.token_end == 96
 
     def test_a_cache_that_survives_the_revert_is_dropped_and_the_cursor_rewound(self, rig):
-        """Plan §10 #13: ``revert_allocate_context`` returns True without touching a cache whose
+        """``revert_allocate_context`` returns True without touching a cache whose
         ``py_ctx_pre_resize_cap`` is None; the pages then hold no data but the history says they do."""
         req = make_request(1, 100)
         plan, attempt = rig.plan_reserve_launch(req)
@@ -460,10 +461,36 @@ class TestPrepareFetchResources:
         fetched, gen_init = make_request(1, 100), make_request(2, 100)
         PyExecutor._prepare_disagg_gen_resources(executor, [fetched], latch_cached_tokens=False)
         PyExecutor._prepare_disagg_gen_resources(executor, [gen_init])
-        fetched.cached_tokens = 96  # what the context forward writes after the landing
-        gen_init.cached_tokens = 96
+        # Not latched by the preparation: the first write afterwards (the context forward's)
+        # is the one that sticks, and a later write does not move it.
+        assert fetched.cached_tokens == 0
+        fetched.cached_tokens = 96
+        fetched.cached_tokens = 50
         assert fetched.cached_tokens == 96
+        # Latched by the preparation: a write afterwards changes nothing.
+        gen_init.cached_tokens = 96
         assert gen_init.cached_tokens == gen_init.prepopulated_prompt_len
+
+    def test_launch_prepares_resources_without_latching_cached_tokens(self, rig):
+        """Through the fetch flow with the engine's real preparation: the launch prepares the
+        resource managers and leaves ``cached_tokens`` untouched (latched there it would read
+        0: nothing was matched locally), and so does the landing; the latch is still open for
+        the context forward that follows."""
+        executor = rig.executor
+        executor._prepare_disagg_gen_resources = types.MethodType(
+            PyExecutor._prepare_disagg_gen_resources, executor
+        )
+        req = make_request(1, 100)
+        plan, attempt = rig.plan_reserve_launch(req)
+        assert rig.kv.calls[-1] == ("prepare_resources", 1)
+        assert req.cached_tokens == 0
+        attempt.deliver_all()
+        rig.advance(req)
+        assert req.context_current_position == plan.token_end == 96
+        assert req.cached_tokens == 0
+        req.cached_tokens = 96  # the first write, the context forward's, is the one that sticks
+        req.cached_tokens = 50
+        assert req.cached_tokens == 96
 
 
 class TestHoldForTransfer:
@@ -485,8 +512,8 @@ class TestHoldForTransfer:
         assert rig.reader.forgotten == []  # forgotten once the held request is terminated
 
     def test_hold_reads_nothing_of_disagg_and_tolerates_slots_already_released(self, rig):
-        """Plan §9: a seq slot the disagg send freed is a no-op to free again, and
-        ``release_index_slot`` is idempotent."""
+        """A seq slot the disagg send freed is a no-op to free again, and ``release_index_slot``
+        is idempotent."""
         req = make_request(1, 100)
         rig.publish(req)
         rig.slots.free_resources(req)  # disagg start_transfer did this
@@ -523,6 +550,25 @@ class TestTerminateRequest:
         handler.terminate.assert_called_once_with(req)
         rig.executor._do_terminate_request.assert_not_called()
 
+    def test_a_held_request_terminates_through_the_pp_termination_handler_once(self, rig):
+        """The whole way with the handler present: the engine's ``_terminate_request`` reaches
+        the gate, which holds the request; when the publish lands the layer terminates it
+        through the handler, exactly once, and never through ``_do_terminate_request``."""
+        handler = Mock()
+        rig.executor._disagg_pp_termination_handler = handler
+        req = make_request(1, 100)
+        attempt = rig.publish(req)
+        rig.executor._terminate_request(req)
+        handler.terminate.assert_not_called()
+        assert rig.coord.held_request_ids() == {1}
+        attempt.deliver_all()
+        rig.advance()
+        handler.terminate.assert_called_once_with(req)
+        rig.executor._do_terminate_request.assert_not_called()
+        assert rig.records() == [] and not rig.hooks.owns(req)
+        rig.advance()
+        handler.terminate.assert_called_once_with(req)
+
 
 class TestFailRequests:
     def test_fail_requests_uses_the_request_scoped_error_path(self, rig):
@@ -555,7 +601,7 @@ class TestFailRequests:
 
 
 # =============================================================================================
-# Publish selection (plan §9 rule 4)
+# Publish selection
 # =============================================================================================
 
 
@@ -622,7 +668,7 @@ class TestPublishSelection:
 
 
 # =============================================================================================
-# The release gate: plan §9 cases A-E
+# The release gate: cases A-E
 # =============================================================================================
 
 
@@ -938,7 +984,7 @@ class TestCancelAndIdle:
 
         assert isinstance(rig.hooks.plan_fetch(first), FetchPlan)
         assert rig.hooks.plan_fetch(short) is None
-        assert rig.hooks.plan_fetch(gen_init) is None  # plan §9 rule 1
+        assert rig.hooks.plan_fetch(gen_init) is None  # gen-init receives are the transceiver's
         probed = {name for _, (name, _) in ((m, a) for m, a in rig.store.calls if m == "probe")}
         assert len(probed) == 1  # only ``first`` reached the store
         for other in (dummy, continuation):
@@ -1328,6 +1374,31 @@ class TestDeferredEngineTermination:
         assert rig.hooks.on_request_finished(req) is True  # and once only: a fresh id after
         assert rig.terminations() == 1
 
+    def test_outcome_in_the_same_round_as_the_expiry_terminates_once_before_the_deferred_gate(
+        self, monkeypatch
+    ):
+        """The attempt's outcome is already in when the deadline passes: one ``advance`` fails
+        the request (the engine defers its termination), holds it, and terminates it on the
+        outcome. The deferred flush then reaches the gate and must not terminate it again."""
+        now = [5000.0]
+        monkeypatch.setattr(time, "monotonic", lambda: now[0])
+        rig = Rig(fetch_timeout_s=10.0)  # the ``_handle_errors`` mock defers: it terminates nothing
+        req = make_request(1, 100)
+        rig.executor.active_requests = [req]
+        plan, attempt = rig.plan_reserve_launch(req)
+        attempt.deliver_all()
+        now[0] += 10.5
+        rig.advance(req)
+        rig.executor._handle_errors.assert_called_once()
+        rig.executor._do_terminate_request.assert_called_once_with(req)
+        assert req.context_current_position == 0  # failed, not landed
+        assert rig.records() == [] and not rig.hooks.owns(req)
+
+        rig.executor._terminate_request(req)  # the deferred flush
+        rig.executor._do_terminate_request.assert_called_once_with(req)
+        assert rig.hooks.on_request_finished(req) is True
+        assert rig.terminations() == 1
+
 
 class TestRecomputePauseProtection:
     """A request whose publish is in flight must keep its pages: the executor's recompute-pause
@@ -1477,6 +1548,29 @@ class TestCandidatesAndPublishers:
         assert rig.publisher.count("publish") == 1
         extent = rig.publisher.attempts[0].payload
         assert extent.is_last and len(extent.units) == 3  # (100 - 1) // 32 nameable blocks
+
+
+# =============================================================================================
+# The engine fakes mirror the wrapper where the hooks depend on it
+# =============================================================================================
+
+
+class TestEngineFakesMirrorTheWrapper:
+    def test_reserving_again_for_a_request_with_a_cache_keeps_the_cache(self):
+        """The wrapper's ``reserve_transfer_pages`` reuses a request's cache and never lowers its
+        history; the fake does the same, so a second reservation (the scheduler asking again for
+        a plan whose launch did not go through) keeps the committed tokens of the first."""
+        kv = FakeKVCacheManager(TPB)
+        req = make_request(1, 100)
+        assert kv.reserve_transfer_pages(req, 96)
+        first = kv.kv_cache_map[1]
+        first.num_committed_tokens = 32
+        assert kv.reserve_transfer_pages(req, 64)
+        assert kv.kv_cache_map[1] is first
+        assert first.history_length == 96 and first.num_committed_tokens == 32
+        assert kv.reserve_transfer_pages(req, 128)
+        assert kv.kv_cache_map[1] is first and first.history_length == 128
+        assert first.capacity >= 128
 
 
 # =============================================================================================

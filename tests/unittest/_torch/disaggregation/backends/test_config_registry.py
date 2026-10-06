@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""U0 (integration plan §11): the KV transfer config file and the backend registry.
+"""The KV transfer config file and the backend registry.
 
 YAML -> ``KVTransferConfig`` validation, ``build_backends`` over a fake type, rollback on a failed
 build, ``close_backends`` tolerance, and the built-in ``mooncake`` entry: imported lazily, refusing

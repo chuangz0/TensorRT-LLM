@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""E2 (integration plan §9, §11): the store layer coexisting with disaggregated serving.
+"""The store layer coexisting with disaggregated serving.
 
 A context engine and a generation engine live in one process, as in
 ``test_llm_pytorch.py::test_llm_disagg_gen_cancelled``, both with the same KV transfer config.

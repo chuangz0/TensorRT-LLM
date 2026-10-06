@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""E3 (integration plan §9, §11): several context instances sharing one store, several
-generation instances taking KV from them.
+"""Several context instances sharing one store, several generation instances taking KV from
+them.
 
 The deployment this models: a pool of context instances with the same parallelism publish to
 and fetch from one Mooncake store, so a prompt any of them has computed is a store hit for all

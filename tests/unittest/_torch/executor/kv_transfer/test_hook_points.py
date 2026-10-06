@@ -1,12 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The hook points of integration plan §5, read off the engine source.
+"""The KV transfer hook points of the engine loop, read off the engine source.
 
 Each hook is one guarded call in a shared engine file, placed relative to a named neighbour
 (after ``poll_gen_transfers``, before ``_send_kv_async``, ...). Running ``_executor_loop`` in a
-unit test would need the model engine, sampler and hang detector; the order the plan requires is
-a property of the source, so this checks the source: delete or move a hook and a test here fails
-and names it. Behaviour of each hook is covered by ``test_hooks.py``.
+unit test would need the model engine, sampler and hang detector; the order the design requires
+is a property of the source, so this checks the source: delete or move a hook and a test here
+fails and names it. The source-text assertions are deliberate, not a stopgap: they pin the
+*placement* of each hook, which no behavioural test of the hooks can see, and they are written
+against whitespace-collapsed source so that reformatting does not break them. Behaviour of each
+hook is covered by ``test_hooks.py``.
 """
 
 import ast
@@ -101,7 +104,7 @@ def test_publish_follows_the_context_commit_and_precedes_the_disagg_send_in_the_
 
 
 def test_overlap_loop_publishes_only_the_previous_batch():
-    """Only ``previous_batch`` is committed and forward-complete at that point (plan §5 #4)."""
+    """Only ``previous_batch`` is committed and forward-complete at that point."""
     text = source_of(PyExecutor._executor_loop_overlap)
     ordered(
         text,
@@ -123,7 +126,7 @@ def test_overlap_loop_publishes_only_the_previous_batch():
     assert len(hook_calls(text, "publish_committed_blocks")) == 1
 
 
-# ---- the pipeline-parallel loop (multi-rank plan S4 ①-⑥) ----
+# ---- the pipeline-parallel loop ----
 
 
 def test_pp_loop_advances_at_the_head_launches_after_stage_0_and_paces_idle():

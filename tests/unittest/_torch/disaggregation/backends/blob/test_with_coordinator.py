@@ -12,6 +12,8 @@ The backend answers on its own threads, so each step that depends on it waits on
 
 import time
 
+import pytest
+
 __extra_import_path__ = ["~/tensorrt_llm/_torch", "../../orchestration/kv_transfer"]
 from disaggregation.backends.blob.store import BlobStoreError  # noqa: E402
 from disaggregation.backends.config import (  # noqa: E402
@@ -41,6 +43,8 @@ from store_fakes import (  # noqa: E402
     write,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 PROMPT = 29
 END = (PROMPT - 1) // TPB * TPB  # 28: seven nameable blocks
 BLOCKS = END // TPB
@@ -48,10 +52,11 @@ UNIT_BYTES = 64
 
 
 class Side:
-    """One rank: a store backend over the shared store, with a coordinator on top of it."""
+    """One rank: a store backend over the shared store, with a coordinator on top of it;
+    ``config_overrides`` go to the backend's ``BlobStoreConfig``."""
 
-    def __init__(self, store: FakeBlobStore, *, publishes: bool) -> None:
-        self.rank = make_rank(store, arena_bytes=1 << 16)
+    def __init__(self, store: FakeBlobStore, *, publishes: bool, **config_overrides) -> None:
+        self.rank = make_rank(store, arena_bytes=1 << 16, **config_overrides)
         for o in range(BLOCKS + 2):
             self.rank.resolver.add(0, o, UNIT_BYTES // 2, UNIT_BYTES // 2)  # two segments each
         self.reader = FakeReader(groups=[full_attention(0)], tokens_per_block=TPB)
@@ -265,6 +270,40 @@ def test_probe_outage_defers_within_budget_then_plans_local_without_a_fetch():
         assert gen.backend.counters.probe_hits == 0
     finally:
         gen.close()
+
+
+PROBE_TTL_S = 0.5
+"""Short enough to expire inside a test, long enough that a loaded machine cannot expire an
+answer before the first ``wait_until`` has seen it."""
+
+
+def test_probe_answer_expiring_before_the_planner_reads_it_is_asked_again_not_read_as_a_miss():
+    """The backend keeps an unclaimed probe answer for ``probe_ttl_s``; a planner that comes
+    back later finds it gone. The lookup is asked again and the request stays deferred: an
+    expired answer is never an empty one, so no miss is read into it, and the fetch is planned
+    from the store once the fresh answer is in."""
+    store = FakeBlobStore()
+    ctx, gen = Side(store, publishes=True), Side(store, publishes=False, probe_ttl_s=PROBE_TTL_S)
+    try:
+        req = FakeRequest(5, prompt_len=PROMPT)
+        _publish(ctx, req)
+        gen.coord.advance([req], 0.0)
+        assert gen.coord.plan_fetch(req) is DEFER
+        counters = gen.backend.counters
+        wait_until(lambda: counters.probe_hits == BLOCKS, what="the first lookup")
+        lookups_before = store.count("holds")
+        time.sleep(PROBE_TTL_S + 0.1)  # past the TTL: the answer nobody read is dropped
+        gen.coord.advance([req], 1.0)
+        assert gen.coord.plan_fetch(req) is DEFER  # asked again, not read as a miss
+        wait_until(lambda: counters.probe_hits == 2 * BLOCKS, what="the second lookup")
+        assert store.count("holds") == lookups_before + 1  # one fresh lookup, nothing else
+        gen.coord.advance([req], 1.5)
+        plan = gen.coord.plan_fetch(req)
+        assert isinstance(plan, FetchPlan) and plan.token_end == END
+        assert counters.probe_misses == 0 and gen.records()[0]["state"] == "PLANNED"
+    finally:
+        gen.close()
+        ctx.close()
 
 
 # ---------------------------------------------------------------------------------------------

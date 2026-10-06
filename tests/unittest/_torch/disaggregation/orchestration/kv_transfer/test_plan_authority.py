@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Owner and follower on a ``LockstepWorld(2)`` (multi-rank plan S4 (a)).
+"""Owner and follower on a ``LockstepWorld(2)``.
 
 Rank 0 is the OWNER: it plans, its payload carries no plans, and ``export_plan_answers`` hands
 its answers out. Rank 1 is the FOLLOWER: it never plans or probes; ``adopt_plan_answers`` builds
@@ -131,16 +131,62 @@ def test_follower_holds_an_answer_until_its_request_appears_then_both_land(world
     advance_all(world, rigs, req, 2.0)
     for rig in rigs:
         assert rig.effects.only("unpark") == [(req, END, False, None)]
-    assert rigs[FOLLOWER].coord._pending_answers == {}
 
 
 def test_follower_drops_a_held_answer_when_the_request_ends(rigs):
-    stray = FakeRequest(7, prompt_len=29)
+    """Two answers arrive for requests not yet candidates here; request 7 ends before it ever
+    is one, so its answer is dropped, while request 8's is still applied the round it appears."""
+    stray, late = FakeRequest(7, prompt_len=29), FakeRequest(8, prompt_len=29)
     rigs[FOLLOWER].coord.adopt_plan_answers([], [(7, (END, "store")), (8, None)])
     assert rigs[FOLLOWER].records() == [] and rigs[FOLLOWER].coord.plan_fetch(stray) is DEFER
     assert rigs[FOLLOWER].coord.status_dump()["decided_plans"] == 0  # a None is held too
     rigs[FOLLOWER].coord.notify_request_finished(stray)
-    assert rigs[FOLLOWER].coord._pending_answers == {8: None}
+    rigs[FOLLOWER].coord.adopt_plan_answers([stray, late], [])
+    assert rigs[FOLLOWER].coord.plan_fetch(stray) is DEFER  # its answer is gone
+    assert rigs[FOLLOWER].coord.plan_fetch(late) is None  # its answer was kept
+    assert rigs[FOLLOWER].coord.status_dump()["decided_plans"] == 1
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="adopt_plan_answers counts only this call's answers, not a held answer it applies",
+)
+def test_follower_counts_a_held_answer_it_applies_as_decided():
+    """``adopt_plan_answers`` returns how many of the views got no answer and stay deferred; a
+    view whose answer was held from an earlier round gets that answer now and is decided."""
+    world = LockstepWorld(2, authority_of=authority_of)
+    rig = Rig(sources=("store",), **world.rig_kwargs(FOLLOWER))
+    req = store_request()
+    rig.coord.adopt_plan_answers([], [(1, (END, "store"))])  # held: not a candidate yet
+    assert rig.coord.adopt_plan_answers([req], []) == 0
+    assert isinstance(rig.coord.plan_fetch(req), FetchPlan)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="_record_answer re-plans a STAGING record and starts a second landing without "
+    "releasing the first",
+)
+def test_follower_refuses_an_answer_for_a_staging_record(world):
+    """The owner decides a request once; an answer that nevertheless reaches the follower again
+    while the record it decided is landing on the host must not start a second landing (the
+    first would be forgotten without a release) or restart the record's clock."""
+    rigs = [
+        Rig(sources=("host",), unlaunched_timeout_s=UNLAUNCHED_TIMEOUT_S, **world.rig_kwargs(r))
+        for r in range(world.n)
+    ]
+    req = store_request()
+    advance_all(world, rigs, req, 0.0)
+    answers = rigs[OWNER].coord.export_plan_answers()
+    follower = rigs[FOLLOWER]
+    follower.coord.adopt_plan_answers([req], answers, 0.0)
+    assert follower.record(1)["state"] == "STAGING" and follower.host.count("fetch_to_host") == 1
+
+    follower.coord.adopt_plan_answers([req], answers, 0.5)  # the same answer once more
+
+    assert follower.host.count("fetch_to_host") == 1
+    assert len(follower.host.landings) == 1 and follower.host.releases() == 0
+    assert follower.record(1)["state"] == "STAGING" and follower.record(1)["has_landing"]
 
 
 def test_materialize_refuses_a_routed_source(world):
@@ -174,12 +220,12 @@ def test_follower_launching_one_round_late_lands_both_once(world, rigs):
 
     advance_all(world, rigs, req, 1.0)  # owner TERMINAL, follower UNLAUNCHED: no landing
     assert [rig.effects.count("unpark") for rig in rigs] == [0, 0]
-    assert rigs[OWNER].fetch_record(1).state.value == "IN_FLIGHT"
-    assert rigs[FOLLOWER].fetch_record(1).peer_launched_at == 1.0
+    assert rigs[OWNER].record(1)["state"] == "IN_FLIGHT"
+    assert rigs[FOLLOWER].record(1)["peer_launched_at"] == 1.0
 
     follower_attempt = launch_on(rigs[FOLLOWER], req, 1.0)  # round R+1: pages found here now
     follower_attempt.deliver_all()
-    assert rigs[FOLLOWER].fetch_record(1).peer_launched_at is None
+    assert rigs[FOLLOWER].record(1)["peer_launched_at"] is None
 
     advance_all(world, rigs, req, 2.0)  # both TERMINAL: both land in the same round
     for rig in rigs:

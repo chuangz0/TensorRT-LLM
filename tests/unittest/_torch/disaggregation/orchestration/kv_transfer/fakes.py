@@ -156,11 +156,17 @@ class FakeRequest:
 
 
 class FakeRoute:
+    """A ``Route`` that counts its closes; ``close_errors`` is a queue of exceptions the next
+    ``close`` calls raise instead (a close that raises has not closed, per the contract)."""
+
     def __init__(self, hint: Mapping[str, object]) -> None:
         self.hint = hint
         self.closed = 0
+        self.close_errors: deque[BaseException] = deque()
 
     def close(self) -> None:
+        if self.close_errors:
+            raise self.close_errors.popleft()
         self.closed += 1
 
 
@@ -217,7 +223,9 @@ class FakeFetches:
 
     * ``script(outcome)`` queues an outcome for the next ``fetch`` in call order; ``script_for(names,
       outcome)`` scripts by the exact unit-name set of the extent (checked first). A scripted value
-      may be an ``Outcome``, ``None`` (in flight), or a callable ``extent -> Outcome``.
+      may be an ``Outcome``, ``None`` (in flight), or a callable ``extent -> Outcome``. A fetch of
+      an empty extent is delivered empty at once, as the blob backend's ``admit_delivery`` does
+      (the ``Fetches`` contract itself says nothing about empty extents), and consumes no script.
     * ``quiesce_answers`` is consumed one per ``quiesce`` call; ``True`` once exhausted.
     * ``strict_quiesce`` makes ``quiesce`` fail the test when asked about an attempt that has no
       outcome yet.
@@ -281,7 +289,7 @@ class FakeFetches:
         if self.reject_next > 0:
             self.reject_next -= 1
             raise SubmissionRejected(f"{self.name} rejected")
-        outcome = self._scripted(extent)
+        outcome = Delivered(frozenset()) if not extent.units else self._scripted(extent)
         if self.aux_for_next is not None:
             attempt = FakeAuxAttempt(extent, self.aux_for_next, outcome)
             self.aux_for_next = None
@@ -392,7 +400,9 @@ class FakeChunk:
 class FakeLanding:
     """A ``Landing`` whose outcome tests set with ``finish`` (or ``deliver_all``); ``place``
     hands out a ``FakeAttempt`` scripted on the owning ``FakeLandsOnHost``; ``releases`` counts
-    ``release`` calls."""
+    ``release`` calls. A ``place`` after ``release`` fails the test: the coordinator forgets a
+    landing when it releases it, so such a call is a harness invariant broken, not back-pressure
+    (which the real backend would answer with ``SubmissionRejected``)."""
 
     def __init__(
         self, backend: FakeLandsOnHost, name: bytes, units: Sequence[bytes], outcome=None
@@ -419,6 +429,9 @@ class FakeLanding:
         self.finish(Delivered(frozenset(self.units) - frozenset(missing)))
 
     def place(self, extent: CacheExtent) -> FakeAttempt:
+        assert self.releases == 0, (
+            f"{self.backend.name}: place on landing {self.name!r} after release"
+        )
         return self.backend._place(self, extent)
 
     def release(self) -> None:
@@ -431,7 +444,9 @@ class FakeLandsOnHost:
 
     * ``script(outcome)`` queues an outcome for the next ``fetch_to_host``'s landing, in call
       order; unscripted landings start in flight (``None``) and tests ``finish`` them.
-    * ``script_place(outcome)`` does the same for the attempts ``Landing.place`` returns.
+    * ``script_place(outcome)`` does the same for the attempts ``Landing.place`` returns; a
+      placement of an empty extent completes at once, as ``Landing.place`` promises, and
+      consumes none.
     * ``reject_next`` / ``reject_place_next`` make that many upcoming ``fetch_to_host`` /
       ``place`` calls raise ``SubmissionRejected``.
     * ``probe`` answers ``probe_answers`` one per call, else ``probe_default``: ``"all"`` means
@@ -486,7 +501,10 @@ class FakeLandsOnHost:
         if self.reject_place_next > 0:
             self.reject_place_next -= 1
             raise SubmissionRejected(f"{self.name} refused a placement")
-        outcome = self._place_outcomes.popleft() if self._place_outcomes else None
+        if not extent.units:
+            outcome = Delivered(frozenset())
+        else:
+            outcome = self._place_outcomes.popleft() if self._place_outcomes else None
         attempt = FakeAttempt(extent, outcome(extent) if callable(outcome) else outcome)
         landing.placements.append(attempt)
         self.attempts.append(attempt)

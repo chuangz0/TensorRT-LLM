@@ -27,7 +27,14 @@ from disaggregation.backends.blob.drivers.mooncake import (  # noqa: E402
 )
 from disaggregation.backends.blob.store import GetStatus, PutStatus  # noqa: E402
 from disaggregation.base.cache_backend import Delivered, Failed, Unit  # noqa: E402
-from store_fakes import MemoryArena, extent, make_rank, pattern, wait_until  # noqa: E402
+from store_fakes import (  # noqa: E402
+    MemoryArena,
+    extent,
+    make_host_rank,
+    make_rank,
+    pattern,
+    wait_until,
+)
 
 pytest.importorskip("mooncake.store")
 
@@ -109,6 +116,40 @@ def _rank(store, **overrides):
     """A backend over the real store; source units in group 0, destinations in group 1."""
     rank = make_rank(store, arena_bytes=1 << 16, namespace=f"t{os.getpid()}", **overrides)
     return rank
+
+
+def _host_rank(store, **overrides):
+    """The ``landing: host`` shape over the real store: its two host pools are registered with
+    Mooncake, the caller's memory is not; source units in group 0, destinations in group 1."""
+    return make_host_rank(store, arena_bytes=1 << 16, namespace=f"t{os.getpid()}", **overrides)
+
+
+def test_host_landing_round_trips_against_the_master(store):
+    """Publish through the pinned publish pool, land in the landing pool, place into pages the
+    store never saw: the bytes come back whole, segment cuts and all."""
+    with _host_rank(store) as rank:
+        src = [rank.unit(0, i, 96, 32) for i in range(3)]
+        for i, u in enumerate(src):
+            rank.write(u, pattern(i + 1, 128))
+        published = rank.finish(rank.backend.publish(extent(src, name=b"ctx")))
+        assert published == Delivered(frozenset(u.name for u in src))
+        assert all(store.raw.get_size(rank.key(u)) == 128 for u in src)
+
+        dst = []
+        for i, u in enumerate(src):
+            rank.resolver.add(1, i, 64, 64)  # the same bytes, cut differently on this side
+            dst.append(Unit(name=u.name, local_group=1, local=i))
+            rank.fill(dst[-1], 0xEE)
+        landing = rank.land(dst, name=b"gen")
+        assert landing.poll() == Delivered(frozenset(u.name for u in dst))
+        assert all(rank.read(u) == bytes([0xEE]) * 128 for u in dst)  # on the host so far
+        assert rank.place(landing, dst) == Delivered(frozenset(u.name for u in dst))
+        for i, u in enumerate(dst):
+            assert rank.read(u) == pattern(i + 1, 128)
+        landing.release()
+        assert rank.registration is None  # the caller's pool was never registered
+        assert rank.backend.landings_held() == 0
+        assert rank.backend.counters.fetch_hits == 3 and rank.backend.counters.failed_attempts == 0
 
 
 def test_publish_then_fetch_round_trips_two_segment_units(store):

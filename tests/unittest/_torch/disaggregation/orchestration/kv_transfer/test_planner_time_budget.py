@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""U4 (integration plan §11, §10 #5): the planner's wall-clock probe budget.
+"""The planner's wall-clock probe budget.
 
 ``Planner(probe_timeout_s=)`` measured on the ``now`` each ``decide`` receives, the loop clock the
 coordinator passes to ``advance``: a request waiting on a store probe is deferred until

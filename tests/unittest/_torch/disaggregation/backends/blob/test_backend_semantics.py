@@ -13,6 +13,8 @@ from disaggregation.backends.blob.store import BlobStoreError, GetStatus, PutSta
 from disaggregation.base.cache_backend import Delivered, Failed, Unit  # noqa: E402
 from store_fakes import FakeBlobStore, extent, make_rank, pattern, wait_until  # noqa: E402
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _pair(**overrides):
     """A publisher and a fetcher over one store, each with its own memory and matching units:
@@ -125,6 +127,25 @@ def test_publish_where_a_unit_fails_to_write_is_failed():
         assert rank.store.count("holds") == 1  # the lookup before the put; none after
         assert rank.backend.counters.publish_stored == 1
         assert rank.backend.counters.failed_attempts == 1
+
+
+def test_put_transport_failure_is_failed_not_declined():
+    """A put call that raises (the transport, not the store's answer about a unit) fails the
+    attempt: nothing is read as declined, the store is not asked whether it holds the units
+    afterwards, and the failure is counted."""
+    with make_rank() as rank:
+        u = rank.unit(0, 0, 8)
+        rank.write(u, pattern(1, 8))
+        rank.store.fail_next("put", BlobStoreError("rpc failed"))
+        attempt = rank.backend.publish(extent([u]))
+        outcome = rank.finish(attempt)
+        assert isinstance(outcome, Failed) and "rpc failed" in outcome.reason
+        assert rank.store.count("holds") == 1  # the lookup before the put; none after
+        assert rank.backend.counters.publish_declined == 0
+        assert rank.backend.counters.publish_stored == 0
+        assert rank.backend.counters.failed_attempts == 1
+        assert rank.key(u) not in rank.store.objects
+        assert rank.backend.quiesce([attempt]) is True
 
 
 def test_publish_whose_lookup_fails_is_failed():

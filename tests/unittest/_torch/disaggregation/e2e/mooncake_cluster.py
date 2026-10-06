@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Shared pieces of the store e2e tests (integration plan §11): a ``mooncake_master`` and a
-long-lived segment provider on free loopback ports, the KV transfer YAML of plan §8, the model and
-KV cache settings every engine uses, and the status dumps written by ``close``.
+"""Shared pieces of the store e2e tests: a ``mooncake_master`` and a long-lived segment provider
+on free loopback ports, the KV transfer YAML, the model and KV cache settings every engine uses,
+and the status dumps written by ``close``.
 
 Mooncake objects live in the client segments; the engines contribute none
-(``global_segment_size: 0``, plan §10 #8), so the provider is the one client whose segment holds
-the published blocks, and it must outlive every ``LLM()`` of a test.
+(``global_segment_size: 0``), so the provider is the one client whose segment holds the published
+blocks, and it must outlive every ``LLM()`` of a test. A test that wants a provider of another
+size parametrizes the ``mooncake_cluster`` fixture indirectly with the segment's byte count.
 """
 
 from __future__ import annotations
@@ -189,6 +190,10 @@ class MooncakeCluster:
     master: subprocess.Popen
     provider: subprocess.Popen
 
+    def kill_master(self) -> None:
+        """The store's master goes away mid-test; every client call fails from here on."""
+        kill(self.master)
+
     def close(self) -> None:
         kill(self.provider)
         kill(self.master)
@@ -240,19 +245,21 @@ def tinyllama_path() -> str:
 
 
 @pytest.fixture
-def mooncake_cluster():
+def mooncake_cluster(request):
     """A master and one segment provider, killed at teardown whatever happened. Needs a GPU,
-    the Mooncake bindings and ``mooncake_master``; no model weights."""
+    the Mooncake bindings and ``mooncake_master``; no model weights. The provider's segment is
+    ``SEGMENT_BYTES`` unless the test parametrizes this fixture indirectly with another size."""
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("the engines need a GPU")
     pytest.importorskip("mooncake.store")
     if not os.access(MASTER, os.X_OK):
         pytest.skip("mooncake_master binary not found")
+    segment_bytes = getattr(request, "param", SEGMENT_BYTES)
     master_address, master = start_master()
     provider = None
     try:
-        provider = start_segment_provider(master_address)
+        provider = start_segment_provider(master_address, segment_bytes)
         cluster = MooncakeCluster(master_address, master, provider)
         yield cluster
     finally:
@@ -276,10 +283,23 @@ def mooncake_cluster():
 
 
 def write_kv_transfer_yaml(
-    directory, master_address: str, namespace: str, *, landing: str | None = None, **overrides
+    directory,
+    master_address: str,
+    namespace: str,
+    *,
+    landing: str | None = None,
+    backend_overrides: dict | None = None,
+    omit_coordinator_timeouts: bool = False,
+    **overrides,
 ) -> str:
-    """The plan §8 file for a TCP loopback store. ``landing`` is written only when given: left
-    out, the mooncake factory resolves it to ``host`` for TCP, which is what the tests assert."""
+    """The KV transfer config file for a TCP loopback store with one backend.
+
+    ``landing`` is written only when given: left out, the mooncake factory resolves it to
+    ``host`` for TCP, which is what the tests assert. ``backend_overrides`` are merged into the
+    backend entry (``max_landed_units`` and the other backend options live there, not at the
+    top level). The three coordinator timeouts are written explicitly unless
+    ``omit_coordinator_timeouts`` asks for the defaults; ``overrides`` go to the top level.
+    """
     backend = dict(
         name="shared-store",
         type="mooncake",
@@ -294,7 +314,10 @@ def write_kv_transfer_yaml(
     )
     if landing is not None:
         backend["landing"] = landing
-    config = dict(fetch_timeout_s=30, publish_timeout_s=60, probe_timeout_s=1.0, backends=[backend])
+    backend.update(backend_overrides or {})
+    config = dict(backends=[backend])
+    if not omit_coordinator_timeouts:
+        config.update(fetch_timeout_s=30, publish_timeout_s=60, probe_timeout_s=1.0)
     config.update(overrides)
     path = os.path.join(str(directory), "kv_transfer.yaml")
     with open(path, "w", encoding="utf-8") as f:

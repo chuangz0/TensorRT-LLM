@@ -11,9 +11,11 @@ __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.base.cache_backend import (  # noqa: E402
     Attempt,
     CacheExtent,
+    Delivered,
     Fetches,
     Publishes,
     RegistersPools,
+    Unit,
 )
 from disaggregation.orchestration.kv_transfer.interfaces import (  # noqa: E402
     CarriesAux,
@@ -32,6 +34,8 @@ from fakes import (  # noqa: E402
     FakeRoute,
     KVTransferCoordinator,
 )
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_modules_under_test_were_not_imported_through_tensorrt_llm():
@@ -125,3 +129,59 @@ def test_lands_on_host_and_landing_are_non_empty_and_disjoint_from_fetches():
     assert isinstance(landing, Landing)
     assert not isinstance(object(), Landing)
     assert isinstance(landing.place(CacheExtent(name=b"x", units=(), is_last=True)), Attempt)
+
+
+# ---- the harness invariants the fakes enforce ----
+
+
+def one_unit_extent() -> CacheExtent:
+    return CacheExtent(name=b"x", units=(Unit(name=b"u", local_group=0, local=0),), is_last=True)
+
+
+def test_fakes_refuse_quiesce_before_outcome():
+    """A real backend's ``quiesce`` waits for a live attempt on the engine thread; the strict
+    fakes fail the test instead, so a coordinator that asks too early is caught at once. Once
+    the attempt has its outcome the same call is answered."""
+    store = FakeFetches(strict_quiesce=True)
+    live = store.fetch(one_unit_extent())
+    with pytest.raises(AssertionError, match="quiesce asked under 1 live attempt"):
+        store.quiesce([live])
+    live.deliver_all()
+    assert store.quiesce([live]) is True
+
+    publisher = FakePublishes(strict_quiesce=True)
+    pending = publisher.publish(one_unit_extent())
+    with pytest.raises(AssertionError, match="live attempt"):
+        publisher.quiesce([pending])
+
+    host = FakeLandsOnHost(strict_quiesce=True)
+    placement = host.fetch_to_host(b"n", [b"u"]).place(one_unit_extent())
+    with pytest.raises(AssertionError, match="live attempt"):
+        host.quiesce([placement])
+
+
+def test_fake_landing_refuses_a_placement_after_release():
+    """The coordinator forgets a landing when it releases it; a placement on a released landing
+    is a harness invariant broken, and the fake fails the test rather than answering."""
+    host = FakeLandsOnHost()
+    landing = host.fetch_to_host(b"n", [b"u"])
+    landing.release()
+    with pytest.raises(AssertionError, match="after release"):
+        landing.place(one_unit_extent())
+
+
+def test_fakes_deliver_an_empty_extent_at_once_without_consuming_a_script():
+    """An empty extent completes at once: ``Landing.place`` promises it, and the fetch fake
+    mirrors the blob backend's ``admit_delivery`` (the ``Fetches`` contract leaves it open).
+    The scripted outcome stays queued for the next extent that names something."""
+    empty = CacheExtent(name=b"x", units=(), is_last=True)
+    store = FakeFetches()
+    store.script(Delivered(frozenset({b"u"})))
+    assert store.fetch(empty).poll() == Delivered(frozenset())
+    assert store.fetch(one_unit_extent()).poll() == Delivered(frozenset({b"u"}))
+
+    host = FakeLandsOnHost()
+    host.script_place(Delivered(frozenset({b"u"})))
+    landing = host.fetch_to_host(b"n", [b"u"])
+    assert landing.place(empty).poll() == Delivered(frozenset())
+    assert landing.place(one_unit_extent()).poll() == Delivered(frozenset({b"u"}))

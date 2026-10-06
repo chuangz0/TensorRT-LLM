@@ -46,6 +46,8 @@ from store_fakes import (  # noqa: E402
     wait_until,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 UNIT = 64
 
 
@@ -223,7 +225,6 @@ def test_slot_shortage_queues_the_landing_and_release_hands_it_to_a_worker():
         for _ in range(20):
             assert second.poll() is None  # queued, non-blocking
         assert rank.store.count("holds") == lookups  # the worker was not asked yet
-        assert rank.inflight_slots_free() == 256
         first.release()  # the engine thread returns the slot and dispatches the queue head
         wait_until(lambda: second.poll() is not None)
         assert second.poll() == Delivered(frozenset({b.name}))
@@ -271,6 +272,9 @@ def test_publish_completes_while_a_landing_holds_every_landing_slot_on_the_only_
 
 
 def test_landings_take_no_inflight_slot_but_placements_do():
+    """With one in-flight slot: two landings with their gets in flight leave it free (a publish
+    is still accepted), a placement takes it (a second placement is refused), and the slot is
+    back once the placement has landed (the second placement is then accepted)."""
     store = FakeBlobStore()
     direct, theirs = _published(store, 2)
     with direct, make_host_rank(store, max_inflight_ops=1) as rank:
@@ -279,18 +283,20 @@ def test_landings_take_no_inflight_slot_but_placements_do():
         first = rank.backend.fetch_to_host(b"a", [a.name])
         second = rank.backend.fetch_to_host(b"b", [b.name])
         rank.store.wait_entered(6)  # 2 registrations, 2 lookups, 2 gets parked
-        assert rank.inflight_slots_free() == 1  # two gets in flight, no inflight slot taken
+        out = rank.unit(1, 0, UNIT)
+        rank.write(out, pattern(9, UNIT))
+        published = rank.backend.publish(extent([out], name=b"pub"))  # the slot was free
         rank.store.unblock()
         wait_until(lambda: first.poll() is not None and second.poll() is not None)
+        assert isinstance(rank.finish(published), Delivered)
         rank.landing_copier.block("copy")
         placing = first.place(extent([a]))
         rank.landing_copier.wait_entered(1)
-        assert rank.inflight_slots_free() == 0
         with pytest.raises(SubmissionRejected, match="1 deliveries already in flight"):
             second.place(extent([b]))
         rank.landing_copier.unblock()
         assert isinstance(rank.finish(placing), Delivered)
-        assert rank.inflight_slots_free() == 1
+        assert rank.place(second, [b]) == Delivered(frozenset({b.name}))  # the slot is back
         first.release()
         second.release()
 
@@ -328,7 +334,6 @@ def test_release_while_queued_dequeues_and_takes_no_slot():
         time.sleep(0.05)
         assert rank.store.count("holds") == lookups
         assert rank.free_landing_slots() == 1 and rank.backend.landings_held() == 0
-        assert rank.inflight_slots_free() == 256
         assert rank.backend.counters.failed_attempts == 0  # a release is not a failure
 
 
@@ -461,6 +466,34 @@ def test_close_refuses_queued_landings_frees_held_slots_and_release_afterwards_i
         with pytest.raises(SubmissionRejected):
             landed.place(extent([a]))
         rank.backend.close()  # idempotent
+        assert store.closed == 1
+
+
+def test_fetch_to_host_racing_close_is_refused_or_released():
+    """``fetch_to_host`` and ``close`` meeting: a landing past the closed check is tracked
+    before it is queued, so a ``close`` that runs in between finds it and refuses it; a
+    ``fetch_to_host`` after ``close`` is refused outright. Either way no slot stays held and
+    the landing's ``poll`` is never left pending. The interleaving is played deterministically
+    by running ``close`` from inside the landing's enqueue."""
+    store = FakeBlobStore()
+    direct, theirs = _published(store, 1)
+    with direct, make_host_rank(store) as rank:
+        (a,) = _mirror(rank, theirs)
+        pool = rank.landing_pool
+        enqueue = pool.enqueue
+
+        def close_then_enqueue(waiter, count):
+            rank.backend.close()
+            enqueue(waiter, count)
+
+        pool.enqueue = close_then_enqueue
+        racing = rank.backend.fetch_to_host(b"racing", [a.name])
+        outcome = racing.poll()
+        assert isinstance(outcome, Failed) and "released before landing" in outcome.reason
+        assert rank.backend.landings_held() == 0 and rank.free_landing_slots() == 4
+        racing.release()  # inert
+        with pytest.raises(SubmissionRejected):
+            rank.backend.fetch_to_host(b"late", [a.name])
         assert store.closed == 1
 
 

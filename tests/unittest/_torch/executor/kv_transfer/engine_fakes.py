@@ -256,10 +256,12 @@ class FakeKVCacheManager:
     """The slice of ``KVCacheManagerV2`` the effects, the hooks and the reader touch.
 
     ``commit_to[rid]`` overrides what ``try_commit_blocks`` commits (default: the cursor).
-    ``release_index_slot`` is idempotent, as the real wrapper's is (plan §7 #3).
-    ``reserve_transfer_pages`` answers ``reserve_answer`` (default ``True``) and, when it does
-    reserve, leaves behind a cache declaring history to ``token_end``, as the scheduler's call
-    on the real wrapper does.
+    ``release_index_slot`` is idempotent, as the real wrapper's is. ``reserve_transfer_pages``
+    answers ``reserve_answer`` (default ``True``) and, when it does reserve, leaves behind a
+    cache declaring history to ``token_end``, as the scheduler's call on the real wrapper does;
+    a request that already has a cache keeps it, with its history raised to ``token_end`` if
+    that is further (the wrapper never lowers history) and its committed tokens untouched.
+    ``prepare_resources`` is the no-op the engine's gen-init preparation calls.
     """
 
     def __init__(self, tokens_per_block: int = TPB) -> None:
@@ -273,11 +275,20 @@ class FakeKVCacheManager:
         self._early_freed: set[int] = set()
 
     def reserve_transfer_pages(self, request, token_end: int) -> bool:
-        self.calls.append(("reserve_transfer_pages", request.py_request_id))
+        rid = request.py_request_id
+        self.calls.append(("reserve_transfer_pages", rid))
         if not self.reserve_answer:
             return False
-        self.kv_cache_map[request.py_request_id] = FakeKVCache(history_length=token_end)
+        kv_cache = self.kv_cache_map.get(rid)
+        if kv_cache is None:
+            self.kv_cache_map[rid] = FakeKVCache(history_length=token_end)
+        else:
+            kv_cache.history_length = max(kv_cache.history_length, token_end)
+            kv_cache.capacity = max(kv_cache.capacity, kv_cache.history_length)
         return True
+
+    def prepare_resources(self, scheduled_batch) -> None:
+        self.calls.append(("prepare_resources", len(scheduled_batch.context_requests_last_chunk)))
 
     def get_history_length(self, request) -> int | None:
         kv_cache = self.kv_cache_map.get(request.py_request_id)

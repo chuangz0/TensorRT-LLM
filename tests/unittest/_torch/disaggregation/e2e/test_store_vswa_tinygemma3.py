@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""E3: the store path on a variable-sliding-window model.
+"""The store path on a variable-sliding-window model.
 
 Two engines, one prompt, one store, as ``test_store_e2e_tinyllama``, on a Gemma3 whose layers
 alternate sliding and full attention, so the KV cache has a windowed group and a full-attention
@@ -95,7 +95,9 @@ def real_gemma3_path() -> str | None:
     return None
 
 
-def run_engine(tmp_path, monkeypatch, tag: str, model_path: str, prompt, *, max_seq_len: int):
+def run_engine(
+    tmp_path, monkeypatch, tag: str, model_path: str, prompt, *, max_seq_len: int, **llm_kwargs
+):
     """One ``LLM()`` on integer prompts that generates once and shuts down; returns
     (tokens, first-step logits, status dump)."""
     from tensorrt_llm import LLM
@@ -108,6 +110,7 @@ def run_engine(tmp_path, monkeypatch, tag: str, model_path: str, prompt, *, max_
         kv_cache_config=kv_cache_config(),
         max_seq_len=max_seq_len,
         disable_overlap_scheduler=True,
+        **llm_kwargs,
     )
     # No tokenizer, so the end id is given by hand (Gemma's <eos>); ignored anyway, so that every
     # run generates the same number of tokens whatever the random weights produce.
@@ -122,6 +125,54 @@ def run_engine(tmp_path, monkeypatch, tag: str, model_path: str, prompt, *, max_
     finally:
         llm.shutdown()
     return tokens, first_step_logits, read_status_dump(tmp_path, tag)
+
+
+def run_two_engines_and_check(
+    mooncake_cluster,
+    tmp_path,
+    monkeypatch,
+    model_path: str,
+    namespace: str,
+    prompt_len: int,
+    published_by_a: int,
+    fetched_by_b: int,
+    **llm_kwargs,
+) -> None:
+    """A then B on one prompt, both with ``llm_kwargs``; the exact counters, equal tokens and
+    first-step logits within bfloat16 tolerance."""
+    nameable = (prompt_len - 1) // TOKENS_PER_BLOCK
+    config_path = write_kv_transfer_yaml(tmp_path, mooncake_cluster.master_address, namespace)
+    monkeypatch.setenv(KV_TRANSFER_CONFIG_ENV, config_path)
+    prompt = prompt_token_ids(prompt_len=prompt_len)
+
+    tokens_a, logits_a, dump_a = run_engine(
+        tmp_path, monkeypatch, "a", model_path, prompt, **llm_kwargs
+    )
+    tokens_b, logits_b, dump_b = run_engine(
+        tmp_path, monkeypatch, "b", model_path, prompt, **llm_kwargs
+    )
+
+    assert len(tokens_a) == MAX_TOKENS
+    assert tokens_a == tokens_b
+    assert logits_a.shape == logits_b.shape
+    torch.testing.assert_close(logits_b, logits_a, atol=1e-2, rtol=1e-2)
+
+    counters_a = counters(dump_a)
+    assert counters_a["publish_stored"] == published_by_a, counters_a
+    assert counters_a["fetch_hits"] == 0 and counters_a["fetch_misses"] == 0, counters_a
+    assert counters_a["failed_attempts"] == 0, counters_a
+    assert_no_leftover_records(dump_a)
+
+    counters_b = counters(dump_b)
+    # B asks about every nameable block of both groups; the store holds what A published.
+    assert counters_b["probe_hits"] == published_by_a, counters_b
+    assert counters_b["probe_misses"] == 2 * nameable - published_by_a, counters_b
+    assert counters_b["fetch_hits"] == fetched_by_b, counters_b
+    assert counters_b["fetch_misses"] == 0, counters_b
+    assert counters_b["failed_attempts"] == 0, counters_b
+    # Whether fetched or recomputed, what B offers at the end is already in the store.
+    assert counters_b["publish_stored"] == 0, counters_b
+    assert_no_leftover_records(dump_b)
 
 
 CASES = [
@@ -150,37 +201,42 @@ def test_store_fetch_on_a_vswa_model(
         model_path = real_gemma3_path()
         if model_path is None:
             pytest.skip("Gemma-3-1b-it weights not found (GEMMA3_MODEL_PATH or LLM_MODELS_ROOT)")
-    nameable = (prompt_len - 1) // TOKENS_PER_BLOCK
-    namespace = f"e3-{os.getpid()}-{model}-{prompt_len}"
-    config_path = write_kv_transfer_yaml(tmp_path, mooncake_cluster.master_address, namespace)
-    monkeypatch.setenv(KV_TRANSFER_CONFIG_ENV, config_path)
-    prompt = prompt_token_ids(prompt_len=prompt_len)
-
-    tokens_a, logits_a, dump_a = run_engine(
-        tmp_path, monkeypatch, "a", model_path, prompt, max_seq_len=MAX_SEQ_LEN[model]
+    run_two_engines_and_check(
+        mooncake_cluster,
+        tmp_path,
+        monkeypatch,
+        model_path,
+        f"e3-{os.getpid()}-{model}-{prompt_len}",
+        prompt_len,
+        published_by_a,
+        fetched_by_b,
+        max_seq_len=MAX_SEQ_LEN[model],
     )
-    tokens_b, logits_b, dump_b = run_engine(
-        tmp_path, monkeypatch, "b", model_path, prompt, max_seq_len=MAX_SEQ_LEN[model]
+
+
+CHUNK_TOKENS = 64
+"""Two blocks per context chunk: the 330-token prompt prefills in six chunks on A and, after
+the fetch lands at 320, in one on B."""
+
+
+@timeout_mark(900)
+def test_store_fetch_on_a_vswa_model_with_chunked_prefill(
+    mooncake_cluster, tmp_path, monkeypatch, tiny_gemma3_path
+):
+    """Chunked prefill on both engines, on the tiny model's window-aligned case: A publishes
+    once its last chunk has committed, B's first chunk is the fetch and the tail runs in chunks
+    afterwards; counters, tokens and first-step logits are those of the unchunked run."""
+    run_two_engines_and_check(
+        mooncake_cluster,
+        tmp_path,
+        monkeypatch,
+        tiny_gemma3_path,
+        f"e3-chunked-{os.getpid()}",
+        330,
+        14,
+        14,
+        max_seq_len=MAX_SEQ_LEN["tiny"],
+        enable_chunked_prefill=True,
+        max_num_tokens=CHUNK_TOKENS,
+        max_batch_size=4,
     )
-
-    assert len(tokens_a) == MAX_TOKENS
-    assert tokens_a == tokens_b
-    assert logits_a.shape == logits_b.shape
-    torch.testing.assert_close(logits_b, logits_a, atol=1e-2, rtol=1e-2)
-
-    counters_a = counters(dump_a)
-    assert counters_a["publish_stored"] == published_by_a, counters_a
-    assert counters_a["fetch_hits"] == 0 and counters_a["fetch_misses"] == 0, counters_a
-    assert counters_a["failed_attempts"] == 0, counters_a
-    assert_no_leftover_records(dump_a)
-
-    counters_b = counters(dump_b)
-    # B asks about every nameable block of both groups; the store holds what A published.
-    assert counters_b["probe_hits"] == published_by_a, counters_b
-    assert counters_b["probe_misses"] == 2 * nameable - published_by_a, counters_b
-    assert counters_b["fetch_hits"] == fetched_by_b, counters_b
-    assert counters_b["fetch_misses"] == 0, counters_b
-    assert counters_b["failed_attempts"] == 0, counters_b
-    # Whether fetched or recomputed, what B offers at the end is already in the store.
-    assert counters_b["publish_stored"] == 0, counters_b
-    assert_no_leftover_records(dump_b)

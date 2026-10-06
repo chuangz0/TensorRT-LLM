@@ -198,7 +198,7 @@ def _pp_executor(monkeypatch, calls: list, *, rank: int) -> PyExecutor:
     """Idle executor on a two-stage pipeline; rank 0 schedules, rank 1 receives
     the schedule from its predecessor and re-runs the scheduler locally. A
     recording KV transfer binding is attached, so the transcript also pins the
-    six KV transfer hooks of the PP loop (multi-rank plan S4)."""
+    six KV transfer hooks of the PP loop."""
     executor = _idle_executor(monkeypatch, calls)
     executor.kv_transfer = _recording_kv_transfer(calls)
     executor._kv_fetch_launch_queue = []

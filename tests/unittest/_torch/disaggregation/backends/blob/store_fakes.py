@@ -433,13 +433,9 @@ class Rank:
         return self.finish(landing.place(extent(units, name=name)))
 
     def free_landing_slots(self) -> int:
+        """The pool keeps no public free count; its ``_free`` list is the one place to read it."""
         assert self.landing_pool is not None
         return len(self.landing_pool._free)
-
-    def inflight_slots_free(self) -> int:
-        """The inner backend's ``max_inflight_ops`` semaphore, as seen from outside."""
-        assert self.inner is not None
-        return self.inner._inflight._value
 
     def write(self, unit: Unit, data: bytes) -> None:
         write(self.segments(unit), data)
@@ -527,6 +523,7 @@ def make_host_rank(
         landing_wait_timeout_s=landing_wait_timeout_s,
     )
     rank.publish_pool, rank.publish_copier, rank.trace = publish_pool, publish_copier, trace
+    # The pool does not expose its copier; the fake one is read back here so tests can gate it.
     rank.landing_pool, rank.landing_copier = landing_pool, landing_pool._copier
     return rank
 

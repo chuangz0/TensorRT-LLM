@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """``N`` real ``KVTransferHooks`` on ``N`` threads, one per TP rank, whose coordinators meet in the
-``FakeDistGroup`` collective through the real ``EngineCollective`` (plan S3 (b)).
+``FakeDistGroup`` collective through the real ``EngineCollective``.
 
 Each round every rank runs what the loop runs: ``advance_round``, ``plan_fetch``, the scheduler's
 page reservation, ``launch_reserved_fetches``; then delivers its own store's attempts; later
@@ -10,8 +10,8 @@ with the same payload on every rank), every rank lands once, TP shards publish t
 names under different shard tags, and a rank that cannot reserve pages holds the landing until
 ``unlaunched_timeout_s`` makes every rank start over in the same round.
 
-Under ``pp_size=2`` (plan S4 (b)) the test plays Stage 0 of the PP loop: the owner's exported
-answers cross to the follower through a queue, pickled as the schedule would carry them.
+Under ``pp_size=2`` the test plays Stage 0 of the PP loop: the owner's exported answers cross to
+the follower through a queue, pickled as the schedule would carry them.
 """
 
 import pickle
@@ -41,6 +41,15 @@ def clock(monkeypatch):
     now = {"t": 1000.0}
     monkeypatch.setattr(time, "monotonic", lambda: now["t"])
     return now
+
+
+def paces_idle(hooks, monkeypatch) -> bool:
+    """Whether an idle loop pass on this rank would yield: the hooks sleep when a request is
+    still deferred on a store lookup or the coordinator has pending work."""
+    sleeps = []
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
+    hooks.pace_idle()
+    return bool(sleeps)
 
 
 def make_world(world_size: int, **rig_kwargs):
@@ -102,7 +111,7 @@ def test_a_rank_without_pages_holds_the_landing_until_the_timeout_restarts_every
     assert [rig.effects.unparks for rig in rigs] == [0, 0]
     assert [r["state"] for r in launched.records()] == ["IN_FLIGHT"]
     assert [r["state"] for r in laggard.records()] == ["PLANNED"]
-    assert laggard.fetch_record(1).peer_launched_at == 1001.0
+    assert laggard.record(1)["peer_launched_at"] == 1001.0
 
     clock["t"] += UNLAUNCHED_TIMEOUT_S - 0.1
     group.run(one_round)  # still within the budget
@@ -149,7 +158,7 @@ class Stage0:
         return pickle.loads(self._wire.get(timeout=5.0))
 
 
-def test_pp_follower_adopts_the_owners_plans_and_lands_in_the_same_round():
+def test_pp_follower_adopts_the_owners_plans_and_lands_in_the_same_round(monkeypatch):
     group = FakeDistGroup(world_size=2, tp_size=1, pp_size=2)
     owner = RankRig(group, 0, plan_authority=PlanAuthority.OWNER)
     follower = RankRig(group, 1, plan_authority=PlanAuthority.FOLLOWER)
@@ -170,7 +179,7 @@ def test_pp_follower_adopts_the_owners_plans_and_lands_in_the_same_round():
 
     assert stage0.sent == [[(1, (TOKEN_END, "store"))], []]
     assert follower.store.count("probe") == 0  # the follower never plans
-    assert follower.hooks._num_deferred_requests == 0
+    assert not paces_idle(follower.hooks, monkeypatch)  # nothing deferred, nothing pending
     for rig, request in zip((owner, follower), requests):
         assert rig.effects.unparks == 1 and rig.effects.give_backs == 0
         assert request.context_current_position == TOKEN_END
@@ -206,7 +215,7 @@ def test_pp_follower_without_pages_launches_a_round_late_and_both_land_together(
             follower.schedule_round([requests[1]], adopt=stage0.adopt)  # reserves and launches
             after_round[1].wait()
             assert [owner.effects.unparks, follower.effects.unparks] == [0, 0]
-            assert follower.fetch_record(1).peer_launched_at is None  # cleared by its launch
+            assert follower.record(1)["peer_launched_at"] is None  # cleared by its launch
             follower.deliver_all()
             follower.schedule_round([requests[1]], adopt=stage0.adopt)
             after_round[2].wait()
@@ -224,7 +233,7 @@ def test_pp_follower_without_pages_launches_a_round_late_and_both_land_together(
     assert [vote[1] for vote in votes_by_round[2]] == ["TERMINAL"]
 
 
-def test_pp_follower_without_an_answer_counts_the_candidate_as_deferred():
+def test_pp_follower_without_an_answer_counts_the_candidate_as_deferred(monkeypatch):
     group = FakeDistGroup(world_size=2, tp_size=1, pp_size=2)
     owner = RankRig(group, 0, plan_authority=PlanAuthority.OWNER)
     follower = RankRig(group, 1, plan_authority=PlanAuthority.FOLLOWER)
@@ -243,8 +252,45 @@ def test_pp_follower_without_an_answer_counts_the_candidate_as_deferred():
     assert stage0.sent == [[]]
     assert owner.hooks.plan_fetch(requests[0]) is DEFER
     assert follower.hooks.plan_fetch(requests[1]) is DEFER
-    assert follower.hooks._num_deferred_requests == 1
-    assert owner.hooks._num_deferred_requests == 1
+    # Both ranks count the request as deferred: an idle pass yields on each, although neither
+    # coordinator has a record (the lookup is the only thing that can move).
+    for rig in (owner, follower):
+        assert not rig.hooks.has_pending_work()
+        assert paces_idle(rig.hooks, monkeypatch)
+
+
+def test_a_request_with_a_publish_in_flight_survives_the_recompute_pause_on_every_rank():
+    """Pool pressure tears requests down for a recompute; the executor's own teardown skips a
+    request whose blocks a store backend is still reading (its id is in
+    ``inflight_request_ids`` on every rank), so only the other request loses its cache. Once
+    the publish has landed everywhere the protection is gone and the same pause frees it."""
+    world_size = 2
+    group, rigs = make_world(world_size)
+    publishing = rank_local_requests(world_size, request_id=1)
+    plain = rank_local_requests(world_size, request_id=2)
+
+    def publish_then_pause(rank):
+        rig = rigs[rank]
+        rig.publish(publishing[rank])  # a publish in flight: the store reads the pages
+        rig.kv.reserve_transfer_pages(plain[rank], TOKEN_END)  # the other request's cache
+        rig.schedule_round([], recompute_pause=[publishing[rank], plain[rank]])
+
+    group.run(publish_then_pause)
+    for rig in rigs:
+        assert rig.hooks.inflight_request_ids() == {1}
+        assert 1 in rig.kv.kv_cache_map and 2 not in rig.kv.kv_cache_map
+        assert [r["state"] for r in rig.records()] == ["IN_FLIGHT"]
+
+    def land_then_pause(rank):
+        rig = rigs[rank]
+        rig.deliver_all()
+        rig.schedule_round([], recompute_pause=[publishing[rank]])
+
+    group.run(land_then_pause)
+    for rig in rigs:
+        assert rig.hooks.inflight_request_ids() == frozenset() and rig.records() == []
+        assert 1 not in rig.kv.kv_cache_map
+        assert rig.gathers() == ["allgather"] * 2
 
 
 def test_attention_dp_replicas_run_without_a_collective_and_share_the_shard_tag():

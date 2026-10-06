@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""U3 (integration plan §5 #10-#12, §11): the KV fetch seam of ``KVCacheV2Scheduler``.
+"""The KV fetch seam of ``KVCacheV2Scheduler``.
 
 The scheduler asks a duck-typed ``kv_transfer_hooks`` about every first-chunk context request
 before it prepares any cache for it. ``DEFER`` skips the request this round at no cost; a plan
@@ -419,8 +419,8 @@ class FilteringPlanner(FakePlanner):
 
 
 def test_dummy_request_with_a_planner_attached_is_scheduled_normally():
-    """The hooks' candidate filter (plan §9 rule 3) answers None for a dummy even when a plan
-    would exist; the scheduler then takes the ordinary context path for it."""
+    """The hooks' candidate filter answers None for a dummy even when a plan would exist; the
+    scheduler then takes the ordinary context path for it."""
     mgr = make_kv_cache_manager()
     sched = make_scheduler(mgr)
     planner = FilteringPlanner({1: FakePlan(token_end=64), 2: FakePlan(token_end=64)})
@@ -436,7 +436,7 @@ def test_dummy_request_with_a_planner_attached_is_scheduled_normally():
 
 
 # ---------------------------------------------------------------------------------------------
-# A request with a publish in flight keeps its pages (plan §9 rule 5, design §4.3)
+# A request with a publish in flight keeps its pages (design §4.3)
 # ---------------------------------------------------------------------------------------------
 
 PROTECT_99 = dict(protected_from_eviction_request_ids=frozenset({99}))
@@ -632,7 +632,7 @@ def test_planner_is_asked_after_the_prefix_probe_but_before_any_cache_work():
 
 
 # ---------------------------------------------------------------------------------------------
-# Import hygiene (plan §3, §10 #3)
+# Import hygiene
 # ---------------------------------------------------------------------------------------------
 
 
