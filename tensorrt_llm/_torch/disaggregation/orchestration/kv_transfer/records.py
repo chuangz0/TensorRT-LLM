@@ -113,8 +113,8 @@ class TransferRecord:
             settled on this rank as soon as its own attempts are over.
         quiesce_refused: The backend could not vouch for the pages at the release point. The
             engine is fatal; the record stays so the pages are never handed out again.
-        retry_hint: Fetch only; the block boundary the next try may aim for at most: the merged
-            B (``remote_cache.merge``) of the try whose ``served`` came up short.
+        retry_hint: Fetch only; the block boundary the next try may aim for at most: the ranks'
+            agreed MIN of the merged B (``remote_cache.merge``) of the try that came up short.
         rejected: Publish only; some submission of this record raised ``SubmissionRejected``.
             The units it carried were never offered, so the publish as a whole has failed even if
             the other pieces land.

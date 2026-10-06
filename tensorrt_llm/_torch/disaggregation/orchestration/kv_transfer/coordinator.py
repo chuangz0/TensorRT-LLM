@@ -86,8 +86,7 @@ class VoteKind(Enum):
     UNLAUNCHED: fetch planned but not launched here (no pages yet); holds up a landing, not a failure.
     INFLIGHT: an attempt is still running here; nothing may be decided this round.
     FAILED: decisive: this rank's attempt failed, or it gave up launching.
-    TERMINAL: every attempt here ended without failure; carries ``(B, retry_hint)`` for a fetch,
-        with ``retry_hint == B`` by construction (the wire keeps both fields).
+    TERMINAL: every attempt here ended without failure; carries ``token_end`` for a fetch.
     """
 
     UNLAUNCHED = "UNLAUNCHED"
@@ -97,20 +96,20 @@ class VoteKind(Enum):
 
 
 class Vote(NamedTuple):
-    """One rank's word on one record. ``b`` and ``hint`` matter for ``TERMINAL`` fetches only."""
+    """One rank's word on one record. ``token_end`` is the block boundary this rank's attempts
+    reached, the merged ``B`` of design §7.1 (``remote_cache.merge``); it matters for ``TERMINAL``
+    fetches only."""
 
     kind: VoteKind
-    b: int = 0
-    hint: int = 0
+    token_end: int = 0
 
 
-_Verdict = tuple[int, int, bool]
-"""``(MIN(B), MIN(retry_hint), failed)``: what the ranks agreed on for one record. Every rank votes
-``retry_hint == B``, so the two minima agree; both are kept for the wire shape."""
+_Verdict = tuple[int, bool]
+"""``(MIN(token_end), failed)``: what the ranks agreed on for one record."""
 
 
 class _RoundMessage(NamedTuple):
-    """One rank's word per round: ``votes`` as ``[(key, kind, B, hint)]``, ``expired`` as
+    """One rank's word per round: ``votes`` as ``[(key, kind, token_end)]``, ``expired`` as
     ``[key]``, ``plans`` as ``[(rid, encoded answer)]``. A plain 3-tuple on the wire."""
 
     votes: list
@@ -130,8 +129,8 @@ def _ballots_by_key(gathered: Sequence[_RoundMessage]) -> dict[RecordKey, list[V
     """Every rank's vote on every record, in gathered order; keys come back as tuples."""
     ballots: dict[RecordKey, list[Vote]] = {}
     for message in gathered:
-        for key, kind, b, hint in message.votes:
-            ballots.setdefault(tuple(key), []).append(Vote(VoteKind(kind), b, hint))
+        for key, kind, token_end in message.votes:
+            ballots.setdefault(tuple(key), []).append(Vote(VoteKind(kind), token_end))
     return ballots
 
 
@@ -142,8 +141,7 @@ def _reduce_votes(ballots: Mapping[RecordKey, list[Vote]], n: int) -> dict[Recor
     INFLIGHT holds the round (a failure landed now would quiesce under a running attempt and
     block the engine thread); else any FAILED is decisive for every rank, delivered data
     included; else any UNLAUNCHED holds the round (a landing needs every rank's pages); else
-    every rank is TERMINAL and the landing takes MIN(B), MIN(hint), since ranks hold different
-    layer groups.
+    every rank is TERMINAL and the landing takes MIN(B), since ranks hold different layer groups.
     """
     verdicts: dict[RecordKey, _Verdict] = {}
     for key, votes in ballots.items():
@@ -153,9 +151,9 @@ def _reduce_votes(ballots: Mapping[RecordKey, list[Vote]], n: int) -> dict[Recor
         if VoteKind.INFLIGHT in kinds:
             continue
         if VoteKind.FAILED in kinds:
-            verdicts[key] = (0, 0, True)
+            verdicts[key] = (0, True)
         elif VoteKind.UNLAUNCHED not in kinds:
-            verdicts[key] = (min(v.b for v in votes), min(v.hint for v in votes), False)
+            verdicts[key] = (min(v.token_end for v in votes), False)
     return verdicts
 
 
@@ -628,8 +626,8 @@ class KVTransferCoordinator:
         # so a retry above B would ask again for the very units that just came up short. A unit
         # the local cache committed while the fetch was on its way was never asked for, and
         # counts as arrived.
-        b = merge(rec.plan, rec.merged_served() | rec.committed_names)
-        return Vote(VoteKind.TERMINAL, b, b)
+        token_end = merge(rec.plan, rec.merged_served() | rec.committed_names)
+        return Vote(VoteKind.TERMINAL, token_end)
 
     @staticmethod
     def _finished_vote(rec: TransferRecord) -> Vote:
@@ -638,7 +636,7 @@ class KVTransferCoordinator:
         delivering lands on its own word; without a plan (dropped after a failed try) no peer is
         delivering, and B does not matter."""
         if rec.direction == "fetch" and rec.plan is not None:
-            return Vote(VoteKind.TERMINAL, rec.plan.token_end, rec.plan.token_end)
+            return Vote(VoteKind.TERMINAL, rec.plan.token_end)
         return Vote(VoteKind.TERMINAL)
 
     @staticmethod
@@ -651,8 +649,8 @@ class KVTransferCoordinator:
         if is_failure(outcome):
             return Vote(VoteKind.FAILED)
         served = outcome.served if isinstance(outcome, Delivered) else frozenset()
-        b = merge(rec.plan, served)
-        return Vote(VoteKind.TERMINAL, b, b)
+        token_end = merge(rec.plan, served)
+        return Vote(VoteKind.TERMINAL, token_end)
 
     def _unlaunched_vote(self, rec: TransferRecord, now: float) -> Vote:
         """A planned record without an attempt here: UNLAUNCHED holds the others until this rank
@@ -786,9 +784,7 @@ class KVTransferCoordinator:
     ) -> tuple[dict[RecordKey, _Verdict], list[RecordKey], dict[int, _PlanAnswer]]:
         voted = self._plan_authority is PlanAuthority.VOTED
         message = _RoundMessage(
-            votes=[
-                (key, vote.kind.value, vote.b, vote.hint) for key, vote in sorted(votes.items())
-            ],
+            votes=[(key, vote.kind.value, vote.token_end) for key, vote in sorted(votes.items())],
             expired=sorted(expired),
             plans=(
                 [(rid, _encode_plan_answer(ans)) for rid, ans in sorted(answers.items())]
@@ -840,14 +836,14 @@ class KVTransferCoordinator:
             rec = self._records.get(key)
             if rec is None:
                 continue
-            b, hint, failed = verdicts[key]
+            token_end, failed = verdicts[key]
             if rec.direction == "publish":
                 self._finish_publish(rec, failed=failed)
             elif rec.request_id in self._finished:
                 # The request is gone; the agreement only says every rank releases it now.
                 self._release_finished_fetch(rec)
             elif self._backend_busy_on(rec):
-                self._apply_fetch_verdict(rec, b, hint, failed, now)
+                self._apply_fetch_verdict(rec, token_end, failed, now)
             elif self._idle_with_plan(rec):
                 # An UNLAUNCHED vote blocks a landing, so the only verdict that reaches an
                 # unlaunched record is a failure: drop the plan without touching pages.
@@ -935,17 +931,18 @@ class KVTransferCoordinator:
             self._fail_expired_fetch(rec, now)
 
     def _apply_fetch_verdict(
-        self, rec: TransferRecord, b: int, hint: int, failed: bool, now: float
+        self, rec: TransferRecord, token_end: int, failed: bool, now: float
     ) -> None:
         if failed:
             self._fetch_failed_or_short(rec, hint=None, reason="kv fetch failed")
-        elif b == rec.plan.token_end:
+        elif token_end == rec.plan.token_end:
             if rec.state is RecordState.STAGING:
                 self._mark_staged(rec, now)
             else:
                 self._land_in_pages(rec)
         else:
-            self._fetch_failed_or_short(rec, hint=hint, reason="kv fetch served short")
+            # The agreed MIN(token_end) is as far as every rank got: the retry aims no higher.
+            self._fetch_failed_or_short(rec, hint=token_end, reason="kv fetch served short")
 
     @staticmethod
     def _mark_staged(rec: TransferRecord, now: float) -> None:

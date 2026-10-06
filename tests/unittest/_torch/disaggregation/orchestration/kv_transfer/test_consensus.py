@@ -6,10 +6,10 @@ rank behaves like rank 0.
 
 Covers the one reduction of design §7.1 "齐" over the four vote kinds: an INFLIGHT vote holds
 the round, then any FAILED is decisive for every rank, then an UNLAUNCHED vote holds a landing,
-else the landing takes MIN(B) and MIN(hint). Plan answers become DEFER if any rank defers, None
-on any disagreement about ``(token_end, source)``, the plan when identical. A record of a
-finished request keeps voting until the ranks agree, so every rank terminates the request in
-the same round; a record past its deadline is rank-local and settles on its own outcome.
+else the landing takes MIN(B). Plan answers become DEFER if any rank defers, None on any
+disagreement about ``(token_end, source)``, the plan when identical. A record of a finished
+request keeps voting until the ranks agree, so every rank terminates the request in the same
+round; a record past its deadline is rank-local and settles on its own outcome.
 """
 
 import pytest
@@ -125,7 +125,7 @@ def test_every_rank_lands_when_every_rank_serves_everything(world):
         assert len(rig.payloads()) == 2
 
 
-def test_min_b_across_ranks_fails_every_rank_and_replans_to_the_min_hint(world):
+def test_min_b_across_ranks_fails_every_rank_and_replans_to_the_min_b(world):
     rigs = make_rigs(world)
     req = worker_request()
     attempts = launch_all(world, rigs, req)
@@ -143,8 +143,8 @@ def test_min_b_across_ranks_fails_every_rank_and_replans_to_the_min_hint(world):
         assert rig.record(1)["state"] == "PLANNED"
     # The wire shows B = 28 on the full ranks and B = 24 on rank 1; the reduction hides it.
     for rig in peers(rigs):
-        assert votes_of(rig) == [(KEY, "TERMINAL", END, END)]
-    assert votes_of(rigs[DIVERGENT]) == [(KEY, "TERMINAL", END - 4, END - 4)]
+        assert votes_of(rig) == [(KEY, "TERMINAL", END)]
+    assert votes_of(rigs[DIVERGENT]) == [(KEY, "TERMINAL", END - 4)]
 
     advance_all(world, rigs, [req], 2.0)
     plans = [rig.coord.plan_fetch(req) for rig in rigs]
@@ -176,7 +176,7 @@ def test_arrival_waits_until_every_rank_is_terminal(world):
         if rank != DIVERGENT:
             a.deliver_all()
     advance_all(world, rigs, [], 1.0)
-    assert votes_of(rigs[DIVERGENT]) == [(KEY, "INFLIGHT", 0, 0)]
+    assert votes_of(rigs[DIVERGENT]) == [(KEY, "INFLIGHT", 0)]
     for rig in rigs:
         assert rig.record(1)["state"] == "IN_FLIGHT"
         assert rig.effects.count("unpark") == 0 and rig.effects.count("give_back_fetch_pages") == 0
@@ -223,7 +223,7 @@ def test_finished_request_crossing_its_deadline_on_one_rank_fails_nothing(world)
         assert rig.effects.count("fail_requests") == 0
         # A finished fetch still votes; the full ranks report the expiry, and the broadcast
         # makes every rank's record rank-local from here on.
-        assert votes_of(rig) == [(KEY, "INFLIGHT", 0, 0)]
+        assert votes_of(rig) == [(KEY, "INFLIGHT", 0)]
         assert rig.payloads()[-1][1] == ([] if rank == DIVERGENT else [KEY])
         assert rig.record(1)["state"] == "IN_FLIGHT" and rig.record(1)["expired"]
     for a in attempts:
@@ -264,13 +264,13 @@ def test_unlaunched_clock_does_not_start_while_no_rank_has_launched(world):
     advance_all(world, rigs, [], 1.0)  # nobody could reserve pages this round
     advance_all(world, rigs, [], 29.9)
     for rig in rigs:
-        assert votes_of(rig) == [(KEY, "UNLAUNCHED", 0, 0)]
+        assert votes_of(rig) == [(KEY, "UNLAUNCHED", 0)]
         assert rig.fetch_record(1).peer_launched_at is None
         assert isinstance(rig.coord.plan_fetch(req), FetchPlan)  # still waiting for pages
         assert rig.effects.count("fail_requests") == 0
     advance_all(world, rigs, [], 30.0)
     for rig in rigs:
-        assert votes_of(rig) == [(KEY, "FAILED", 0, 0)]
+        assert votes_of(rig) == [(KEY, "FAILED", 0)]
         assert rig.fetch_record(1).plan is None and rig.fetch_record(1).retries_left == 0
         assert rig.effects.calls == []  # nothing launched: nothing to give back or fail
 
@@ -284,10 +284,10 @@ def test_unlaunched_rank_holds_the_landing_until_it_launches_too(world):
         a.deliver_all()
     advance_all(world, rigs, [], 1.0)
     for rig in peers(rigs):
-        assert votes_of(rig) == [(KEY, "TERMINAL", END, END)]
+        assert votes_of(rig) == [(KEY, "TERMINAL", END)]
         assert rig.effects.count("unpark") == 0 and rig.record(1)["state"] == "IN_FLIGHT"
         assert rig.fetch_record(1).peer_launched_at is None
-    assert votes_of(rigs[DIVERGENT]) == [(KEY, "UNLAUNCHED", 0, 0)]
+    assert votes_of(rigs[DIVERGENT]) == [(KEY, "UNLAUNCHED", 0)]
     assert rigs[DIVERGENT].fetch_record(1).peer_launched_at == 1.0  # from the peers' first vote
 
     late = launch_on(rigs[DIVERGENT], req, 2.0)
@@ -311,7 +311,7 @@ def test_rank_unlaunched_past_the_timeout_votes_failed_and_every_rank_replans(wo
         assert rig.effects.count("unpark") == 0 and rig.effects.count("give_back_fetch_pages") == 0
 
     advance_all(world, rigs, [], 1.0 + UNLAUNCHED_TIMEOUT_S)
-    assert votes_of(rigs[DIVERGENT]) == [(KEY, "FAILED", 0, 0)]
+    assert votes_of(rigs[DIVERGENT]) == [(KEY, "FAILED", 0)]
     for rig in peers(rigs):
         # Delivered data is dropped with the failure: the release point, then the pages back.
         assert rig.worker.count("quiesce") == 1 and rig.effects.count("give_back_fetch_pages") == 1
@@ -343,7 +343,7 @@ def test_rank_that_gives_up_launching_holds_no_one_and_fails_the_fetch_for_every
             assert rig.record(1)["state"] == "IN_FLIGHT" and rig.worker.count("quiesce") == 0
     assert laggard.fetch_record(1).launch_gave_up and laggard.coord.plan_fetch(req) is DEFER
     assert laggard.effects.count("give_back_fetch_pages") == 3
-    assert votes_of(laggard) == [(KEY, "FAILED", 0, 0)]
+    assert votes_of(laggard) == [(KEY, "FAILED", 0)]
     laggard.coord.launch_fetches([req], 4.0)  # the scheduler queue may still name it
     assert laggard.worker.count("fetch") == 3
 
@@ -405,9 +405,9 @@ def test_a_given_up_rank_and_an_unlaunched_rank_agree_without_anyone_launching(w
     # Rank 1 never launched: an UNLAUNCHED vote does not hold a failure back.
     loop_advance_all(world, rigs, req, 1.0)
     for rig in peers(rigs):
-        assert votes_of(rig) == [(KEY, "FAILED", 0, 0)]
+        assert votes_of(rig) == [(KEY, "FAILED", 0)]
         assert rig.effects.count("give_back_fetch_pages") == 1  # from the refused launch only
-    assert votes_of(rigs[DIVERGENT]) == [(KEY, "UNLAUNCHED", 0, 0)]
+    assert votes_of(rigs[DIVERGENT]) == [(KEY, "UNLAUNCHED", 0)]
     assert rigs[DIVERGENT].effects.count("give_back_fetch_pages") == 0
     for rig in rigs:
         assert rig.worker.count("quiesce") == 0
@@ -490,14 +490,14 @@ def test_publish_rejected_piece_on_one_rank_waits_for_every_running_publish(worl
     # no verdict quiesces under it.
     advance_all(world, rigs, [], 1.0)
     for rig in rigs:
-        assert votes_of(rig) == [((3, "publish"), "INFLIGHT", 0, 0)]
+        assert votes_of(rig) == [((3, "publish"), "INFLIGHT", 0)]
         assert rig.record(3, "publish")["state"] == "IN_FLIGHT"
 
     laggard.publishers[0].attempts[0].deliver_all()
     advance_all(world, rigs, [], 2.0)
-    assert votes_of(laggard) == [((3, "publish"), "FAILED", 0, 0)]
+    assert votes_of(laggard) == [((3, "publish"), "FAILED", 0)]
     for rig in peers(rigs):  # their publishes still run: the failure waits for them
-        assert votes_of(rig) == [((3, "publish"), "INFLIGHT", 0, 0)]
+        assert votes_of(rig) == [((3, "publish"), "INFLIGHT", 0)]
         assert rig.record(3, "publish")["state"] == "IN_FLIGHT"
     assert laggard.record(3, "publish")["state"] == "IN_FLIGHT"
 
@@ -520,9 +520,9 @@ def test_publish_rejected_on_one_rank_fails_the_publish_on_every_rank(world):
         rig.coord.publish_committed_blocks([req], now=0.0)
     assert rigs[DIVERGENT].publishers[0].attempts == []
     advance_all(world, rigs, [], 1.0)
-    assert votes_of(rigs[DIVERGENT]) == [((3, "publish"), "FAILED", 0, 0)]
+    assert votes_of(rigs[DIVERGENT]) == [((3, "publish"), "FAILED", 0)]
     for rig in peers(rigs):  # still running: no verdict quiesces under them
-        assert votes_of(rig) == [((3, "publish"), "INFLIGHT", 0, 0)]
+        assert votes_of(rig) == [((3, "publish"), "INFLIGHT", 0)]
         assert rig.record(3, "publish")["state"] == "IN_FLIGHT"
     for rig in peers(rigs):
         rig.publishers[0].attempts[0].deliver_all()
@@ -544,9 +544,9 @@ def test_publish_of_a_finished_request_terminates_on_every_rank_in_the_same_roun
         assert rig.effects.names() == ["hold_for_transfer"]
     rigs[0].publishers[0].attempts[0].deliver_all()
     advance_all(world, rigs, [], 1.0)
-    assert votes_of(rigs[0]) == [((3, "publish"), "TERMINAL", 0, 0)]
+    assert votes_of(rigs[0]) == [((3, "publish"), "TERMINAL", 0)]
     for rig in rigs[1:]:
-        assert votes_of(rig) == [((3, "publish"), "INFLIGHT", 0, 0)]
+        assert votes_of(rig) == [((3, "publish"), "INFLIGHT", 0)]
     for rig in rigs:
         assert rig.record(3, "publish")["state"] == "IN_FLIGHT"
         assert rig.effects.count("terminate_request") == 0
@@ -701,8 +701,8 @@ def test_no_rank_is_staged_until_every_rank_has_landed(world):
         rig.host.landings[-1].deliver_all()
     advance_all(world, rigs, [], 1.0)
     for rig in peers(rigs):
-        assert votes_of(rig) == [(KEY, "TERMINAL", END, END)]
-    assert votes_of(rigs[DIVERGENT]) == [(KEY, "INFLIGHT", 0, 0)]
+        assert votes_of(rig) == [(KEY, "TERMINAL", END)]
+    assert votes_of(rigs[DIVERGENT]) == [(KEY, "INFLIGHT", 0)]
     for rig in rigs:
         assert rig.record(1)["state"] == "STAGING" and rig.coord.plan_fetch(req) is DEFER
     rigs[DIVERGENT].host.landings[-1].deliver_all()
@@ -723,13 +723,13 @@ def test_a_placed_rank_waits_for_a_rank_without_pages_and_a_wait_timeout_fails_b
         a.deliver_all()
     advance_all(world, rigs, [], 3.0)
     for rig in peers(rigs):
-        assert votes_of(rig) == [(KEY, "TERMINAL", END, END)]
+        assert votes_of(rig) == [(KEY, "TERMINAL", END)]
         assert rig.effects.count("unpark") == 0 and rig.record(1)["state"] == "IN_FLIGHT"
-    assert votes_of(rigs[DIVERGENT]) == [(KEY, "UNLAUNCHED", 0, 0)]
+    assert votes_of(rigs[DIVERGENT]) == [(KEY, "UNLAUNCHED", 0)]
     assert rigs[DIVERGENT].record(1)["state"] == "STAGED"
 
     advance_all(world, rigs, [], 11.0)  # 10 s since rank 1 was staged
-    assert votes_of(rigs[DIVERGENT]) == [(KEY, "FAILED", 0, 0)]
+    assert votes_of(rigs[DIVERGENT]) == [(KEY, "FAILED", 0)]
     for rig in peers(rigs):
         assert rig.host.count("quiesce") == 1 and rig.effects.count("give_back_fetch_pages") == 1
         assert rig.effects.count("unpark") == 0
@@ -764,13 +764,13 @@ def test_staged_ranks_wait_on_the_landing_clock_not_the_unlaunched_clock():
 
     advance_all(world, rigs, [], 2.0 + UNLAUNCHED_TIMEOUT_S)  # no pages anywhere
     for rig in rigs:
-        assert votes_of(rig) == [(KEY, "UNLAUNCHED", 0, 0)]
+        assert votes_of(rig) == [(KEY, "UNLAUNCHED", 0)]
         assert (
             rig.record(1)["state"] == "STAGED" and rig.effects.count("give_back_fetch_pages") == 0
         )
     advance_all(world, rigs, [], 2.0 + 30.0)  # 30 s since both were staged
     for rig in rigs:
-        assert votes_of(rig) == [(KEY, "FAILED", 0, 0)]
+        assert votes_of(rig) == [(KEY, "FAILED", 0)]
         assert rig.fetch_record(1).plan is None and rig.host.releases() == 1
 
 
@@ -784,9 +784,9 @@ def test_a_rank_refused_landing_memory_holds_the_landing_of_the_others(world):
         rig.host.landings[-1].deliver_all()
     loop_advance_all(world, rigs, req, 1.0)
     for rig in peers(rigs):
-        assert votes_of(rig) == [(KEY, "TERMINAL", END, END)]
+        assert votes_of(rig) == [(KEY, "TERMINAL", END)]
         assert rig.record(1)["state"] == "STAGING"  # held by the UNLAUNCHED vote
-    assert votes_of(rigs[DIVERGENT]) == [(KEY, "UNLAUNCHED", 0, 0)]
+    assert votes_of(rigs[DIVERGENT]) == [(KEY, "UNLAUNCHED", 0)]
     assert rigs[DIVERGENT].record(1)["state"] == "STAGING"  # asked again, accepted this round
     rigs[DIVERGENT].host.landings[-1].deliver_all()
     advance_all(world, rigs, [], 2.0)

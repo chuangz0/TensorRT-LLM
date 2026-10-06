@@ -273,7 +273,7 @@ def test_cancelled_by_peer_counts_as_failed():
     rig.coord.advance([], 1.0)
     assert rig.effects.count("give_back_fetch_pages") == 1
     assert rig.record(1)["state"] == "PLANNED"
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0, 0)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0)]
 
 
 def test_local_cancel_is_delivered_nothing_not_a_failure():
@@ -282,7 +282,7 @@ def test_local_cancel_is_delivered_nothing_not_a_failure():
     rig.plan_and_launch(req).finish(Cancelled(by_peer=False))
     rig.coord.advance([], 1.0)
     # On the wire it is a short serve (TERMINAL with B = 0), so the retry path applies.
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", 0, 0)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", 0)]
     assert rig.effects.count("give_back_fetch_pages") == 1
     assert rig.effects.count("fail_requests") == 0
     assert rig.record(1)["state"] == "PLANNED"
@@ -344,7 +344,7 @@ def test_transport_error_and_rejection_alternation_is_bounded(gen_init):
 
     # 4. Its FAILED vote lands on the next advance.
     loop_advance(rig, req, 3.0)
-    assert rig.payloads()[-1][0] == [((rid, "fetch"), "FAILED", 0, 0)]
+    assert rig.payloads()[-1][0] == [((rid, "fetch"), "FAILED", 0)]
     if gen_init:
         assert rig.effects.only("fail_requests") == [((req,), "kv fetch launch given up")]
         assert rig.records() == [] and rig.coord.plan_fetch(req) is None
@@ -513,7 +513,7 @@ def test_aligned_context_prompt_fetches_to_the_last_nameable_block():
     assert rig.effects.only("unpark") == [(req, 24, False, None)]
 
 
-def test_served_short_retries_with_min_hint():
+def test_served_short_retries_with_min_b():
     rig = Rig()
     req = worker_request()
     attempt = rig.plan_and_launch(req)
@@ -787,7 +787,7 @@ def test_publish_rejected_outright_votes_failed_and_terminates_with_the_agreemen
     assert rig.effects.names() == ["hold_for_transfer"]
     assert rig.record(3, "publish")["state"] == "PLANNED"
     rig.coord.advance([], 1.0)
-    assert rig.payloads()[-1][0] == [((3, "publish"), "FAILED", 0, 0)]
+    assert rig.payloads()[-1][0] == [((3, "publish"), "FAILED", 0)]
     assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
     assert pub.count("quiesce") == 0
     assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
@@ -802,7 +802,7 @@ def test_publish_rejected_while_the_request_runs_votes_failed_and_is_released():
     pub.reject_next = 1
     rig.coord.publish_committed_blocks([req], now=0.0)
     rig.coord.advance([], 1.0)
-    assert rig.payloads()[-1][0] == [((3, "publish"), "FAILED", 0, 0)]
+    assert rig.payloads()[-1][0] == [((3, "publish"), "FAILED", 0)]
     assert rig.records() == [] and rig.effects.calls == []  # a warning is the only word
     assert rig.coord.notify_request_finished(req, 2.0) is True
 
@@ -1095,7 +1095,7 @@ def test_allgather_payload_carries_plan_answers_and_arrivals():
     rig.worker.attempts[0].deliver_all()
     rig.coord.advance([], 1.0)
     arrivals, expired, plans = rig.payloads()[1]
-    assert arrivals == [((1, "fetch"), "TERMINAL", END, END)] and plans == []
+    assert arrivals == [((1, "fetch"), "TERMINAL", END)] and plans == []
 
 
 def test_allgather_payload_wires_none_and_defer():
@@ -1113,7 +1113,7 @@ def test_peer_reporting_short_b_fails_the_local_landed_fetch():
     def peer(local):
         arrivals, expired, plans = local
         return (
-            [(key, kind, b - 4, hint - 4) for key, kind, b, hint in arrivals],
+            [(key, kind, token_end - 4) for key, kind, token_end in arrivals],
             expired,
             plans,
         )
@@ -1125,7 +1125,7 @@ def test_peer_reporting_short_b_fails_the_local_landed_fetch():
     assert rig.effects.count("unpark") == 0 and rig.effects.count("give_back_fetch_pages") == 1
     assert rig.record(1)["state"] == "PLANNED"
     rig.coord.advance([req], 2.0)
-    assert rig.coord.plan_fetch(req).token_end == END - 4  # MIN(hint) from the peer
+    assert rig.coord.plan_fetch(req).token_end == END - 4  # MIN(B) from the peer
 
 
 def test_peer_voting_a_different_source_makes_the_plan_none():
@@ -1401,7 +1401,7 @@ def test_refused_landing_keeps_the_plan_votes_unlaunched_and_is_asked_again_next
     assert rig.coord.plan_fetch(req) is DEFER and rig.effects.calls == []
 
     loop_advance(rig, req, 1.0)
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "UNLAUNCHED", 0, 0)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "UNLAUNCHED", 0)]
     assert rig.host.count("fetch_to_host") == 2 and rig.host.count("probe") == 1
     rec = rig.record(1)
     assert rec["state"] == "STAGING" and rec["waiting_since"] is None and rec["has_landing"]
@@ -1417,7 +1417,7 @@ def test_landing_that_fails_or_comes_up_short_is_released_and_replanned_without_
     else:
         landing.finish(Failed("store gone"))
     rig.coord.advance([], 1.0)
-    kind = ("TERMINAL", END - 4, END - 4) if ending == "short" else ("FAILED", 0, 0)
+    kind = ("TERMINAL", END - 4) if ending == "short" else ("FAILED", 0)
     assert rig.payloads()[-1][0] == [((1, "fetch"), *kind)]
     assert landing.releases == 1
     assert rig.effects.count("give_back_fetch_pages") == 0 and rig.host.count("quiesce") == 0
@@ -1496,7 +1496,7 @@ def test_units_the_local_cache_committed_meanwhile_count_as_served(source):
     assert rig.fetch_record(1).committed_names == rig.reader.unit_names(req, range(2))
     attempt.deliver_all()
     rig.coord.advance([], 3.0)
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", END, END)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", END)]
     assert rig.effects.only("unpark") == [(req, END, False, None)]
     assert rig.effects.count("give_back_fetch_pages") == 0
 
@@ -1512,7 +1512,7 @@ def test_placement_of_an_empty_extent_parks_for_one_round_then_unparks():
     assert rig.effects.names() == ["prepare_fetch_resources", "park_for_fetch"]
     assert rig.record(1)["state"] == "IN_FLIGHT"
     rig.coord.advance([], 3.0)
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", END, END)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", END)]
     assert rig.effects.only("unpark") == [(req, END, False, None)]
     assert landing.releases == 1
 
@@ -1531,7 +1531,7 @@ def test_units_the_reservation_has_no_page_for_make_the_delivery_short(source):
     assert rig.fetch_record(1).committed_names == frozenset()
     attempt.deliver_all()
     rig.coord.advance([], 3.0)
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", 20, 20)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", 20)]
     assert rig.effects.count("unpark") == 0 and rig.effects.count("give_back_fetch_pages") == 1
     assert rig.record(1)["state"] == "PLANNED"
     if source == "host":
@@ -1553,7 +1553,7 @@ def test_placement_refused_three_times_gives_up_and_the_agreement_replans():
     assert landing.releases == 0
 
     loop_advance(rig, req, 5.0)
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0, 0)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0)]
     rec = rig.fetch_record(1)
     assert landing.releases == 1 and rec.landing is None
     assert rec.state.value == "PLANNED" and rec.plan is None and rec.retries_left == 0
@@ -1597,7 +1597,7 @@ def test_request_ending_before_placement_releases_the_landing_and_votes_until_ag
     assert rec["state"] == stage and rec["has_landing"] is False
     assert rig.coord.has_inflight() is False  # nothing runs for it any more
     rig.coord.advance([], 3.0)
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", END, END)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", END)]
     assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
     assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
 
@@ -1611,7 +1611,7 @@ def test_request_ending_while_planned_is_terminated_with_the_agreement():
     assert rig.coord.notify_request_finished(req, 1.0) is False
     assert rig.effects.names() == ["hold_for_transfer"]
     rig.coord.advance([], 2.0)
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", END, END)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", END)]
     assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
     assert rig.records() == [] and rig.worker.count("quiesce") == 0
 
@@ -1643,9 +1643,9 @@ def test_reserve_wait_of_a_device_direct_plan_spends_a_retry_then_computes_local
     assert isinstance(rig.coord.plan_fetch(req), FetchPlan)
     assert rig.fetch_record(1).waiting_since == 0.0
     loop_advance(rig, req, 4.9)
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "UNLAUNCHED", 0, 0)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "UNLAUNCHED", 0)]
     loop_advance(rig, req, 5.0)
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0, 0)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0)]
     rec = rig.fetch_record(1)
     assert rec.retries_left == 0 and rec.plan is None and rec.waiting_since is None
     assert rig.coord.plan_fetch(req) is DEFER and rig.effects.count("fail_requests") == 0
@@ -1654,9 +1654,9 @@ def test_reserve_wait_of_a_device_direct_plan_spends_a_retry_then_computes_local
     assert isinstance(rig.coord.plan_fetch(req), FetchPlan)
     assert rig.fetch_record(1).waiting_since == 6.0
     loop_advance(rig, req, 10.9)
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "UNLAUNCHED", 0, 0)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "UNLAUNCHED", 0)]
     loop_advance(rig, req, 11.0)
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0, 0)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0)]
     assert rig.records() == [] and rig.coord.plan_fetch(req) is None
     assert rig.effects.calls == [] and rig.worker.count("quiesce") == 0
 
@@ -1669,9 +1669,9 @@ def test_landing_wait_timeout_spends_a_retry_at_each_wait_then_computes_locally(
     rig.host.reject_next = 100
     rig.coord.advance([req], 0.0)
     loop_advance(rig, req, 4.9)
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "UNLAUNCHED", 0, 0)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "UNLAUNCHED", 0)]
     loop_advance(rig, req, 5.0)
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0, 0)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0)]
     rec = rig.fetch_record(1)
     assert rec.retries_left == 0 and rec.plan is None and rec.waiting_since is None
     assert rig.coord.plan_fetch(req) is DEFER and rig.effects.count("fail_requests") == 0
@@ -1683,9 +1683,9 @@ def test_landing_wait_timeout_spends_a_retry_at_each_wait_then_computes_locally(
     rig.coord.advance([], 7.0)
     assert rig.record(1)["state"] == "STAGED" and rig.record(1)["waiting_since"] == 7.0
     loop_advance(rig, req, 11.9)  # the scheduler never finds pages
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "UNLAUNCHED", 0, 0)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "UNLAUNCHED", 0)]
     loop_advance(rig, req, 12.0)
-    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0, 0)]
+    assert rig.payloads()[-1][0] == [((1, "fetch"), "FAILED", 0)]
     assert landing.releases == 1 and rig.records() == []
     assert rig.coord.plan_fetch(req) is None and rig.effects.count("fail_requests") == 0
     assert rig.effects.count("give_back_fetch_pages") == 0 and rig.host.count("quiesce") == 0
