@@ -392,13 +392,32 @@ class BlobStoreBackend:
             self._pending.add(span)
         try:
             self._store.register_span(address, size)
-            reg = _Registration(self, address, size)
-            with self._lock:
-                self._registrations.append(reg)
+            reg = self._adopt_registration(address, size)
         finally:
             with self._lock:
                 self._pending.discard(span)
         return reg
+
+    def _adopt_registration(self, address: int, size: int) -> _Registration:
+        """Put a span the store just registered on the table. When ``close`` ran meanwhile, the
+        span is taken back from the store and refused as the pre-check would have, so that a
+        closed backend leaves nothing registered."""
+        with self._lock:
+            if not self._closed:
+                reg = _Registration(self, address, size)
+                self._registrations.append(reg)
+                return reg
+        try:
+            self._store.unregister_span(address, size)
+        except BlobStoreError as exc:
+            logger.warning(
+                "blob store [%s]: unregistering [%#x, %#x) failed after close: %s",
+                self._store.describe(),
+                address,
+                address + size,
+                exc,
+            )
+        raise RuntimeError("store backend is closed")
 
     def _check_overlap(self, address: int, size: int) -> None:
         """Caller holds the lock."""

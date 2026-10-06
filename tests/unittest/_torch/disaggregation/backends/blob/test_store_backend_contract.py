@@ -185,11 +185,6 @@ def test_register_pool_during_close_is_refused():
         assert rank.store.count("unregister_span") == 1  # undone by close
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="register_pool appends a registration whose store call outlived close without "
-    "undoing or refusing it",
-)
 def test_registration_in_flight_when_close_runs_is_undone_or_refused():
     """A registration whose store call is still running when ``close`` runs: once the store
     answers, the registration is either refused or undone (whether ``close`` returned at once

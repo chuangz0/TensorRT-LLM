@@ -147,10 +147,6 @@ def test_follower_drops_a_held_answer_when_the_request_ends(rigs):
     assert rigs[FOLLOWER].coord.status_dump()["decided_plans"] == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="adopt_plan_answers counts only this call's answers, not a held answer it applies",
-)
 def test_follower_counts_a_held_answer_it_applies_as_decided():
     """``adopt_plan_answers`` returns how many of the views got no answer and stay deferred; a
     view whose answer was held from an earlier round gets that answer now and is decided."""
@@ -162,11 +158,6 @@ def test_follower_counts_a_held_answer_it_applies_as_decided():
     assert isinstance(rig.coord.plan_fetch(req), FetchPlan)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="_record_answer re-plans a STAGING record and starts a second landing without "
-    "releasing the first",
-)
 def test_follower_refuses_an_answer_for_a_staging_record(world):
     """The owner decides a request once; an answer that nevertheless reaches the follower again
     while the record it decided is landing on the host must not start a second landing (the

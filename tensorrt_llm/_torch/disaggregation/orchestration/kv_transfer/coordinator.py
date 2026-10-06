@@ -370,8 +370,7 @@ class KVTransferCoordinator:
             else:
                 token_end, source = encoded
                 self._record_answer(rid, self._planner.materialize(view, token_end, source), now)
-        answered = {rid for rid, _ in answers}
-        return sum(1 for rid in by_rid if rid not in answered)
+        return sum(1 for view in views if self.plan_fetch(view) is DEFER)
 
     # ---- scheduler hook (read-only, non-blocking) ----
 
@@ -713,6 +712,12 @@ class KVTransferCoordinator:
             and rec.plan is not None
         )
 
+    @staticmethod
+    def _awaits_plan(rec: TransferRecord | None) -> bool:
+        """Whether a plan answer is due for the request: it has no fetch record, or a PLANNED one
+        whose plan was dropped. Any other record is decided already."""
+        return rec is None or (rec.state is RecordState.PLANNED and rec.plan is None)
+
     def _wants_pages_now(self, rec: TransferRecord) -> bool:
         """Whether the scheduler should reserve pages for the record: a device-direct plan not
         launched yet, or a host-first plan whose landing is complete. A host-first plan still
@@ -747,7 +752,7 @@ class KVTransferCoordinator:
             # A record that already has a plan is not planned again, even when the scheduler is
             # answered DEFER for it because this rank gave up launching: what comes next is for
             # the ranks to agree on in the apply phase, not for this rank to decide alone.
-            if rec is not None and (rec.state is not RecordState.PLANNED or rec.plan is not None):
+            if not self._awaits_plan(rec):
                 continue
             self._requests[rid] = req
             self._probe(req)
@@ -898,12 +903,16 @@ class KVTransferCoordinator:
         """Write a decided answer: ``None`` releases a planned record, a plan goes on the record
         (created if needed) and ``plan_fetch`` reads it from now on. A plan from a host-first
         source is started right here, since it needs no pages to begin; any other waits for the
-        scheduler's pages from now, on the wait clock."""
-        self._plans[rid] = ans
+        scheduler's pages from now, on the wait clock. An answer for a record that is decided
+        already is ignored."""
         key = (rid, "fetch")
         rec = self._records.get(key)
+        if not self._awaits_plan(rec):
+            logger.debug("request %d: plan answer ignored, record is %s", rid, rec.state.value)
+            return
+        self._plans[rid] = ans
         if ans is None:
-            if rec is not None and rec.state is RecordState.PLANNED:
+            if rec is not None:
                 self._release(rec)
             return
         if rec is None:
@@ -1295,9 +1304,25 @@ class KVTransferCoordinator:
 
     @staticmethod
     def _close_routes(rec: TransferRecord) -> None:
+        """Close the current try's routes. A close that raises has not closed: the handle stays
+        on its attempt and is closed again only if the record reaches another release point; a
+        record released right after takes it along. The other routes are still closed."""
         for a in rec.current_try_attempts():
-            if a.route is not None:
+            if a.route is None:
+                continue
+            # Broad on purpose, against CODING_GUIDELINES: the contract says a failing close
+            # raises but leaves the type to the backend, and a cleanup failure must not take
+            # the engine loop down.
+            try:
                 a.route.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "request %d: closing the route from %s failed, handle kept: %s",
+                    rec.request_id,
+                    a.source,
+                    exc,
+                )
+            else:
                 a.route = None
 
     @staticmethod

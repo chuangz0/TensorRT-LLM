@@ -521,10 +521,6 @@ def test_repeated_route_transport_errors_fail_gen_init():
     assert rig.records() == [] and rig.coord.plan_fetch(req) is None
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="_close_routes calls Route.close unguarded, so a close that raises escapes advance",
-)
 def test_route_close_raising_is_contained():
     """A route whose ``close`` raises has not closed (the contract leaves the handle open for
     another try). The raise must not escape ``advance``: the delivery it belongs to is complete
