@@ -12,6 +12,7 @@ and names it. Behaviour of each hook is covered by ``test_hooks.py``.
 import ast
 import inspect
 import re
+import textwrap
 
 import pytest
 
@@ -191,19 +192,31 @@ def test_pp_executed_batch_publishes_after_the_context_commit_and_before_the_dis
 # ---- release gate, cancel, idle, shutdown ----
 
 
-def test_release_gate_is_the_first_statement_of_terminate_request():
-    tree = ast.parse(inspect.getsource(PyExecutor._terminate_request).strip())
-    body = tree.body[0].body
-    first = body[0]
-    text = ast.unparse(first)
-    assert isinstance(first, ast.If)
+def test_release_gate_precedes_everything_that_frees_the_request():
+    """The gate is the first ``kv_transfer`` statement of ``_terminate_request`` and nothing
+    before it terminates. The KV connector block ahead of it only defers: both of its early
+    returns re-enter ``_terminate_request`` later (``_finish_connector_load_termination``,
+    ``_release_transfer``), so the gate still runs for every termination. The layer's own deferred
+    release goes straight to ``_do_terminate_request`` (plan §9), so a connector statement after
+    the gate would be skipped for a held request: the connector block stays ahead of it."""
+    source = textwrap.dedent(inspect.getsource(PyExecutor._terminate_request))
+    body = ast.parse(source).body[0].body
+    statements = [ast.unparse(statement) for statement in body]
+    gate_index = next(i for i, text in enumerate(statements) if "kv_transfer" in text)
+    assert isinstance(body[gate_index], ast.If)
     ordered(
-        text,
+        statements[gate_index],
         GUARD,
         "not request.is_dummy_request",
         "not self.kv_transfer.on_request_finished(request)",
         "return",
     )
+    before = " ".join(statements[:gate_index])
+    after = " ".join(statements[gate_index + 1 :])
+    for terminator in ("_do_terminate_request", "_disagg_pp_termination_handler"):
+        assert terminator not in before, f"{terminator} runs before the release gate"
+        assert terminator in after
+    assert "kv_connector_manager" not in after, "connector deferral after the gate is skipped"
 
 
 def test_cancel_asks_is_tracking_before_the_transceiver():
@@ -219,12 +232,13 @@ def test_cancel_asks_is_tracking_before_the_transceiver():
 
 def test_idle_detection_counts_a_transfer_in_flight_as_live():
     text = inspect.getsource(PyExecutor._fetch_and_enqueue_requests)
-    idle = re.search(r"idle = \((.*?)\)\n", text, re.S)
+    idle = re.search(r"idle = \((.*?)\)\n\s*if idle:", text, re.S)
     assert idle is not None
     ordered(
         idle.group(1),
         "total_num_live_requests == 0",
         "not self.is_shutdown",
+        "not self._has_pending_connector_transfers()",
         GUARD,
         "self.kv_transfer.has_transfer_in_flight()",
     )
@@ -260,16 +274,26 @@ def test_every_hook_call_is_guarded():
 
 
 def test_creator_assembles_lazily_from_the_environment_variable():
-    text = source_of(py_executor_creator._create_py_executor_impl)
+    """Attached once the final executor exists (after any profiling re-creation) and before its
+    worker starts; the assembly module is imported there and nowhere at module load."""
+    text = source_of(py_executor_creator._create_py_executor)
     ordered(
         text,
+        "py_executor = create_py_executor_instance(",
+        "start_worker=False",
         'os.environ.get("TRTLLM_KV_TRANSFER_CONFIG")',
         "from .kv_transfer.assembly import attach_kv_transfer",
         "attach_kv_transfer(",
         "py_executor.start_worker()",
     )
-    module_text = inspect.getsource(py_executor_creator)
-    assert "kv_transfer.assembly" not in module_text.split("def _create_py_executor_impl")[0]
+    assert text.count("py_executor.start_worker()") == 1
+    module = ast.parse(inspect.getsource(py_executor_creator))
+    module_imports = [
+        ast.unparse(statement)
+        for statement in module.body
+        if isinstance(statement, (ast.Import, ast.ImportFrom))
+    ]
+    assert not [text for text in module_imports if "kv_transfer" in text]
 
 
 def test_scheduler_asks_the_planner_after_the_prefix_probe_and_before_any_cache_work():
@@ -281,6 +305,6 @@ def test_scheduler_asks_the_planner_after_the_prefix_probe_and_before_any_cache_
         "self._try_take_fetch_path(req)",
         "fetch_launch_queue.append(req)",
         "budget.peft_pages_needed(req)",
-        "self._try_schedule_context(req, budget)",
+        "self._try_schedule_context(",
     )
     assert "kv_transfer_planner = None" in source_of(scheduler_v2.KVCacheV2Scheduler.__init__)

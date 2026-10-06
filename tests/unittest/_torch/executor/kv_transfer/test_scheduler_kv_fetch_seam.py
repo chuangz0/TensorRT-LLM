@@ -129,6 +129,10 @@ def make_kv_cache_manager(
     mgr.can_evict = False
     mgr._has_cp_helix = False
     mgr.is_vswa = False
+    # No KV connector: a Mock here would read as a pending load on every request and exempt
+    # it from eviction. No tier below GPU: the context path's page preemption stays off.
+    mgr.kv_connector_manager = None
+    mgr.has_cache_tier_below_gpu = True
     mgr.probe_first_new_block_key.side_effect = first_new_block_fn or (lambda req: None)
     mgr.kv_cache_map = _KVCacheMap()
     mgr.prepare_context.side_effect = lambda req, reuse_limit=None: True
