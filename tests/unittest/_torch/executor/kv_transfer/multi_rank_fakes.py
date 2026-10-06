@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """One real ``KVTransferHooks`` per rank, over the fakes of ``engine_fakes``, for the threaded
 multi-rank tests: ``RankRig`` is one rank; its collective is a ``FakeDistRank`` of the
-``FakeDistGroup`` all the rigs of a world share, reached through the real ``EngineDist``.
+``FakeDistGroup`` all the rigs of a world share, reached through the real ``EngineCollective``.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.records import
 from tensorrt_llm._torch.disaggregation.remote_cache import FetchPlan, FetchSource, Planner
 from tensorrt_llm._torch.disaggregation.resource.region import parallel_shard_tag
 from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import (
-    EngineDist,
+    EngineCollective,
     EngineWorkQueue,
     PyExecutorKVTransferEffects,
 )
@@ -68,7 +68,7 @@ class CountingEffects(PyExecutorKVTransferEffects):
 
 
 def rank_mapping(dist: FakeDistRank, *, enable_attention_dp: bool = False) -> SimpleNamespace:
-    """The ``Mapping`` attributes ``EngineDist`` and ``parallel_shard_tag`` read, for one rank."""
+    """The ``Mapping`` attributes ``EngineCollective`` and ``parallel_shard_tag`` read, for one rank."""
     return SimpleNamespace(
         rank=dist.rank,
         world_size=dist.world_size,
@@ -119,7 +119,7 @@ class RankRig:
             self.reader,
             self.effects,
             EngineWorkQueue(),
-            EngineDist(self.dist, self.mapping),
+            EngineCollective(self.dist, self.mapping),
             fetch_timeout_s=fetch_timeout_s,
             unlaunched_timeout_s=unlaunched_timeout_s,
             plan_authority=plan_authority,

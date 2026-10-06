@@ -121,7 +121,7 @@ class KVv2ResourceReader:
         )
         return extent, frozenset(committed_names)
 
-    def publish_description(self, request) -> tuple[CacheExtent, None]:
+    def publish_extent_and_chunk(self, request) -> tuple[CacheExtent, None]:
         """Every committed full block the request still holds, in the pages it holds right now.
 
         A windowed group holds ``[0, sink) | [stale_end(history), committed)``, with ``history``
@@ -129,7 +129,7 @@ class KVv2ResourceReader:
         fetcher's largest target ``B = (prompt_len - 1) // tpb * tpb``. With ``window % tpb == 0``
         the two stale ends differ exactly when ``prompt_len % tpb`` is ``0`` or ``tpb - 1``; the
         window's first block at ``B`` is then already dropped here, and since the stale end grows
-        with the target no larger target does without it either. A fetcher's ``servable_end``
+        with the target no larger target does without it either. A fetcher's ``servable_blocks``
         falls to what the sink blocks alone serve (nothing, without sinks) and the request
         computes locally.
 

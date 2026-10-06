@@ -589,7 +589,7 @@ class FakeEngineQueue:
         return ran
 
 
-class FakeDist:
+class FakeCollective:
     """Single rank: ``allgather`` answers with the caller's own payload; ``calls`` keeps a copy
     of every payload gathered."""
 
@@ -607,7 +607,7 @@ class FakeDist:
 
 class LockstepWorld:
     """``n`` real coordinators stepped in lockstep on one thread, each over a ``LockstepGather``
-    as its ``DistLike``.
+    as its ``Collective``.
 
     ``run(fn)`` calls ``fn(0)``; when rank 0 reaches its one collective, its gather runs ``fn(1)``
     nested (and so on up to rank ``n-1``), so every rank's payload exists before any gather
@@ -652,7 +652,7 @@ class LockstepWorld:
 
 
 class LockstepGather:
-    """The ``DistLike`` of one rank of a ``LockstepWorld``; records every payload."""
+    """The ``Collective`` of one rank of a ``LockstepWorld``; records every payload."""
 
     def __init__(self, world: LockstepWorld, rank: int) -> None:
         self._world = world
@@ -665,7 +665,7 @@ class LockstepGather:
 
 
 class PeerGather:
-    """``DistLike`` of a single real rank plus hand-written peers: ``peer(local_payload) ->
+    """``Collective`` of a single real rank plus hand-written peers: ``peer(local_payload) ->
     peer_payload`` for each peer function; the gathered list is ``[local, *peers]``."""
 
     def __init__(self, *peers: Callable[[object], object]) -> None:
@@ -693,7 +693,7 @@ class FakeReader:
       minus what the reservation looks like at launch: ordinals below ``committed_blocks[rid]``
       are returned as committed names instead, ordinals at or above ``reserved_blocks[rid]`` are
       dropped (the reservation fell short).
-    * ``publish_description`` pops the next scripted ``(extent, chunk)`` for the request
+    * ``publish_extent_and_chunk`` pops the next scripted ``(extent, chunk)`` for the request
       (``script_publish``), or builds one covering every full block with no chunk.
     """
 
@@ -756,8 +756,8 @@ class FakeReader:
         )
         return extent, frozenset(committed_names)
 
-    def publish_description(self, request):
-        self.calls.append(("publish_description", (request,)))
+    def publish_extent_and_chunk(self, request):
+        self.calls.append(("publish_extent_and_chunk", (request,)))
         steps = self._publish_steps.get(request.py_request_id)
         if steps:
             return steps.popleft()
@@ -779,7 +779,7 @@ class FakeReader:
     def script_publish(
         self, request, steps: Sequence[tuple[Sequence[int], bool, object]]
     ) -> list[CacheExtent]:
-        """Script ``publish_description`` for ``request``: one ``(ordinals, is_last, chunk)`` per
+        """Script ``publish_extent_and_chunk`` for ``request``: one ``(ordinals, is_last, chunk)`` per
         context step. Returns the extents in order so tests can refer to them."""
         keys = self.block_keys(request)
         extents = []
@@ -818,7 +818,7 @@ class Rig:
     ``sources`` is given; ``host`` is a ``FakeLandsOnHost`` store that holds every prompt. ``trace``
     interleaves backend ``quiesce`` calls with effects. Every backend, publishers included, is
     strict about ``quiesce``: asking under a live attempt fails the test. The collective is
-    ``FakeDist`` unless a ``dist`` (``LockstepGather``, ``PeerGather``) is given; ``payloads()``
+    ``FakeCollective`` unless a ``dist`` (``LockstepGather``, ``PeerGather``) is given; ``payloads()``
     lists what this rank sent either way. ``probe_timeout_s`` is measured on the ``now`` tests
     pass to ``advance``: with the default, a request deferred at 0.0 and 1.0 is planned without
     the store at 2.0.
@@ -857,7 +857,7 @@ class Rig:
             p.strict_quiesce = True
         self.effects = RecordingEffects(trace=self.trace)
         self.queue = FakeEngineQueue()
-        self.dist = dist if dist is not None else FakeDist()
+        self.dist = dist if dist is not None else FakeCollective()
         self.planner = Planner(self.sources, self.reader, tpb, probe_timeout_s=probe_timeout_s)
         self.coord = KVTransferCoordinator(
             self.sources,
@@ -891,13 +891,13 @@ class Rig:
 
     def plan_and_launch(self, req: FakeRequest, now: float = 0.0) -> FakeAttempt:
         """``advance`` with ``req`` as the only candidate, read its plan into ``plans``, then
-        ``launch_fetches``; returns the attempt the worker created."""
+        ``launch_reserved_fetches``; returns the attempt the worker created."""
         self.coord.advance([req], now)
         plan = self.coord.plan_fetch(req)
         assert isinstance(plan, FetchPlan), f"expected a plan before launch, got {plan!r}"
         self.plans[req.py_request_id] = plan
         before = len(self.worker.attempts)
-        self.coord.launch_fetches([req], now)
+        self.coord.launch_reserved_fetches([req], now)
         assert len(self.worker.attempts) == before + 1, "launch did not create a worker attempt"
         return self.worker.attempts[-1]
 
@@ -911,12 +911,12 @@ class Rig:
 
     def reserve_and_place(self, req: FakeRequest, now: float) -> FakeAttempt:
         """The scheduler's part for a ``STAGED`` record: read the plan (reserving is implied),
-        then ``launch_fetches``; returns the placement attempt."""
+        then ``launch_reserved_fetches``; returns the placement attempt."""
         plan = self.coord.plan_fetch(req)
         assert isinstance(plan, FetchPlan), f"expected a plan to reserve for, got {plan!r}"
         self.plans[req.py_request_id] = plan
         before = len(self.host.attempts)
-        self.coord.launch_fetches([req], now)
+        self.coord.launch_reserved_fetches([req], now)
         assert len(self.host.attempts) == before + 1, "launch did not place the landing"
         return self.host.attempts[-1]
 

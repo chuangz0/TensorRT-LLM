@@ -16,7 +16,7 @@
 capabilities it recognises (``PlacesPieces``, ``CarriesAux``, ``LandsOnHost`` with its ``Landing``).
 
 Everything here is a ``Protocol`` or an enum. The engine adapter (``pyexecutor``) provides the
-``KVTransferEffects``, the ``EngineQueue`` and the ``DistLike``, so the coordinator can be driven
+``KVTransferEffects``, the ``EngineQueue`` and the ``Collective``, so the coordinator can be driven
 by fakes: an effects recorder and a single-rank collective. The read-only views it consumes
 (``RequestView``, ``GroupSpec``, ``ResourceReader``) live in ``base/views.py``; the planner's
 answers and its source table (``DEFER``, ``FetchSource``) in ``remote_cache.py``. Nothing in this
@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CarriesAux",
-    "DistLike",
+    "Collective",
     "EngineQueue",
     "KVTransferEffects",
     "Landing",
@@ -136,7 +136,7 @@ class EngineQueue(Protocol):
         ...
 
 
-class DistLike(Protocol):
+class Collective(Protocol):
     """The one collective the coordinator uses, over the ranks that plan together (the world, or
     this rank's pipeline group under attention DP; the assembly decides which). It needs no rank
     or world size: the gathered list's length is the participant count, and every reduction is

@@ -31,7 +31,7 @@ from tensorrt_llm._torch.disaggregation.remote_cache import (
     _stale_range,
     merge,
     required_ordinals,
-    servable_end,
+    servable_blocks,
 )
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.kv_v2_reader import KVv2ResourceReader
@@ -348,7 +348,7 @@ class TestFetchExtent:
 
 
 # ---------------------------------------------------------------------------------------------
-# publish_description
+# publish_extent_and_chunk
 # ---------------------------------------------------------------------------------------------
 
 
@@ -356,10 +356,10 @@ class TestPublishDescription:
     def test_two_identical_committed_requests_publish_identical_names(self, manager, reader):
         a = make_request(1, prompt_tokens(1))
         compute_and_commit(manager, a)
-        extent_a, chunk_a = reader.publish_description(EngineRequestView(a))
+        extent_a, chunk_a = reader.publish_extent_and_chunk(EngineRequestView(a))
         b = make_request(2, prompt_tokens(1))
         compute_and_commit(manager, b)
-        extent_b, chunk_b = reader.publish_description(EngineRequestView(b))
+        extent_b, chunk_b = reader.publish_extent_and_chunk(EngineRequestView(b))
 
         assert chunk_a is None and chunk_b is None
         assert extent_a.is_last and extent_b.is_last
@@ -379,15 +379,15 @@ class TestPublishDescription:
         b = make_request(2, prompt_tokens(2))
         compute_and_commit(manager, a)
         compute_and_commit(manager, b)
-        names_a = {u.name for u in reader.publish_description(EngineRequestView(a))[0].units}
-        names_b = {u.name for u in reader.publish_description(EngineRequestView(b))[0].units}
+        names_a = {u.name for u in reader.publish_extent_and_chunk(EngineRequestView(a))[0].units}
+        names_b = {u.name for u in reader.publish_extent_and_chunk(EngineRequestView(b))[0].units}
         assert not names_a & names_b
 
     def test_publish_offers_only_committed_blocks(self, manager, reader):
         """A request whose cache exists but committed nothing yet offers nothing."""
         request = make_request(1, prompt_tokens(1))
         assert manager.reserve_transfer_pages(request, 128)
-        extent, _ = reader.publish_description(EngineRequestView(request))
+        extent, _ = reader.publish_extent_and_chunk(EngineRequestView(request))
         assert extent.units == ()
         assert extent.is_last is False  # prefill has not ended
 
@@ -536,7 +536,7 @@ class TestLayout:
     def test_unit_addresses_lie_inside_a_registered_span(self, manager, reader):
         request = make_request(1, prompt_tokens(1))
         compute_and_commit(manager, request)
-        extent, _ = reader.publish_description(EngineRequestView(request))
+        extent, _ = reader.publish_extent_and_chunk(EngineRequestView(request))
         page_table = build_page_table_from_manager(manager)
         resolver = KVv2RegionResolver(page_table)
         spans = resolver.pool_memory_spans()
@@ -724,7 +724,7 @@ class TestVariableSlidingWindow:
         compute_and_commit(vswa_manager, request)
         windowed, full = groups_of(vswa_reader)
         keys = vswa_reader.block_keys(EngineRequestView(request))
-        extent, chunk = vswa_reader.publish_description(EngineRequestView(request))
+        extent, chunk = vswa_reader.publish_extent_and_chunk(EngineRequestView(request))
         assert chunk is None and extent.is_last
         names = {u.name for u in extent.units}
         # History is the whole prompt: (230 + 1 - 64) // 32 == 5, so window blocks 5 and 6 live.
@@ -748,7 +748,9 @@ class TestVariableSlidingWindow:
         planner = store_planner(vswa_reader)
         _, units = planner.probe_query(view)
         keys = vswa_reader.block_keys(view)
-        assert servable_end(frozenset(units), keys, vswa_reader.group_specs(), NAMEABLE, TPB) == 7
+        assert (
+            servable_blocks(frozenset(units), keys, vswa_reader.group_specs(), NAMEABLE, TPB) == 7
+        )
         plan = planner.decide(view, {"store": frozenset(units)}, now=0.0)
         assert plan.token_end == B and plan.reuse_end == 7
         assert all(g.ordinals == () for g in plan.group_plans)

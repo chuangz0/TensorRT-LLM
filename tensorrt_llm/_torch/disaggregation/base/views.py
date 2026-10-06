@@ -125,7 +125,7 @@ class ResourceReader(Protocol):
         the delivery then comes up short and is retried."""
         ...
 
-    def publish_description(self, request: RequestView) -> tuple[CacheExtent, Chunk | None]:
+    def publish_extent_and_chunk(self, request: RequestView) -> tuple[CacheExtent, Chunk | None]:
         """What this context step made available: named units, and the positional chunk for
         backends that place pieces. Built from committed pages."""
         ...

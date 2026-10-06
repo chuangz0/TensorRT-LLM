@@ -67,7 +67,7 @@ def propagate(rigs, req):
 def launch_on(rig, req, now):
     plan = rig.coord.plan_fetch(req)
     assert isinstance(plan, FetchPlan)
-    rig.coord.launch_fetches([req], now)
+    rig.coord.launch_reserved_fetches([req], now)
     return rig.store.attempts[-1]
 
 

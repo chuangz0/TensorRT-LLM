@@ -51,7 +51,7 @@ from ...disaggregation.resource.region import (
     parallel_shard_tag,
 )
 from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from .effects import EngineDist, EngineWorkQueue, PyExecutorKVTransferEffects
+from .effects import EngineCollective, EngineWorkQueue, PyExecutorKVTransferEffects
 from .hooks import KVTransferHooks
 
 if TYPE_CHECKING:
@@ -343,7 +343,7 @@ def attach_kv_transfer(
         ),
         max_unit_bytes=resolver.max_unit_bytes(),
         device_index=executor.device_id,
-        unit_bytes=_unit_bytes_by_name(reader, resolver),
+        unit_bytes_of=_unit_bytes_by_name(reader, resolver),
         max_request_blocks=-(-executor.max_seq_len // reader.tokens_per_block),
         landing_wait_timeout_s=config.landing_wait_timeout_s,
     )
@@ -359,7 +359,7 @@ def attach_kv_transfer(
             reader,
             effects,
             EngineWorkQueue(),
-            EngineDist(executor.dist, mapping),
+            EngineCollective(executor.dist, mapping),
             plan_authority=plan_authority_for(mapping),
         )
         install_log_forwarding()

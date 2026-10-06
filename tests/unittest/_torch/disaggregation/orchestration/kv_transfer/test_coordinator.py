@@ -57,7 +57,7 @@ def drive_rounds(rig: Rig, req: FakeRequest, rounds: int) -> int:
         if plan is None:
             return round_index
         if isinstance(plan, FetchPlan):
-            rig.coord.launch_fetches([req], float(round_index))
+            rig.coord.launch_reserved_fetches([req], float(round_index))
     raise AssertionError(f"request {req.py_request_id} still undecided after {rounds} rounds")
 
 
@@ -69,7 +69,7 @@ def test_undecided_request_answers_defer_and_has_no_record():
     req = worker_request()
     assert rig.coord.plan_fetch(req) is DEFER
     assert rig.records() == []
-    assert rig.coord.has_inflight() is False
+    assert rig.coord.has_backend_work() is False
 
 
 def test_advance_plans_and_plan_fetch_reads_the_plan():
@@ -81,7 +81,7 @@ def test_advance_plans_and_plan_fetch_reads_the_plan():
     rec = rig.record(1)
     assert rec["state"] == "PLANNED" and rec["attempts"] == 0 and rec["token_end"] == END
     assert rig.effects.calls == []  # planning has no side effects
-    assert rig.coord.has_inflight() is False
+    assert rig.coord.has_backend_work() is False
 
 
 def test_launch_opens_route_fetches_and_parks():
@@ -99,7 +99,7 @@ def test_launch_opens_route_fetches_and_parks():
     assert attempt.payload is extent
     rec = rig.record(1)
     assert rec["state"] == "IN_FLIGHT" and rec["attempts"] == 1 and rec["try_index"] == 0
-    assert rig.coord.has_inflight() is True
+    assert rig.coord.has_backend_work() is True
     # Past PLANNED there is nothing more to plan: the scheduler hook answers None.
     assert rig.coord.plan_fetch(req) is None
     # The store is never asked for a route.
@@ -109,7 +109,7 @@ def test_launch_opens_route_fetches_and_parks():
 def test_launch_is_a_noop_for_requests_without_a_plan():
     rig = Rig()
     req = worker_request()
-    rig.coord.launch_fetches([req], 0.0)
+    rig.coord.launch_reserved_fetches([req], 0.0)
     assert rig.effects.calls == [] and rig.worker.calls == []
 
 
@@ -135,7 +135,7 @@ def test_delivered_lands_unparks_and_closes_route_without_quiesce():
     assert rig.worker.count("quiesce") == 0  # not a release point yet
     rec = rig.record(1)
     assert rec["state"] == "LANDED" and rec["outcomes"] == ["Delivered"]
-    assert rig.coord.has_inflight() is False
+    assert rig.coord.has_backend_work() is False
     assert rig.coord.plan_fetch(req) is None  # decided: compute locally from here
 
 
@@ -241,7 +241,7 @@ def test_failed_quiesces_before_give_back_and_keeps_one_retry():
     rec = rig.record(1)
     assert rec["state"] == "PLANNED" and rec["token_end"] is None
     assert rig.coord.plan_fetch(req) is DEFER  # planned but not yet re-decided
-    assert rig.coord.has_inflight() is False
+    assert rig.coord.has_backend_work() is False
 
 
 def test_second_failure_releases_and_request_is_replanned_as_none():
@@ -333,7 +333,7 @@ def test_transport_error_and_rejection_alternation_is_bounded(gen_init):
             rig.worker.reject_next = 1
         loop_advance(rig, req, float(index))
         assert isinstance(rig.coord.plan_fetch(req), FetchPlan)
-        rig.coord.launch_fetches([req], float(index))
+        rig.coord.launch_reserved_fetches([req], float(index))
         rec = rig.fetch_record(rid)
         assert rig.record(rid)["state"] == "PLANNED" and rec.plan is not None
         assert rec.consecutive_launch_failures == index + 1 and rec.retries_left == 1
@@ -388,7 +388,7 @@ def test_route_refused_gives_up_and_settles_on_local_compute_after_two_agreement
     req = worker_request()
     rig.worker.open_route_errors.append(error)
     rig.coord.advance([req], 0.0)
-    rig.coord.launch_fetches([req], 0.0)
+    rig.coord.launch_reserved_fetches([req], 0.0)
     assert rig.effects.names() == ["prepare_fetch_resources", "give_back_fetch_pages"]
     assert rig.worker.count("fetch") == 0 and rig.worker.count("quiesce") == 0
     # This plan can never work here: the rank gives up at once and answers the scheduler DEFER
@@ -401,7 +401,7 @@ def test_route_refused_gives_up_and_settles_on_local_compute_after_two_agreement
     assert rig.fetch_record(1).retries_left == 0 and rig.coord.plan_fetch(req) is DEFER
     rig.worker.open_route_errors.append(error)
     loop_advance(rig, req, 2.0)
-    rig.coord.launch_fetches([req], 2.0)
+    rig.coord.launch_reserved_fetches([req], 2.0)
     assert rig.fetch_record(1).launch_gave_up
     # ... which is refused again; the second agreement settles on local compute.
     loop_advance(rig, req, 3.0)
@@ -415,7 +415,7 @@ def test_gen_init_route_refused_fails_the_request_at_the_next_agreement():
     req = gen_init_request()
     rig.worker.open_route_errors.append(ValueError("unknown peer"))
     rig.coord.advance([req], 0.0)
-    rig.coord.launch_fetches([req], 0.0)
+    rig.coord.launch_reserved_fetches([req], 0.0)
     # NB-5: pages first; the verdict waits for the ranks' agreement on the next advance.
     assert rig.effects.names() == ["prepare_fetch_resources", "give_back_fetch_pages"]
     assert rig.coord.plan_fetch(req) is DEFER and rig.record(7)["state"] == "PLANNED"
@@ -431,7 +431,7 @@ def test_route_transport_error_keeps_the_plan_and_the_retry():
     req = worker_request()
     rig.worker.open_route_errors.append(RuntimeError("peer metadata fetch failed"))
     rig.coord.advance([req], 0.0)
-    rig.coord.launch_fetches([req], 0.0)
+    rig.coord.launch_reserved_fetches([req], 0.0)
     assert rig.effects.names() == ["prepare_fetch_resources", "give_back_fetch_pages"]
     assert rig.worker.count("fetch") == 0 and rig.worker.count("quiesce") == 0
     # The record keeps its plan: the scheduler reserves for the same fetch again next round.
@@ -465,7 +465,7 @@ def test_repeated_route_transport_errors_fail_gen_init():
     rig.worker.open_route_errors.extend(RuntimeError(f"e{i}") for i in range(3))
     for round_index in range(3):
         loop_advance(rig, req, float(round_index))
-        rig.coord.launch_fetches([req], float(round_index))
+        rig.coord.launch_reserved_fetches([req], float(round_index))
     assert rig.effects.count("fail_requests") == 0 and rig.coord.plan_fetch(req) is DEFER
     loop_advance(rig, req, 3.0)  # the FAILED vote lands: a gen-init fetch has no retry
     ((reqs, reason),) = rig.effects.only("fail_requests")
@@ -479,7 +479,7 @@ def test_route_failure_does_not_strand_other_requests_in_the_same_launch():
     a, b, c = worker_request(1), worker_request(2), worker_request(3)
     rig.worker.open_route_errors.append(RuntimeError("only a's route fails"))
     rig.coord.advance([a, b, c], 0.0)
-    rig.coord.launch_fetches([a, b, c], 0.0)
+    rig.coord.launch_reserved_fetches([a, b, c], 0.0)
     assert rig.effects.only("prepare_fetch_resources") == [((a, b, c),)]
     assert rig.effects.only("give_back_fetch_pages") == [((a,),)]
     assert rig.effects.only("park_for_fetch") == [((b, c),)]
@@ -529,7 +529,7 @@ def test_served_short_retries_with_min_b():
     assert isinstance(replan, FetchPlan) and replan.token_end == END - 4
     assert ordinals_by_group(replan) == {0: tuple(range(6))}
 
-    rig.coord.launch_fetches([req], 2.0)
+    rig.coord.launch_reserved_fetches([req], 2.0)
     rig.worker.attempts[-1].deliver_all()
     rig.coord.advance([], 3.0)
     assert rig.effects.only("unpark") == [(req, END - 4, False, None)]
@@ -574,7 +574,7 @@ def test_submission_rejected_gives_back_without_quiesce_or_retry_cost():
     rig.worker.reject_next = 1
     rig.coord.advance([req], 0.0)
     plan = rig.coord.plan_fetch(req)
-    rig.coord.launch_fetches([req], 0.0)
+    rig.coord.launch_reserved_fetches([req], 0.0)
     # NB-5: the resources were prepared for the launch, so they are given back, in that order.
     assert rig.effects.names() == ["prepare_fetch_resources", "give_back_fetch_pages"]
     assert rig.worker.count("quiesce") == 0
@@ -683,14 +683,14 @@ def test_publish_flow_holds_then_terminates_after_quiesce():
     assert pub.payloads("publish") == []
     rec = rig.record(3, "publish")
     assert rec["state"] == "PLANNED" and rec["attempts"] == 0
-    assert rig.coord.has_inflight() is False
+    assert rig.coord.has_backend_work() is False
     rig.coord.advance([], 1.0)
     assert rig.record(3, "publish")["state"] == "PLANNED" and pub.count("quiesce") == 0
 
     rig.coord.publish_committed_blocks([req], now=2.0)
     rig.coord.notify_request_finished(req)
     assert pub.payloads("publish") == [ext[1]]
-    assert rig.record(3, "publish")["state"] == "IN_FLIGHT" and rig.coord.has_inflight()
+    assert rig.record(3, "publish")["state"] == "IN_FLIGHT" and rig.coord.has_backend_work()
     assert rig.effects.names() == ["hold_for_transfer"]
     assert rig.effects.only("hold_for_transfer") == [((req,),)]
     assert rig.coord.status_dump()["finished_pending"] == [3]
@@ -1005,7 +1005,7 @@ def test_no_publishers_means_no_publish_records():
     rig.coord.publish_committed_blocks([req], now=0.0)
     rig.coord.notify_request_finished(req)
     assert rig.records() == [] and rig.effects.calls == []
-    assert rig.reader.calls == []  # publish_description is not even asked
+    assert rig.reader.calls == []  # publish_extent_and_chunk is not even asked
 
 
 def test_places_pieces_gets_every_chunk_plain_publisher_only_the_last():
@@ -1078,7 +1078,7 @@ def test_one_allgather_per_advance_and_none_elsewhere():
     rig = Rig()
     req = worker_request()
     rig.coord.advance([req], 0.0)
-    rig.coord.launch_fetches([req], 0.0)
+    rig.coord.launch_reserved_fetches([req], 0.0)
     rig.coord.advance([], 1.0)
     rig.coord.notify_request_finished(req)
     rig.coord.publish_committed_blocks([], now=2.0)
@@ -1091,7 +1091,7 @@ def test_allgather_payload_carries_plan_answers_and_arrivals():
     rig.coord.advance([req], 0.0)
     arrivals, expired, plans = rig.payloads()[0]
     assert arrivals == [] and expired == [] and plans == [(1, (END, "worker"))]
-    rig.coord.launch_fetches([req], 0.0)
+    rig.coord.launch_reserved_fetches([req], 0.0)
     rig.worker.attempts[0].deliver_all()
     rig.coord.advance([], 1.0)
     arrivals, expired, plans = rig.payloads()[1]
@@ -1251,7 +1251,7 @@ def test_store_fetch_has_no_route():
     req = FakeRequest(1, prompt_len=29)
     rig.store.probe_default = rig.reader.unit_names(req, range(7))
     rig.coord.advance([req], 0.0)
-    rig.coord.launch_fetches([req], 0.0)
+    rig.coord.launch_reserved_fetches([req], 0.0)
     assert rig.store.count("open_route") == 0
     extent, route = rig.store.calls[-1][1]
     assert route is None
@@ -1292,7 +1292,7 @@ def test_two_requests_progress_independently(candidates_twice):
     rig.coord.advance([a, b], 0.0)
     if candidates_twice:
         rig.coord.advance([a, b], 0.5)  # PLANNED with a plan: left alone
-    rig.coord.launch_fetches([a, b], 1.0)
+    rig.coord.launch_reserved_fetches([a, b], 1.0)
     assert rig.effects.only("park_for_fetch") == [((a, b),)]
     rig.worker.attempts[1].deliver_all()
     rig.coord.advance([], 2.0)
@@ -1323,7 +1323,7 @@ def test_three_consecutive_rejections_fail_a_gen_init_fetch():
     for round_index in range(3):
         loop_advance(rig, req, float(round_index))
         assert isinstance(rig.coord.plan_fetch(req), FetchPlan)
-        rig.coord.launch_fetches([req], float(round_index))
+        rig.coord.launch_reserved_fetches([req], float(round_index))
     assert rig.worker.count("fetch") == 3
     assert rig.effects.count("give_back_fetch_pages") == 3
     assert rig.effects.count("fail_requests") == 0 and rig.coord.plan_fetch(req) is DEFER
@@ -1367,7 +1367,7 @@ def test_host_first_plan_starts_its_landing_when_decided_and_parks_nothing():
     assert rig.effects.calls == []  # no pages: nothing prepared, nothing parked
     assert rig.coord.plan_fetch(req) is DEFER
     # A landing is work in flight for pacing, but it names no page and parks no request.
-    assert rig.coord.has_inflight() is True
+    assert rig.coord.has_backend_work() is True
     assert rig.coord.inflight_request_ids() == frozenset()
     assert rig.coord.parked_request_ids() == frozenset()
 
@@ -1545,7 +1545,7 @@ def test_placement_refused_three_times_gives_up_and_the_agreement_replans():
     rig.host.reject_place_next = 3
     for index, now in enumerate((2.0, 3.0, 4.0)):
         assert isinstance(rig.coord.plan_fetch(req), FetchPlan)
-        rig.coord.launch_fetches([req], now)
+        rig.coord.launch_reserved_fetches([req], now)
         rec = rig.fetch_record(1)
         assert rec.state.value == "STAGED" and rec.consecutive_launch_failures == index + 1
     assert rig.effects.count("give_back_fetch_pages") == 3  # page back-pressure, counted as such
@@ -1595,7 +1595,7 @@ def test_request_ending_before_placement_releases_the_landing_and_votes_until_ag
     assert rig.effects.names() == ["hold_for_transfer"]
     rec = rig.record(1)
     assert rec["state"] == stage and rec["has_landing"] is False
-    assert rig.coord.has_inflight() is False  # nothing runs for it any more
+    assert rig.coord.has_backend_work() is False  # nothing runs for it any more
     rig.coord.advance([], 3.0)
     assert rig.payloads()[-1][0] == [((1, "fetch"), "TERMINAL", END)]
     assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
@@ -1634,7 +1634,7 @@ def test_request_failed_by_the_coordinator_answers_the_late_release_gate_once():
 
 
 def test_reserve_wait_of_a_device_direct_plan_spends_a_retry_then_computes_locally():
-    """The scheduler never finds pages for the plan (``launch_fetches`` is never called): the
+    """The scheduler never finds pages for the plan (``launch_reserved_fetches`` is never called): the
     wait is clocked from the plan's decision, the fetch is given up at the wait timeout, the
     retry waits once more, and the request computes locally; the scheduler is never stalled."""
     rig = Rig(landing_wait_timeout_s=5.0)

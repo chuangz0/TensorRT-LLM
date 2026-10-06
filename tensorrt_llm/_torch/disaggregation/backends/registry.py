@@ -55,9 +55,9 @@ class BackendBuildContext:
         layout_fingerprint: Digest of the local memory layout, for content-addressed names.
         max_unit_bytes: The largest unit any layer group produces; sizes staging buffers.
         device_index: CUDA device of the KV pools, for backends that copy through host memory.
-        unit_bytes: Byte size of the unit called ``name``, for a backend that lands units in its
-            own memory before it knows their pages (``LandsOnHost``). ``None`` when the assembly
-            offers no such backend.
+        unit_bytes_of: Callable giving the byte size of the unit called ``name``, for a backend
+            that lands units in its own memory before it knows their pages (``LandsOnHost``).
+            ``None`` when the assembly offers no such backend.
         max_request_blocks: Blocks the longest request spans (``max_seq_len`` over
             ``tokens_per_block``), so a backend can warn when its landing memory is short of
             one fetch. ``None`` when unknown.
@@ -70,7 +70,7 @@ class BackendBuildContext:
     layout_fingerprint: bytes
     max_unit_bytes: int
     device_index: Optional[int] = None
-    unit_bytes: Optional[Callable[[bytes], int]] = None
+    unit_bytes_of: Optional[Callable[[bytes], int]] = None
     max_request_blocks: Optional[int] = None
     landing_wait_timeout_s: Optional[float] = 30.0
 

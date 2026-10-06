@@ -29,7 +29,7 @@ parked for one would be a worker lost. One pool serves one of the two styles; th
 pool per style.
 
 Nothing here imports torch or CUDA at module load. Copies go through a ``Copier``
-(``backends/host_copy.py``); the default one is created lazily by ``open_default_staging``.
+(``backends/host_copy.py``); the default one is created lazily by ``open_pinned_staging_pool``.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ from ...base.region import Segment
 from ..host_copy import Copier, CudaCopier
 from .store import BlobStore, BlobStoreError
 
-__all__ = ["HostStagingPool", "SlotWaiter", "open_default_staging", "plan_slot_geometry"]
+__all__ = ["HostStagingPool", "SlotWaiter", "open_pinned_staging_pool", "plan_slot_geometry"]
 
 
 def plan_slot_geometry(
@@ -245,7 +245,7 @@ class HostStagingPool:
         self._copier.sync()
 
 
-def open_default_staging(
+def open_pinned_staging_pool(
     store: BlobStore,
     *,
     slot_bytes: int,

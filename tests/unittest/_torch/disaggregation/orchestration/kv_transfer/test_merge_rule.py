@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Pure-function tests of the merge rule (design §6.3), ``servable_end`` (the store decision
+"""Pure-function tests of the merge rule (design §6.3), ``servable_blocks`` (the store decision
 over every paged group) and their shared input ``required_ordinals``.
 
 Synthetic model: tpb = 4, a windowed group of W = 3 blocks (12 tokens) with 1 sink block, and
@@ -31,7 +31,7 @@ from disaggregation.remote_cache import (  # noqa: E402
     _stale_range,
     merge,
     required_ordinals,
-    servable_end,
+    servable_blocks,
 )
 from fakes import (  # noqa: E402
     TPB,
@@ -224,30 +224,32 @@ def test_merge_never_exceeds_token_end():
     assert merge(plan, served) == 24
 
 
-# ---- servable_end: the store decision over every paged group ----
+# ---- servable_blocks: the store decision over every paged group ----
 
 ALL = range(7)
 
 
-def test_servable_end_lands_at_nameable_when_every_group_is_whole():
-    assert servable_end(held((FULL, ALL), (WINDOW, ALL)), KEYS, [FULL, WINDOW], NAMEABLE, TPB) == 7
+def test_servable_blocks_lands_at_nameable_when_every_group_is_whole():
+    assert (
+        servable_blocks(held((FULL, ALL), (WINDOW, ALL)), KEYS, [FULL, WINDOW], NAMEABLE, TPB) == 7
+    )
 
 
-def test_servable_end_steps_down_to_where_the_missing_window_block_is_stale():
+def test_servable_blocks_steps_down_to_where_the_missing_window_block_is_stale():
     # Window block 5 missing: e=7 needs {0,4,5,6}, e=6 needs {0,3,4,5}, e=5 needs {0,2,3,4}.
     answer = held((FULL, ALL), (WINDOW, [0, 1, 2, 3, 4, 6]))
-    assert servable_end(answer, KEYS, [FULL, WINDOW], NAMEABLE, TPB) == 5
+    assert servable_blocks(answer, KEYS, [FULL, WINDOW], NAMEABLE, TPB) == 5
     # The same missing block after a fetch to 28: blocks 2 and 3 were stale at 28 and never
     # asked for, so merge cannot stop at 20 and falls to where only the sink block is live.
     plan = make_plan([FULL, WINDOW], token_end=END, keys=KEYS, reuse_end=0)
     assert merge(plan, plan_unit_names(plan) - names(WINDOW, KEYS, [5])) == 4
 
 
-def test_servable_end_counts_a_block_below_the_local_prefix_as_missing():
+def test_servable_blocks_counts_a_block_below_the_local_prefix_as_missing():
     # Full block 0 is not in the store (the local tree has it): the decision is computed with
     # reuse_end = 0 for rank agreement, so no target is servable ...
     answer = held((FULL, range(1, 7)), (WINDOW, ALL))
-    assert servable_end(answer, KEYS, [FULL, WINDOW], NAMEABLE, TPB) == 0
+    assert servable_blocks(answer, KEYS, [FULL, WINDOW], NAMEABLE, TPB) == 0
     # ... while a plan already built above that prefix never asked for block 0 and merges whole.
     plan = make_plan([FULL, WINDOW], token_end=END, keys=KEYS, reuse_end=2)
     assert merge(plan, plan_unit_names(plan)) == END
@@ -264,12 +266,12 @@ def test_servable_end_counts_a_block_below_the_local_prefix_as_missing():
     ],
     ids=["sink_missing", "full_tail_missing", "window_only", "state_ignored", "no_paged_group"],
 )
-def test_servable_end_table(specs, answer, expected):
-    assert servable_end(answer, KEYS, specs, NAMEABLE, TPB) == expected
+def test_servable_blocks_table(specs, answer, expected):
+    assert servable_blocks(answer, KEYS, specs, NAMEABLE, TPB) == expected
 
 
-def test_servable_end_with_nothing_nameable_is_zero():
-    assert servable_end(held((FULL, ALL)), KEYS, [FULL], 0, TPB) == 0
+def test_servable_blocks_with_nothing_nameable_is_zero():
+    assert servable_blocks(held((FULL, ALL)), KEYS, [FULL], 0, TPB) == 0
 
 
 def test_publisher_window_one_block_ahead_of_the_fetch_target_serves_nothing():
@@ -279,8 +281,8 @@ def test_publisher_window_one_block_ahead_of_the_fetch_target_serves_nothing():
     window = windowed(1, window_blocks=3, sink_blocks=0)
     keys = KEYS[:6]  # nameable = (28 - 1) // 4 = 6
     answer = held((FULL, range(6)), (window, [4, 5]))
-    assert servable_end(answer, keys, [FULL, window], 6, TPB) == 0
-    assert servable_end(answer, keys, [FULL], 6, TPB) == 6  # the full group alone would allow B
+    assert servable_blocks(answer, keys, [FULL, window], 6, TPB) == 0
+    assert servable_blocks(answer, keys, [FULL], 6, TPB) == 6  # the full group alone would allow B
 
 
 # ---- retry: the hint is merge's B, and the store answer is judged again below it ----

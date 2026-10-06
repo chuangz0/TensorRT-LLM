@@ -5,7 +5,7 @@
 A ``PyExecutor`` built with ``object.__new__`` and the attributes the effects read, a real
 ``KVTransferCoordinator`` and ``Planner``, and fakes for the reader and the backends. Covered:
 every effect of design §7.3 in table order; the two alias states; the release gate's five cases
-A-E of plan §9 (E synthesized: the disagg send never comes back); the dummy bypass; ``is_tracking``
+A-E of plan §9 (E synthesized: the disagg send never comes back); the dummy bypass; ``owns``
 on the cancel path; ``has_pending_work`` for idle detection; ``pace_idle``; ``close()`` order
 and its timeout against a hanging backend; and the status dump's JSON schema.
 """
@@ -27,7 +27,7 @@ from engine_fakes import (
     FakeReader,
     FakeSlotManager,
     HangingClose,
-    SingleRankDist,
+    SingleRankCollective,
     extent_names,
     finish_prefill,
     make_executor,
@@ -94,7 +94,7 @@ class Rig:
             self.reader,
             self.effects,
             EngineWorkQueue(),
-            SingleRankDist(),
+            SingleRankCollective(),
             fetch_timeout_s=fetch_timeout_s,
             publish_timeout_s=publish_timeout_s,
         )
@@ -263,7 +263,7 @@ def test_request_view_has_constant_plan_inputs_and_passes_everything_else_throug
         _ = view.no_such_attribute
 
 
-def test_work_queue_and_single_rank_dist_complete_the_contract():
+def test_work_queue_and_single_rank_collective_complete_the_contract():
     queue = EngineWorkQueue()
     ran = []
     for i in range(3):
@@ -271,7 +271,7 @@ def test_work_queue_and_single_rank_dist_complete_the_contract():
     assert queue.drain(2) == 2 and ran == [0, 1]
     assert queue.drain(5) == 1 and ran == [0, 1, 2]
     assert queue.drain(5) == 0
-    assert SingleRankDist().allgather({"x": 1}) == [{"x": 1}]
+    assert SingleRankCollective().allgather({"x": 1}) == [{"x": 1}]
 
 
 # =============================================================================================
@@ -287,7 +287,7 @@ class TestParkForFetch:
         assert req.state == KV_FETCH_IN_PROGRESS
         assert rig.coord.parked_request_ids() == {1}
         assert rig.coord.held_request_ids() == frozenset()
-        assert rig.hooks.is_tracking(req)
+        assert rig.hooks.owns(req)
         assert rig.hooks.has_pending_work()
         # prepare_fetch_resources went first, with the engine request, not the view.
         rig.executor._prepare_disagg_gen_resources.assert_called_once()
@@ -316,7 +316,7 @@ class TestUnpark:
         assert req.py_ctx_pre_resize_cap is None  # plan §10 #11
         assert rig.kv.calls == [("try_commit_blocks", 1)]
         assert rig.kv.kv_cache_map[1].num_committed_tokens == 96
-        assert not rig.hooks.is_tracking(req)
+        assert not rig.hooks.owns(req)
         assert not rig.hooks.has_pending_work()
         assert rig.hooks.plan_fetch(req) is None  # decided: compute the rest locally
         # A landed fetch record reaches its release point when the request ends (design §4.3).
@@ -340,7 +340,7 @@ class TestUnpark:
         assert req.state == CONTEXT_INIT
         assert req.context_current_position == 128
         assert rig.kv.kv_cache_map[1].num_committed_tokens == 128
-        assert not rig.hooks.is_tracking(req)
+        assert not rig.hooks.owns(req)
 
     def test_landing_below_the_declared_history_is_a_wiring_error(self, rig):
         req = make_request(1, 100)
@@ -390,7 +390,7 @@ class TestGiveBackFetchPages:
         rig.executor._revert_ctx_alloc.assert_called_once_with([req])
         assert rig.kv.count("free_resources") == 0
         assert req.state == CONTEXT_INIT
-        assert not rig.hooks.is_tracking(req)
+        assert not rig.hooks.owns(req)
         assert rig.store.count("quiesce") == 1  # quiesced before the pages were given back
         # One retry: the request is undecided again and the record is kept for the budget.
         assert rig.hooks.plan_fetch(req) is DEFER
@@ -423,7 +423,7 @@ class TestGiveBackFetchPages:
         assert rig.store.attempts == []
         rig.executor._revert_ctx_alloc.assert_called_once_with([req])
         assert rig.store.count("quiesce") == 0
-        assert req.state == CONTEXT_INIT and not rig.hooks.is_tracking(req)
+        assert req.state == CONTEXT_INIT and not rig.hooks.owns(req)
         # The plan stands: the scheduler reserves for the same fetch next round, no retry spent.
         assert rig.hooks.plan_fetch(req) is plan
 
@@ -474,7 +474,7 @@ class TestHoldForTransfer:
         assert rig.kv.count("release_index_slot") == 1
         assert 1 in rig.kv.kv_cache_map  # the pages stay for the backend
         assert rig.kv.count("free_resources") == 0
-        assert rig.hooks.is_tracking(req)
+        assert rig.hooks.owns(req)
         assert rig.hooks.has_pending_work()
         assert rig.reader.forgotten == []  # forgotten once the held request is terminated
 
@@ -574,9 +574,9 @@ class TestPublishSelection:
 
         rig.hooks.publish_committed_blocks([done, mid, failed, first_token_done, dummy])
 
-        assert [c for c in rig.reader.calls if c[0] == "publish_description"] == [
-            ("publish_description", 1),
-            ("publish_description", 4),
+        assert [c for c in rig.reader.calls if c[0] == "publish_extent_and_chunk"] == [
+            ("publish_extent_and_chunk", 1),
+            ("publish_extent_and_chunk", 4),
         ]
         assert rig.publisher.count("publish") == 2
         assert all(a.payload.is_last for a in rig.publisher.attempts)
@@ -633,7 +633,7 @@ class TestReleaseGate:
 
         rig.executor._do_terminate_request.assert_called_once_with(req)
         assert req.state != KV_PUBLISH_IN_PROGRESS
-        assert not rig.hooks.is_tracking(req)
+        assert not rig.hooks.owns(req)
         assert rig.kv.count("free_resources") == 0  # _do_terminate_request owns that
         assert rig.coord.status_dump()["finished_pending"] == []
 
@@ -645,13 +645,13 @@ class TestReleaseGate:
 
         assert rig.terminations() == 0
         assert req.state == KV_PUBLISH_IN_PROGRESS
-        assert rig.hooks.is_tracking(req) and rig.hooks.has_pending_work()
+        assert rig.hooks.owns(req) and rig.hooks.has_pending_work()
         rig.advance()  # still in flight
         assert rig.terminations() == 0
         attempt.deliver_all()
         rig.advance()
         rig.executor._do_terminate_request.assert_called_once_with(req)
-        assert not rig.hooks.is_tracking(req) and not rig.hooks.has_pending_work()
+        assert not rig.hooks.owns(req) and not rig.hooks.has_pending_work()
         assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
 
     def test_case_b_publish_failure_still_terminates_the_finished_request_once(self, rig, caplog):
@@ -666,7 +666,7 @@ class TestReleaseGate:
         rig.executor._handle_errors.assert_not_called()
         rig.executor._do_terminate_request.assert_called_once_with(req)
         assert any("kv publish failed" in r.getMessage() for r in caplog.records)
-        assert not rig.hooks.is_tracking(req)
+        assert not rig.hooks.owns(req)
         assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
 
     def test_case_c_ctx_only_send_done_first_publish_in_flight(self, rig):
@@ -686,7 +686,7 @@ class TestReleaseGate:
         attempt.deliver_all()
         rig.advance()
         rig.executor._do_terminate_request.assert_called_once_with(req)
-        assert rig.records() == [] and not rig.hooks.is_tracking(req)
+        assert rig.records() == [] and not rig.hooks.owns(req)
 
     def test_case_d_publish_landed_first_send_in_flight(self, rig):
         """The publish landed while the request was still running: the record is released and
@@ -702,7 +702,7 @@ class TestReleaseGate:
         rig.executor._terminate_request(req)  # release_transfer, send complete
 
         rig.executor._do_terminate_request.assert_called_once_with(req)
-        assert not rig.hooks.is_tracking(req)
+        assert not rig.hooks.owns(req)
         assert rig.slots.freed == []  # the gate did not hold, so no slot work of ours
         assert rig.coord.status_dump()["finished_pending"] == []
 
@@ -731,9 +731,9 @@ class TestReleaseGate:
         for _ in range(3):
             rig.advance()
         assert rig.terminations() == 1
-        assert not rig.hooks.is_tracking(req) and not rig.hooks.has_pending_work()
+        assert not rig.hooks.owns(req) and not rig.hooks.has_pending_work()
         assert rig.records() == []
-        assert rig.coord.tracked_requests() == []
+        assert rig.coord.owned_requests() == []
         assert rig.coord.status_dump()["finished_pending"] == []
 
     def test_publish_rejected_outright_is_held_one_round_then_terminated_exactly_once(self, rig):
@@ -752,7 +752,7 @@ class TestReleaseGate:
 
         rig.advance()
         rig.executor._do_terminate_request.assert_called_once_with(req)
-        assert rig.records() == [] and not rig.hooks.is_tracking(req)
+        assert rig.records() == [] and not rig.hooks.owns(req)
         assert rig.coord.status_dump()["finished_pending"] == []
         for _ in range(2):
             rig.advance()
@@ -783,7 +783,7 @@ class TestReleaseGate:
         rig.executor._do_terminate_request.assert_called_once_with(req)
         rig.executor._revert_ctx_alloc.assert_not_called()
         assert req.context_current_position == 0  # never unparked
-        assert rig.records() == [] and not rig.hooks.is_tracking(req)
+        assert rig.records() == [] and not rig.hooks.owns(req)
 
     def test_request_finished_with_a_plan_but_no_launch_is_terminated_with_the_agreement(self, rig):
         """No pages here, but a peer may have launched the same plan: the record votes once so
@@ -838,21 +838,21 @@ class TestCancelAndIdle:
         rig.executor._terminate_request(req)
         assert rig.executor._try_cancel_request(req) is False
 
-    def test_is_tracking_reads_the_record_table_not_the_state(self, rig):
+    def test_owns_reads_the_record_table_not_the_state(self, rig):
         req = make_request(1, 100)
         req.state = KV_FETCH_IN_PROGRESS  # a disagg gen-init in transmission looks like this
-        assert rig.hooks.is_tracking(req) is False
+        assert rig.hooks.owns(req) is False
         assert rig.executor._try_cancel_request(req) is True  # no transceiver: cancellable
         dummy = make_request(2, 100)
         dummy.is_dummy_request = True
-        assert rig.hooks.is_tracking(dummy) is False
+        assert rig.hooks.owns(dummy) is False
 
-    def test_running_request_with_a_publish_in_flight_is_not_tracked_but_is_in_flight(self, rig):
-        """A publish does not own a running request: it stays cancellable (``is_tracking`` is
+    def test_running_request_with_a_publish_in_flight_is_not_owned_but_is_in_flight(self, rig):
+        """A publish does not own a running request: it stays cancellable (``owns`` is
         False) while its pages stay protected (``inflight_request_ids`` names it)."""
         req = make_request(1, 100)
         rig.publish(req)  # still running: not finished, publish IN_FLIGHT
-        assert rig.hooks.is_tracking(req) is False
+        assert rig.hooks.owns(req) is False
         assert rig.hooks.inflight_request_ids() == {1}
         assert rig.executor._try_cancel_request(req) is True
 
@@ -1125,7 +1125,7 @@ class TestHeldRequestFailurePaths:
         assert any("kv publish failed" in r.getMessage() for r in caplog.records)
         assert req.state != LlmRequestState.GENERATION_COMPLETE  # not failed
         assert rig.coord.held_request_ids() == frozenset()
-        assert not rig.hooks.is_tracking(req)
+        assert not rig.hooks.owns(req)
         assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
         for _ in range(2):  # nothing left that could terminate it again
             rig.advance()
@@ -1200,7 +1200,7 @@ class TestFetchExpiry:
         rig.executor._do_terminate_request.assert_called_once_with(req)
         assert req.context_current_position == 0  # never unparked
         assert rig.kv.count("try_commit_blocks") == 0
-        assert rig.records() == [] and not rig.hooks.is_tracking(req)
+        assert rig.records() == [] and not rig.hooks.owns(req)
 
     def test_expired_fetch_without_an_outcome_is_freed_by_close(self, monkeypatch, tmp_path):
         now = [5000.0]
@@ -1234,7 +1234,7 @@ class TestRejectedSubmissions:
         assert rig.store.count("fetch") == 6  # 3 per plan, two plans
         assert rig.store.attempts == []  # nothing escaped
         assert rig.executor._revert_ctx_alloc.call_count == rig.store.count("fetch")
-        assert req.state == CONTEXT_INIT and not rig.hooks.is_tracking(req)
+        assert req.state == CONTEXT_INIT and not rig.hooks.owns(req)
         assert rig.records() == []
 
     def test_publish_expiry_of_a_running_request_only_warns(self, monkeypatch):
@@ -1281,7 +1281,7 @@ class TestEngineErrorPathWithParkedRequests:
         rig.advance()
         rig.executor._do_terminate_request.assert_called_once_with(req)
         rig.executor._revert_ctx_alloc.assert_not_called()  # a gone request gets no give-back
-        assert not rig.hooks.is_tracking(req) and rig.records() == []
+        assert not rig.hooks.owns(req) and rig.records() == []
 
     def test_parked_request_without_an_outcome_is_freed_by_close(self, tmp_path):
         rig = Rig(status_dump_path=str(tmp_path / "kvt.json"))
@@ -1315,7 +1315,7 @@ class TestDeferredEngineTermination:
         attempt.deliver_all()
         rig.advance()
         rig.executor._do_terminate_request.assert_called_once_with(req)
-        assert not rig.hooks.is_tracking(req)
+        assert not rig.hooks.owns(req)
 
         rig.executor._terminate_request(req)  # the deferred flush reaches the gate now
         rig.executor._do_terminate_request.assert_called_once_with(req)
@@ -1372,7 +1372,7 @@ class TestCancelWhileParked:
         assert req.state == CONTEXT_INIT
         assert self._cancel_pass(rig, req) is True
         rig.executor._do_terminate_request.assert_called_once_with(req)
-        assert rig.records() == [] and not rig.hooks.is_tracking(req)
+        assert rig.records() == [] and not rig.hooks.owns(req)
         rig.advance()
         assert rig.terminations() == 1
 
@@ -1385,7 +1385,7 @@ class TestCancelWhileParked:
         ]
         attempt.finish(Failed("boom"))
         rig.advance(req)  # given back, planned again (retry budget)
-        assert req.state == CONTEXT_INIT and not rig.hooks.is_tracking(req)
+        assert req.state == CONTEXT_INIT and not rig.hooks.owns(req)
         assert self._cancel_pass(rig, req) is True
         # The PLANNED retry record votes once more so the ranks release it together; the layer
         # then terminates the request it held meanwhile.
@@ -1423,7 +1423,7 @@ class TestResponsePass:
         attempt.deliver_all()
         rig.advance()
         rig.executor._do_terminate_request.assert_called_once_with(req)
-        assert rig.records() == [] and not rig.hooks.is_tracking(req)
+        assert rig.records() == [] and not rig.hooks.owns(req)
 
     def test_case_a_through_a_real_handle_responses_pass(self, rig, monkeypatch):
         rig.wire_response_pass(monkeypatch)
@@ -1436,7 +1436,7 @@ class TestResponsePass:
         rig.executor.active_requests = [req]
         rig.executor._handle_responses()
         rig.executor._do_terminate_request.assert_called_once_with(req)
-        assert not rig.hooks.is_tracking(req)
+        assert not rig.hooks.owns(req)
 
 
 class TestCandidatesAndPublishers:
@@ -1502,7 +1502,7 @@ class TestHostFirstSchedulerSeam:
         rig.advance(req)
         assert rig.store.count("fetch_to_host") == 1 and rig.hooks.plan_fetch(req) is DEFER
         assert rig.kv.count("reserve_transfer_pages") == 0
-        assert req.state == CONTEXT_INIT and not rig.hooks.is_tracking(req)
+        assert req.state == CONTEXT_INIT and not rig.hooks.owns(req)
         assert rig.hooks.has_pending_work()  # a landing paces the idle loop ...
         assert rig.hooks.inflight_request_ids() == frozenset()  # ... but protects no page
         assert [r["state"] for r in rig.records()] == ["STAGING"]
@@ -1530,14 +1530,14 @@ class TestHostFirstSchedulerSeam:
         assert self.scheduler_round(rig, req) is True
         assert rig.store.count("place") == 1
         assert req.state == KV_FETCH_IN_PROGRESS and rig.coord.parked_request_ids() == {1}
-        assert rig.hooks.is_tracking(req) and rig.hooks.inflight_request_ids() == {1}
+        assert rig.hooks.owns(req) and rig.hooks.inflight_request_ids() == {1}
         (placed,) = rig.store.attempts
         assert extent_names(placed.payload) == rig.reader.unit_names(req, range(3))
 
         placed.deliver_all()
         rig.advance(req)
         assert req.state == CONTEXT_INIT and req.context_current_position == 96
-        assert landing.releases == 1 and not rig.hooks.is_tracking(req)
+        assert landing.releases == 1 and not rig.hooks.owns(req)
         assert [r["state"] for r in rig.records()] == ["LANDED"]
 
     def test_request_finished_while_staging_releases_the_landing_at_once_then_terminates(self):
@@ -1549,7 +1549,7 @@ class TestHostFirstSchedulerSeam:
         landing = rig.store.landings[0]
         rig.executor._terminate_request(req)
         assert rig.terminations() == 0 and rig.coord.held_request_ids() == {1}
-        assert landing.releases == 1 and not rig.coord.has_inflight()
+        assert landing.releases == 1 and not rig.coord.has_backend_work()
         assert rig.hooks.has_pending_work()  # held: the loop must not sleep on its queue
         rig.advance()
         rig.executor._do_terminate_request.assert_called_once_with(req)

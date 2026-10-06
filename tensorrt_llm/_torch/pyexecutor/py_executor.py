@@ -8379,8 +8379,7 @@ class PyExecutor:
             connector.release_unstarted_prefix_loads(request)
             if connector.defer_load_termination(request):
                 return False
-        if self.kv_transfer is not None and self.kv_transfer.is_tracking(
-                request):
+        if self.kv_transfer is not None and self.kv_transfer.owns(request):
             # A parked or held request is this layer's; cancel again once it is released.
             return False
         if self.kv_cache_transceiver is None:

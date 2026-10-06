@@ -18,7 +18,7 @@ from disaggregation.orchestration.kv_transfer.coordinator import KVTransferCoord
 from disaggregation.remote_cache import DEFER, FetchPlan, FetchSource, Planner  # noqa: E402
 from fakes import (  # noqa: E402
     TPB,
-    FakeDist,
+    FakeCollective,
     FakeEngineQueue,
     FakeReader,
     FakeRequest,
@@ -63,7 +63,7 @@ class Side:
             self.reader,
             self.effects,
             self.queue,
-            FakeDist(),
+            FakeCollective(),
         )
 
     @property
@@ -135,7 +135,7 @@ def test_publish_on_one_rank_then_probe_plan_launch_and_land_on_another():
         assert plan.source == "store" and plan.token_end == END and plan.hint is None
         assert ordinals_by_group(plan) == {0: tuple(range(BLOCKS))}
         gen.fill_all(0xEE)
-        gen.coord.launch_fetches([req], 1.0)
+        gen.coord.launch_reserved_fetches([req], 1.0)
         assert gen.effects.names() == ["prepare_fetch_resources", "park_for_fetch"]
         assert gen.records()[0]["state"] == "IN_FLIGHT"
 
@@ -171,7 +171,7 @@ def test_content_gone_between_probe_and_fetch_is_a_short_serve_retried_once_then
         _probe_and_plan(gen, req)
         store.evict_all()  # the answer was advisory (SPEC §6.2 probe): stale before the fetch
         gen.fill_all(0xEE)
-        gen.coord.launch_fetches([req], 1.0)
+        gen.coord.launch_reserved_fetches([req], 1.0)
 
         gen.advance_until("give_back_fetch_pages")
         # Delivered(∅) is a miss, not a failure: quiesce, give the pages back, keep one retry.
@@ -206,7 +206,7 @@ def test_store_outage_during_fetch_is_failed_gives_pages_back_and_the_retry_land
         _publish(ctx, req)
         _probe_and_plan(gen, req)
         store.fail_next("holds")  # the fetch's own lookup, not the probe's
-        gen.coord.launch_fetches([req], 1.0)
+        gen.coord.launch_reserved_fetches([req], 1.0)
 
         gen.advance_until("give_back_fetch_pages")
         rec = gen.records()[0]
@@ -218,7 +218,7 @@ def test_store_outage_during_fetch_is_failed_gives_pages_back_and_the_retry_land
         gen.coord.advance([req], 20.0)
         plan = gen.coord.plan_fetch(req)
         assert isinstance(plan, FetchPlan) and plan.token_end == END
-        gen.coord.launch_fetches([req], 20.0)
+        gen.coord.launch_reserved_fetches([req], 20.0)
         assert gen.records()[0]["try_index"] == 1 and gen.records()[0]["attempts"] == 2
         gen.advance_until("unpark")
         assert gen.effects.only("unpark") == [(req, END, False, None)]
@@ -291,14 +291,14 @@ class HostSide(Side):
             self.reader,
             self.effects,
             self.queue,
-            FakeDist(),
+            FakeCollective(),
         )
 
 
 def test_host_landing_rank_lands_first_then_places_after_the_scheduler_reserves():
     """The host-first flow end to end over a real backend: the plan starts the landing at once
     (``STAGING``, no pages), ``plan_fetch`` defers until the content is on the host, then answers
-    the plan so the scheduler reserves pages, and ``launch_fetches`` places instead of fetching.
+    the plan so the scheduler reserves pages, and ``launch_reserved_fetches`` places instead of fetching.
     The landing is released in the same round the request is unparked."""
     store = FakeBlobStore()
     ctx, gen = Side(store, publishes=True), HostSide(store, publishes=False)
@@ -327,7 +327,7 @@ def test_host_landing_rank_lands_first_then_places_after_the_scheduler_reserves(
         assert gen.rank.backend.landings_held() == 1
 
         # The scheduler reserved: launch places, parks, and the next round unparks + releases.
-        gen.coord.launch_fetches([req], 2.0)
+        gen.coord.launch_reserved_fetches([req], 2.0)
         assert gen.effects.names() == ["prepare_fetch_resources", "park_for_fetch"]
         assert gen.records()[0]["state"] == "IN_FLIGHT"
         gen.advance_until("unpark")

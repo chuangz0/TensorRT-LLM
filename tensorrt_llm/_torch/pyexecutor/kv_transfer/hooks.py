@@ -152,7 +152,7 @@ class KVTransferHooks:
         """After scheduling (design §3.2 step 3): start the fetches the scheduler reserved for."""
         if fetch_launch_queue:
             views = [EngineRequestView(request) for request in fetch_launch_queue]
-            self.coordinator.launch_fetches(views, time.monotonic())
+            self.coordinator.launch_reserved_fetches(views, time.monotonic())
 
     def publish_committed_blocks(self, context_requests: Sequence[LlmRequest]) -> None:
         """After a context step whose forward has completed and whose blocks are committed
@@ -168,7 +168,7 @@ class KVTransferHooks:
         now, ``False`` when this layer holds it and will terminate it later, or already has."""
         return self.coordinator.notify_request_finished(EngineRequestView(request))
 
-    def is_tracking(self, request: LlmRequest) -> bool:
+    def owns(self, request: LlmRequest) -> bool:
         """Whether this layer owns the request right now: parked for a fetch, or held after it
         finished. Read from the coordinator's record table, never from the request state. A
         running request with a publish in flight is not owned: it stays cancellable."""
@@ -234,7 +234,7 @@ class KVTransferHooks:
         still_in_flight = (
             frozenset() if backends_closed else self.coordinator.inflight_request_ids()
         )
-        for view in self.coordinator.tracked_requests():
+        for view in self.coordinator.owned_requests():
             request = view.request
             if request.py_request_id in still_in_flight:
                 logger.warning(

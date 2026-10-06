@@ -13,7 +13,7 @@ from disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority  #
 from disaggregation.remote_cache import FetchPlan  # noqa: E402
 from fakes import (  # noqa: E402
     TPB,
-    FakeDist,
+    FakeCollective,
     FakeEngineQueue,
     FakeFetches,
     FakeLandsOnHost,
@@ -49,7 +49,7 @@ def build(*, store: FakeFetches, plan_authority: PlanAuthority = PlanAuthority.V
         reader,
         RecordingEffects(),
         FakeEngineQueue(),
-        FakeDist(),
+        FakeCollective(),
         plan_authority=plan_authority,
     )
     return coordinator, reader
@@ -92,5 +92,5 @@ def test_a_host_landing_backend_with_a_hint_key_is_refused_at_assembly():
     )
     with pytest.raises(ValueError, match="takes no hint_key"):
         build_coordinator(
-            config, [handle], reader, RecordingEffects(), FakeEngineQueue(), FakeDist()
+            config, [handle], reader, RecordingEffects(), FakeEngineQueue(), FakeCollective()
         )

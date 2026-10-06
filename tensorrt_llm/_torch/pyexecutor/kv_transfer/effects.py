@@ -16,7 +16,7 @@
 
 ``EngineRequestView`` is the ``RequestView`` over one ``LlmRequest``; ``PyExecutorKVTransferEffects``
 is the ``KVTransferEffects`` over one ``PyExecutor`` and the only place that writes a request's
-transfer state; ``EngineWorkQueue`` and ``EngineDist`` complete the contract. The two state
+transfer state; ``EngineWorkQueue`` and ``EngineCollective`` complete the contract. The two state
 constants spell the coordination layer's states with the alias table of design §12.2.
 """
 
@@ -40,7 +40,7 @@ if TYPE_CHECKING:
 __all__ = [
     "KV_FETCH_IN_PROGRESS",
     "KV_PUBLISH_IN_PROGRESS",
-    "EngineDist",
+    "EngineCollective",
     "EngineRequestView",
     "EngineWorkQueue",
     "PyExecutorKVTransferEffects",
@@ -113,8 +113,8 @@ class EngineWorkQueue:
         return ran
 
 
-class EngineDist:
-    """``DistLike`` over the executor's ``dist``, for the ranks that plan together.
+class EngineCollective:
+    """``Collective`` over the executor's ``dist``, for the ranks that plan together.
 
     Without attention DP every rank plans together: the whole world, through ``allgather``. Under
     attention DP each replica plans on its own: this rank's pipeline group, through

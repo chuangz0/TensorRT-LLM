@@ -33,7 +33,7 @@ from typing import Any, Callable, Collection, Mapping
 from ..config import BackendEntry
 from ..registry import BackendBuildContext, BackendHandle
 from .backend import BlobStoreBackend, BlobStoreConfig, HostLandingBlobBackend
-from .staging import HostStagingPool, open_default_staging, plan_slot_geometry
+from .staging import HostStagingPool, open_pinned_staging_pool, plan_slot_geometry
 from .store import BlobStore
 
 __all__ = ["build_blob_backend"]
@@ -59,7 +59,7 @@ def build_blob_backend(
         raise ValueError(f"backend {entry.name!r}: a blob store takes no hint_key")
     backend_options, driver_options = _split_options(entry, driver_fields)
     config = BlobStoreConfig.from_dict(backend_options)
-    if config.lands_on_host and context.unit_bytes is None:
+    if config.lands_on_host and context.unit_bytes_of is None:
         raise ValueError(
             f"backend {entry.name!r}: landing 'host' needs the assembly to size units by name"
         )
@@ -102,11 +102,11 @@ def _host_landing_handle(
     inner = BlobStoreBackend(
         store, config, context.resolver, context.layout_fingerprint, staging=publish_pool
     )
-    assert context.unit_bytes is not None  # checked by the caller before the store was opened
+    assert context.unit_bytes_of is not None  # checked by the caller before the store was opened
     backend = HostLandingBlobBackend(
         inner,
         landing_pool,
-        context.unit_bytes,
+        context.unit_bytes_of,
         landing_wait_timeout_s=context.landing_wait_timeout_s,
     )
     return BackendHandle(
@@ -128,7 +128,7 @@ def _open_pool(
     store: BlobStore, context: BackendBuildContext, max_slots: int | None, budget_bytes: int
 ) -> HostStagingPool:
     slot_bytes, num_slots = plan_slot_geometry(context.max_unit_bytes, max_slots, budget_bytes)
-    return open_default_staging(
+    return open_pinned_staging_pool(
         store, slot_bytes=slot_bytes, num_slots=num_slots, device_index=context.device_index
     )
 

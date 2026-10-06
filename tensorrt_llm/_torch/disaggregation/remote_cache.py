@@ -15,7 +15,7 @@
 """Source policy and the merge rule (design §6.3, §7.2).
 
 The planner is the only place that reads request content in order to *decide*; building extents
-and chunks belongs to ``resource/``. ``servable_end`` (how far a store answer can take a request)
+and chunks belongs to ``resource/``. ``servable_blocks`` (how far a store answer can take a request)
 and ``merge`` (how far a delivery did take it) are pure functions of names and sets, so both rules
 can be tested with no engine at all.
 """
@@ -42,7 +42,7 @@ __all__ = [
     "Planner",
     "merge",
     "required_ordinals",
-    "servable_end",
+    "servable_blocks",
     "unit_names",
 ]
 
@@ -148,7 +148,7 @@ def _stale_range(spec: GroupSpec, history: int, tpb: int) -> tuple[int, int]:
 def _required_ranges(spec: GroupSpec, history: int, reuse_end: int, tpb: int) -> tuple[range, ...]:
     """``required_ordinals`` as at most two non-empty ranges: the sink blocks above the local
     prefix, then the live window above it (full attention: one range, ``[reuse_end, full)``).
-    ``servable_end`` checks each range with one prefix-sum lookup instead of a set walk."""
+    ``servable_blocks`` checks each range with one prefix-sum lookup instead of a set walk."""
     full = history // tpb
     if spec.kind is CacheKind.STATE:
         if history % tpb != 0 or full <= reuse_end:
@@ -209,7 +209,7 @@ def merge(plan: FetchPlan, served: frozenset[bytes]) -> int:
     are in ``served`` (design §6.3). Never below the local prefix end.
 
     ``merge`` asks which of the units the plan *asked for* arrived: it trims below
-    ``plan.reuse_end`` and walks down from ``plan.token_end``. ``servable_end`` asks the other
+    ``plan.reuse_end`` and walks down from ``plan.token_end``. ``servable_blocks`` asks the other
     question, which target a probe answer over every nameable block can serve. Under a windowed
     group any block missing at or above ``stale_end(token_end)`` drags B down to the reuse floor:
     the window blocks a lower boundary needs were stale at ``token_end``, so they were never
@@ -218,7 +218,7 @@ def merge(plan: FetchPlan, served: frozenset[bytes]) -> int:
     return _merge(plan, served, plan.group_plans)
 
 
-def servable_end(
+def servable_blocks(
     answer: frozenset[bytes],
     keys: Sequence[bytes],
     specs: Sequence[GroupSpec],
@@ -294,7 +294,7 @@ class Planner:
         nameable to fetch. Rank-independent: it starts at block 0, not at the local prefix.
 
         Every group is asked about every nameable block, not only the blocks live at the largest
-        target: ``servable_end`` may settle on a smaller target whose window needs blocks that
+        target: ``servable_blocks`` may settle on a smaller target whose window needs blocks that
         are stale at the largest one, and one probe is one RPC however many names it carries.
         """
         if req.is_gen_init:
@@ -382,7 +382,7 @@ class Planner:
             if answer is None:
                 pending = True
                 continue
-            end = servable_end(answer, keys, self._reader.group_specs(), cap, tpb)
+            end = servable_blocks(answer, keys, self._reader.group_specs(), cap, tpb)
             if end > 0:
                 chosen, token_end = source, end * tpb
                 break

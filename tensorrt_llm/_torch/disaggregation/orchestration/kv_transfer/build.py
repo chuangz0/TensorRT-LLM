@@ -28,7 +28,7 @@ from ...backends.registry import BackendHandle
 from ...base.views import ResourceReader
 from ...remote_cache import FetchSource, Planner
 from .coordinator import KVTransferCoordinator
-from .interfaces import DistLike, EngineQueue, KVTransferEffects, LandsOnHost, PlanAuthority
+from .interfaces import Collective, EngineQueue, KVTransferEffects, LandsOnHost, PlanAuthority
 
 __all__ = ["build_coordinator"]
 
@@ -39,7 +39,7 @@ def build_coordinator(
     reader: ResourceReader,
     effects: KVTransferEffects,
     queue: EngineQueue,
-    dist: DistLike,
+    dist: Collective,
     *,
     plan_authority: PlanAuthority = PlanAuthority.VOTED,
 ) -> KVTransferCoordinator:

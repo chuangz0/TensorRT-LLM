@@ -11,7 +11,7 @@ SPDX-License-Identifier: Apache-2.0
 ## A 类:改终态设计,需要作者批准
 
 **A1. `disaggregation/remote_cache.py` 承载 `Planner`。**
-README §5 给 `remote_cache.py` 的职责是"远端缓存的取用策略"。本分支落地的 `Planner` 正是它:决定取不取、问谁、按所有分页层组决定取到哪(`servable_end`)并归并(`merge`,其 B 也是重试提示),
+README §5 给 `remote_cache.py` 的职责是"远端缓存的取用策略"。本分支落地的 `Planner` 正是它:决定取不取、问谁、按所有分页层组决定取到哪(`servable_blocks`)并归并(`merge`,其 B 也是重试提示),
 也决定 gen-init 的短路与 gen-first 的 `DEFER`。它**不**持有目的区域——调度器经 `reserve_transfer_pages(req, token_end)` 预留页;**不**构造 extent——
 `KVv2ResourceReader.fetch_extent` 做。README 中与路由提示相关的 `hint.py` 尚不存在,随 worker 后端一并拆出(见 B2)。
 提议:README §5 的 `remote_cache.py` 一行加注"实现为 `Planner`;决策输入只用所有 rank 相同的量"。
@@ -26,7 +26,7 @@ README §5 把 blob 后端拆成 `fetch.py` 与 `publish.py`。本分支的 `Blo
 
 ## B 类:现状注记,进 README 文末"当前落点与上图的出入"段
 
-**B2. `hint.py` 尚不存在。** 路由今天只有 `FetchSource.hint_key`(装配表里每个后端认哪个提示键)+ `KVTransferCoordinator.launch_fetches` 里的一次
+**B2. `hint.py` 尚不存在。** 路由今天只有 `FetchSource.hint_key`(装配表里每个后端认哪个提示键)+ `KVTransferCoordinator.launch_reserved_fetches` 里的一次
 `open_route(hint)`。blob 后端 `hint_key = None`。有 worker 后端接入协调层时再拆。
 
 **B3. `resource/kv_v2_reader.py`。** `ResourceReader` 的 KV v2 实现:请求 → 块键(`context_block_keys`)、层组(`group_specs`)、fetch extent、publish extent。
@@ -39,7 +39,7 @@ README 无对应条目;它是 `resource/` 层"请求 → 可命名内容"的入�
 `orchestration/kv_transfer/records.py`(`TransferRecord` 表,服务 `KVTransferCoordinator`)。统一后后者取代前者(设计 §12.1)。
 
 **B7. 引擎侧三文件。** `pyexecutor/kv_transfer/effects.py`(唯一写请求状态处)、`kv_transfer/hooks.py`(循环每轮调用的对象 `KVTransferHooks`,引擎循环每个钩子点一个方法:
-`advance_round` / `launch_reserved_fetches` / `publish_committed_blocks` / `on_request_finished` / `is_tracking` / `pace_idle` / `close`)、
+`advance_round` / `launch_reserved_fetches` / `publish_committed_blocks` / `on_request_finished` / `owns` / `pace_idle` / `close`)、
 `kv_transfer/assembly.py`(装配与范围守卫)。README 无引擎层;旧路对应 `pyexecutor/disagg_adapter.py`。
 
 **B9. 新契约的落点。** 在 `feat/mooncake-store-backend` 上,SPEC §7 的十三个名字从 `base/cache_backend.py` 导出,与 kv-shared-draft 的

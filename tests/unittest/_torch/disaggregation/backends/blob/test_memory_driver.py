@@ -117,7 +117,7 @@ def test_memory_type_with_host_landing_builds_the_lands_on_host_shape(monkeypatc
     the inner backend, no pool is registered, and a unit round-trips publish -> land -> place."""
     importlib.import_module("disaggregation.backends.blob.drivers.memory")
     factory = importlib.import_module("disaggregation.backends.blob.factory")
-    monkeypatch.setattr(factory, "open_default_staging", fake_open_staging)
+    monkeypatch.setattr(factory, "open_pinned_staging_pool", fake_open_staging)
     arena = MemoryArena(1 << 10)
     resolver = ArenaResolver(arena)
     src = resolver.add(0, 0, 64)
@@ -136,7 +136,7 @@ def test_memory_type_with_host_landing_builds_the_lands_on_host_shape(monkeypatc
         resolver=resolver,
         layout_fingerprint=FINGERPRINT,
         max_unit_bytes=64,
-        unit_bytes=lambda name: 64,
+        unit_bytes_of=lambda name: 64,
     )
     handles = build_backends(KVTransferConfig(backends=(entry,)), context)
     try:

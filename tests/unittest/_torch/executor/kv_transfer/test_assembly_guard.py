@@ -368,7 +368,7 @@ def attach_over_fakes(monkeypatch, tmp_path, executor, *, build_backends, build_
     attach_kv_transfer(
         executor,
         str(config_path),
-        mapping=in_scope_mapping(world_size=1),  # ``EngineDist`` sizes its group from this
+        mapping=in_scope_mapping(world_size=1),  # ``EngineCollective`` sizes its group from this
         spec_config=None,
         kv_connector_manager=None,
         max_beam_width=1,

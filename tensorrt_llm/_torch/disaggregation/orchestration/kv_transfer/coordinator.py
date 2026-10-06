@@ -43,7 +43,7 @@ from ...base.views import RequestView, ResourceReader
 from ...remote_cache import DEFER, Defer, FetchPlan, FetchSource, Planner, merge, unit_names
 from .interfaces import (
     CarriesAux,
-    DistLike,
+    Collective,
     EngineQueue,
     KVTransferEffects,
     LandsOnHost,
@@ -234,7 +234,7 @@ class KVTransferCoordinator:
         reader: ResourceReader,
         effects: KVTransferEffects,
         queue: EngineQueue,
-        dist: DistLike,
+        dist: Collective,
         *,
         fetch_timeout_s: float | None = None,
         publish_timeout_s: float | None = None,
@@ -300,7 +300,9 @@ class KVTransferCoordinator:
         self._apply(verdicts, expired, answers, now)
         return sum(1 for candidate in candidates if self.plan_fetch(candidate) is DEFER)
 
-    def launch_fetches(self, queue: Sequence[RequestView], now: float | None = None) -> None:
+    def launch_reserved_fetches(
+        self, queue: Sequence[RequestView], now: float | None = None
+    ) -> None:
         """After scheduling: start the fetch of every request the scheduler allocated for. A
         record already landed on the host (``STAGED``) places its landing into the pages instead
         of fetching; either way the request is parked until the delivery is agreed on."""
@@ -467,7 +469,7 @@ class KVTransferCoordinator:
         if rec.deadline is None:
             rec.deadline = self._deadline_for(rec, now)
 
-    def has_inflight(self) -> bool:
+    def has_backend_work(self) -> bool:
         """Some backend is working for this coordinator: a delivery into pages, or a landing."""
         return any(self._backend_busy_on(rec) for rec in self._records.values())
 
@@ -511,10 +513,10 @@ class KVTransferCoordinator:
         through ``terminate_request`` once every record of it is gone."""
         return frozenset(self._held)
 
-    def tracked_requests(self) -> list[RequestView]:
+    def owned_requests(self) -> list[RequestView]:
         """Every request this coordinator owns right now: parked or held."""
-        tracked = self.parked_request_ids() | self.held_request_ids()
-        return [self._requests[rid] for rid in sorted(tracked) if rid in self._requests]
+        owned = self.parked_request_ids() | self.held_request_ids()
+        return [self._requests[rid] for rid in sorted(owned) if rid in self._requests]
 
     def status_dump(self) -> dict:
         return {
@@ -1176,7 +1178,7 @@ class KVTransferCoordinator:
             self._records[key] = rec
         elif rec.state not in (RecordState.PLANNED, RecordState.IN_FLIGHT):
             return
-        extent, chunk = self._reader.publish_description(req)
+        extent, chunk = self._reader.publish_extent_and_chunk(req)
         rec.extent = extent
         for name, publisher in self._publishers.items():
             # Design §7.5: a publisher that places pieces works in series and hears every piece;

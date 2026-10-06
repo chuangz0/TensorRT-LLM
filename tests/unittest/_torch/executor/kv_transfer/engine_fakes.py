@@ -218,8 +218,8 @@ class FakePublishes:
         return sum(1 for m, _ in self.calls if m == method)
 
 
-class SingleRankDist:
-    """``DistLike`` for a world of one rank: the gathered list is the payload itself."""
+class SingleRankCollective:
+    """``Collective`` for a world of one rank: the gathered list is the payload itself."""
 
     def allgather(self, payload: object) -> list:
         return [payload]
@@ -416,8 +416,8 @@ class FakeReader:
         extent = CacheExtent(name=f"fetch:{rid}".encode(), units=tuple(units), is_last=True)
         return extent, frozenset(committed_names)
 
-    def publish_description(self, request):
-        self.calls.append(("publish_description", request.py_request_id))
+    def publish_extent_and_chunk(self, request):
+        self.calls.append(("publish_extent_and_chunk", request.py_request_id))
         keys = self.block_keys(request)
         units = [
             Unit(name=s.tag + keys[o], local_group=s.local_group, local=o)

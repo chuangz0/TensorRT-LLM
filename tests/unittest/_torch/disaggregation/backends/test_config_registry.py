@@ -270,7 +270,7 @@ def make_context(**overrides) -> BackendBuildContext:
         layout_fingerprint=FINGERPRINT,
         max_unit_bytes=256,
         device_index=None,
-        unit_bytes=lambda name: 256,
+        unit_bytes_of=lambda name: 256,
     )
     kwargs.update(overrides)
     return BackendBuildContext(**kwargs)
@@ -425,7 +425,7 @@ def test_importing_the_registry_does_not_import_the_mooncake_driver():
 @pytest.fixture
 def mooncake_module(monkeypatch):
     """The driver module with ``MooncakeBlobStore.open`` replaced by a fake; yields
-    ``(factory_module, opened)``: the shared factory module, whose ``open_default_staging`` the
+    ``(factory_module, opened)``: the shared factory module, whose ``open_pinned_staging_pool`` the
     host-landing tests replace, and the fake stores opened so far."""
     driver = importlib.import_module("disaggregation.backends.blob.drivers.mooncake")
     factory = importlib.import_module("disaggregation.backends.blob.factory")
@@ -476,7 +476,7 @@ def fake_pools(mooncake_module, monkeypatch):
         geometry.append((slot_bytes, num_slots, device_index))
         return fake_open_staging(store, slot_bytes=slot_bytes, num_slots=num_slots)
 
-    monkeypatch.setattr(factory, "open_default_staging", open_pool)
+    monkeypatch.setattr(factory, "open_pinned_staging_pool", open_pool)
     return geometry
 
 
@@ -644,7 +644,7 @@ def test_mooncake_host_landing_needs_the_assembly_to_size_units(mooncake_module)
     _, opened = mooncake_module
     config = KVTransferConfig(backends=(entry("store", "mooncake", **TCP_OPTIONS),))
     with pytest.raises(ValueError, match="size units by name"):
-        build_backends(config, make_context(unit_bytes=None))
+        build_backends(config, make_context(unit_bytes_of=None))
     assert opened == []  # refused before a store is opened
 
 
@@ -784,7 +784,7 @@ def test_mooncake_pool_failure_closes_the_store(mooncake_module, monkeypatch):
     def fail_pool(*args, **kwargs):
         raise RuntimeError("no pinned memory")
 
-    monkeypatch.setattr(module, "open_default_staging", fail_pool)
+    monkeypatch.setattr(module, "open_pinned_staging_pool", fail_pool)
     config = KVTransferConfig(backends=(entry("store", "mooncake", **TCP_OPTIONS),))
     with pytest.raises(RuntimeError, match="no pinned memory"):
         build_backends(config, make_context())

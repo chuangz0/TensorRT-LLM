@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""``EngineDist``: the coordinator's ``DistLike`` over the executor's ``dist`` and its ``Mapping``.
+"""``EngineCollective``: the coordinator's ``Collective`` over the executor's ``dist`` and its ``Mapping``.
 
 Without attention DP the ranks that plan together are the world (``dist.allgather``); under
 attention DP they are this rank's pipeline group (``dist.pp_allgather``). A group of one rank
@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import EngineDist
+from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import EngineCollective
 
 pytestmark = pytest.mark.cpu_only
 
@@ -41,19 +41,19 @@ def mapping(*, world_size: int, pp_size: int, enable_attention_dp: bool) -> Simp
 
 def test_without_attention_dp_the_world_gathers():
     dist = RecordingDist(world_size=4, pp_size=2)
-    engine_dist = EngineDist(dist, mapping(world_size=4, pp_size=2, enable_attention_dp=False))
+    collective = EngineCollective(dist, mapping(world_size=4, pp_size=2, enable_attention_dp=False))
     payload = ([], [], [(1, "DEFER")])
 
-    assert engine_dist.allgather(payload) == [payload] * 4
+    assert collective.allgather(payload) == [payload] * 4
     assert dist.calls == [("allgather", payload)]
 
 
 def test_under_attention_dp_the_pipeline_group_gathers():
     dist = RecordingDist(world_size=4, pp_size=2)
-    engine_dist = EngineDist(dist, mapping(world_size=4, pp_size=2, enable_attention_dp=True))
+    collective = EngineCollective(dist, mapping(world_size=4, pp_size=2, enable_attention_dp=True))
     payload = ([], [], [(1, "DEFER")])
 
-    assert engine_dist.allgather(payload) == [payload] * 2
+    assert collective.allgather(payload) == [payload] * 2
     assert dist.calls == [("pp_allgather", payload)]
 
 
@@ -66,13 +66,13 @@ def test_a_group_of_one_answers_locally_without_a_collective(
     world_size, pp_size, enable_attention_dp
 ):
     dist = RecordingDist(world_size=world_size, pp_size=pp_size)
-    engine_dist = EngineDist(
+    collective = EngineCollective(
         dist,
         mapping(world_size=world_size, pp_size=pp_size, enable_attention_dp=enable_attention_dp),
     )
     payload = {"x": 1}
 
-    gathered = engine_dist.allgather(payload)
+    gathered = collective.allgather(payload)
 
     assert gathered == [payload] and gathered[0] is payload
     assert dist.calls == []

@@ -239,12 +239,12 @@ def test_deferred_release_takes_the_same_exits_as_the_statements_after_the_gate(
         )
 
 
-def test_cancel_asks_is_tracking_before_the_transceiver():
+def test_cancel_asks_owns_before_the_transceiver():
     text = source_of(PyExecutor._try_cancel_request)
     ordered(
         text,
         GUARD,
-        "self.kv_transfer.is_tracking(",
+        "self.kv_transfer.owns(",
         "return False",
         "if self.kv_cache_transceiver is None:",
     )

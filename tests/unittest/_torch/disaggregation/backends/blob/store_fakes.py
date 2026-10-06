@@ -358,7 +358,7 @@ def make_staging(
 def fake_open_staging(
     store, *, slot_bytes: int, num_slots: int, device_index=None
 ) -> HostStagingPool:
-    """Stand-in for ``factory.open_default_staging``: a registered host arena over a
+    """Stand-in for ``factory.open_pinned_staging_pool``: a registered host arena over a
     ``FakeCopier`` instead of a pinned torch buffer over CUDA. Same signature, so a test patches
     the factory's name with it."""
     host = MemoryArena(slot_bytes * num_slots)

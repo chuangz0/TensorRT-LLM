@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """``N`` real ``KVTransferHooks`` on ``N`` threads, one per TP rank, whose coordinators meet in the
-``FakeDistGroup`` collective through the real ``EngineDist`` (plan S3 (b)).
+``FakeDistGroup`` collective through the real ``EngineCollective`` (plan S3 (b)).
 
 Each round every rank runs what the loop runs: ``advance_round``, ``plan_fetch``, the scheduler's
 page reservation, ``launch_reserved_fetches``; then delivers its own store's attempts; later

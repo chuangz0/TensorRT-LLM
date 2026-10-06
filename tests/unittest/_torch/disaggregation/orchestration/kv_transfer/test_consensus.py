@@ -72,7 +72,7 @@ def launch_on(rig, req, now):
     assert isinstance(plan, FetchPlan)
     rig.plans[req.py_request_id] = plan
     before = len(rig.worker.attempts)
-    rig.coord.launch_fetches([req], now)
+    rig.coord.launch_reserved_fetches([req], now)
     assert len(rig.worker.attempts) == before + 1, "launch did not create a worker attempt"
     return rig.worker.attempts[-1]
 
@@ -192,7 +192,7 @@ def test_gen_init_expiry_on_one_rank_fails_every_rank(world):
     advance_all(world, rigs, [req], 0.0)
     for rank, rig in enumerate(rigs):
         # Launched later on rank 1: its own deadline is 15.
-        rig.coord.launch_fetches([req], 5.0 if rank == DIVERGENT else 0.0)
+        rig.coord.launch_reserved_fetches([req], 5.0 if rank == DIVERGENT else 0.0)
     advance_all(world, rigs, [], 10.0)
     for rig in rigs:
         # Every rank fails the request in this round; the pages stay held while the attempt may
@@ -213,7 +213,9 @@ def test_finished_request_crossing_its_deadline_on_one_rank_fails_nothing(world)
     req = worker_request()
     advance_all(world, rigs, [req], 0.0)
     for rank, rig in enumerate(rigs):
-        rig.coord.launch_fetches([req], 5.0 if rank == DIVERGENT else 0.0)  # deadlines 15 / 10
+        rig.coord.launch_reserved_fetches(
+            [req], 5.0 if rank == DIVERGENT else 0.0
+        )  # deadlines 15 / 10
     attempts = [rig.worker.attempts[-1] for rig in rigs]
     for rig in rigs:
         rig.coord.notify_request_finished(req, 6.0)
@@ -337,14 +339,14 @@ def test_rank_that_gives_up_launching_holds_no_one_and_fails_the_fetch_for_every
     laggard.worker.reject_next = 3
     for now in (1.0, 2.0, 3.0):
         assert isinstance(laggard.coord.plan_fetch(req), FetchPlan)
-        laggard.coord.launch_fetches([req], now)
+        laggard.coord.launch_reserved_fetches([req], now)
         advance_all(world, rigs, [], now)
         for rig in peers(rigs):  # the running attempts are not disturbed
             assert rig.record(1)["state"] == "IN_FLIGHT" and rig.worker.count("quiesce") == 0
     assert laggard.fetch_record(1).launch_gave_up and laggard.coord.plan_fetch(req) is DEFER
     assert laggard.effects.count("give_back_fetch_pages") == 3
     assert votes_of(laggard) == [(KEY, "FAILED", 0)]
-    laggard.coord.launch_fetches([req], 4.0)  # the scheduler queue may still name it
+    laggard.coord.launch_reserved_fetches([req], 4.0)  # the scheduler queue may still name it
     assert laggard.worker.count("fetch") == 3
 
     for a in running:
@@ -362,7 +364,7 @@ def test_rank_that_gives_up_launching_holds_no_one_and_fails_the_fetch_for_every
     running = [launch_on(rig, req, 6.0) for rig in peers(rigs)]
     laggard.worker.reject_next = 3
     for now in (7.0, 8.0, 9.0):
-        laggard.coord.launch_fetches([req], now)
+        laggard.coord.launch_reserved_fetches([req], now)
         advance_all(world, rigs, [], now)
     for a in running:
         a.deliver_all()
@@ -379,7 +381,7 @@ def test_route_refused_on_one_rank_fails_the_fetch_for_every_rank(world):
     running = [launch_on(rig, req, 0.0) for rig in peers(rigs)]
     laggard = rigs[DIVERGENT]
     laggard.worker.open_route_errors.append(ValueError("bad hint"))
-    laggard.coord.launch_fetches([req], 0.0)
+    laggard.coord.launch_reserved_fetches([req], 0.0)
     assert laggard.fetch_record(1).launch_gave_up and laggard.coord.plan_fetch(req) is DEFER
     loop_advance_all(world, rigs, req, 1.0)
     for rig in peers(rigs):  # in flight: nothing lands yet
@@ -400,7 +402,7 @@ def test_a_given_up_rank_and_an_unlaunched_rank_agree_without_anyone_launching(w
         rig.worker.open_route_errors.append(ValueError("bad hint"))
     advance_all(world, rigs, [req], 0.0)
     for rig in peers(rigs):
-        rig.coord.launch_fetches([req], 0.0)
+        rig.coord.launch_reserved_fetches([req], 0.0)
         assert rig.fetch_record(1).launch_gave_up
     # Rank 1 never launched: an UNLAUNCHED vote does not hold a failure back.
     loop_advance_all(world, rigs, req, 1.0)
@@ -430,13 +432,13 @@ def test_expiry_on_a_launched_rank_fails_and_releases_the_unlaunched_rank_at_onc
     assert laggard.records() == [] and laggard.effects.count("hold_for_transfer") == 0
     for rig in peers(rigs):
         assert rig.record(1)["state"] == "IN_FLIGHT" and rig.record(1)["expired"]
-        assert rig.effects.count("hold_for_transfer") == 1 and rig.coord.has_inflight()
+        assert rig.effects.count("hold_for_transfer") == 1 and rig.coord.has_backend_work()
 
     for a in running:
         a.deliver_all()
     advance_all(world, rigs, [], 11.0)  # the late outcomes settle locally, without rank 1
     for rig in peers(rigs):
-        assert rig.records() == [] and not rig.coord.has_inflight()
+        assert rig.records() == [] and not rig.coord.has_backend_work()
         assert rig.effects.count("terminate_request") == 1 and rig.effects.count("unpark") == 0
         assert votes_of(rig) == []
 
@@ -653,7 +655,7 @@ def test_identical_plans_are_kept_and_local_reuse_may_differ(world):
         else:
             assert ordinals_by_group(plan) == {0: tuple(range(7))}
     for rig in rigs:
-        rig.coord.launch_fetches([req], 1.0)
+        rig.coord.launch_reserved_fetches([req], 1.0)
     for rig in rigs:
         rig.worker.attempts[-1].deliver_all()
     advance_all(world, rigs, [], 2.0)
@@ -688,7 +690,7 @@ def place_on(rig, req, now):
     assert isinstance(plan, FetchPlan)
     rig.plans[req.py_request_id] = plan
     before = len(rig.host.attempts)
-    rig.coord.launch_fetches([req], now)
+    rig.coord.launch_reserved_fetches([req], now)
     assert len(rig.host.attempts) == before + 1, "launch did not place the landing"
     return rig.host.attempts[-1]
 
