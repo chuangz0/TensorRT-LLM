@@ -1966,7 +1966,11 @@ class PyExecutor:
     @property
     def should_stop_processing(self):
         return self.is_shutdown and len(self.active_requests) == 0 and \
-            len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers()
+            len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers() \
+            and not (self.kv_transfer is not None
+                     # A publish of a finished request may still be in flight;
+                     # every rank reads the same gathered word.
+                     and self.kv_transfer.any_rank_has_pending_work())
 
     def _has_pending_connector_transfers(self) -> bool:
         connector = getattr(self, "kv_connector_manager", None)
@@ -6193,8 +6197,18 @@ class PyExecutor:
             # clear stats once every rank is aligned.
             iter_stats_payload = (self._adp_iter_stats.next_payload()
                                   if self.enable_iter_perf_stats else None)
+            kv_transfer_pending = 0
+            if self.kv_transfer is not None:
+                # This rank's pending KV transfer work rides the rank-state gather to its peers.
+                kv_transfer_pending = self.kv_transfer.pending_bit()
             all_rank_states = self.adp_router.gather_all_rank_states(
-                active_requests, iter_stats_payload=iter_stats_payload)
+                active_requests,
+                iter_stats_payload=iter_stats_payload,
+                kv_transfer_pending=kv_transfer_pending)
+            if self.kv_transfer is not None:
+                # Every replica's pending KV transfer work, from the same gather.
+                self.kv_transfer.absorb_peer_pending(
+                    any(s.kv_transfer_pending for s in all_rank_states))
             if self.enable_iter_perf_stats:
                 for record in self._adp_iter_stats.finalize(
                         all_rank_states, is_rank0=self.dist.rank == 0):

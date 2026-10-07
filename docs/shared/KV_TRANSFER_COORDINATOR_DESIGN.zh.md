@@ -223,6 +223,8 @@ sequenceDiagram
 | `plan_fetch(req)`(钩子) | 调度器评估 context 请求时,**在** `prepare_context_cache` **之前** | 读记录表,答 `FetchPlan / None / DEFER`。不分配、不改状态、不阻塞 |
 | `launch_reserved_fetches(queue, now)` | 调度后,forward 前 | 对调度器已分配的请求发起 fetch |
 | `publish_committed_blocks(reqs, now)` | 每个 context step 之后、响应 pass 之前 | 对本轮算了 context 的请求发起或推进 publish;结束的请求由引擎经释放门单独 `notify_request_finished`,仍有记录在飞(publish 未 RELEASED,或 fetch 在飞)的 `hold_for_transfer` |
+| `KVTransferHooks.has_pending_work()`(钩子) | 空闲判定(`_fetch_and_enqueue_requests`)、`pace_idle` | 本 rank 有待办,或上一轮"齐"里任一 rank 报了待办(`any_rank_pending`),或 ADP 下本轮 rank-state gather 里任一副本报了待办:循环不得阻塞在请求队列上 |
+| `KVTransferHooks.any_rank_has_pending_work()`(钩子) | 关停:`should_stop_processing`,在请求广播之后、本轮 `advance_round` 之前 | 关停排空:`(本 rank 有待办 and not any_rank_drained) or any_rank_pending or ADP 同轮 gather 到的副本位`;为真则循环再跑一轮,直到在飞 publish 落地、held 请求终结。各 rank 读到同一值:每一项要么是齐到的(上一轮的两个 OR、ADP 本轮的位),要么在集合的各 rank 上对称产生(本 rank 自己的记录:同一 forward 后的 publish、同一响应 pass 里的 hold、同一计划的 fetch);stop check 不读本地时钟。排空期限:关停后首个只剩传输的轮(`is_shutdown and not active_requests`)起 `close_timeout_s`,过期的 rank 在"齐"里报 `drained`、`pending=False`;任一 rank 报了 drained,所有 rank 自下一轮起不再计自己的待办,store 挂死时关停最多耗两倍该界(排空 + 后端 close) |
 
 `candidates` = 处于 `CONTEXT_INIT` 且计划尚未决定的请求:新到的、上一轮 `DEFER` 的、失败后要重试的。计划在循环头算而不是在调度器里算,是因为 store 的 `probe` 可能要一个来回、路由提示异步到达,而计划必须在所有 rank 上一致。
 
@@ -440,7 +442,8 @@ class KVTransferCoordinator:
                  plan_authority: PlanAuthority = PlanAuthority.VOTED, queue_budget: int = 64): ...
 
     # ---- 循环入口(只有 advance 做集合通信:每个 rank 每轮恰调一次)----
-    def advance(self, candidates: Sequence[RequestView], now: float) -> int: ...  # 返回仍未决定(答 DEFER)的候选数
+    def advance(self, candidates: Sequence[RequestView], now: float, *,
+                drained: bool = False) -> int: ...  # 返回仍未决定(答 DEFER)的候选数;drained=True 的 rank 报 drained 且 pending 报 False
     def launch_reserved_fetches(self, queue: Sequence[RequestView], now: float | None = None) -> None: ...
     def publish_committed_blocks(self, reqs: Sequence[RequestView], now: float | None = None) -> None: ...
 
@@ -457,6 +460,8 @@ class KVTransferCoordinator:
         # 释放门:True = 引擎现在可终止;False = 本层 hold 住、稍后由本层终止(或已终止)
     def has_backend_work(self) -> bool: ...                 # 有后端在为本层工作:在飞交付或落地
     def has_pending_work(self) -> bool: ...                 # 不等新请求也会有进展:空闲判定与 pace_idle 用
+    any_rank_pending: bool                                 # 上一轮"齐"里任一 rank 报了 pending(各 rank 读到同一值);首轮前为 False
+    any_rank_drained: bool                                 # 上一轮"齐"里任一 rank 报了 drained(已过关停排空期限);同上
     def inflight_request_ids(self) -> frozenset[int]: ...  # 后端仍可能碰其页的请求:调度器的驱逐保护与释放门用
     def parked_request_ids(self) -> frozenset[int]: ...    # fetch 在飞、仍在跑的请求
     def held_request_ids(self) -> frozenset[int]: ...      # 已结束、被 hold 的请求
@@ -466,7 +471,7 @@ class KVTransferCoordinator:
 
 `reader` 是本 rank 的资源视图(extent 与 chunk 从它取);`dist` 是 `Collective` 协议,测试注入单 rank 伪件。请求以 `py_request_id` 为键记在协调层自己的表中。两个必填超时的缺省只在 `backends/config.py`(`KVTransferConfig`)一处,由装配传入。
 
-`status_dump` 给出 JSON 可序列化的快照:`plan_authority`;`records`,每条记录一项,带 `request_id`、`direction`、`state`、`try_index`、`attempts`、`outcomes`、`deadline`、`expired`、`token_end`、`launch_gave_up`、`peer_launched_at`、`has_landing`、`waiting_since`,以及重试簿记 `retries_left`、`consecutive_launch_failures`、`retry_hint` 和 `committed_names`(只给计数,名字是哈希);`decided_plans`(记住的计划答案数);`finished_pending`(已结束、尚未终止的请求)。关停时由 `pyexecutor/kv_transfer/hooks.py` 连同各后端的计数一起写成 JSON 文件。读者按键取值,给记录项加键是兼容变更。
+`status_dump` 给出 JSON 可序列化的快照:`plan_authority`;`records`,每条记录一项,带 `request_id`、`direction`、`state`、`try_index`、`attempts`、`outcomes`、`deadline`、`expired`、`token_end`、`launch_gave_up`、`peer_launched_at`、`has_landing`、`waiting_since`,以及重试簿记 `retries_left`、`consecutive_launch_failures`、`retry_hint` 和 `committed_names`(只给计数,名字是哈希);`decided_plans`(记住的计划答案数);`finished_pending`(已结束、尚未终止的请求);`any_rank_pending`、`any_rank_drained`(上一轮是否有 rank 报了 pending / drained)。关停时由 `pyexecutor/kv_transfer/hooks.py` 连同各后端的计数一起写成 JSON 文件。读者按键取值,给记录项加键是兼容变更。
 
 `advance` 的四个阶段,每个阶段只操作记录表:
 
@@ -479,7 +484,7 @@ class KVTransferCoordinator:
 - 对 `candidates` 算本 rank 的计划答案(§7.2);`FOLLOWER` 不算。已有计划的记录(含 `launch_gave_up` 而对调度器答 `DEFER` 的)不重算:下一步由共识决定。
 
 **齐**(一次集合通信;三种 `PlanAuthority` 下每轮都发生,空闲轮也发生)
-- payload:`[(record_id, 票型, B)]`、过期的记录 id、`[(request_id, (token_end, source) | None | DEFER)]`;计划段只在 `VOTED` 下携带,其余模式为空列表。
+- payload(线上是 5 元组):`[(record_id, 票型, B)]`、过期的记录 id、`[(request_id, (token_end, source) | None | DEFER)]`、`pending`(收阶段之后本 rank 是否仍有待办:后端在干活、fetch 等页、已结束请求的记录等共识;drained 的 rank 报 False)、`drained`(本 rank 是否已过关停排空期限);计划段只在 `VOTED` 下携带,其余模式为空列表。各 rank 对 `pending`、`drained` 分别取 OR 存为 `any_rank_pending`、`any_rank_drained`,供空闲判定与关停排空读取(§3.2)。
 - 票型四种,fetch 与 publish 同一形状、同一归约:`UNLAUNCHED`(fetch 有计划、本 rank 的页里还没有 attempt:页未预留、发起没成功,或已落 host 等页)、`INFLIGHT`(本 rank 还有 attempt 或落地在跑)、`FAILED`(本 rank 的 attempt 或落地失败;放弃发起 `launch_gave_up`;同伴已发起而本 rank 未发起超过 `unlaunched_timeout_s`;等页或等落地内存超过 `landing_wait_timeout_s`;publish 有提交被拒 `rejected`)、`TERMINAL(B)`(本 rank 全部 attempt 无失败结束,B 为归并结果;publish 的 `B=0`)。请求已结束的记录照样投票,直到共识,使各 rank 同一轮终结请求:仍 `IN_FLIGHT` 的按 attempt 结局投(`_inflight_vote`:在跑则 `INFLIGHT`,任一 attempt Failed 则 `FAILED`,否则 `TERMINAL(归并 B)`),不在 `IN_FLIGHT` 的投 `TERMINAL`(fetch 带计划目标,`_finished_vote`;被拒的 publish 仍投 `FAILED`);只有过期的记录才不投票、本地结算。
 - 范围:`world`;ADP 下改为本 PP 组(今天 `_gen_consensus` 的规则)。
 - 到达归约(仍要求每条记录 `seen==n`),按序:任一 `INFLIGHT` → 本轮不落地(失败落地要 `quiesce`,不能压在活 attempt 上);否则任一 `FAILED` → 决定性失败,已 Delivered 的 rank 一样丢弃、退页、耗一次重试;否则任一 `UNLAUNCHED` → 本轮不落地(落地要每个 rank 的页都在);否则全 `TERMINAL`,取 `MIN(B)`,因为各 rank 持有的层组不同,`served` 不同;served short 时 `MIN(B)` 也是下次重试的 `retry_hint`。
@@ -833,7 +838,7 @@ class StreamsLayers(Protocol):
 | pipelined 分块发送 | 保留:`publish_committed_blocks` 每步调用,worker 实现 `PlacesPieces` |
 | 子请求的投票 id | 保留:共识按记录 id |
 | `AsyncTransferManager.start_transfer` 释放 seq slot、spec 资源、draft 的 index slot | 保留:`hold_for_transfer` |
-| `pace_idle` / `poll_progress_when_idle` | 保留:循环层用 `has_pending_work()`(在飞、等页、等共识都算);空闲路径也执行 `EngineQueue` |
+| `pace_idle` / `poll_progress_when_idle` | 保留:循环层用 `has_pending_work()`(在飞、等页、等共识都算,含同伴 rank 上一轮齐到的 `any_rank_pending` 与 ADP 的 rank-state 位);空闲路径也执行 `EngineQueue` |
 | 超时的 ADP allgather、`check_transfer_timeouts` 对 ctx 发送的超时 | 保留:并入共识;publish 记录有 deadline |
 | aux 通道(首 token、draft token、ctx_usage) | 保留:`CarriesAux`,经 `unpark` 交给引擎 |
 | 超时后晚到的数据 | gen-init 与普通 fetch 同样过期即 `fail_requests`;晚到的 `Delivered` 只释放记录(`_release_finished_fetch`),不 `unpark`(§7.1、§9.6) |

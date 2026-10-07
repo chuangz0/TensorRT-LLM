@@ -220,7 +220,13 @@ class TestRankState:
 
     def test_serialize(self):
         state = RankState(rank=0, num_active_requests=5, num_active_tokens=100)
-        assert state.serialize() == [0, 5, 100, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0]
+        assert state.serialize() == [0, 5, 100, 0, 0, 0, -1, 0, 0, 0, 0, 0, 0, 0]
+
+    def test_kv_transfer_pending_rides_the_prefix_and_defaults_to_zero(self):
+        state = RankState(rank=1, kv_transfer_pending=1)
+        assert state.serialize()[:5] == [1, 0, 0, 0, 1]
+        assert RankState.deserialize(data=state.serialize()) == state
+        assert RankState.deserialize(data=[1, 0, 0, 0]).kv_transfer_pending == 0
 
     def test_deserialize(self):
         state = RankState.deserialize(data=[2, 3, 50])

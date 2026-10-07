@@ -164,6 +164,8 @@ def test_publish_on_one_rank_then_probe_plan_launch_and_land_on_another():
         assert gen.records() == [] and gen.effects.count("hold_for_transfer") == 0
         assert gen.coord.status_dump() == {
             "plan_authority": "VOTED",
+            "any_rank_pending": True,
+            "any_rank_drained": False,
             "records": [],
             "decided_plans": 0,
             "finished_pending": [],

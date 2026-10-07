@@ -44,7 +44,10 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 __extra_import_path__ = ["../../disaggregation"]
 from fake_dist import FakeDistGroup, FakeDistRank  # noqa: E402
 
-__all__ = ["CountingEffects", "FakeDistGroup", "RankRig", "rank_mapping"]
+__all__ = ["CLOSE_TIMEOUT_S", "CountingEffects", "FakeDistGroup", "RankRig", "rank_mapping"]
+
+CLOSE_TIMEOUT_S = 5.0
+"""Every rig's ``close_timeout_s``: how long its shutdown drain counts its own pending work."""
 
 
 class CountingEffects(PyExecutorKVTransferEffects):
@@ -87,9 +90,10 @@ class RankRig:
     """One rank of a world: real coordinator, planner, effects and hooks over the fakes, with
     ``schedule_round`` standing in for what the engine loop and the V2 scheduler do per round.
 
-    ``unlaunched_timeout_s``, ``fetch_timeout_s`` and ``plan_authority`` go to the coordinator;
-    the store answers every probe and every fetch stays in flight until ``deliver_all``. The
-    executor's ``_free_request_resources`` frees the fake cache, so an eviction is observable in
+    ``unlaunched_timeout_s``, ``fetch_timeout_s`` and ``plan_authority`` go to the coordinator,
+    ``close_timeout_s`` to the hooks (a per-rig value plays clock skew between ranks); the store
+    answers every probe and every fetch stays in flight until ``deliver_all``. The executor's
+    ``_free_request_resources`` frees the fake cache, so an eviction is observable in
     ``kv.kv_cache_map``.
     """
 
@@ -102,6 +106,7 @@ class RankRig:
         unlaunched_timeout_s: float | None = 10.0,
         fetch_timeout_s: float | None = None,
         plan_authority: PlanAuthority = PlanAuthority.VOTED,
+        close_timeout_s: float = CLOSE_TIMEOUT_S,
     ) -> None:
         self.rank = rank
         self.dist = group.rank(rank)
@@ -144,7 +149,7 @@ class RankRig:
             self.effects,
             [handle],
             [entry],
-            close_timeout_s=5.0,
+            close_timeout_s=close_timeout_s,
         )
         self.executor.kv_transfer = self.hooks
         self.executor._free_request_resources.side_effect = self.kv.free_resources

@@ -280,6 +280,48 @@ def test_idle_detection_counts_a_transfer_in_flight_as_live():
     )
 
 
+def test_stop_check_waits_for_pending_transfer_work_and_reads_the_same_word_on_every_rank():
+    """``should_stop_processing`` consults the layer; at both loop exits it is read after the
+    request broadcast (every rank consumes the shutdown item in the same round) and before this
+    round's ``advance_round``, so every rank decides on the same word."""
+    text = source_of(PyExecutor.should_stop_processing.fget)
+    ordered(
+        text,
+        "self.is_shutdown",
+        "not self._has_pending_connector_transfers()",
+        GUARD,
+        "self.kv_transfer.any_rank_has_pending_work()",
+    )
+    for loop in (PyExecutor._prepare_and_schedule_batch, PyExecutor._executor_loop_pp):
+        ordered(
+            source_of(loop),
+            "self._fetch_and_activate_new_requests()",
+            "if self.should_stop_processing:",
+            "self.kv_transfer.advance_round(self.active_requests)",
+        )
+
+
+def test_attention_dp_carries_the_pending_bit_in_the_rank_state_gather_before_the_broadcast():
+    """Under attention DP the coordinator's collective is the pipeline group, so a replica's
+    pending work reaches the other replicas as a field of the rank-state gather, which every
+    rank enters every round before the request broadcast and the stop check."""
+    text = source_of(PyExecutor._fetch_new_requests)
+    ordered(
+        text,
+        "if self.enable_attention_dp:",
+        GUARD,
+        "kv_transfer_pending = self.kv_transfer.pending_bit()",
+        "self.adp_router.gather_all_rank_states(",
+        "kv_transfer_pending=kv_transfer_pending",
+        GUARD,
+        "self.kv_transfer.absorb_peer_pending(",
+        "any(s.kv_transfer_pending for s in all_rank_states)",
+        "self._fetch_and_enqueue_requests(",
+    )
+    assert len(hook_calls(text, "pending_bit")) == 1
+    assert len(hook_calls(text, "absorb_peer_pending")) == 1
+
+
 def test_shutdown_closes_the_layer_after_the_device_sync_and_before_the_managers():
     text = source_of(PyExecutor.shutdown)
     ordered(

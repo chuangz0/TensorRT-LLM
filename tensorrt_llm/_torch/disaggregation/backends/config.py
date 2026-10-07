@@ -163,7 +163,10 @@ class KVTransferConfig:
         probe_timeout_s: Longest a request waits for a store lookup before it plans without
             the store (wall-clock, from its first deferral).
         close_timeout_s: Longest ``close`` waits for the backends to finish before it gives them
-            up and releases the requests they were holding.
+            up and releases the requests they were holding. Also the longest the engine loop
+            keeps running at shutdown for a transfer still in flight on this rank, counted from
+            the first round with nothing left but transfers, so with a store that hangs,
+            shutdown may take up to twice this bound: the drain, then the backend close.
     """
 
     backends: tuple[BackendEntry, ...]

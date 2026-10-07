@@ -21,7 +21,7 @@ import time
 
 import pytest
 from engine_fakes import make_request
-from multi_rank_fakes import FakeDistGroup, RankRig
+from multi_rank_fakes import CLOSE_TIMEOUT_S, FakeDistGroup, RankRig
 
 from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority
 from tensorrt_llm._torch.disaggregation.remote_cache import DEFER
@@ -170,23 +170,27 @@ def test_pp_follower_adopts_the_owners_plans_and_lands_in_the_same_round(monkeyp
             stage0.owner_round([requests[0]])  # round 1: plan, export, reserve, launch
             owner.deliver_all()
             stage0.owner_round([requests[0]])  # round 2: both TERMINAL -> unpark
+            stage0.owner_round([requests[0]])  # round 3: nothing left to say
         else:
             follower.schedule_round([requests[1]], adopt=stage0.adopt)  # adopt, reserve, launch
             follower.deliver_all()
             follower.schedule_round([requests[1]], adopt=stage0.adopt)
+            follower.schedule_round([requests[1]], adopt=stage0.adopt)
 
     group.run(engine_loop)
 
-    assert stage0.sent == [[(1, (TOKEN_END, "store"))], []]
+    assert stage0.sent == [[(1, (TOKEN_END, "store"))], [], []]
     assert follower.store.count("probe") == 0  # the follower never plans
     assert not paces_idle(follower.hooks, monkeypatch)  # nothing deferred, nothing pending
     for rig, request in zip((owner, follower), requests):
         assert rig.effects.unparks == 1 and rig.effects.give_backs == 0
         assert request.context_current_position == TOKEN_END
-        assert rig.gathers() == ["allgather"] * 2
+        assert rig.gathers() == ["allgather"] * 3
         assert rig.coord.status_dump()["plan_authority"] == rig.coord.plan_authority.value
     # Both ranks speak in every round, and neither carries plans in the collective.
-    assert [payload[2] for _, payload in owner.dist.calls] == [[], []]
+    assert [payload[2] for _, payload in owner.dist.calls] == [[], [], []]
+    # The pending word: True while the fetch is planned or in flight, False once it landed.
+    assert [payload[3] for _, payload in owner.dist.calls] == [False, True, False]
     assert owner.dist.calls == follower.dist.calls
 
 
@@ -291,6 +295,198 @@ def test_a_request_with_a_publish_in_flight_survives_the_recompute_pause_on_ever
         assert rig.hooks.inflight_request_ids() == frozenset() and rig.records() == []
         assert 1 not in rig.kv.kv_cache_map
         assert rig.gathers() == ["allgather"] * 2
+
+
+def publish_then_shut_down(rigs, requests) -> None:
+    """On every rank: the request's prefill ended and its blocks are offered, the gate holds
+    the finished request, and the shutdown item has been consumed."""
+    for rig, request in zip(rigs, requests):
+        rig.publish(request)
+        rig.executor._terminate_request(request)
+        rig.executor.is_shutdown = True
+
+
+def test_shutdown_drain_exits_in_the_same_round_on_every_rank():
+    """A finished request whose publish is still in flight on rank 0 only: the stop check reads
+    the same word on both ranks every round, both keep gathering until the publish lands and
+    the held request is terminated, and both read False in the same round afterwards."""
+    world_size = 2
+    group, rigs = make_world(world_size)
+    requests = rank_local_requests(world_size)
+    publish_then_shut_down(rigs, requests)
+    rigs[1].deliver_all()  # rank 1's store is done, rank 0's is not
+
+    def one_round(rank):
+        rigs[rank].schedule_round([])
+
+    for rig in rigs:
+        assert rig.hooks.any_rank_has_pending_work()  # before any drain round: own word
+    group.run(one_round)  # rank 0 INFLIGHT, rank 1 TERMINAL: no verdict yet
+    for rig in rigs:
+        assert rig.hooks.any_rank_has_pending_work() and rig.coord.any_rank_pending
+        assert rig.executor._do_terminate_request.call_count == 0
+    rigs[0].deliver_all()
+    group.run(one_round)  # both TERMINAL: released and terminated on both ranks
+    for rig in rigs:
+        assert rig.executor._do_terminate_request.call_count == 1 and rig.records() == []
+        assert rig.hooks.any_rank_has_pending_work()  # that round's words still saw the record
+    group.run(one_round)  # nothing left anywhere: every word is False
+    for rig in rigs:
+        assert not rig.hooks.any_rank_has_pending_work() and not rig.hooks.has_pending_work()
+        assert rig.gathers() == ["allgather"] * 3
+
+
+def test_shutdown_drain_gives_up_in_the_same_round_once_the_deadline_passes(clock):
+    """Rank 0's store never finishes. Past the drain deadline (``close_timeout_s`` after the
+    first round at shutdown) each rank reports itself drained and no pending work; the stop
+    check reads False on both ranks in the same round, with rank 0's attempt still in flight."""
+    world_size = 2
+    group, rigs = make_world(world_size)
+    requests = rank_local_requests(world_size)
+    publish_then_shut_down(rigs, requests)
+    rigs[1].deliver_all()
+
+    def one_round(rank):
+        rigs[rank].schedule_round([])
+
+    group.run(one_round)  # t = 1000: the drain clock starts on both ranks
+    for rig in rigs:
+        assert rig.hooks.any_rank_has_pending_work()
+    clock["t"] += CLOSE_TIMEOUT_S
+    group.run(one_round)  # past the deadline: both report drained, neither pending
+    for rig in rigs:
+        assert rig.coord.any_rank_drained and not rig.coord.any_rank_pending
+        assert not rig.hooks.any_rank_has_pending_work()
+        assert rig.hooks.has_pending_work()  # idle pacing still sees the record
+        assert [r["state"] for r in rig.records()] == ["IN_FLIGHT"]
+        assert rig.executor._do_terminate_request.call_count == 0
+        assert rig.gathers() == ["allgather"] * 2
+
+
+def skewed_world(clock_skew_s: float):
+    """Two TP ranks whose drain deadlines differ by ``clock_skew_s``: rank 0's clock runs
+    ahead, so it reaches its deadline a round before rank 1 does."""
+    group = FakeDistGroup(world_size=2, tp_size=2)
+    rigs = [
+        RankRig(group, 0, close_timeout_s=CLOSE_TIMEOUT_S),
+        RankRig(group, 1, close_timeout_s=CLOSE_TIMEOUT_S + clock_skew_s),
+    ]
+    for rig in rigs:
+        rig.executor.is_shutdown = True
+    return group, rigs
+
+
+def stop_words(rigs, clock, now_by_rank) -> list[bool]:
+    """Each rank's stop check, evaluated with its own clock reading."""
+    words = []
+    for rig, now in zip(rigs, now_by_rank):
+        clock["t"] = now
+        words.append(rig.hooks.any_rank_has_pending_work())
+    return words
+
+
+def test_shutdown_drain_with_skewed_clocks_reads_the_same_word_on_every_rank(clock):
+    """The reviewer's probe. No record exists at the last advance before the deadline; then a
+    request finishes with its first publish on every rank (fresh, symmetric work), and the two
+    ranks reach the stop check with their clocks on either side of the deadline, rank 0's
+    ahead by a round. The word is equal on both ranks every round, rank 0 (drained first)
+    still lands its publish because rank 1's word keeps the loop alive, and both exit together.
+    """
+    group, rigs = skewed_world(clock_skew_s=1.0)
+
+    def one_round(rank):
+        rigs[rank].schedule_round([])
+
+    group.run(one_round)  # t = 1000: deadlines 1005 (rank 0) and 1006 (rank 1)
+    clock["t"] = 1004.5
+    group.run(one_round)  # nothing to say yet
+    assert [rig.coord.any_rank_pending for rig in rigs] == [False, False]
+    requests = rank_local_requests(2)
+    publish_then_shut_down(rigs, requests)  # finished with a publish in flight, after the advance
+    assert stop_words(rigs, clock, [1005.0 + 1e-4, 1005.0 - 1e-4]) == [True, True]
+
+    clock["t"] = 1005.2
+    group.run(one_round)  # rank 0 drained (pending False), rank 1 not (pending True)
+    assert [rig.coord.any_rank_drained for rig in rigs] == [True, True]
+    assert [rig.coord.any_rank_pending for rig in rigs] == [True, True]
+    assert stop_words(rigs, clock, [1005.4, 1005.3]) == [True, True]
+    for rig in rigs:
+        rig.deliver_all()
+    clock["t"] = 1005.6
+    group.run(one_round)  # both TERMINAL: landed, terminated on both; only rank 1 says pending
+    for rig in rigs:
+        assert rig.executor._do_terminate_request.call_count == 1 and rig.records() == []
+    assert stop_words(rigs, clock, [1005.8, 1005.7]) == [True, True]
+    clock["t"] = 1006.1
+    group.run(one_round)  # both drained, nothing anywhere
+    assert stop_words(rigs, clock, [1006.3, 1006.2]) == [False, False]
+    for rig in rigs:
+        assert rig.gathers() == ["allgather"] * 5
+
+
+def test_shutdown_drain_with_skewed_clocks_and_a_hung_store_exits_together(clock):
+    """As above, but no store ever finishes: rank 0 is drained a round before rank 1; the word
+    stays True on both while rank 1 still reports pending, and turns False on both in the
+    round after rank 1 is drained too, with every attempt still in flight."""
+    group, rigs = skewed_world(clock_skew_s=1.0)
+    requests = rank_local_requests(2)
+
+    def one_round(rank):
+        rigs[rank].schedule_round([])
+
+    group.run(one_round)  # t = 1000: deadlines 1005 and 1006
+    publish_then_shut_down(rigs, requests)
+    assert stop_words(rigs, clock, [1005.0 + 1e-4, 1005.0 - 1e-4]) == [True, True]
+    clock["t"] = 1005.2
+    group.run(one_round)  # rank 0 drained, rank 1 pending
+    assert stop_words(rigs, clock, [1005.4, 1005.3]) == [True, True]
+    clock["t"] = 1006.2
+    group.run(one_round)  # both drained, neither pending
+    assert stop_words(rigs, clock, [1006.4, 1006.3]) == [False, False]
+    for rig in rigs:
+        assert [r["state"] for r in rig.records()] == ["IN_FLIGHT"]
+        assert rig.executor._do_terminate_request.call_count == 0
+        assert rig.gathers() == ["allgather"] * 3
+
+
+def test_attention_dp_replica_sees_a_peers_pending_publish_through_the_rank_state_bit(
+    monkeypatch,
+):
+    """Replicas enter no collective, so a replica's pending work reaches its peers as the bit
+    the engine puts in the attention-DP rank-state gather: ``pending_bit`` out, the OR of every
+    replica's bit back through ``absorb_peer_pending``. The idle replica then neither blocks on
+    its queue nor stops at shutdown while the publishing replica still works."""
+    group, rigs = make_world(2, enable_attention_dp=True)
+    idle, publishing = rigs
+    request = make_request(11, PROMPT_LEN)
+    publishing.publish(request)
+    publishing.executor._terminate_request(request)  # held
+
+    def rank_state_gather() -> list[int]:
+        bits = [rig.hooks.pending_bit() for rig in rigs]
+        for rig in rigs:
+            rig.hooks.absorb_peer_pending(any(bits))
+        return bits
+
+    assert rank_state_gather() == [0, 1]
+    assert not idle.coord.has_pending_work()  # nothing of its own ...
+    assert idle.hooks.has_pending_work() and idle.hooks.any_rank_has_pending_work()  # ... yet
+    assert paces_idle(idle.hooks, monkeypatch)
+
+    publishing.deliver_all()
+    for rig in rigs:
+        rig.schedule_round([])  # the publish lands; the held request is terminated
+    assert publishing.executor._do_terminate_request.call_count == 1
+    assert publishing.records() == []
+    assert rank_state_gather() == [0, 1]  # that round's own word still saw the record
+    assert idle.hooks.any_rank_has_pending_work()
+    for rig in rigs:
+        rig.schedule_round([])
+    assert rank_state_gather() == [0, 0]
+    for rig in rigs:
+        assert not rig.hooks.has_pending_work() and not rig.hooks.any_rank_has_pending_work()
+        assert not paces_idle(rig.hooks, monkeypatch)
+        assert rig.gathers() == []  # a group of one enters no collective
 
 
 def test_attention_dp_replicas_run_without_a_collective_and_share_the_shard_tag():

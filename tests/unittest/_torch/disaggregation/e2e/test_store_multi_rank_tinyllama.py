@@ -21,7 +21,6 @@ discovers them). GPU memory is registered through dma-buf: the Mooncake wheel re
 """
 
 import os
-import time
 
 import pytest
 from mooncake_cluster import (
@@ -30,7 +29,6 @@ from mooncake_cluster import (
     LAYOUTS,
     MODELS,
     SELECTED_MODELS,
-    SETTLE_S,
     TOKENS_PER_BLOCK,
     TRANSPORTS,
     assert_no_leftover_records,
@@ -65,7 +63,6 @@ def run_engine(
     layout,
     *,
     disable_overlap,
-    settle_s=0.0,
     max_seq_len=None,
 ):
     from tensorrt_llm import LLM
@@ -81,7 +78,6 @@ def run_engine(
     )
     try:
         tokens = generate_ids(llm, prompt)
-        time.sleep(settle_s)
     finally:
         llm.shutdown()
     return tokens
@@ -119,7 +115,6 @@ def test_store_fetch_multi_rank(transport_store, layout, model, request, tmp_pat
         prompt,
         layout,
         disable_overlap=True,
-        settle_s=SETTLE_S if world_size > 1 else 0.0,
         max_seq_len=max_seq_len,
     )
     tokens_b = run_engine(

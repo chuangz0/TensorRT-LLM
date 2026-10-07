@@ -119,6 +119,7 @@ def _recording_kv_transfer(calls: list) -> SimpleNamespace:
         launch_reserved_fetches=record("launch_reserved_fetches"),
         publish_committed_blocks=record("publish_committed_blocks"),
         pace_idle=record("pace_idle"),
+        any_rank_has_pending_work=record("any_rank_has_pending_work", False),
     )
 
 
@@ -249,9 +250,10 @@ _SCHEDULE_HEAD = [
     ("receive_gen_init", []),
     ("poll_progress_when_idle",),
 ]
-# Non-PP loops flush at loop exit; the PP loop does not.
+# Non-PP loops flush at loop exit; the PP loop does not. With a KV transfer binding
+# attached, the stop check asks it whether any rank still has pending work.
 _SHUTDOWN_PASS = [("handle_errors_synced",), ("flush_pending_transfer_responses",)]
-_PP_SHUTDOWN_PASS = [("handle_errors_synced",)]
+_PP_SHUTDOWN_PASS = [("handle_errors_synced",), ("kv_transfer.any_rank_has_pending_work",)]
 
 
 def test_executor_loop_transcript(monkeypatch) -> None:

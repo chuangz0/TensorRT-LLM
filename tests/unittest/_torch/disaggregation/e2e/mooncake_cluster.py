@@ -436,14 +436,6 @@ SELECTED_EXACT_LAYOUTS = os.environ.get("KV_TRANSFER_E2E_LAYOUTS", "tp1").split(
 TRANSPORT_SEGMENT_BYTES = 4 << 30
 """``gemma3_12b`` at 2000 tokens publishes about 750 MiB of KV."""
 
-SETTLE_S = float(os.environ.get("KV_TRANSFER_E2E_SETTLE_S", "3"))
-"""How long a publishing engine of more than one rank keeps serving after its request finished,
-so the publish lands while the loop still runs. Known engine gap, not designed behaviour: rank 0
-blocks idle in ``_fetch_and_enqueue_requests`` because only its own ``has_pending_work()`` gates
-the idle wait, so a peer rank's pending publish of a finished request waits for the next wake-up,
-and shutdown does not drain publishes in flight (readability work order appendix item 2a).
-Remove this sleep when the engine wakes on peers' pending work."""
-
 
 def world_size_of(layout: dict) -> int:
     return layout.get("tensor_parallel_size", 1) * layout.get("pipeline_parallel_size", 1)

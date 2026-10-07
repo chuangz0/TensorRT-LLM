@@ -156,6 +156,8 @@ def test_request_end_releases_landed_fetch_with_exactly_one_quiesce():
     assert rig.worker.routes[0].closed == 1  # idempotent close, not closed twice
     assert rig.coord.status_dump() == {
         "plan_authority": "VOTED",
+        "any_rank_pending": True,
+        "any_rank_drained": False,
         "records": [],
         "decided_plans": 0,
         "finished_pending": [],
@@ -209,6 +211,8 @@ def test_request_end_while_in_flight_abandons_then_releases_on_outcome(late):
     assert quiesce_indices(rig.trace)[0] < effect_indices(rig.trace, "terminate_request")[0]
     assert rig.coord.status_dump() == {
         "plan_authority": "VOTED",
+        "any_rank_pending": True,
+        "any_rank_drained": False,
         "records": [],
         "decided_plans": 0,
         "finished_pending": [],
@@ -765,8 +769,8 @@ def test_finished_request_whose_peer_stays_in_flight_is_terminated_at_its_deadli
     and the held request is terminated here without a failure, since it already ended."""
 
     def peer_in_flight(local):
-        votes, expired, plans = local
-        return ([(key, "INFLIGHT", 0) for key, _, _ in votes], expired, plans)
+        votes, expired, plans, pending, drained = local
+        return ([(key, "INFLIGHT", 0) for key, _, _ in votes], expired, plans, pending, drained)
 
     rig = Rig(dist=PeerGather(peer_in_flight), fetch_timeout_s=10.0)
     req = worker_request()
@@ -866,7 +870,7 @@ def test_publish_expiry_warns_and_waits_for_the_outcome():
     rec = rig.record(3, "publish")
     assert rec["state"] == "IN_FLIGHT" and rec["expired"]
     rig.coord.advance([], 6.0)
-    assert rig.payloads()[-1] == ([], [], [])  # expired: no longer the ranks' business
+    assert rig.payloads()[-1] == ([], [], [], True, False)  # expired: no vote, but work here
     pub.attempts[0].deliver_all()
     rig.coord.advance([], 7.0)
     assert rig.effects.names() == ["hold_for_transfer", "terminate_request"]
@@ -938,7 +942,9 @@ def test_pipelined_publish_of_finished_request_without_last_piece_is_bounded():
     rig = Rig(
         publishers=[placing],
         publish_timeout_s=5.0,
-        dist=PeerGather(lambda local: ([], [], local[2])),  # a peer that casts no vote on it
+        dist=PeerGather(
+            lambda local: ([], [], local[2], False, False)
+        ),  # a peer with no vote on it
     )
     req = FakeRequest(3, prompt_len=29)
     rig.reader.script_publish(
@@ -1126,6 +1132,8 @@ def test_publish_rejected_while_fetch_in_flight_terminates_once_the_fetch_releas
     assert rig.effects.count("unpark") == 0
     assert rig.coord.status_dump() == {
         "plan_authority": "VOTED",
+        "any_rank_pending": True,
+        "any_rank_drained": False,
         "records": [],
         "decided_plans": 0,
         "finished_pending": [],
@@ -1150,6 +1158,8 @@ def test_publish_landed_first_waits_for_the_in_flight_fetch_before_terminating()
     assert rig.effects.count("unpark") == 0
     assert rig.coord.status_dump() == {
         "plan_authority": "VOTED",
+        "any_rank_pending": True,
+        "any_rank_drained": False,
         "records": [],
         "decided_plans": 0,
         "finished_pending": [],
@@ -1181,6 +1191,8 @@ def test_both_records_in_flight_fetch_releases_first_then_publish_lands():
     assert rig.worker.count("quiesce") == 1 and pub.count("quiesce") == 1
     assert rig.coord.status_dump() == {
         "plan_authority": "VOTED",
+        "any_rank_pending": True,
+        "any_rank_drained": False,
         "records": [],
         "decided_plans": 0,
         "finished_pending": [],
@@ -1277,13 +1289,47 @@ def test_allgather_payload_carries_plan_answers_and_arrivals():
     rig = Rig()
     req = worker_request()
     rig.coord.advance([req], 0.0)
-    arrivals, expired, plans = rig.payloads()[0]
+    arrivals, expired, plans, pending, _ = rig.payloads()[0]
     assert arrivals == [] and expired == [] and plans == [(1, (END, "worker"))]
+    assert pending is False  # the plan is written after the gather: no record yet
     rig.coord.launch_reserved_fetches([req], 0.0)
     rig.worker.attempts[0].deliver_all()
     rig.coord.advance([], 1.0)
-    arrivals, expired, plans = rig.payloads()[1]
+    arrivals, expired, plans, _, _ = rig.payloads()[1]
     assert arrivals == [((1, "fetch"), "TERMINAL", END)] and plans == []
+
+
+def test_allgather_payload_carries_pending_and_drained_and_the_ors_are_last_rounds():
+    """The 4th element is whether this rank has pending work after the poll, the 5th whether it
+    is drained (``advance(..., drained=True)``): a drained rank reports no pending work while its
+    attempt is still in flight. ``any_rank_pending`` and ``any_rank_drained`` are the gathered
+    ORs, False before the first round."""
+    pub = FakePublishes()
+    rig = Rig(publishers=[pub])
+    assert rig.coord.any_rank_pending is False and rig.coord.any_rank_drained is False
+    rig.coord.advance([], 0.0)
+    assert rig.payloads()[-1] == ([], [], [], False, False)
+    assert rig.coord.any_rank_pending is False and rig.coord.any_rank_drained is False
+    req = FakeRequest(3, prompt_len=29)
+    rig.coord.publish_committed_blocks([req], now=0.0)
+    rig.coord.advance([], 1.0)
+    assert rig.payloads()[-1][3:] == (True, False) and rig.coord.any_rank_pending is True
+    rig.coord.advance([], 2.0, drained=True)
+    assert rig.payloads()[-1][3:] == (False, True)
+    assert rig.coord.any_rank_pending is False and rig.coord.any_rank_drained is True
+    assert rig.record(3, "publish")["state"] == "IN_FLIGHT"
+    dump = rig.coord.status_dump()
+    assert dump["any_rank_pending"] is False and dump["any_rank_drained"] is True
+
+
+def test_any_rank_pending_and_drained_are_true_on_a_peers_word_alone():
+    rig = Rig(dist=PeerGather(lambda local: ([], [], local[2], True, False)))
+    rig.coord.advance([], 0.0)
+    assert rig.payloads()[-1][3:] == (False, False)
+    assert rig.coord.any_rank_pending is True and rig.coord.any_rank_drained is False
+    rig = Rig(dist=PeerGather(lambda local: ([], [], local[2], False, True)))
+    rig.coord.advance([], 0.0)
+    assert rig.coord.any_rank_pending is False and rig.coord.any_rank_drained is True
 
 
 def test_allgather_payload_wires_none_and_defer():
@@ -1299,11 +1345,13 @@ def test_allgather_payload_wires_none_and_defer():
 
 def test_peer_reporting_short_b_fails_the_local_landed_fetch():
     def peer(local):
-        arrivals, expired, plans = local
+        arrivals, expired, plans, pending, drained = local
         return (
             [(key, kind, token_end - 4) for key, kind, token_end in arrivals],
             expired,
             plans,
+            pending,
+            drained,
         )
 
     rig = Rig(dist=PeerGather(peer))
@@ -1318,8 +1366,8 @@ def test_peer_reporting_short_b_fails_the_local_landed_fetch():
 
 def test_peer_voting_a_different_source_makes_the_plan_none():
     def peer(local):
-        arrivals, expired, plans = local
-        return (arrivals, expired, [(rid, (v[0], "store")) for rid, v in plans])
+        arrivals, expired, plans, pending, drained = local
+        return (arrivals, expired, [(rid, (v[0], "store")) for rid, v in plans], pending, drained)
 
     rig = Rig(dist=PeerGather(peer))
     req = worker_request()
@@ -1328,7 +1376,7 @@ def test_peer_voting_a_different_source_makes_the_plan_none():
 
 
 def test_peer_not_reporting_an_arrival_keeps_it_in_flight():
-    rig = Rig(dist=PeerGather(lambda local: ([], [], local[2])))
+    rig = Rig(dist=PeerGather(lambda local: ([], [], local[2], False, False)))
     req = worker_request()
     rig.plan_and_launch(req).deliver_all()
     rig.coord.advance([], 1.0)
@@ -1339,7 +1387,7 @@ def test_consensus_wait_is_bounded_by_fetch_timeout():
     """Two ranks; the peer's request is gone and it casts no vote on the record any more. The
     delivered rank waits for the agreement until its deadline, then fails the request and
     settles the record on its own word instead of waiting forever."""
-    rig = Rig(dist=PeerGather(lambda local: ([], [], local[2])), fetch_timeout_s=10.0)
+    rig = Rig(dist=PeerGather(lambda local: ([], [], local[2], False, False)), fetch_timeout_s=10.0)
     req = worker_request()
     rig.plan_and_launch(req, now=0.0).deliver_all()
     rig.coord.advance([], 9.0)
@@ -1640,8 +1688,8 @@ def test_peer_launched_at_is_cleared_when_the_landing_memory_arrives():
     is accepted: a STAGING record is on the fetch deadline, not on the unlaunched clock."""
 
     def peer_landed(local):
-        votes, expired, plans = local
-        return ([(key, "TERMINAL", END) for key, _, _ in votes], expired, plans)
+        votes, expired, plans, pending, drained = local
+        return ([(key, "TERMINAL", END) for key, _, _ in votes], expired, plans, pending, drained)
 
     rig = host_rig(dist=PeerGather(peer_landed))
     req = host_request()
@@ -1822,6 +1870,8 @@ def test_staging_expiry_fails_the_request_and_releases_the_landing_at_once():
     assert rig.coord.held_request_ids() == frozenset()
     assert rig.coord.status_dump() == {
         "plan_authority": "VOTED",
+        "any_rank_pending": True,
+        "any_rank_drained": False,
         "records": [],
         "decided_plans": 0,
         "finished_pending": [],

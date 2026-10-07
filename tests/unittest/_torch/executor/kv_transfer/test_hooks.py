@@ -324,7 +324,7 @@ class TestUnpark:
         assert rig.kv.calls == [("try_commit_blocks", 1)]
         assert rig.kv.kv_cache_map[1].num_committed_tokens == 96
         assert not rig.hooks.owns(req)
-        assert not rig.hooks.has_pending_work()
+        assert not rig.coord.has_pending_work()
         assert rig.hooks.plan_fetch(req) is None  # decided: compute the rest locally
         # A landed fetch record reaches its release point when the request ends (design §4.3).
         assert [r["state"] for r in rig.records()] == ["LANDED"]
@@ -703,8 +703,11 @@ class TestReleaseGate:
         attempt.deliver_all()
         rig.advance()
         rig.executor._do_terminate_request.assert_called_once_with(req)
-        assert not rig.hooks.owns(req) and not rig.hooks.has_pending_work()
+        assert not rig.hooks.owns(req) and not rig.coord.has_pending_work()
         assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
+        assert rig.hooks.has_pending_work()  # that round's gathered word still saw the record
+        rig.advance()
+        assert not rig.hooks.has_pending_work()
 
     def test_case_b_publish_failure_still_terminates_the_finished_request_once(self, rig, caplog):
         """The request already answered its client; a store that then fails to take its blocks
@@ -909,6 +912,8 @@ class TestCancelAndIdle:
         assert rig.executor._try_cancel_request(req) is True
 
     def test_has_pending_work_reports_fetches_and_publishes(self, rig):
+        """True while this rank has work, and for one more round after it ends: the round
+        that ends it gathers the ranks' words while the record still exists."""
         assert rig.hooks.has_pending_work() is False
         req = make_request(1, 100)
         rig.plan(req)  # planned, not launched: waiting for pages on this layer's clock
@@ -918,10 +923,14 @@ class TestCancelAndIdle:
         assert rig.hooks.has_pending_work() is True
         attempt.deliver_all()
         rig.advance(req)
+        assert rig.coord.has_pending_work() is False and rig.hooks.has_pending_work() is True
+        rig.advance(req)
         assert rig.hooks.has_pending_work() is False
         pub = rig.publish(req)
         assert rig.hooks.has_pending_work() is True
         pub.deliver_all()
+        rig.advance()
+        assert rig.coord.has_pending_work() is False and rig.hooks.has_pending_work() is True
         rig.advance()
         assert rig.hooks.has_pending_work() is False
 
@@ -944,8 +953,11 @@ class TestCancelAndIdle:
         assert sleeps == [0.001, 0.001]
         rig2.store.attempts[-1].deliver_all()
         rig2.advance(req2)
+        rig2.hooks.pace_idle()  # the landing round's gathered word: one more yield
+        assert sleeps == [0.001, 0.001, 0.001]
+        rig2.advance(req2)
         rig2.hooks.pace_idle()
-        assert sleeps == [0.001, 0.001]
+        assert sleeps == [0.001, 0.001, 0.001]
 
     def test_pace_idle_sleeps_while_a_fetch_waits_for_pages_or_a_request_is_held(self, monkeypatch):
         """A planned fetch the scheduler finds no pages for, and a finished request held until
@@ -964,9 +976,13 @@ class TestCancelAndIdle:
         rig.hooks.pace_idle()
         assert sleeps == [0.001, 0.001]
         rig.advance()
-        assert rig.terminations() == 1 and not rig.hooks.has_pending_work()
+        assert rig.terminations() == 1 and not rig.coord.has_pending_work()
+        rig.hooks.pace_idle()  # that round's gathered word: one more yield
+        assert sleeps == [0.001, 0.001, 0.001]
+        rig.advance()
+        assert not rig.hooks.has_pending_work()
         rig.hooks.pace_idle()
-        assert sleeps == [0.001, 0.001]
+        assert sleeps == [0.001, 0.001, 0.001]
 
     def test_candidates_are_first_chunk_context_init_non_dummy_only(self, rig):
         first = make_request(1, 100)
@@ -1074,6 +1090,72 @@ class TestClose:
         hooks_logger.error.assert_not_called()
         wait_for_closer_thread_to_exit()
 
+    def test_stop_check_sees_a_publish_submitted_and_held_after_this_rounds_advance(self, rig):
+        """Round N: the loop head's ``advance_round`` runs before the forward; the publish is
+        submitted after the forward and the gate holds the finished request in the response
+        pass. Round N+1 consumes the shutdown item: its stop check, with no advance in between,
+        must keep the loop running on this rank's own word, since no gathered word has seen the
+        record yet."""
+        rig.advance()
+        held = make_request(1, 100)
+        rig.publish(held)
+        rig.executor._terminate_request(held)
+        rig.executor.is_shutdown = True
+        assert rig.coord.any_rank_pending is False
+        assert rig.hooks.any_rank_has_pending_work()
+
+    def test_shutdown_drain_lands_the_held_publish_and_close_finds_nothing_left(self, tmp_path):
+        dump_path = tmp_path / "kvt.json"
+        rig = Rig(status_dump_path=str(dump_path))
+        held = make_request(1, 100)
+        attempt = rig.publish(held)
+        rig.executor._terminate_request(held)
+        rig.executor.is_shutdown = True
+        assert rig.hooks.any_rank_has_pending_work()
+
+        attempt.deliver_all()
+        rig.advance()  # the drain round: the publish lands, the held request is terminated
+        assert rig.records() == [] and rig.coord.status_dump()["finished_pending"] == []
+        assert rig.terminations() == 1
+        assert rig.hooks.any_rank_has_pending_work()  # that round's word still saw the record
+        rig.advance()
+        assert not rig.hooks.any_rank_has_pending_work()
+
+        rig.hooks.close()
+        assert rig.trace == ["backend.close"]  # nothing left to free
+        with open(dump_path, encoding="utf-8") as f:
+            coordinator = json.load(f)["coordinator"]
+        assert coordinator["records"] == [] and coordinator["finished_pending"] == []
+        assert coordinator["any_rank_pending"] is False
+
+    def test_shutdown_drain_stops_counting_its_own_work_after_close_timeout(self, monkeypatch):
+        """The attempt never finishes. ``close_timeout_s`` after the first round at shutdown
+        with nothing left but transfers this rank reports itself drained, and its word turns
+        False with the record still in flight, so a hung store cannot keep the loop alive;
+        idle pacing still sees the record."""
+        now = {"t": 1000.0}
+        monkeypatch.setattr(time, "monotonic", lambda: now["t"])
+        rig = Rig(close_timeout_s=5.0)
+        held = make_request(1, 100)
+        rig.publish(held)
+        rig.executor._terminate_request(held)
+        rig.executor.is_shutdown = True
+        rig.executor.active_requests = [make_request(2, 100)]  # a request still running
+        rig.advance()  # not quiescent: the drain clock does not start
+        now["t"] += 10.0
+        rig.executor.active_requests = []
+        rig.advance()  # the first quiescent round at shutdown starts the drain clock
+        assert rig.hooks.any_rank_has_pending_work()
+        now["t"] += 4.9
+        rig.advance()
+        assert rig.hooks.any_rank_has_pending_work() and not rig.coord.any_rank_drained
+        now["t"] += 0.1
+        rig.advance()  # past the deadline: this rank reports itself drained
+        assert rig.coord.any_rank_drained
+        assert not rig.hooks.any_rank_has_pending_work()
+        assert rig.hooks.has_pending_work()
+        assert [r["state"] for r in rig.records()] == ["IN_FLIGHT"]
+
     def test_status_dump_schema(self, tmp_path):
         dump_path = tmp_path / "kvt.json"
         rig = Rig(status_dump_path=str(dump_path))
@@ -1096,11 +1178,14 @@ class TestClose:
         coordinator = dump["coordinator"]
         assert set(coordinator) == {
             "plan_authority",
+            "any_rank_pending",
+            "any_rank_drained",
             "records",
             "decided_plans",
             "finished_pending",
         }
         assert coordinator["plan_authority"] == "VOTED"
+        assert coordinator["any_rank_pending"] is True  # the last advance saw the planned fetch
         assert coordinator["finished_pending"] == [1]
         assert isinstance(coordinator["decided_plans"], int)
         records = {(r["request_id"], r["direction"]): r for r in coordinator["records"]}
@@ -1148,6 +1233,8 @@ class TestClose:
         dump = rig.hooks.status_dump()
         assert dump["coordinator"] == {
             "plan_authority": "VOTED",
+            "any_rank_pending": False,
+            "any_rank_drained": False,
             "records": [],
             "decided_plans": 0,
             "finished_pending": [],

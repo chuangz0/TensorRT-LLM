@@ -132,6 +132,8 @@ class RankState:
     num_active_requests: int = 0
     num_active_tokens: int = 0
     num_retiring_requests: int = 0
+    kv_transfer_pending: int = 0
+    """Whether this rank's KV transfer layer still has pending work (0 or 1)."""
     iter_stats: RankIterStatsPayload = field(default_factory=RankIterStatsPayload)
 
     def copy_iter_stats_from(self, iter_stats_payload: RankIterStatsPayload | None) -> None:
@@ -146,6 +148,7 @@ class RankState:
             self.num_active_requests,
             self.num_active_tokens,
             self.num_retiring_requests,
+            self.kv_transfer_pending,
             *self.iter_stats.serialize(),
         ]
 
@@ -153,7 +156,7 @@ class RankState:
     def deserialize(cls, data: list[int]) -> RankState:
         """Deserialize from a flat list received via allgather."""
         values = list(data)
-        rank_state_prefix_field_count = 4
+        rank_state_prefix_field_count = 5
         rank_state_fields = fields(cls)[:rank_state_prefix_field_count]
         max_field_count = rank_state_prefix_field_count + len(fields(RankIterStatsPayload))
         if len(values) < 1:
@@ -175,6 +178,7 @@ class RankState:
             num_active_requests=rank_values[1],
             num_active_tokens=rank_values[2],
             num_retiring_requests=rank_values[3],
+            kv_transfer_pending=rank_values[4],
             iter_stats=RankIterStatsPayload.deserialize(values[rank_state_prefix_field_count:]),
         )
 
@@ -286,6 +290,7 @@ class ADPRouter(ABC):
         active_requests: list[LlmRequest],
         new_requests: list[RequestQueueItem] | None = None,
         iter_stats_payload: RankIterStatsPayload | None = None,
+        kv_transfer_pending: int = 0,
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
 
@@ -296,6 +301,9 @@ class ADPRouter(ABC):
                 new-request info (e.g. KV-cache-aware routing).
             iter_stats_payload: Completed previous-iteration stats payload to
                 piggyback on this allgather, if one is pending.
+            kv_transfer_pending: Whether this rank's KV transfer layer still
+                has pending work (0 or 1), piggybacked for the other ranks'
+                idle and shutdown decisions.
         """
         if self.exclude_retiring_requests:
             active_requests_for_overlap = build_active_requests_for_overlap(active_requests)
@@ -305,6 +313,7 @@ class ADPRouter(ABC):
             num_retiring_requests = 0
         local_state = self.create_rank_state(active_requests_for_overlap, new_requests or [])
         local_state.num_retiring_requests = num_retiring_requests
+        local_state.kv_transfer_pending = kv_transfer_pending
         local_state.copy_iter_stats_from(iter_stats_payload)
         responses = self.dist.tp_allgather(local_state.serialize())
         return [RankState.deserialize(data=resp) for resp in responses]

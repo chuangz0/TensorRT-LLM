@@ -63,7 +63,9 @@ class KVTransferHooks:
         effects: The engine-side effects.
         backends: The built backends, in config order; closed by ``close``.
         backend_entries: Their config entries, for the status dump.
-        close_timeout_s: How long ``close`` waits for the backends before giving them up.
+        close_timeout_s: How long ``close`` waits for the backends before giving them up, and
+            how long the loop's shutdown drain waits for this rank's own pending work once
+            nothing but transfers is left.
         status_dump_path: Where ``close`` writes the JSON status dump; ``None`` writes nothing.
         started_at: ``time.time()`` at assembly; recorded in the dump so a test can order
             several engines by creation.
@@ -99,6 +101,12 @@ class KVTransferHooks:
         self._num_deferred_requests = 0
         """Requests still undecided after the last advance (or, on a follower, after the last
         adoption); each is waiting on a store lookup."""
+        self._peer_pending = False
+        """Attention DP: whether some replica reported pending work in this round's rank-state
+        gather (``absorb_peer_pending``). Stays ``False`` without attention DP."""
+        self._drain_deadline: float | None = None
+        """When this rank reports itself drained at shutdown; set by the first ``advance_round``
+        with nothing left but transfers, ``close_timeout_s`` ahead."""
 
     # ---- loop entry points ----
 
@@ -107,7 +115,11 @@ class KVTransferHooks:
         ``coordinator.advance`` reaps landed transfers and plans them. A follower plans nothing
         here; its undecided count is set when it adopts the owner's answers."""
         candidates = self._undecided_candidates(active_requests)
-        num_deferred = self.coordinator.advance(candidates, time.monotonic())
+        now = time.monotonic()
+        self._start_drain_clock_at_quiescence(now)
+        num_deferred = self.coordinator.advance(
+            candidates, now, drained=self._drain_deadline_passed(now)
+        )
         if self.coordinator.plan_authority is not PlanAuthority.FOLLOWER:
             self._num_deferred_requests = num_deferred
 
@@ -165,10 +177,55 @@ class KVTransferHooks:
         )
 
     def has_pending_work(self) -> bool:
-        """Whether this layer will make progress without a new request: a transfer in flight, a
-        fetch waiting for pages, or a finished request held until the ranks agree. The loop must
-        not block on its request queue while this is true."""
-        return self.coordinator.has_pending_work()
+        """Whether this layer will make progress without a new request, here or on a peer: a
+        transfer in flight, a fetch waiting for pages, or a finished request held until the
+        ranks agree. The loop must not block on its request queue while this is true: only the
+        loop can move a held request on, and a peer's held request waits for this rank's next
+        round."""
+        return self.coordinator.has_pending_work() or self._pending_on_a_peer()
+
+    def any_rank_has_pending_work(self) -> bool:
+        """The shutdown drain's condition: the loop must not stop while any rank has pending
+        work. Equal on every rank at its stop check: each term is gathered (the previous
+        round's ``any_rank_pending`` and ``any_rank_drained``; under attention DP, this round's
+        replica bits) or created alike on every rank of the collective (this rank's own
+        records, counted until some rank reported itself drained). No local clock is read."""
+        return self._pending_work_as_every_rank_sees_it() or self._peer_pending
+
+    def pending_bit(self) -> int:
+        """Attention DP: this rank's word for the rank-state gather, read by every replica's
+        ``absorb_peer_pending``. ``0`` or ``1``, since the gather carries integers."""
+        return int(self._pending_work_as_every_rank_sees_it())
+
+    def absorb_peer_pending(self, any_replica_pending: bool) -> None:
+        """Attention DP: the OR of every replica's ``pending_bit`` from this round's rank-state
+        gather."""
+        self._peer_pending = bool(any_replica_pending)
+
+    def _pending_work_as_every_rank_sees_it(self) -> bool:
+        """This rank's own work, which its collective's ranks share, until some rank reported
+        itself drained; or what some rank reported pending last round."""
+        coordinator = self.coordinator
+        return (
+            coordinator.has_pending_work() and not coordinator.any_rank_drained
+        ) or coordinator.any_rank_pending
+
+    def _pending_on_a_peer(self) -> bool:
+        return self.coordinator.any_rank_pending or self._peer_pending
+
+    def _start_drain_clock_at_quiescence(self, now: float) -> None:
+        """The first round at shutdown with nothing left but transfers starts the drain clock:
+        ``close_timeout_s`` later this rank reports itself drained, so a hung store cannot keep
+        the loop alive, while it still takes part in every round its peers need."""
+        if (
+            self._drain_deadline is None
+            and self._executor.is_shutdown
+            and not self._executor.active_requests
+        ):
+            self._drain_deadline = now + self._close_timeout_s
+
+    def _drain_deadline_passed(self, now: float) -> bool:
+        return self._drain_deadline is not None and now >= self._drain_deadline
 
     def inflight_request_ids(self) -> frozenset[int]:
         """Requests whose pages a backend may still read or write: a transfer in flight, or a
@@ -181,8 +238,8 @@ class KVTransferHooks:
     def pace_idle(self) -> None:
         """An idle loop pass that only this layer's clocks can unblock (a transfer in flight, a
         lookup a request is deferred on, a fetch waiting for pages, a held request waiting for
-        the ranks) yields briefly instead of spinning through the budgets."""
-        if self._num_deferred_requests or self.coordinator.has_pending_work():
+        the ranks, here or on a peer) yields briefly instead of spinning through the budgets."""
+        if self._num_deferred_requests or self.has_pending_work():
             time.sleep(_IDLE_BACKEND_WAIT_S)
 
     # ---- shutdown ----

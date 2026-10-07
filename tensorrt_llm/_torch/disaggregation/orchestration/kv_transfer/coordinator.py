@@ -113,11 +113,15 @@ _Verdict = tuple[int, bool]
 
 class _RoundMessage(NamedTuple):
     """One rank's word per round: ``votes`` as ``[(key, kind, token_end)]``, ``expired`` as
-    ``[key]``, ``plans`` as ``[(rid, encoded answer)]``. A plain 3-tuple on the wire."""
+    ``[key]``, ``plans`` as ``[(rid, encoded answer)]``, ``pending`` as whether this rank still
+    has pending work, ``drained`` as whether it is past its shutdown drain deadline. A plain
+    5-tuple on the wire."""
 
     votes: list
     expired: list
     plans: list
+    pending: bool
+    drained: bool
 
 
 def _encode_plan_answer(answer: _PlanAnswer) -> _EncodedPlanAnswer:
@@ -288,18 +292,29 @@ class KVTransferCoordinator:
         self._terminated_before_gate: set[int] = set()
         """Held requests this coordinator terminated before the engine's release gate asked about
         them; the gate is answered "not yours" once, so the engine does not terminate twice."""
+        self._any_rank_pending = False
+        """Whether some rank of the collective reported pending work in the last round."""
+        self._any_rank_drained = False
+        """Whether some rank of the collective reported itself past its shutdown drain deadline
+        in the last round."""
 
     # ---- loop entry points (``advance`` is the one collective: once per rank per round) ----
 
-    def advance(self, candidates: Sequence[RequestView], now: float) -> int:
+    def advance(
+        self, candidates: Sequence[RequestView], now: float, *, drained: bool = False
+    ) -> int:
         """Head of the loop: poll outcomes into votes, plan candidates, agree across ranks, apply.
+
+        ``drained`` is whether this rank has waited long enough for its own pending work at
+        shutdown; it goes in this rank's word, and a drained rank reports no pending work.
 
         Returns how many candidates are still undecided afterwards (``plan_fetch`` answers
         ``DEFER``): each is waiting on a store lookup, or on the ranks' agreement.
         """
         votes, expired = self._poll_and_vote(now)
         answers = self._plan(candidates, now)
-        verdicts, expired, answers = self._agree(votes, expired, answers, now)
+        pending = not drained and self.has_pending_work()
+        verdicts, expired, answers = self._agree(votes, expired, answers, pending, drained, now)
         self._apply(verdicts, expired, answers, now)
         return sum(1 for candidate in candidates if self.plan_fetch(candidate) is DEFER)
 
@@ -496,6 +511,18 @@ class KVTransferCoordinator:
             for rec in self._records.values()
         )
 
+    @property
+    def any_rank_pending(self) -> bool:
+        """Whether some rank of the collective reported pending work in the last round: the
+        OR of every rank's word, so identical on every rank. ``False`` before the first round."""
+        return self._any_rank_pending
+
+    @property
+    def any_rank_drained(self) -> bool:
+        """Whether some rank of the collective reported itself past its shutdown drain deadline
+        in the last round; the OR of every rank's word, so identical on every rank."""
+        return self._any_rank_drained
+
     def inflight_request_ids(self) -> frozenset[int]:
         """Requests whose pages a backend may still touch: a record ``IN_FLIGHT``, or one whose
         backend refused to vouch for the pages at the release point."""
@@ -533,13 +560,16 @@ class KVTransferCoordinator:
         """This coordinator's state as JSON-serializable values, for the status dump the hooks
         write at shutdown: the plan authority, one entry per record, the plan answers still
         remembered (``decided_plans``) and the finished requests not yet terminated
-        (``finished_pending``). A record entry carries its state and clocks plus the retry
+        (``finished_pending``) and what the ranks reported in the last round (``any_rank_pending``,
+        ``any_rank_drained``). A record entry carries its state and clocks plus the retry
         bookkeeping (``retries_left``, ``consecutive_launch_failures``, ``retry_hint``) and how
         many of the plan's units the local cache had committed by launch (``committed_names``;
         the names themselves are hashes). Readers take entries by key, so an entry may gain
         keys."""
         return {
             "plan_authority": self._plan_authority.value,
+            "any_rank_pending": self._any_rank_pending,
+            "any_rank_drained": self._any_rank_drained,
             "records": [
                 {
                     "request_id": rec.request_id,
@@ -820,6 +850,8 @@ class KVTransferCoordinator:
         votes: Mapping[RecordKey, Vote],
         expired: Sequence[RecordKey],
         answers: Mapping[int, _PlanAnswer],
+        pending: bool,
+        drained: bool,
         now: float,
     ) -> tuple[dict[RecordKey, _Verdict], list[RecordKey], dict[int, _PlanAnswer]]:
         voted = self._plan_authority is PlanAuthority.VOTED
@@ -831,13 +863,17 @@ class KVTransferCoordinator:
                 if voted
                 else []
             ),
+            pending=pending,
+            drained=drained,
         )
         # A plain tuple goes out (no class tag in the pickle); a peer's word comes back as
-        # whatever 3-sequence the transport made of it.
+        # whatever 5-sequence the transport made of it.
         gathered = [_RoundMessage._make(word) for word in self._dist.allgather(tuple(message))]
         ballots = _ballots_by_key(gathered)
         self._note_peer_launches(votes, ballots, now)
         verdicts = _reduce_votes(ballots, len(gathered))
+        self._any_rank_pending = any(word.pending for word in gathered)
+        self._any_rank_drained = any(word.drained for word in gathered)
         expired_all = {tuple(key) for word in gathered for key in word.expired}
         # An owner's answers are its own word; they reach the followers with the schedule.
         consensus = _reduce_plans(gathered, answers) if voted else dict(answers)

@@ -17,7 +17,6 @@ pages, same tail computation. So:
 """
 
 import os
-import time
 
 import pytest
 from mooncake_cluster import (
@@ -28,7 +27,6 @@ from mooncake_cluster import (
     MODELS,
     SELECTED_EXACT_LAYOUTS,
     SELECTED_MODELS,
-    SETTLE_S,
     TOKENS_PER_BLOCK,
     TRANSPORTS,
     counters,
@@ -123,8 +121,6 @@ def test_fetched_prefix_is_exact(transport_store, model, layout, request, tmp_pa
         llm = _engine(model_path, layout, max_seq_len)
         try:
             results[tag] = _generate(llm, prompt)
-            if tag == "a" and world_size > 1:
-                time.sleep(SETTLE_S)
         finally:
             llm.shutdown()
     fetched = sum(counters(d)["fetch_hits"] for d in read_rank_dumps(tmp_path, "b", world_size))
