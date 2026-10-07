@@ -20,6 +20,7 @@ from mooncake_cluster import (
     KV_TRANSFER_CONFIG_ENV,
     KV_TRANSFER_STATUS_DUMP_ENV,
     NAMEABLE_BLOCKS,
+    RDMA_ENV,
     assert_no_leftover_records,
     counters,
     dump_template,
@@ -89,11 +90,6 @@ def assert_a_published_and_b_fetched_everything(
     assert_no_leftover_records(dump_b)
 
 
-RDMA_ENV = "KV_TRANSFER_E2E_RDMA"
-"""Set to ``1`` on a machine whose transport writes GPU memory directly: the explicit
-``landing: device`` variant registers the KV pools with Mooncake, which over loopback TCP is the
-unverified path, so it is skipped by default."""
-
 LANDINGS = [
     pytest.param(None, id="landing_default_host"),
     pytest.param(
@@ -104,6 +100,9 @@ LANDINGS = [
         ),
     ),
 ]
+"""The explicit ``landing: device`` variant registers the KV pools with Mooncake, which over
+loopback TCP is the unverified path: it runs only with ``RDMA_ENV`` set, on a machine whose
+transport writes GPU memory directly."""
 
 
 @timeout_mark(600)

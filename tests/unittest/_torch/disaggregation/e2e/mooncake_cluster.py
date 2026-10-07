@@ -35,6 +35,12 @@ import yaml
 KV_TRANSFER_CONFIG_ENV = "TRTLLM_KV_TRANSFER_CONFIG"
 KV_TRANSFER_STATUS_DUMP_ENV = "TRTLLM_KV_TRANSFER_STATUS_DUMP"
 
+RDMA_ENV = "KV_TRANSFER_E2E_RDMA"
+"""``1`` enables the RDMA transports; the machine needs an RDMA NIC."""
+RDMA_DEVICES_ENV = "KV_TRANSFER_E2E_RDMA_DEVICES"
+"""HCAs handed to Mooncake as ``device_name``; empty lets it discover them, which on some hosts
+pairs InfiniBand ports with Ethernet ones that cannot reach them."""
+
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), *([".."] * 5)))
 _MODEL_NAME = "TinyLlama-1.1B-Chat-v1.0"
 
@@ -129,6 +135,11 @@ def wait_tcp(port: int, timeout: float) -> bool:
     return False
 
 
+def host_ip() -> str:
+    """The address an RDMA endpoint announces: the host's own, not loopback."""
+    return socket.gethostbyname(socket.gethostname())
+
+
 def kill(proc: subprocess.Popen | None) -> None:
     """Kill the process and everything in its session (both are started with
     ``start_new_session=True``): the Mooncake client forks helpers that outlive their parent."""
@@ -171,9 +182,11 @@ _PROVIDER_SCRIPT = textwrap.dedent(
     """
     import sys, time
     from mooncake.store import MooncakeDistributedStore
-    master, segment_bytes = sys.argv[1], int(sys.argv[2])
+    master, segment_bytes, protocol, host, devices = sys.argv[1:6]
     store = MooncakeDistributedStore()
-    status = store.setup("127.0.0.1", "P2PHANDSHAKE", segment_bytes, 16 << 20, "tcp", "", master)
+    status = store.setup(
+        host, "P2PHANDSHAKE", int(segment_bytes), 16 << 20, protocol, devices, master
+    )
     if status != 0:
         print(f"SETUP_FAILED {status}", flush=True)
         sys.exit(1)
@@ -195,8 +208,7 @@ class MooncakeCluster:
         kill(self.master)
 
     def close(self) -> None:
-        kill(self.provider)
-        kill(self.master)
+        stop_cluster(self.master_address, self.master, self.provider)
 
 
 def start_master() -> tuple[str, subprocess.Popen]:
@@ -214,10 +226,17 @@ def start_master() -> tuple[str, subprocess.Popen]:
 
 
 def start_segment_provider(
-    master_address: str, segment_bytes: int = SEGMENT_BYTES
+    master_address: str, segment_bytes: int = SEGMENT_BYTES, *, protocol: str = "tcp"
 ) -> subprocess.Popen:
+    """A long-lived Mooncake client holding a segment of ``segment_bytes``, on loopback over
+    ``tcp``; over ``rdma`` it announces the host's own address and the HCAs of
+    ``RDMA_DEVICES_ENV``."""
+    host, devices = "127.0.0.1", ""
+    if protocol == "rdma":
+        host, devices = host_ip(), os.environ.get(RDMA_DEVICES_ENV, "")
+    argv = [master_address, str(segment_bytes), protocol, host, devices]
     proc = subprocess.Popen(
-        [sys.executable, "-c", _PROVIDER_SCRIPT, master_address, str(segment_bytes)],
+        [sys.executable, "-c", _PROVIDER_SCRIPT, *argv],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -231,8 +250,36 @@ def start_segment_provider(
             break
     if line != "READY":
         kill(proc)
-        pytest.fail(f"segment provider did not come up: {line!r}")
+        pytest.fail(f"{protocol} segment provider did not come up: {line!r}")
     return proc
+
+
+def skip_without_cluster_prerequisites() -> None:
+    """A GPU for the engines, the Mooncake bindings and ``mooncake_master``; no model weights."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("the engines need a GPU")
+    pytest.importorskip("mooncake.store")
+    if not os.access(MASTER, os.X_OK):
+        pytest.skip("mooncake_master binary not found")
+
+
+def stop_cluster(
+    master_address: str, master: subprocess.Popen, provider: subprocess.Popen | None
+) -> None:
+    """Kill the provider and the master, sweep what survived, and fail if anything did. The
+    master address is unique to the test: the master carries its port, the provider carries the
+    address; a Mooncake helper that survived would carry one of the two."""
+    kill(provider)
+    kill(master)
+    rpc_port = master_address.rsplit(":", 1)[1]
+    leftovers = leftover_pids(f"--rpc_port={rpc_port}") + leftover_pids(master_address)
+    for pid in leftovers:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    assert not leftovers, f"mooncake processes of this test survived teardown: {leftovers}"
 
 
 @pytest.fixture
@@ -246,35 +293,19 @@ def tinyllama_path() -> str:
 
 @pytest.fixture
 def mooncake_cluster(request):
-    """A master and one segment provider, killed at teardown whatever happened. Needs a GPU,
-    the Mooncake bindings and ``mooncake_master``; no model weights. The provider's segment is
-    ``SEGMENT_BYTES`` unless the test parametrizes this fixture indirectly with another size."""
-    torch = pytest.importorskip("torch")
-    if not torch.cuda.is_available():
-        pytest.skip("the engines need a GPU")
-    pytest.importorskip("mooncake.store")
-    if not os.access(MASTER, os.X_OK):
-        pytest.skip("mooncake_master binary not found")
+    """A master and one segment provider on loopback TCP, killed at teardown whatever happened
+    (``stop_cluster``). Needs a GPU, the Mooncake bindings and ``mooncake_master``; no model
+    weights. The provider's segment is ``SEGMENT_BYTES`` unless the test parametrizes this
+    fixture indirectly with another size."""
+    skip_without_cluster_prerequisites()
     segment_bytes = getattr(request, "param", SEGMENT_BYTES)
     master_address, master = start_master()
     provider = None
     try:
         provider = start_segment_provider(master_address, segment_bytes)
-        cluster = MooncakeCluster(master_address, master, provider)
-        yield cluster
+        yield MooncakeCluster(master_address, master, provider)
     finally:
-        kill(provider)
-        kill(master)
-        # The master address is unique to this test: the master carries its port, the provider
-        # carries the address; a Mooncake helper that survived would carry one of the two.
-        rpc_port = master_address.rsplit(":", 1)[1]
-        leftovers = leftover_pids(f"--rpc_port={rpc_port}") + leftover_pids(master_address)
-        for pid in leftovers:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        assert not leftovers, f"mooncake processes of this test survived teardown: {leftovers}"
+        stop_cluster(master_address, master, provider)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -287,12 +318,14 @@ def write_kv_transfer_yaml(
     master_address: str,
     namespace: str,
     *,
+    protocol: str = "tcp",
     landing: str | None = None,
     backend_overrides: dict | None = None,
     omit_coordinator_timeouts: bool = False,
     **overrides,
 ) -> str:
-    """The KV transfer config file for a TCP loopback store with one backend.
+    """The KV transfer config file for a store with one backend, on loopback over ``tcp``; over
+    ``rdma`` the engine announces the host's own address and the HCAs of ``RDMA_DEVICES_ENV``.
 
     ``landing`` is written only when given: left out, the mooncake factory resolves it to
     ``host`` for TCP, which is what the tests assert. ``backend_overrides`` are merged into the
@@ -305,13 +338,16 @@ def write_kv_transfer_yaml(
         type="mooncake",
         roles=["fetch", "publish"],
         master_server_address=master_address,
-        protocol="tcp",
+        protocol=protocol,
         local_hostname="127.0.0.1",
         metadata_server="P2PHANDSHAKE",
         global_segment_size=0,
         local_buffer_size=256 << 20,
         namespace=namespace,
     )
+    if protocol == "rdma":
+        backend["local_hostname"] = host_ip()
+        backend["device_name"] = os.environ.get(RDMA_DEVICES_ENV, "")
     if landing is not None:
         backend["landing"] = landing
     backend.update(backend_overrides or {})
@@ -360,14 +396,8 @@ def assert_no_leftover_records(dump: dict) -> None:
 
 
 # ---------------------------------------------------------------------------------------------
-# Multi-rank and RDMA runs (E4, E5)
+# Multi-rank and RDMA runs
 # ---------------------------------------------------------------------------------------------
-
-RDMA_ENV = "KV_TRANSFER_E2E_RDMA"
-"""``1`` enables the RDMA transports; the machine needs an RDMA NIC."""
-RDMA_DEVICES_ENV = "KV_TRANSFER_E2E_RDMA_DEVICES"
-"""HCAs handed to Mooncake as ``device_name``; empty lets it discover them, which on some hosts
-pairs InfiniBand ports with Ethernet ones that cannot reach them."""
 
 _needs_rdma = pytest.mark.skipif(
     os.environ.get(RDMA_ENV) != "1", reason=f"{RDMA_ENV}=1 only: needs an RDMA NIC"
@@ -400,12 +430,19 @@ MODELS = {
     "gemma3_1b": ("gemma/gemma-3-1b-it", 1000, 2048, True),
 }
 SELECTED_MODELS = os.environ.get("KV_TRANSFER_E2E_MODELS", "tinyllama").split(",")
+"""``MODELS`` keys the multi-rank and exactness tests run, comma-separated."""
+SELECTED_EXACT_LAYOUTS = os.environ.get("KV_TRANSFER_E2E_LAYOUTS", "tp1").split(",")
+"""Layouts the exactness test runs, comma-separated: ``tp1`` (one rank) or ``LAYOUTS`` keys."""
+TRANSPORT_SEGMENT_BYTES = 4 << 30
+"""``gemma3_12b`` at 2000 tokens publishes about 750 MiB of KV."""
 
 SETTLE_S = float(os.environ.get("KV_TRANSFER_E2E_SETTLE_S", "3"))
-"""How long the publishing engine keeps serving after its request finished, so the publish lands
-while the loop still runs: the loop stops at shutdown without waiting for transfers in flight, and
-with several ranks rank 0 can block idle while a peer's publish of a finished request has not
-settled yet."""
+"""How long a publishing engine of more than one rank keeps serving after its request finished,
+so the publish lands while the loop still runs. Known engine gap, not designed behaviour: rank 0
+blocks idle in ``_fetch_and_enqueue_requests`` because only its own ``has_pending_work()`` gates
+the idle wait, so a peer rank's pending publish of a finished request waits for the next wake-up,
+and shutdown does not drain publishes in flight (readability work order appendix item 2a).
+Remove this sleep when the engine wakes on peers' pending work."""
 
 
 def world_size_of(layout: dict) -> int:
@@ -423,94 +460,23 @@ def model_path_for(request, model: str) -> str:
     return path
 
 
-def host_ip() -> str:
-    return socket.gethostbyname(socket.gethostname())
-
-
-_TRANSPORT_PROVIDER_SCRIPT = textwrap.dedent(
-    """
-    import sys, time
-    from mooncake.store import MooncakeDistributedStore
-    master, segment_bytes, protocol, host, devices = sys.argv[1:6]
-    store = MooncakeDistributedStore()
-    status = store.setup(host, "P2PHANDSHAKE", int(segment_bytes), 16 << 20, protocol, devices, master)
-    if status != 0:
-        print(f"SETUP_FAILED {status}", flush=True)
-        sys.exit(1)
-    print("READY", flush=True)
-    while True:
-        time.sleep(1.0)
-    """
-)
-
-
 @pytest.fixture
 def transport_store(request):
-    """A master and one segment provider speaking the ``TRANSPORTS`` protocol given by indirect
-    parametrization; yields ``(protocol, landing, master_address)``."""
+    """A master and one segment provider of ``TRANSPORT_SEGMENT_BYTES`` speaking the
+    ``TRANSPORTS`` protocol given by indirect parametrization; yields
+    ``(protocol, landing, master_address)``. Same prerequisites and teardown as
+    ``mooncake_cluster``."""
     protocol, landing = request.param
-    torch = pytest.importorskip("torch")
-    if not torch.cuda.is_available():
-        pytest.skip("the engines need a GPU")
-    pytest.importorskip("mooncake.store")
-    if not os.access(MASTER, os.X_OK):
-        pytest.skip("mooncake_master binary not found")
+    skip_without_cluster_prerequisites()
     master_address, master = start_master()
-    host = "127.0.0.1" if protocol == "tcp" else host_ip()
-    devices = "" if protocol == "tcp" else os.environ.get(RDMA_DEVICES_ENV, "")
-    provider = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            _TRANSPORT_PROVIDER_SCRIPT,
-            master_address,
-            str(4 << 30),
-            protocol,
-            host,
-            devices,
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        start_new_session=True,
-    )
+    provider = None
     try:
-        deadline = time.monotonic() + READY_TIMEOUT_S
-        line = ""
-        while time.monotonic() < deadline and not line:
-            line = provider.stdout.readline().strip()
-        if line != "READY":
-            pytest.fail(f"{protocol} segment provider did not come up: {line!r}")
+        provider = start_segment_provider(
+            master_address, TRANSPORT_SEGMENT_BYTES, protocol=protocol
+        )
         yield protocol, landing, master_address
     finally:
-        kill(provider)
-        kill(master)
-
-
-def write_transport_yaml(directory, master_address, namespace, protocol, landing) -> str:
-    """``write_kv_transfer_yaml`` for either protocol: over RDMA the engine announces the host's
-    own address and the HCAs of ``RDMA_DEVICES_ENV``."""
-    backend = dict(
-        name="shared-store",
-        type="mooncake",
-        roles=["fetch", "publish"],
-        master_server_address=master_address,
-        protocol=protocol,
-        local_hostname="127.0.0.1" if protocol == "tcp" else host_ip(),
-        metadata_server="P2PHANDSHAKE",
-        global_segment_size=0,
-        local_buffer_size=256 << 20,
-        namespace=namespace,
-    )
-    if protocol == "rdma":
-        backend["device_name"] = os.environ.get(RDMA_DEVICES_ENV, "")
-    if landing is not None:
-        backend["landing"] = landing
-    config = dict(fetch_timeout_s=30, publish_timeout_s=60, probe_timeout_s=1.0, backends=[backend])
-    path = os.path.join(str(directory), "kv_transfer.yaml")
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(config, f)
-    return path
+        stop_cluster(master_address, master, provider)
 
 
 def read_rank_dumps(directory, tag: str, world_size: int) -> list[dict]:
@@ -522,9 +488,3 @@ def read_rank_dumps(directory, tag: str, world_size: int) -> list[dict]:
     dumps.sort(key=lambda d: d["rank"])
     assert [d["rank"] for d in dumps] == list(range(world_size)), [d["rank"] for d in dumps]
     return dumps
-
-
-def backend_of(dump: dict) -> dict:
-    (backend,) = dump["backends"]
-    assert backend["type"] == "mooncake" and backend["name"] == "shared-store"
-    return backend
