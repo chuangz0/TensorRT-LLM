@@ -2951,11 +2951,7 @@ class PyExecutor:
                                "prepare_expect_snapshot_points"):
                         self.kv_cache_manager.prepare_expect_snapshot_points(
                             self.active_requests)
-                    protected = self._protected_from_eviction_ids()
-                    local_scheduler_output = self.scheduler.schedule_request(
-                        self.active_requests,
-                        self.inflight_req_ids,
-                        protected_from_eviction_request_ids=protected)
+                    local_scheduler_output = self._schedule_active_requests()
                     local_disagg_candidates = getattr(
                         local_scheduler_output,
                         "fitting_disagg_gen_init_requests", [])
@@ -6689,17 +6685,21 @@ class PyExecutor:
                 return context_requests[:i]
         return context_requests
 
-    def _protected_from_eviction_ids(self) -> frozenset[int]:
-        """Requests the scheduler may neither evict nor recompute-pause this round.
-
-        A store backend may still read or write the pages of a request with a KV
-        transfer in flight; handing those pages to someone else would poison the
-        store. The request stays schedulable (its own active cache locks the
-        pages); only eviction and pause are ruled out.
-        """
+    def _schedule_active_requests(self):
+        """``scheduler.schedule_request`` on the active requests. With the KV
+        transfer layer attached it also passes the requests whose pages a store
+        backend may still read or write, which the scheduler must neither evict
+        nor recompute-pause: handing those pages to someone else would poison
+        the store. Without the layer it makes the plain two-argument call, which
+        every scheduler accepts."""
         if self.kv_transfer is not None:
-            return self.kv_transfer.inflight_request_ids()
-        return frozenset()
+            return self.scheduler.schedule_request(
+                self.active_requests,
+                self.inflight_req_ids,
+                protected_from_eviction_request_ids=self.kv_transfer.
+                inflight_request_ids())
+        return self.scheduler.schedule_request(self.active_requests,
+                                               self.inflight_req_ids)
 
     @nvtx_range("_schedule")
     def _schedule(self):
@@ -6709,11 +6709,7 @@ class PyExecutor:
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
-        protected = self._protected_from_eviction_ids()
-        scheduler_output = self.scheduler.schedule_request(
-            self.active_requests,
-            self.inflight_req_ids,
-            protected_from_eviction_request_ids=protected)
+        scheduler_output = self._schedule_active_requests()
 
         scheduled_encoder_requests = scheduler_output.encoder_requests
         should_batch_encoder_requests = (self.is_encoder_decoder
@@ -6769,7 +6765,8 @@ class PyExecutor:
             scheduler_output.scheduled_mm_encoder_items)
         scheduled_requests.recompute_paused_requests = scheduler_output.recompute_paused_requests
         # Read by launch_reserved_fetches right after _schedule().
-        self._kv_fetch_launch_queue = scheduler_output.fetch_launch_queue
+        if self.kv_transfer is not None:
+            self._kv_fetch_launch_queue = scheduler_output.fetch_launch_queue
 
         self._maybe_record_hang_diagnostic_phase("scheduled",
                                                  scheduled_requests)

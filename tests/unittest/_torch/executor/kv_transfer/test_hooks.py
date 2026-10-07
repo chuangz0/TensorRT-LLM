@@ -1404,6 +1404,49 @@ class TestDeferredEngineTermination:
         assert rig.terminations() == 1
 
 
+class TestScheduleActiveRequests:
+    """The engine's one scheduler call. Without the KV transfer layer it is upstream's
+    two-argument call, so a scheduler that knows nothing of the layer still runs; with the layer
+    attached the requests with a transfer in flight ride along as the protected set."""
+
+    def test_schedule_without_kv_transfer_makes_upstreams_two_argument_call(self, rig):
+        rig.executor.kv_transfer = None
+        req = make_request(1, 100)
+        rig.executor.active_requests = [req]
+        rig.executor.inflight_req_ids = {7}
+
+        class UpstreamScheduler:
+            def schedule_request(self, active_requests, inflight_request_ids):
+                return ("scheduled", active_requests, inflight_request_ids)
+
+        rig.executor.scheduler = UpstreamScheduler()
+        assert rig.executor._schedule_active_requests() == ("scheduled", [req], {7})
+
+    def test_schedule_with_kv_transfer_passes_the_pages_in_flight_as_protected(self, rig):
+        publishing = make_request(1, 100)
+        rig.publish(publishing)  # still running: not finished, publish IN_FLIGHT
+        plain = make_request(2, 100)
+        rig.executor.active_requests = [publishing, plain]
+        rig.executor.inflight_req_ids = set()
+        seen = {}
+
+        class RecordingScheduler:
+            def schedule_request(
+                self, active_requests, inflight_request_ids, *, protected_from_eviction_request_ids
+            ):
+                seen.update(
+                    active=active_requests,
+                    inflight=inflight_request_ids,
+                    protected=protected_from_eviction_request_ids,
+                )
+                return "scheduled"
+
+        rig.executor.scheduler = RecordingScheduler()
+        assert rig.executor._schedule_active_requests() == "scheduled"
+        assert seen == dict(active=[publishing, plain], inflight=set(), protected={1})
+        assert seen["protected"] == rig.coord.inflight_request_ids()
+
+
 class TestRecomputePauseProtection:
     """A request whose publish is in flight must keep its pages: the executor's recompute-pause
     teardown skips it (the scheduler never picks it as a victim either; see the scheduler seam

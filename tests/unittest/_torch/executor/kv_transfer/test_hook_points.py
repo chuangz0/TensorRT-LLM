@@ -74,17 +74,31 @@ def test_schedule_hands_the_fetch_launch_queue_to_the_executor():
 
 
 def test_schedule_protects_requests_with_a_transfer_in_flight_from_eviction():
-    text = source_of(PyExecutor._protected_from_eviction_ids)
-    ordered(text, GUARD, "return self.kv_transfer.inflight_request_ids()", "return frozenset()")
-    text = source_of(PyExecutor._schedule)
+    text = source_of(PyExecutor._schedule_active_requests)
     ordered(
         text,
-        "protected = self._protected_from_eviction_ids()",
+        GUARD,
         "self.scheduler.schedule_request(",
-        "protected_from_eviction_request_ids=protected)",
+        "protected_from_eviction_request_ids=",
+        "inflight_request_ids()",
+        "return self.scheduler.schedule_request(self.active_requests, self.inflight_req_ids)",
     )
+    assert "scheduler_output = self._schedule_active_requests()" in source_of(PyExecutor._schedule)
     text = source_of(PyExecutor._terminate_recompute_paused_requests)
     ordered(text, GUARD, "self.kv_transfer.inflight_request_ids()", "continue")
+
+
+def test_schedule_without_the_layer_is_upstreams_two_argument_call():
+    """Only the KV-cache-V2 scheduler accepts the protected set; every other scheduler keeps
+    upstream's ``schedule_request(active_requests, inflight_req_ids)``, so the call made when
+    no layer is attached must carry no keyword."""
+    text = source_of(PyExecutor._schedule_active_requests)
+    guarded, _, plain = text.partition(
+        "return self.scheduler.schedule_request(self.active_requests"
+    )
+    assert GUARD in guarded and "protected_from_eviction_request_ids" in guarded
+    assert plain.startswith(", self.inflight_req_ids)")
+    assert "protected_from_eviction_request_ids" not in plain
 
 
 def test_publish_follows_the_context_commit_and_precedes_the_disagg_send_in_the_plain_loop():
@@ -141,8 +155,7 @@ def test_pp_loop_advances_at_the_head_launches_after_stage_0_and_paces_idle():
         "self._pad_attention_dp_dummy_request()",
         "self._pp_schedule_and_propagate(microbatch_id)",
         "if self.dist.rank != 0:",
-        "protected = self._protected_from_eviction_ids()",
-        "protected_from_eviction_request_ids=protected)",
+        "local_scheduler_output = self._schedule_active_requests()",
         "self.disagg.revert_deferred_gen_init(",
         GUARD,
         "self.kv_transfer.launch_reserved_fetches( self._kv_fetch_launch_queue if self.dist.rank "
