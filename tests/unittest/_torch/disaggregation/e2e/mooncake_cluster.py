@@ -357,3 +357,174 @@ def assert_no_leftover_records(dump: dict) -> None:
     assert coordinator["records"] == [], coordinator
     assert coordinator["finished_pending"] == [], coordinator
     assert coordinator["decided_plans"] == 0, coordinator
+
+
+# ---------------------------------------------------------------------------------------------
+# Multi-rank and RDMA runs (E4, E5)
+# ---------------------------------------------------------------------------------------------
+
+RDMA_ENV = "KV_TRANSFER_E2E_RDMA"
+"""``1`` enables the RDMA transports; the machine needs an RDMA NIC."""
+RDMA_DEVICES_ENV = "KV_TRANSFER_E2E_RDMA_DEVICES"
+"""HCAs handed to Mooncake as ``device_name``; empty lets it discover them, which on some hosts
+pairs InfiniBand ports with Ethernet ones that cannot reach them."""
+
+_needs_rdma = pytest.mark.skipif(
+    os.environ.get(RDMA_ENV) != "1", reason=f"{RDMA_ENV}=1 only: needs an RDMA NIC"
+)
+TRANSPORTS = [
+    pytest.param(("tcp", None), id="tcp"),
+    pytest.param(("rdma", "device"), id="rdma_device", marks=_needs_rdma),
+    pytest.param(("rdma", "host"), id="rdma_host", marks=_needs_rdma),
+]
+"""``(protocol, landing)`` for ``transport_store``; a ``None`` landing is the factory's default
+(``host`` over TCP). Over RDMA the GPU KV pools are registered through dma-buf, which the Mooncake
+wheel does only with ``WITH_NVIDIA_PEERMEM=0``; the tests set it unless the caller did."""
+
+LAYOUTS = {
+    "tp2": dict(tensor_parallel_size=2),
+    "pp2": dict(pipeline_parallel_size=2),
+    "tp2_adp": dict(tensor_parallel_size=2, enable_attention_dp=True),
+    "tp2pp2": dict(tensor_parallel_size=2, pipeline_parallel_size=2),
+}
+
+MODELS = {
+    # name: (path under $LLM_MODELS_ROOT, or None for the tinyllama fixture; prompt length;
+    #        max_seq_len; whether the model has sliding-window layer groups)
+    "tinyllama": (None, PROMPT_LEN, None, False),
+    "llama31_8b": ("llama-3.1-model/Llama-3.1-8B-Instruct", 1000, None, False),
+    "qwen3_8b": ("Qwen3/Qwen3-8B", 1000, None, False),
+    # W = 1024, L = 2000: stale_end(L) == stale_end(B) == 30, so every live block is fetchable.
+    "gemma3_12b": ("gemma/gemma-3-12b-it", 2000, 4096, True),
+    # W = 512, L = 1000: window-aligned, as test_store_vswa_tinygemma3's real case.
+    "gemma3_1b": ("gemma/gemma-3-1b-it", 1000, 2048, True),
+}
+SELECTED_MODELS = os.environ.get("KV_TRANSFER_E2E_MODELS", "tinyllama").split(",")
+
+SETTLE_S = float(os.environ.get("KV_TRANSFER_E2E_SETTLE_S", "3"))
+"""How long the publishing engine keeps serving after its request finished, so the publish lands
+while the loop still runs: the loop stops at shutdown without waiting for transfers in flight, and
+with several ranks rank 0 can block idle while a peer's publish of a finished request has not
+settled yet."""
+
+
+def world_size_of(layout: dict) -> int:
+    return layout.get("tensor_parallel_size", 1) * layout.get("pipeline_parallel_size", 1)
+
+
+def model_path_for(request, model: str) -> str:
+    """The weights of ``model`` (a ``MODELS`` key), or a skip."""
+    rel = MODELS[model][0]
+    if rel is None:
+        return request.getfixturevalue("tinyllama_path")
+    path = os.path.join(os.environ.get("LLM_MODELS_ROOT", ""), rel)
+    if not os.path.isdir(path):
+        pytest.skip(f"{path} not found")
+    return path
+
+
+def host_ip() -> str:
+    return socket.gethostbyname(socket.gethostname())
+
+
+_TRANSPORT_PROVIDER_SCRIPT = textwrap.dedent(
+    """
+    import sys, time
+    from mooncake.store import MooncakeDistributedStore
+    master, segment_bytes, protocol, host, devices = sys.argv[1:6]
+    store = MooncakeDistributedStore()
+    status = store.setup(host, "P2PHANDSHAKE", int(segment_bytes), 16 << 20, protocol, devices, master)
+    if status != 0:
+        print(f"SETUP_FAILED {status}", flush=True)
+        sys.exit(1)
+    print("READY", flush=True)
+    while True:
+        time.sleep(1.0)
+    """
+)
+
+
+@pytest.fixture
+def transport_store(request):
+    """A master and one segment provider speaking the ``TRANSPORTS`` protocol given by indirect
+    parametrization; yields ``(protocol, landing, master_address)``."""
+    protocol, landing = request.param
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("the engines need a GPU")
+    pytest.importorskip("mooncake.store")
+    if not os.access(MASTER, os.X_OK):
+        pytest.skip("mooncake_master binary not found")
+    master_address, master = start_master()
+    host = "127.0.0.1" if protocol == "tcp" else host_ip()
+    devices = "" if protocol == "tcp" else os.environ.get(RDMA_DEVICES_ENV, "")
+    provider = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            _TRANSPORT_PROVIDER_SCRIPT,
+            master_address,
+            str(4 << 30),
+            protocol,
+            host,
+            devices,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + READY_TIMEOUT_S
+        line = ""
+        while time.monotonic() < deadline and not line:
+            line = provider.stdout.readline().strip()
+        if line != "READY":
+            pytest.fail(f"{protocol} segment provider did not come up: {line!r}")
+        yield protocol, landing, master_address
+    finally:
+        kill(provider)
+        kill(master)
+
+
+def write_transport_yaml(directory, master_address, namespace, protocol, landing) -> str:
+    """``write_kv_transfer_yaml`` for either protocol: over RDMA the engine announces the host's
+    own address and the HCAs of ``RDMA_DEVICES_ENV``."""
+    backend = dict(
+        name="shared-store",
+        type="mooncake",
+        roles=["fetch", "publish"],
+        master_server_address=master_address,
+        protocol=protocol,
+        local_hostname="127.0.0.1" if protocol == "tcp" else host_ip(),
+        metadata_server="P2PHANDSHAKE",
+        global_segment_size=0,
+        local_buffer_size=256 << 20,
+        namespace=namespace,
+    )
+    if protocol == "rdma":
+        backend["device_name"] = os.environ.get(RDMA_DEVICES_ENV, "")
+    if landing is not None:
+        backend["landing"] = landing
+    config = dict(fetch_timeout_s=30, publish_timeout_s=60, probe_timeout_s=1.0, backends=[backend])
+    path = os.path.join(str(directory), "kv_transfer.yaml")
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(config, f)
+    return path
+
+
+def read_rank_dumps(directory, tag: str, world_size: int) -> list[dict]:
+    """One dump per rank of the engine tagged ``tag``, ordered by rank."""
+    dumps = []
+    for path in glob.glob(os.path.join(str(directory), f"kvt-{tag}-*.json")):
+        with open(path, encoding="utf-8") as f:
+            dumps.append(json.load(f))
+    dumps.sort(key=lambda d: d["rank"])
+    assert [d["rank"] for d in dumps] == list(range(world_size)), [d["rank"] for d in dumps]
+    return dumps
+
+
+def backend_of(dump: dict) -> dict:
+    (backend,) = dump["backends"]
+    assert backend["type"] == "mooncake" and backend["name"] == "shared-store"
+    return backend
