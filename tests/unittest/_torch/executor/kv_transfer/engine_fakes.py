@@ -18,6 +18,12 @@ from types import SimpleNamespace
 from typing import Iterable, Sequence
 from unittest.mock import Mock
 
+from tensorrt_llm._torch.disaggregation.backends.config import (
+    DEFAULT_FETCH_WAIT_TIMEOUT_S,
+    DEFAULT_UNLAUNCHED_TIMEOUT_S,
+    BackendEntry,
+)
+from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
 from tensorrt_llm._torch.disaggregation.base.backend import CacheKind
 from tensorrt_llm._torch.disaggregation.base.cache_backend import (
     CacheExtent,
@@ -27,13 +33,29 @@ from tensorrt_llm._torch.disaggregation.base.cache_backend import (
     Unit,
 )
 from tensorrt_llm._torch.disaggregation.base.views import GroupSpec
+from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.coordinator import (
+    KVTransferCoordinator,
+)
+from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.engine_protocols import (
+    PlanAuthority,
+)
+from tensorrt_llm._torch.disaggregation.remote_cache import FetchPlan, FetchSource, Planner
 from tensorrt_llm._torch.disaggregation.resource.naming import group_tag
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import (
+    EngineKVTransferEffects,
+    EngineWorkQueue,
+)
+from tensorrt_llm._torch.pyexecutor.kv_transfer.hooks import KVTransferHooks
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.bindings import SamplingConfig
 
 TPB = 32
+PROMPT_LEN = 100
+TOKEN_END = 96
+"""The fetch target of a ``PROMPT_LEN`` prompt: ``(100 - 1) // TPB`` nameable blocks of ``TPB``."""
+CONTEXT_INIT = LlmRequestState.CONTEXT_INIT
 
 
 def full_attention(local_group: int = 0) -> GroupSpec:
@@ -44,7 +66,9 @@ def block_key(seed: str, ordinal: int) -> bytes:
     return hashlib.blake2b(f"{seed}:{ordinal}".encode(), digest_size=8).digest()
 
 
-def make_request(request_id: int, prompt_len: int = 100, *, max_new_tokens: int = 4) -> LlmRequest:
+def make_request(
+    request_id: int, prompt_len: int = PROMPT_LEN, *, max_new_tokens: int = 4
+) -> LlmRequest:
     """A real ``LlmRequest`` in ``CONTEXT_INIT`` as its first context chunk."""
     return LlmRequest(
         request_id=request_id,
@@ -99,12 +123,12 @@ class FakeFetches:
         self.calls: list[tuple[str, tuple]] = []
         self.attempts: list[FakeAttempt] = []
         self.quiesce_answers: deque[bool] = deque()
-        self.reject_next = 0
+        self.reject_next_calls = 0
 
     def fetch(self, extent: CacheExtent, *, route=None) -> FakeAttempt:
         self.calls.append(("fetch", (extent, route)))
-        if self.reject_next > 0:
-            self.reject_next -= 1
+        if self.reject_next_calls > 0:
+            self.reject_next_calls -= 1
             raise SubmissionRejected(f"{self.name} rejected")
         attempt = FakeAttempt(extent)
         self.attempts.append(attempt)
@@ -196,12 +220,12 @@ class FakePublishes:
         self.name = name
         self.calls: list[tuple[str, tuple]] = []
         self.attempts: list[FakeAttempt] = []
-        self.reject_next = 0
+        self.reject_next_calls = 0
 
     def publish(self, extent: CacheExtent) -> FakeAttempt:
         self.calls.append(("publish", (extent,)))
-        if self.reject_next > 0:
-            self.reject_next -= 1
+        if self.reject_next_calls > 0:
+            self.reject_next_calls -= 1
             raise SubmissionRejected(f"{self.name} rejected publish")
         attempt = FakeAttempt(extent)
         self.attempts.append(attempt)
@@ -448,3 +472,207 @@ class FakeReader:
     def unit_names(self, request, ordinals: Iterable[int]) -> frozenset[bytes]:
         keys = self.block_keys(request)
         return frozenset(s.tag + keys[o] for s in self.groups for o in ordinals)
+
+
+# ---------------------------------------------------------------------------------------------
+# One executor with the real coordinator, effects and hooks over the fakes
+# ---------------------------------------------------------------------------------------------
+
+
+class EngineRig:
+    """One executor with the real coordinator, planner, effects and hooks over the fakes.
+
+    ``collective`` is the coordinator's ``Collective`` (``SingleRankCollective`` by default; a
+    multi-rank world passes its own) and ``effects_class`` the engine effects to build over the
+    executor (the real ones by default). With ``host_first`` the store lands in its own memory
+    first (``LandsOnHost``); otherwise it answers every probe with ``probe_answer``. The executor's
+    ``_free_request_resources`` frees the fake cache and notes the request in ``trace``, so an
+    eviction is observable in ``kv.kv_cache_map`` and in order against ``backend.close``.
+    """
+
+    def __init__(
+        self,
+        *,
+        collective=None,
+        effects_class=EngineKVTransferEffects,
+        host_first: bool = False,
+        probe_answer="all",
+        publish: bool = True,
+        fetch_timeout_s=None,
+        publish_timeout_s=None,
+        unlaunched_timeout_s=DEFAULT_UNLAUNCHED_TIMEOUT_S,
+        plan_authority: PlanAuthority = PlanAuthority.ALL_RANKS,
+        close_timeout_s: float = 5.0,
+        status_dump_path=None,
+        backend_close=None,
+    ) -> None:
+        self.kv = FakeKVCacheManager(TPB)
+        self.slots = FakeSlotManager()
+        self.executor = make_executor(self.kv, self.slots)
+        self.reader = FakeReader(self.kv)
+        self.store = (
+            FakeLandsOnHost(name="store")
+            if host_first
+            else FakeFetches(name="store", probe_answer=probe_answer)
+        )
+        self.publisher = FakePublishes()
+        sources = [FetchSource("store", self.store, None)]
+        self.planner = Planner(sources, self.reader, TPB, probe_timeout_s=0.05)
+        self.effects = effects_class(self.executor)
+        self.coord = KVTransferCoordinator(
+            sources,
+            [self.publisher] if publish else [],
+            self.planner,
+            self.reader,
+            self.effects,
+            EngineWorkQueue(),
+            collective if collective is not None else SingleRankCollective(),
+            unlaunched_timeout_s=unlaunched_timeout_s,
+            fetch_wait_timeout_s=DEFAULT_FETCH_WAIT_TIMEOUT_S,
+            fetch_timeout_s=fetch_timeout_s,
+            publish_timeout_s=publish_timeout_s,
+            plan_authority=plan_authority,
+        )
+        self.trace: list = []
+        self.backend_close = backend_close or (lambda: self.trace.append("backend.close"))
+        handle = BackendHandle(
+            name="store",
+            hint_key=None,
+            fetcher=self.store,
+            publisher=self.publisher if publish else None,
+            pool_registrar=None,
+            close=self.backend_close,
+            read_counters=lambda: {
+                "fetch_hits": self.store.count("fetch"),
+                "publish_stored": self.publisher.count("publish"),
+            },
+        )
+        entry = BackendEntry.from_dict(
+            {
+                "name": "store",
+                "type": "fake",
+                "roles": ["fetch", "publish"] if publish else ["fetch"],
+            }
+        )
+        self.hooks = KVTransferHooks(
+            self.executor,
+            self.coord,
+            self.effects,
+            [handle],
+            [entry],
+            close_timeout_s=close_timeout_s,
+            status_dump_path=status_dump_path,
+            started_at=123.5,
+        )
+        self.executor.kv_transfer = self.hooks
+        self.executor._free_request_resources.side_effect = self._free_request_resources
+
+    def _free_request_resources(self, request) -> None:
+        self.trace.append(("free", request.py_request_id))
+        self.kv.free_resources(request)
+
+    # -- the loop, one hook at a time --
+
+    def advance(self, *active) -> None:
+        self.hooks.advance_round(list(active))
+
+    def plan(self, req) -> FetchPlan:
+        self.advance(req)
+        plan = self.hooks.fetch_answer(req)
+        assert isinstance(plan, FetchPlan), f"expected a plan, got {plan!r}"
+        return plan
+
+    def reserve(self, req, token_end: int, *, committed: int = 0) -> FakeKVCache:
+        """What the scheduler's ``reserve_transfer_pages(req, token_end)`` leaves behind."""
+        kv_cache = FakeKVCache(history_length=token_end, num_committed_tokens=committed)
+        self.kv.kv_cache_map[req.py_request_id] = kv_cache
+        req.py_ctx_pre_resize_cap = 0
+        self.slots.add(req)
+        return kv_cache
+
+    def launch(self, req):
+        before = len(self.store.attempts)
+        self.hooks.launch_reserved_fetches([req])
+        assert len(self.store.attempts) == before + 1, "launch did not create a store attempt"
+        return self.store.attempts[-1]
+
+    def plan_reserve_launch(self, req):
+        plan = self.plan(req)
+        self.reserve(req, plan.token_end)
+        return plan, self.launch(req)
+
+    def publish(self, req):
+        """Prefill ended this step; the loop offers the request's blocks."""
+        finish_prefill(req)
+        self.kv.kv_cache_map.setdefault(
+            req.py_request_id, FakeKVCache(history_length=req.prompt_len)
+        )
+        self.slots.add(req)
+        before = len(self.publisher.attempts)
+        self.hooks.publish_committed_blocks([req])
+        assert len(self.publisher.attempts) == before + 1, "no publish attempt was made"
+        return self.publisher.attempts[-1]
+
+    def deliver_all(self) -> None:
+        """Every fetch and publish attempt of this rank's backends still in flight completes."""
+        for attempt in (*self.store.attempts, *self.publisher.attempts):
+            if attempt.poll() is None:
+                attempt.deliver_all()
+
+    # -- what a scenario reads --
+
+    def records(self) -> list[dict]:
+        return self.coord.status_dump()["records"]
+
+    def record(self, request_id: int, direction: str = "fetch") -> dict | None:
+        for rec in self.records():
+            if rec["request_id"] == request_id and rec["direction"] == direction:
+                return rec
+        return None
+
+    def held_and_parked(self) -> tuple[frozenset[int], frozenset[int]]:
+        """``(held_request_ids, parked_request_ids)`` of the coordinator, read together."""
+        return self.coord.held_request_ids(), self.coord.parked_request_ids()
+
+    def terminations(self) -> int:
+        return self.executor._do_terminate_request.call_count
+
+    def published_unit_names(self) -> frozenset[bytes]:
+        return frozenset(
+            unit.name for attempt in self.publisher.attempts for unit in attempt.payload.units
+        )
+
+    # -- the engine's own paths, where a test drives them --
+
+    def wire_engine_error_path(self) -> None:
+        """Make the ``_handle_errors`` mock do what the engine's does to the failed requests:
+        mark them complete, drop them from ``active_requests``, terminate each through
+        ``_terminate_request`` (whose release gate asks this layer)."""
+        executor = self.executor
+
+        def handle_errors(error_msg=None, *, requests=None, charge_budget=True, **_):
+            failed = list(executor.active_requests) if requests is None else list(requests)
+            for request in failed:
+                request.state = LlmRequestState.GENERATION_COMPLETE
+            executor.active_requests = [r for r in executor.active_requests if r not in failed]
+            for request in failed:
+                executor._terminate_request(request)
+
+        executor._handle_errors.side_effect = handle_errors
+
+    def wire_response_pass(self, monkeypatch) -> None:
+        """What a real ``_handle_responses`` reads besides the requests themselves."""
+        executor = self.executor
+        executor.perf_manager = Mock()
+        executor.iter_counter = 3
+        executor.stream_interval = 1
+        executor.disable_overlap_scheduler = True
+        disagg = Mock()
+        disagg.inflight_cancel_active.return_value = False
+        # ``PyExecutor.disagg`` is a read-only property over the disagg coordinator.
+        monkeypatch.setattr(PyExecutor, "disagg", property(lambda self: disagg))
+        executor.model_engine = SimpleNamespace(route_capture=None)
+        executor.force_terminate_ctx_for_partial_reuse = False
+        executor._enqueue_responses = Mock()
+        executor.dist = SimpleNamespace(rank=0)
+        executor.gather_all_responses = False

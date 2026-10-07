@@ -1,15 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The KV transfer hook points of the engine loop, read off the engine source.
+"""Where each KV transfer hook sits in the engine loop, checked against the engine source.
 
-Each hook is one guarded call in a shared engine file, placed relative to a named neighbour
-(after ``poll_gen_transfers``, before ``_send_kv_async``, ...). Running ``_executor_loop`` in a
-unit test would need the model engine, sampler and hang detector; the order the design requires
-is a property of the source, so this checks the source: delete or move a hook and a test here
-fails and names it. The source-text assertions are deliberate, not a stopgap: they pin the
-*placement* of each hook, which no behavioural test of the hooks can see, and they are written
-against whitespace-collapsed source so that reformatting does not break them. Behaviour of each
-hook is covered by ``test_hooks.py``.
+Each hook is one guarded ``self.kv_transfer.<hook>(...)`` call in a shared engine file, placed
+relative to a named neighbour (after ``poll_gen_transfers``, before ``_send_kv_async``, ...).
+Checked here, on whitespace-collapsed source: that every hook is present exactly once, guarded,
+and in the order the design requires; that the release gate is the first ``kv_transfer``
+statement of ``_terminate_request``; that the assembly is imported lazily. What each hook does is
+``test_hooks.py``, ``test_effects.py`` and ``test_release_gate.py``.
 """
 
 import ast

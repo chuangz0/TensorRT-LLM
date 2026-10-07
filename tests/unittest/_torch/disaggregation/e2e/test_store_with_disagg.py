@@ -13,97 +13,61 @@ the transceiver.
 """
 
 import os
-import time
 
 import pytest
-from mooncake_cluster import (
+from status_dumps import assert_no_leftover_records, counters, read_single_rank_dump
+from store_engine import (
     KV_TRANSFER_CONFIG_ENV,
-    KV_TRANSFER_STATUS_DUMP_ENV,
-    assert_no_leftover_records,
-    counters,
-    dump_template,
     generate_ids,
-    kv_cache_config,
     prompt_token_ids,
-    read_status_dump,
+    run_engine,
     sampling_params,
+    start_engine,
     timeout_mark,
+    used_num_blocks_settled,
     write_kv_transfer_yaml,
 )
 
 pytestmark = [pytest.mark.threadleak(enabled=False), pytest.mark.private_mpi_session]
 
-STATS_SETTLE_RETRIES = 15
 ROUNDS = 2
 
 
-def used_num_blocks_settled(llm) -> int:
-    """The last ``usedNumBlocks`` the engine reported once no further iterations run."""
-    time.sleep(1.0)
-    last = None
-    quiet_polls = 0
-    for _ in range(STATS_SETTLE_RETRIES):
-        stats = llm.get_stats(2)
-        if stats:
-            last = stats[-1]["kvCacheStats"]["usedNumBlocks"]
-            quiet_polls = 0
-        else:
-            quiet_polls += 1
-            if last is not None and quiet_polls >= 2:
-                return last
-        time.sleep(1.0)
-    if last is None:
-        pytest.fail("the context engine reported no iteration stats")
-    return last
-
-
 @timeout_mark(600)
-def test_store_with_disagg_ctx_gen(mooncake_cluster, tinyllama_path, tmp_path, monkeypatch):
-    from tensorrt_llm import LLM
+def test_context_engine_publishes_to_the_store_while_sending_kv_to_the_generation_engine(
+    mooncake_cluster, tinyllama_path, tmp_path, monkeypatch
+):
     from tensorrt_llm.disaggregated_params import DisaggregatedParams
-    from tensorrt_llm.llmapi import CacheTransceiverConfig
 
     prompt = prompt_token_ids()
 
-    # O0: one plain engine, no store, no transceiver; created and gone before the pair.
+    # One plain engine, no store, no transceiver; created and gone before the pair.
     monkeypatch.delenv(KV_TRANSFER_CONFIG_ENV, raising=False)
-    monkeypatch.delenv(KV_TRANSFER_STATUS_DUMP_ENV, raising=False)
-    plain = LLM(
-        model=tinyllama_path, kv_cache_config=kv_cache_config(), disable_overlap_scheduler=True
-    )
-    try:
-        expected = generate_ids(plain, prompt)
-    finally:
-        plain.shutdown()
+    (expected,) = run_engine(tmp_path, monkeypatch, None, tinyllama_path, [prompt]).tokens
     assert len(expected) > 0
 
-    namespace = f"e2-{os.getpid()}"
+    namespace = f"with-disagg-{os.getpid()}"
     config_path = write_kv_transfer_yaml(tmp_path, mooncake_cluster.master_address, namespace)
     monkeypatch.setenv(KV_TRANSFER_CONFIG_ENV, config_path)
 
-    def transceiver():
-        return CacheTransceiverConfig(
-            backend="NIXL", transceiver_runtime="PYTHON", kv_transfer_timeout_ms=30000
-        )
-
-    monkeypatch.setenv(KV_TRANSFER_STATUS_DUMP_ENV, dump_template(tmp_path, "ctx"))
-    llm_ctx = LLM(
-        model=tinyllama_path,
-        kv_cache_config=kv_cache_config(),
-        disable_overlap_scheduler=True,
+    llm_ctx = start_engine(
+        tmp_path,
+        monkeypatch,
+        "ctx",
+        tinyllama_path,
+        cache_transceiver=True,
         enable_iter_perf_stats=True,
-        cache_transceiver_config=transceiver(),
     )
     llm_gen = None
     dump_ctx = dump_gen = None
     try:
-        monkeypatch.setenv(KV_TRANSFER_STATUS_DUMP_ENV, dump_template(tmp_path, "gen"))
-        llm_gen = LLM(
-            model=tinyllama_path,
-            kv_cache_config=kv_cache_config(),
-            disable_overlap_scheduler=True,
+        llm_gen = start_engine(
+            tmp_path,
+            monkeypatch,
+            "gen",
+            tinyllama_path,
+            cache_transceiver=True,
             enable_iter_perf_stats=True,
-            cache_transceiver_config=transceiver(),
         )
 
         outputs = []
@@ -133,16 +97,17 @@ def test_store_with_disagg_ctx_gen(mooncake_cluster, tinyllama_path, tmp_path, m
         assert used_after_round[1] == used_after_round[0], used_after_round
     finally:
         llm_ctx.shutdown()
-        dump_ctx = read_status_dump(tmp_path, "ctx")
+        dump_ctx = read_single_rank_dump(tmp_path, "ctx")
         if llm_gen is not None:
             llm_gen.shutdown()
-            dump_gen = read_status_dump(tmp_path, "gen")
+            dump_gen = read_single_rank_dump(tmp_path, "gen")
 
     counters_ctx = counters(dump_ctx)
     assert counters_ctx["publish_stored"] > 0, counters_ctx
     # The second identical request probes the store and finds every block (probe_hits), but on
     # the same engine the local radix tree already serves the whole prompt, so the plan's ask is
-    # empty and no unit is fetched: a store *fetch* is only observable across engines (E1).
+    # empty and no unit is fetched: a store *fetch* is only observable across engines, which is
+    # what ``test_store_round_trip`` shows.
     assert counters_ctx["probe_hits"] > 0, counters_ctx
     assert counters_ctx["fetch_misses"] == 0, counters_ctx
     assert counters_ctx["failed_attempts"] == 0, counters_ctx

@@ -35,6 +35,7 @@ from disaggregation.base.views import GroupSpec  # noqa: E402
 from disaggregation.orchestration.kv_transfer.coordinator import KVTransferCoordinator  # noqa: E402
 from disaggregation.orchestration.kv_transfer.engine_protocols import PlanAuthority  # noqa: E402
 from disaggregation.remote_cache import (  # noqa: E402
+    DEFER,
     FetchPlan,
     FetchSource,
     GroupPlan,
@@ -46,6 +47,9 @@ from disaggregation.resource.naming import group_tag  # noqa: E402
 
 TPB = 4
 """Tokens per block used throughout the tests."""
+
+END = 28
+"""``token_end`` of the 29-token requests the tests use: seven nameable blocks of ``TPB``."""
 
 
 # ---------------------------------------------------------------------------------------------
@@ -231,7 +235,7 @@ class FakeFetches:
       outcome yet.
     * ``probe_answers`` is consumed one per ``probe`` call, else ``probe_default``. An ``Exception``
       instance is raised instead of returned.
-    * ``reject_next`` makes that many upcoming ``fetch`` calls raise ``SubmissionRejected``.
+    * ``reject_next_calls`` makes that many upcoming ``fetch`` calls raise ``SubmissionRejected``.
     * ``aux_for_next`` makes the next attempt a ``FakeAuxAttempt`` carrying that mapping.
     * ``single_destination`` makes ``open_route`` raise ``NotImplementedError`` (a store);
       ``open_route_errors`` is a queue of exceptions the next ``open_route`` calls raise instead.
@@ -261,7 +265,7 @@ class FakeFetches:
         self.quiesce_answers: deque[bool] = deque()
         self.probe_answers: deque = deque()
         self.open_route_errors: deque[BaseException] = deque()
-        self.reject_next = 0
+        self.reject_next_calls = 0
         self.aux_for_next: Mapping[str, object] | None = None
 
     # -- scripting --
@@ -286,8 +290,8 @@ class FakeFetches:
 
     def fetch(self, extent: CacheExtent, *, route=None) -> FakeAttempt:
         self.calls.append(("fetch", (extent, route)))
-        if self.reject_next > 0:
-            self.reject_next -= 1
+        if self.reject_next_calls > 0:
+            self.reject_next_calls -= 1
             raise SubmissionRejected(f"{self.name} rejected")
         outcome = Delivered(frozenset()) if not extent.units else self._scripted(extent)
         if self.aux_for_next is not None:
@@ -346,14 +350,14 @@ class FakePublishes:
         self.calls: list[tuple[str, tuple]] = []
         self.attempts: list[FakeAttempt] = []
         self.quiesce_answers: deque[bool] = deque()
-        self.reject_next = 0
+        self.reject_next_calls = 0
         self.reject_methods: set[str] = set()
         """Methods (``"publish"``, ``"place_piece"``) that always raise ``SubmissionRejected``."""
 
     def _submit(self, method: str, payload: object) -> FakeAttempt:
         self.calls.append((method, (payload,)))
-        if self.reject_next > 0 or method in self.reject_methods:
-            self.reject_next = max(0, self.reject_next - 1)
+        if self.reject_next_calls > 0 or method in self.reject_methods:
+            self.reject_next_calls = max(0, self.reject_next_calls - 1)
             raise SubmissionRejected(f"{self.name} rejected {method}")
         attempt = FakeAttempt(payload)
         self.attempts.append(attempt)
@@ -444,8 +448,8 @@ class FakeLandsOnHost:
     * ``script_place(outcome)`` does the same for the attempts ``Landing.place`` returns; a
       placement of an empty extent completes at once, as ``Landing.place`` promises, and
       consumes none.
-    * ``reject_next`` / ``reject_place_next`` make that many upcoming ``fetch_to_host`` /
-      ``place`` calls raise ``SubmissionRejected``.
+    * ``reject_next_calls`` / ``reject_next_place_calls`` make that many upcoming
+      ``fetch_to_host`` / ``place`` calls raise ``SubmissionRejected``.
     * ``probe`` answers ``probe_answers`` one per call, else ``probe_default``: ``"all"`` means
       every unit asked about (the store holds the whole prompt).
     * ``quiesce_answers`` as ``FakeFetches``; every call is appended to ``calls``.
@@ -468,8 +472,8 @@ class FakeLandsOnHost:
         self.attempts: list[FakeAttempt] = []
         self.quiesce_answers: deque[bool] = deque()
         self.probe_answers: deque = deque()
-        self.reject_next = 0
-        self.reject_place_next = 0
+        self.reject_next_calls = 0
+        self.reject_next_place_calls = 0
         self._landing_outcomes: deque = deque()
         self._place_outcomes: deque = deque()
 
@@ -485,8 +489,8 @@ class FakeLandsOnHost:
 
     def fetch_to_host(self, units: Sequence[bytes]) -> FakeLanding:
         self.calls.append(("fetch_to_host", (tuple(units),)))
-        if self.reject_next > 0:
-            self.reject_next -= 1
+        if self.reject_next_calls > 0:
+            self.reject_next_calls -= 1
             raise SubmissionRejected(f"{self.name} refused a landing")
         outcome = self._landing_outcomes.popleft() if self._landing_outcomes else None
         landing = FakeLanding(self, units, outcome)
@@ -495,8 +499,8 @@ class FakeLandsOnHost:
 
     def _place(self, landing: FakeLanding, extent: CacheExtent) -> FakeAttempt:
         self.calls.append(("place", (landing, extent)))
-        if self.reject_place_next > 0:
-            self.reject_place_next -= 1
+        if self.reject_next_place_calls > 0:
+            self.reject_next_place_calls -= 1
             raise SubmissionRejected(f"{self.name} refused a placement")
         if not extent.units:
             outcome = Delivered(frozenset())
@@ -532,7 +536,7 @@ class FakeLandsOnHost:
     def count(self, method: str) -> int:
         return sum(1 for m, _ in self.calls if m == method)
 
-    def closes(self) -> int:
+    def total_closes(self) -> int:
         """``close`` calls over every landing this backend handed out."""
         return sum(landing.closes for landing in self.landings)
 
@@ -585,7 +589,8 @@ class RecordingEffects:
     def count(self, name: str) -> int:
         return self.names().count(name)
 
-    def only(self, name: str) -> list[tuple]:
+    def args_of(self, name: str) -> list[tuple]:
+        """The arguments of every call of the effect ``name``, in order."""
         return [args for n, args in self.calls if n == name]
 
 
@@ -608,9 +613,14 @@ class FakeEngineQueue:
         return ran
 
 
-class FakeCollective:
+class SingleRankCollective:
     """Single rank: ``allgather`` answers with the caller's own payload; ``calls`` keeps a copy
-    of every payload gathered."""
+    of every payload gathered.
+
+    ``engine_fakes.SingleRankCollective`` is its twin for the engine-side suite: that suite
+    imports the contract through ``tensorrt_llm`` and this one as ``disaggregation.*``, and one
+    process must not hold the contract's module objects twice, so neither suite imports the
+    other's fakes."""
 
     rank = 0
     world_size = 1
@@ -625,29 +635,43 @@ class FakeCollective:
 
 
 class LockstepWorld:
-    """``n`` real coordinators stepped in lockstep on one thread, each over a ``LockstepGather``
-    as its ``Collective``.
+    """``n`` real coordinators stepped in lockstep on one thread, each over a
+    ``LockstepCollective`` as its ``Collective``.
 
     ``run(fn)`` calls ``fn(0)``; when rank 0 reaches its one collective, its gather runs ``fn(1)``
     nested (and so on up to rank ``n-1``), so every rank's payload exists before any gather
     returns. Each rank then applies the same gathered list. ``fn`` must call ``advance`` exactly
-    once per rank. Between ``run`` calls the test scripts each rank's fakes freely.
+    once per rank. Between ``run`` calls the test scripts each rank's fakes freely;
+    ``advance_all`` and ``advance_as_hooks_would`` are the two rounds every scenario plays.
 
     ``authority_of(rank)`` names each rank's ``PlanAuthority`` (default: every rank ``ALL_RANKS``);
-    ``Rig`` construction reads it through ``rig_kwargs``.
+    ``make_rigs`` builds one ``CoordinatorRig`` per rank over it.
     """
 
     def __init__(self, n: int, authority_of: Callable[[int], PlanAuthority] | None = None) -> None:
         self.n = n
         self.authority_of = authority_of or (lambda rank: PlanAuthority.ALL_RANKS)
-        self.gathers = [LockstepGather(self, r) for r in range(n)]
+        self.gathers = [LockstepCollective(self, r) for r in range(n)]
         self._fn: Callable[[int], object] | None = None
         self._payloads: dict[int, object] = {}
         self._results: list = []
 
     def rig_kwargs(self, rank: int) -> dict:
-        """The keyword arguments that place a ``Rig`` at ``rank`` of this world."""
+        """The keyword arguments that place a ``CoordinatorRig`` at ``rank`` of this world."""
         return {"dist": self.gathers[rank], "plan_authority": self.authority_of(rank)}
+
+    def make_rigs(self, **kw) -> list[CoordinatorRig]:
+        """One ``CoordinatorRig`` per rank, all built with ``kw``."""
+        return [CoordinatorRig(**self.rig_kwargs(rank), **kw) for rank in range(self.n)]
+
+    def advance_all(self, rigs: Sequence[CoordinatorRig], candidates: Sequence, now: float) -> None:
+        """One round in which every rank advances with the same candidates."""
+        self.run(lambda rank: rigs[rank].coord.advance(list(candidates), now))
+
+    def advance_as_hooks_would(self, rigs: Sequence[CoordinatorRig], req, now: float) -> None:
+        """One round in which every rank advances as its engine hooks would: ``req`` is a
+        candidate on the ranks whose answer for it is still ``DEFER``."""
+        self.run(lambda rank: rigs[rank].advance_as_hooks_would(req, now))
 
     def run(self, fn: Callable[[int], object]) -> list:
         assert self._fn is None, "LockstepWorld.run is not reentrant"
@@ -670,7 +694,7 @@ class LockstepWorld:
         return [copy.deepcopy(self._payloads[r]) for r in range(self.n)]
 
 
-class LockstepGather:
+class LockstepCollective:
     """The ``Collective`` of one rank of a ``LockstepWorld``; records every payload."""
 
     def __init__(self, world: LockstepWorld, rank: int) -> None:
@@ -683,7 +707,7 @@ class LockstepGather:
         return self._world._exchange(self.rank, payload)
 
 
-class PeerGather:
+class ScriptedPeersCollective:
     """``Collective`` of a single real rank plus hand-written peers: ``peer(local_payload) ->
     peer_payload`` for each peer function; the gathered list is ``[local, *peers]``."""
 
@@ -830,17 +854,18 @@ class FakeReader:
 # ---------------------------------------------------------------------------------------------
 
 
-class Rig:
+class CoordinatorRig:
     """Everything one coordinator needs, wired with defaults; tests override by keyword.
 
     Sources are ``worker`` (hint key ``"ctx"``) followed by ``store`` (no hint key) unless
     ``sources`` is given; ``host`` is a ``FakeLandsOnHost`` store that holds every prompt. ``trace``
     interleaves backend ``quiesce`` calls with effects. Every backend, publishers included, is
     strict about ``quiesce``: asking under a live attempt fails the test. The collective is
-    ``FakeCollective`` unless a ``dist`` (``LockstepGather``, ``PeerGather``) is given; ``payloads()``
-    lists what this rank sent either way. ``probe_timeout_s`` is measured on the ``now`` tests
-    pass to ``advance``: with the default, a request deferred at 0.0 and 1.0 is planned without
-    the store at 2.0.
+    ``SingleRankCollective`` unless a ``dist`` (``LockstepCollective``, ``ScriptedPeersCollective``)
+    is given; ``payloads()`` lists what this rank sent either way, ``last_votes`` /
+    ``last_expired`` / ``last_plan_answers`` the sections of the latest one. ``probe_timeout_s`` is
+    measured on the ``now`` tests pass to ``advance``: with the default, a request deferred at 0.0
+    and 1.0 is planned without the store at 2.0.
     """
 
     def __init__(
@@ -855,7 +880,7 @@ class Rig:
         **coordinator_kwargs,
     ) -> None:
         self.plans: dict[int, FetchPlan] = {}
-        """Plans as read by ``plan_and_launch`` before launching (unreadable afterwards)."""
+        """Plans as read by ``launch_reserved`` before launching (unreadable afterwards)."""
         self.trace: list = []
         self.reader = FakeReader(groups=groups, tokens_per_block=tpb)
         self.worker = FakeFetches(name="worker", trace=self.trace, strict_quiesce=True)
@@ -876,7 +901,7 @@ class Rig:
             p.strict_quiesce = True
         self.effects = RecordingEffects(trace=self.trace)
         self.queue = FakeEngineQueue()
-        self.dist = dist if dist is not None else FakeCollective()
+        self.dist = dist if dist is not None else SingleRankCollective()
         self.planner = Planner(self.sources, self.reader, tpb, probe_timeout_s=probe_timeout_s)
         coordinator_kwargs.setdefault("unlaunched_timeout_s", DEFAULT_UNLAUNCHED_TIMEOUT_S)
         coordinator_kwargs.setdefault("fetch_wait_timeout_s", DEFAULT_FETCH_WAIT_TIMEOUT_S)
@@ -891,7 +916,7 @@ class Rig:
             **coordinator_kwargs,
         )
 
-    # -- shortcuts --
+    # -- what this rank recorded --
 
     def records(self) -> list[dict]:
         return self.coord.status_dump()["records"]
@@ -906,17 +931,45 @@ class Rig:
         """Every payload this rank handed to its collective, in order."""
         return list(self.dist.calls)
 
-    def plan_and_launch(self, req: FakeRequest, now: float = 0.0) -> FakeAttempt:
-        """``advance`` with ``req`` as the only candidate, read its plan into ``plans``, then
-        ``launch_reserved_fetches``; returns the attempt the worker created."""
-        self.coord.advance([req], now)
+    @property
+    def last_votes(self) -> list:
+        """The vote section of the last payload this rank sent."""
+        return self.payloads()[-1][0]
+
+    @property
+    def last_expired(self) -> list:
+        """The expired-records section of the last payload this rank sent."""
+        return self.payloads()[-1][1]
+
+    @property
+    def last_plan_answers(self) -> list:
+        """The plan-answer section of the last payload this rank sent."""
+        return self.payloads()[-1][2]
+
+    # -- the loop, one hook at a time --
+
+    def advance_as_hooks_would(self, req: FakeRequest, now: float) -> None:
+        """One round's ``advance`` as the engine hooks issue it: the request is a candidate only
+        while its answer is ``DEFER``."""
+        self.coord.advance([req] if self.coord.fetch_answer(req) is DEFER else [], now)
+
+    def launch_reserved(self, req: FakeRequest, now: float) -> FakeAttempt:
+        """The scheduler's part once the plan is answered: read it (reserving is implied), keep it
+        in ``plans``, then ``launch_reserved_fetches``; returns the attempt the plan's source
+        created, which for the ``host`` source is the placement out of the landing."""
         plan = self.coord.fetch_answer(req)
-        assert isinstance(plan, FetchPlan), f"expected a plan before launch, got {plan!r}"
+        assert isinstance(plan, FetchPlan), f"expected a plan to launch, got {plan!r}"
         self.plans[req.py_request_id] = plan
-        before = len(self.worker.attempts)
+        backend = next(source.backend for source in self.sources if source.name == plan.source)
+        before = len(backend.attempts)
         self.coord.launch_reserved_fetches([req], now)
-        assert len(self.worker.attempts) == before + 1, "launch did not create a worker attempt"
-        return self.worker.attempts[-1]
+        assert len(backend.attempts) == before + 1, f"launch created no attempt on {plan.source}"
+        return backend.attempts[-1]
+
+    def plan_and_launch(self, req: FakeRequest, now: float = 0.0) -> FakeAttempt:
+        """``advance`` with ``req`` as the only candidate, then ``launch_reserved``."""
+        self.coord.advance([req], now)
+        return self.launch_reserved(req, now)
 
     def plan_and_land(self, req: FakeRequest, now: float = 0.0) -> FakeLanding:
         """``advance`` with ``req`` as the only candidate on the ``host`` source: the plan is
@@ -926,18 +979,88 @@ class Rig:
         assert len(self.host.landings) == before + 1, "deciding the plan did not start a landing"
         return self.host.landings[-1]
 
-    def reserve_and_place(self, req: FakeRequest, now: float) -> FakeAttempt:
-        """The scheduler's part for a ``LANDED`` record: read the plan (reserving is implied),
-        then ``launch_reserved_fetches``; returns the placement attempt."""
-        plan = self.coord.fetch_answer(req)
-        assert isinstance(plan, FetchPlan), f"expected a plan to reserve for, got {plan!r}"
-        self.plans[req.py_request_id] = plan
-        before = len(self.host.attempts)
-        self.coord.launch_reserved_fetches([req], now)
-        assert len(self.host.attempts) == before + 1, "launch did not place the landing"
-        return self.host.attempts[-1]
+    def land_and_agree(self, req: FakeRequest, now: float = 0.0) -> FakeLanding:
+        """Decide the plan (which starts the landing), deliver the landing, agree: ``LANDED``."""
+        landing = self.plan_and_land(req, now)
+        landing.deliver_all()
+        self.coord.advance([], now + 1.0)
+        assert self.record(req.py_request_id)["state"] == "LANDED"
+        return landing
+
+    def drive_rounds(self, req: FakeRequest, rounds: int) -> int:
+        """The engine loop for one request: ``advance``, then launch when planned, round after
+        round, until the answer is ``None`` (compute locally). Returns how many rounds it took."""
+        for round_index in range(rounds):
+            self.advance_as_hooks_would(req, float(round_index))
+            plan = self.coord.fetch_answer(req)
+            if plan is None:
+                return round_index
+            if isinstance(plan, FetchPlan):
+                self.coord.launch_reserved_fetches([req], float(round_index))
+        raise AssertionError(f"request {req.py_request_id} still deferred after {rounds} rounds")
+
+
+def host_rig(**kw) -> CoordinatorRig:
+    """A ``CoordinatorRig`` over a single ``LandsOnHost`` store that holds every prompt."""
+    return CoordinatorRig(sources=("host",), **kw)
+
+
+# ---------------------------------------------------------------------------------------------
+# Requests
+# ---------------------------------------------------------------------------------------------
 
 
 def worker_request(rid: int = 1, prompt_len: int = 29, **kw) -> FakeRequest:
     """A context request routed to the worker backend (hint key ``"ctx"``)."""
     return FakeRequest(rid, prompt_len, route_hints={"ctx": {"peer": f"peer{rid}"}}, **kw)
+
+
+def store_request(rid: int = 1, prompt_len: int = 29) -> FakeRequest:
+    """A context request without a route hint: planned from a store (``store`` or ``host``)."""
+    return FakeRequest(rid, prompt_len)
+
+
+def gen_init_request() -> FakeRequest:
+    """A disaggregated generation-init request of 30 tokens, routed to the worker."""
+    return FakeRequest(
+        7, prompt_len=30, is_disagg_generation_init=True, route_hints={"ctx": {"peer": "c"}}
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+# Reading the shared trace and the status dump
+# ---------------------------------------------------------------------------------------------
+
+
+def quiesce_indices(trace: Sequence[tuple]) -> list[int]:
+    """Positions of every backend ``quiesce`` in a rig's ``trace``."""
+    return [i for i, (name, _) in enumerate(trace) if name == "quiesce"]
+
+
+def effect_indices(trace: Sequence[tuple], name: str) -> list[int]:
+    """Positions of every effect called ``name`` in a rig's ``trace``."""
+    return [i for i, (n, _) in enumerate(trace) if n == name]
+
+
+def assert_quiesce_precedes(
+    trace: Sequence[tuple], effect: str, *, quiesces: int = 1, effects: int = 1
+) -> None:
+    """Exactly ``quiesces`` backend ``quiesce`` calls and ``effects`` calls of ``effect`` are in
+    the trace, and they alternate quiesce-first: the release point comes before the engine is
+    told (design §4.3)."""
+    q, e = quiesce_indices(trace), effect_indices(trace, effect)
+    assert len(q) == quiesces and len(e) == effects, (q, e)
+    interleaved = [i for pair in zip(q, e) for i in pair]
+    assert interleaved == sorted(interleaved), (q, e)
+
+
+EMPTY_DUMP = {
+    "plan_authority": "ALL_RANKS",
+    "any_rank_pending": True,
+    "any_rank_drained": False,
+    "records": [],
+    "decided_plans": 0,
+    "finished_pending": [],
+}
+"""A single rank's ``status_dump`` once every record has been released: ``any_rank_pending`` is
+still True because the round that released the last record gathered while it existed."""

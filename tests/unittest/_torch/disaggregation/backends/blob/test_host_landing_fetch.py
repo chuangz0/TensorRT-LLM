@@ -8,13 +8,13 @@ What distinguishes this shape from the device one, and what the tests pin down:
 
 * A landing short of slots waits in the pool's queue, never on a worker; the thread that returns
   slots hands it to a worker. Landings do not take the in-flight semaphore.
-* The publish pool and the landing pool are separate, so a staged publish completes while every
+* The publish pool and the landing pool are separate, so a pooled publish completes while every
   landing slot is held by a landing waiting for pages.
 * ``release`` is non-blocking on the caller's thread in every state: queued, get in flight, landed,
   and after the backend has closed.
 * ``poll`` bounds the queue wait; ``place`` writes only the units of its extent.
 
-Every backend is closed inside the test body (``with make_host_rank() as rank``): the repository's
+Every backend is closed inside the test body (``with host_rank() as rank``): the repository's
 thread-leak check runs before fixture teardown.
 """
 
@@ -39,9 +39,9 @@ from disaggregation.base.cache_backend import (  # noqa: E402
 from disaggregation.base.capabilities import Landing, LandsOnHost  # noqa: E402
 from store_fakes import (  # noqa: E402
     FakeBlobStore,
+    device_rank,
     extent,
-    make_host_rank,
-    make_rank,
+    host_rank,
     pattern,
     wait_until,
 )
@@ -54,11 +54,11 @@ UNIT = 64
 def _published(store: FakeBlobStore, count: int, seed: int = 1):
     """Publish ``count`` units of ``UNIT`` bytes from a device-landing rank, keeping it open so
     the test can compare bytes. Returns ``(rank, units)``; the caller closes the rank."""
-    direct = make_rank(store)
+    direct = device_rank(store)
     units = [direct.unit(0, i, UNIT) for i in range(count)]
     for i, u in enumerate(units):
         direct.write(u, pattern(seed + i, UNIT))
-    assert isinstance(direct.finish(direct.backend.publish(extent(units))), Delivered)
+    assert isinstance(direct.outcome_of(direct.backend.publish(extent(units))), Delivered)
     return direct, units
 
 
@@ -74,7 +74,7 @@ def _mirror(rank, units, fill: int = 0xEE):
 
 
 def test_host_shape_is_lands_on_host_and_not_fetches():
-    with make_host_rank() as rank:
+    with host_rank() as rank:
         assert isinstance(rank.backend, HostLandingBlobBackend)
         assert isinstance(rank.backend, LandsOnHost)
         assert not isinstance(rank.backend, Fetches)
@@ -91,12 +91,12 @@ def test_host_shape_is_lands_on_host_and_not_fetches():
 
 
 def test_host_shape_registers_only_its_pools_and_publishes_through_the_publish_pool():
-    with make_host_rank() as rank:
+    with host_rank() as rank:
         assert rank.registration is None
         assert rank.store.count("register_span") == 2  # publish pool, landing pool
         u = rank.unit(0, 0, UNIT)
         rank.write(u, pattern(1, UNIT))
-        assert isinstance(rank.finish(rank.backend.publish(extent([u]))), Delivered)
+        assert isinstance(rank.outcome_of(rank.backend.publish(extent([u]))), Delivered)
         assert rank.store.objects[rank.key(u)] == pattern(1, UNIT)
         assert rank.publish_copier.kinds() == ["d2h"] and rank.landing_copier.copies == []
         assert rank.backend.counters.publish_stored == 1
@@ -108,7 +108,7 @@ def test_host_shape_registers_only_its_pools_and_publishes_through_the_publish_p
 def test_landing_then_place_round_trips_bytes_and_writes_only_the_extent():
     store = FakeBlobStore()
     direct, theirs = _published(store, 3)
-    with direct, make_host_rank(store) as rank:
+    with direct, host_rank(store) as rank:
         a, b, c = _mirror(rank, theirs)
         missing = rank.unit(0, 9, UNIT)
         rank.fill(missing, 0xEE)
@@ -137,7 +137,7 @@ def test_landing_then_place_round_trips_bytes_and_writes_only_the_extent():
 def test_place_of_a_unit_the_landing_did_not_serve_fails_without_touching_memory():
     store = FakeBlobStore()
     direct, theirs = _published(store, 1)
-    with direct, make_host_rank(store) as rank:
+    with direct, host_rank(store) as rank:
         (a,) = _mirror(rank, theirs)
         never = rank.unit(0, 5, UNIT)
         rank.fill(never, 0xEE)
@@ -157,7 +157,7 @@ def test_place_of_a_unit_whose_pages_differ_in_size_from_the_landed_bytes_fails(
     of pages."""
     store = FakeBlobStore()
     direct, theirs = _published(store, 1)
-    with direct, make_host_rank(store) as rank:
+    with direct, host_rank(store) as rank:
         (a,) = _mirror(rank, theirs)
         landing = rank.land([a])
         rank.resolver.add(1, 0, 32, 48)  # the same name resolving to 80 B of pages elsewhere
@@ -175,7 +175,7 @@ def test_place_of_a_unit_whose_pages_differ_in_size_from_the_landed_bytes_fails(
 
 
 def test_place_before_the_landing_has_content_is_rejected():
-    with make_host_rank() as rank:
+    with host_rank() as rank:
         a = rank.unit(0, 0, UNIT)
         rank.store.block("contains")
         landing = rank.backend.fetch_to_host([a.name])
@@ -195,12 +195,12 @@ def test_place_before_the_landing_has_content_is_rejected():
 def test_place_copier_failure_is_failed_quiet_and_keeps_the_landing_placeable():
     store = FakeBlobStore()
     direct, theirs = _published(store, 1)
-    with direct, make_host_rank(store) as rank:
+    with direct, host_rank(store) as rank:
         (a,) = _mirror(rank, theirs)
         landing = rank.land([a])
         rank.landing_copier.fail_next("copy", RuntimeError("cudaMemcpyAsync failed"))
         attempt = landing.place(extent([a]))
-        outcome = rank.finish(attempt)
+        outcome = rank.outcome_of(attempt)
         assert isinstance(outcome, Failed) and "cudaMemcpyAsync" in outcome.reason
         assert rank.backend.quiesce([attempt]) is True
         assert rank.landing_copier.copy_waits == 1  # waited for before the outcome
@@ -216,7 +216,7 @@ def test_place_copier_failure_is_failed_quiet_and_keeps_the_landing_placeable():
 def test_slot_shortage_queues_the_landing_and_release_hands_it_to_a_worker():
     store = FakeBlobStore()
     direct, theirs = _published(store, 2)
-    with direct, make_host_rank(store, landing_slots=1) as rank:
+    with direct, host_rank(store, landing_slots=1) as rank:
         a, b = _mirror(rank, theirs)
         first = rank.land([a])
         lookups = rank.store.count("contains")
@@ -236,7 +236,7 @@ def test_slot_shortage_queues_the_landing_and_release_hands_it_to_a_worker():
 def test_one_worker_one_slot_three_landings_all_complete_in_order():
     store = FakeBlobStore()
     direct, theirs = _published(store, 3)
-    with direct, make_host_rank(store, landing_slots=1, num_workers=1) as rank:
+    with direct, host_rank(store, landing_slots=1, num_workers=1) as rank:
         mine = _mirror(rank, theirs)
         landings = [rank.backend.fetch_to_host([u.name]) for i, u in enumerate(mine)]
         for i, landing in enumerate(landings):
@@ -251,16 +251,16 @@ def test_one_worker_one_slot_three_landings_all_complete_in_order():
 
 
 def test_publish_completes_while_a_landing_holds_every_landing_slot_on_the_only_worker():
-    """The two-pool property: a staged publish only ever waits for other publishes."""
+    """The two-pool property: a pooled publish only ever waits for other publishes."""
     store = FakeBlobStore()
     direct, theirs = _published(store, 1)
-    with direct, make_host_rank(store, landing_slots=1, publish_slots=1, num_workers=1) as rank:
+    with direct, host_rank(store, landing_slots=1, publish_slots=1, num_workers=1) as rank:
         (a,) = _mirror(rank, theirs)
         held = rank.land([a])  # holds the single landing slot, waiting for pages
         out = [rank.unit(1, i, UNIT) for i in range(2)]
         for i, u in enumerate(out):
             rank.write(u, pattern(10 + i, UNIT))
-        assert rank.finish(rank.backend.publish(extent(out))) == Delivered(
+        assert rank.outcome_of(rank.backend.publish(extent(out))) == Delivered(
             frozenset(u.name for u in out)
         )
         for i, u in enumerate(out):
@@ -275,7 +275,7 @@ def test_landings_take_no_inflight_slot_but_placements_do():
     back once the placement has landed (the second placement is then accepted)."""
     store = FakeBlobStore()
     direct, theirs = _published(store, 2)
-    with direct, make_host_rank(store, max_inflight_deliveries=1) as rank:
+    with direct, host_rank(store, max_inflight_deliveries=1) as rank:
         a, b = _mirror(rank, theirs)
         rank.store.block("get")
         first = rank.backend.fetch_to_host([a.name])
@@ -286,14 +286,14 @@ def test_landings_take_no_inflight_slot_but_placements_do():
         published = rank.backend.publish(extent([out], name=b"pub"))  # the slot was free
         rank.store.unblock()
         wait_until(lambda: first.poll() is not None and second.poll() is not None)
-        assert isinstance(rank.finish(published), Delivered)
+        assert isinstance(rank.outcome_of(published), Delivered)
         rank.landing_copier.block("copy")
         placing = first.place(extent([a]))
         rank.landing_copier.wait_entered(1)
         with pytest.raises(SubmissionRejected, match="1 deliveries already in flight"):
             second.place(extent([b]))
         rank.landing_copier.unblock()
-        assert isinstance(rank.finish(placing), Delivered)
+        assert isinstance(rank.outcome_of(placing), Delivered)
         assert rank.place(second, [b]) == Delivered(frozenset({b.name}))  # the slot is back
         first.close()
         second.close()
@@ -302,7 +302,7 @@ def test_landings_take_no_inflight_slot_but_placements_do():
 def test_holds_and_get_run_back_to_back_once_the_slots_are_granted():
     store = FakeBlobStore()
     direct, theirs = _published(store, 2)
-    with direct, make_host_rank(store, landing_slots=1) as rank:
+    with direct, host_rank(store, landing_slots=1) as rank:
         a, b = _mirror(rank, theirs)
         first = rank.land([a])
         calls_before = len(rank.store.calls)
@@ -321,7 +321,7 @@ def test_holds_and_get_run_back_to_back_once_the_slots_are_granted():
 def test_release_while_queued_dequeues_and_takes_no_slot():
     store = FakeBlobStore()
     direct, theirs = _published(store, 2)
-    with direct, make_host_rank(store, landing_slots=1) as rank:
+    with direct, host_rank(store, landing_slots=1) as rank:
         a, b = _mirror(rank, theirs)
         first = rank.land([a])
         lookups = rank.store.count("contains")
@@ -338,7 +338,7 @@ def test_release_while_queued_dequeues_and_takes_no_slot():
 def test_release_while_the_get_is_in_flight_returns_the_slots_after_it():
     store = FakeBlobStore()
     direct, theirs = _published(store, 1)
-    with direct, make_host_rank(store, landing_slots=1) as rank:
+    with direct, host_rank(store, landing_slots=1) as rank:
         (a,) = _mirror(rank, theirs)
         rank.store.block("get")
         landing = rank.backend.fetch_to_host([a.name])
@@ -359,7 +359,7 @@ def test_release_during_an_in_flight_placement_returns_slots_after_the_copy():
     next landing mid-copy."""
     store = FakeBlobStore()
     direct, theirs = _published(store, 1)
-    with direct, make_host_rank(store, landing_slots=1) as rank:
+    with direct, host_rank(store, landing_slots=1) as rank:
         (a,) = _mirror(rank, theirs)
         landing = rank.land([a])
         rank.landing_copier.block("copy")
@@ -374,7 +374,7 @@ def test_release_during_an_in_flight_placement_returns_slots_after_the_copy():
         waiting = rank.backend.fetch_to_host([a.name])  # wants the one slot
         assert waiting.poll() is None
         rank.landing_copier.unblock()
-        assert rank.finish(placing) == Delivered(frozenset({a.name}))
+        assert rank.outcome_of(placing) == Delivered(frozenset({a.name}))
         assert rank.read(a) == pattern(1, UNIT)
         # The slot came back after the copy and went to the queued landing, nowhere earlier.
         wait_until(lambda: waiting.poll() is not None, what="the next landing")
@@ -387,7 +387,7 @@ def test_release_during_an_in_flight_placement_returns_slots_after_the_copy():
 def test_queue_wait_past_the_bound_fails_the_landing_and_dequeues_it():
     store = FakeBlobStore()
     direct, theirs = _published(store, 2)
-    with direct, make_host_rank(store, landing_slots=1, fetch_wait_timeout_s=30.0) as rank:
+    with direct, host_rank(store, landing_slots=1, fetch_wait_timeout_s=30.0) as rank:
         a, b = _mirror(rank, theirs)
         first = rank.land([a])
         second = rank.backend.fetch_to_host([b.name])
@@ -405,7 +405,7 @@ def test_queue_wait_past_the_bound_fails_the_landing_and_dequeues_it():
 def test_landing_failure_gives_the_slots_back_at_once():
     store = FakeBlobStore()
     direct, theirs = _published(store, 1)
-    with direct, make_host_rank(store) as rank:
+    with direct, host_rank(store) as rank:
         (a,) = _mirror(rank, theirs)
         rank.store.fail_next("get", RuntimeError("store unreachable"))
         landing = rank.land([a])
@@ -422,7 +422,7 @@ def test_landing_failure_gives_the_slots_back_at_once():
 
 
 def test_more_units_than_slots_or_an_unknown_unit_fails_before_the_store_is_asked():
-    with make_host_rank(landing_slots=2) as rank:
+    with host_rank(landing_slots=2) as rank:
         units = [rank.unit(0, i, UNIT) for i in range(3)]
         calls = len(rank.store.calls)
         outcome = rank.backend.fetch_to_host([u.name for u in units]).poll()
@@ -434,7 +434,7 @@ def test_more_units_than_slots_or_an_unknown_unit_fails_before_the_store_is_aske
 
 
 def test_unit_larger_than_a_slot_fails_the_landing_at_once():
-    with make_host_rank(slot_bytes=32) as rank:
+    with host_rank(slot_bytes=32) as rank:
         big = rank.unit(0, 0, 33)
         outcome = rank.backend.fetch_to_host([big.name]).poll()
         assert isinstance(outcome, Failed) and "exceeds the landing slot" in outcome.reason
@@ -447,7 +447,7 @@ def test_close_refuses_queued_landings_frees_held_slots_and_release_afterwards_i
     store = FakeBlobStore()
     direct, theirs = _published(store, 2)
     with direct:
-        rank = make_host_rank(store, landing_slots=1)
+        rank = host_rank(store, landing_slots=1)
         a, b = _mirror(rank, theirs)
         landed = rank.land([a])
         queued = rank.backend.fetch_to_host([b.name])
@@ -475,7 +475,7 @@ def test_fetch_to_host_racing_close_is_refused_or_released():
     by running ``close`` from inside the landing's enqueue."""
     store = FakeBlobStore()
     direct, theirs = _published(store, 1)
-    with direct, make_host_rank(store) as rank:
+    with direct, host_rank(store) as rank:
         (a,) = _mirror(rank, theirs)
         pool = rank.landing_pool
         enqueue = pool.enqueue
@@ -499,7 +499,7 @@ def test_close_waits_for_a_get_in_flight_then_returns_its_slots():
     store = FakeBlobStore()
     direct, theirs = _published(store, 1)
     with direct:
-        rank = make_host_rank(store, landing_slots=1)
+        rank = host_rank(store, landing_slots=1)
         (a,) = _mirror(rank, theirs)
         store.block("get")
         landing = rank.backend.fetch_to_host([a.name])
@@ -520,7 +520,7 @@ def test_close_waits_for_a_get_in_flight_then_returns_its_slots():
 
 
 def test_empty_landing_and_empty_placement_complete_at_once_without_the_store():
-    with make_host_rank() as rank:
+    with host_rank() as rank:
         calls = len(rank.store.calls)
         landing = rank.backend.fetch_to_host([])
         assert landing.poll() == Delivered(frozenset())
@@ -534,11 +534,11 @@ def test_empty_landing_and_empty_placement_complete_at_once_without_the_store():
 
 
 def test_quiesce_and_settle_only_know_placements():
-    with make_host_rank() as rank:
+    with host_rank() as rank:
         with pytest.raises(TypeError):
             rank.backend.quiesce([object()])
         u = Unit(name=b"x", local_group=0, local=0)
-        rank.resolver._table[(0, 0)] = ((rank.arena.address, 8),)
+        rank.resolver.map(0, 0, (rank.arena.address, 8))
         attempt = rank.backend.fetch_to_host([]).place(extent([u]))
         outcome = attempt.poll()
         assert isinstance(outcome, Failed) and "not landed" in outcome.reason
@@ -548,7 +548,7 @@ def test_quiesce_and_settle_only_know_placements():
 def test_no_wait_bound_keeps_a_queued_landing_waiting():
     store = FakeBlobStore()
     direct, theirs = _published(store, 2)
-    with direct, make_host_rank(store, landing_slots=1, fetch_wait_timeout_s=None) as rank:
+    with direct, host_rank(store, landing_slots=1, fetch_wait_timeout_s=None) as rank:
         a, b = _mirror(rank, theirs)
         first = rank.land([a])
         second = rank.backend.fetch_to_host([b.name])
@@ -564,7 +564,7 @@ def test_close_fails_a_landing_still_queued_so_poll_is_never_none_forever():
     store = FakeBlobStore()
     direct, theirs = _published(store, 2)
     with direct:
-        rank = make_host_rank(store, landing_slots=1)
+        rank = host_rank(store, landing_slots=1)
         a, b = _mirror(rank, theirs)
         held = rank.land([a])
         queued = rank.backend.fetch_to_host([b.name])

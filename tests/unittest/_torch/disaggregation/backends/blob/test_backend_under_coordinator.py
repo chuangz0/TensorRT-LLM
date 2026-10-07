@@ -23,20 +23,21 @@ from disaggregation.backends.config import (  # noqa: E402
 from disaggregation.orchestration.kv_transfer.coordinator import KVTransferCoordinator  # noqa: E402
 from disaggregation.remote_cache import DEFER, FetchPlan, FetchSource, Planner  # noqa: E402
 from fakes import (  # noqa: E402
+    EMPTY_DUMP,
     TPB,
-    FakeCollective,
     FakeEngineQueue,
     FakeReader,
     FakeRequest,
     RecordingEffects,
+    SingleRankCollective,
     full_attention,
     ordinals_by_group,
 )
 from store_fakes import (  # noqa: E402
     FakeBlobStore,
+    device_rank,
     fill,
-    make_host_rank,
-    make_rank,
+    host_rank,
     pattern,
     read,
     wait_until,
@@ -56,7 +57,7 @@ class Side:
     ``config_overrides`` go to the backend's ``BlobBackendConfig``."""
 
     def __init__(self, store: FakeBlobStore, *, publishes: bool, **config_overrides) -> None:
-        self.rank = make_rank(store, arena_bytes=1 << 16, **config_overrides)
+        self.rank = device_rank(store, arena_bytes=1 << 16, **config_overrides)
         for o in range(BLOCKS + 2):
             self.rank.resolver.add(0, o, UNIT_BYTES // 2, UNIT_BYTES // 2)  # two segments each
         self.reader = FakeReader(groups=[full_attention(0)], tokens_per_block=TPB)
@@ -72,7 +73,7 @@ class Side:
             self.reader,
             self.effects,
             self.queue,
-            FakeCollective(),
+            SingleRankCollective(),
             unlaunched_timeout_s=DEFAULT_UNLAUNCHED_TIMEOUT_S,
             fetch_wait_timeout_s=DEFAULT_FETCH_WAIT_TIMEOUT_S,
         )
@@ -151,7 +152,7 @@ def test_publish_on_one_rank_then_probe_plan_launch_and_land_on_another():
         assert gen.records()[0]["state"] == "IN_FLIGHT"
 
         gen.advance_until("unpark")
-        assert gen.effects.only("unpark") == [(req, END, False, None)]
+        assert gen.effects.args_of("unpark") == [(req, END, False, None)]
         assert gen.records()[0]["state"] == "DELIVERED"
         for o in range(BLOCKS):
             assert gen.block_bytes(o) == pattern(o + 1, UNIT_BYTES) == ctx.block_bytes(o)
@@ -162,14 +163,7 @@ def test_publish_on_one_rank_then_probe_plan_launch_and_land_on_another():
         # The request's end is the release point: one quiesce (True), record gone, no hold.
         gen.coord.holds_finished_request(req)
         assert gen.records() == [] and gen.effects.count("hold_for_transfer") == 0
-        assert gen.coord.status_dump() == {
-            "plan_authority": "ALL_RANKS",
-            "any_rank_pending": True,
-            "any_rank_drained": False,
-            "records": [],
-            "decided_plans": 0,
-            "finished_pending": [],
-        }
+        assert gen.coord.status_dump() == EMPTY_DUMP
     finally:
         gen.close()
         ctx.close()
@@ -234,7 +228,7 @@ def test_store_outage_during_fetch_is_failed_gives_pages_back_and_the_retry_land
         gen.coord.launch_reserved_fetches([req], 20.0)
         assert gen.records()[0]["try_index"] == 1 and gen.records()[0]["attempts"] == 2
         gen.advance_until("unpark")
-        assert gen.effects.only("unpark") == [(req, END, False, None)]
+        assert gen.effects.args_of("unpark") == [(req, END, False, None)]
         for o in range(BLOCKS):
             assert gen.block_bytes(o) == pattern(o + 1, UNIT_BYTES)
         assert (
@@ -318,7 +312,7 @@ class HostSide(Side):
     memory and are placed into pages once the scheduler has reserved them."""
 
     def __init__(self, store: FakeBlobStore, *, publishes: bool) -> None:
-        self.rank = make_host_rank(
+        self.rank = host_rank(
             store,
             arena_bytes=1 << 16,
             landing_slots=BLOCKS + 2,
@@ -338,7 +332,7 @@ class HostSide(Side):
             self.reader,
             self.effects,
             self.queue,
-            FakeCollective(),
+            SingleRankCollective(),
             unlaunched_timeout_s=DEFAULT_UNLAUNCHED_TIMEOUT_S,
             fetch_wait_timeout_s=DEFAULT_FETCH_WAIT_TIMEOUT_S,
         )
@@ -380,7 +374,7 @@ def test_host_landing_rank_lands_first_then_places_after_the_scheduler_reserves(
         assert gen.effects.names() == ["prepare_fetch_resources", "park_for_fetch"]
         assert gen.records()[0]["state"] == "IN_FLIGHT"
         gen.advance_until("unpark")
-        assert gen.effects.only("unpark") == [(req, END, False, None)]
+        assert gen.effects.args_of("unpark") == [(req, END, False, None)]
         assert gen.records()[0]["state"] == "DELIVERED"
         assert not gen.records()[0]["has_landing"]
         assert gen.rank.backend.landings_held() == 0

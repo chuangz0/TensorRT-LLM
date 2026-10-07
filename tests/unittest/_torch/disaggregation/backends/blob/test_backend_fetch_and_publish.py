@@ -11,7 +11,7 @@ import pytest
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.backends.blob.store import BlobStoreError, GetStatus, PutStatus  # noqa: E402
 from disaggregation.base.cache_backend import Delivered, Failed, Unit  # noqa: E402
-from store_fakes import FakeBlobStore, extent, make_rank, pattern, wait_until  # noqa: E402
+from store_fakes import FakeBlobStore, device_rank, extent, pattern, wait_until  # noqa: E402
 
 pytestmark = pytest.mark.cpu_only
 
@@ -20,8 +20,8 @@ def _pair(**overrides):
     """A publisher and a fetcher over one store, each with its own memory and matching units:
     (0,0) one segment, (0,1) two segments, (1,0) one segment in another layer group."""
     store = FakeBlobStore()
-    a = make_rank(store, **overrides)
-    b = make_rank(store, **overrides)
+    a = device_rank(store, **overrides)
+    b = device_rank(store, **overrides)
     for rank in (a, b):
         rank.unit(0, 0, 64)
         rank.unit(0, 1, 40, 24)
@@ -42,12 +42,12 @@ def test_fetch_serves_exactly_what_was_published_with_equal_bytes():
     a, b = _pair()
     with a, b:
         _seed(a, {(0, 0): 1, (0, 1): 2, (1, 0): 3})
-        published = a.finish(a.backend.publish(extent(a.units.values(), name=b"pub")))
+        published = a.outcome_of(a.backend.publish(extent(a.units.values(), name=b"pub")))
         assert published == Delivered(frozenset(u.name for u in a.units.values()))
         assert a.store.objects[a.key(a.units[(0, 1)])] == pattern(2, 64)  # 40 + 24 concatenated
         for unit in b.units.values():
             b.fill(unit, 0xEE)
-        fetched = b.finish(b.backend.fetch(extent(b.units.values(), name=b"other-extent")))
+        fetched = b.outcome_of(b.backend.fetch(extent(b.units.values(), name=b"other-extent")))
         assert fetched == Delivered(frozenset(u.name for u in b.units.values()))
         for coords in a.units:
             assert b.read(b.units[coords]) == a.read(a.units[coords])
@@ -61,10 +61,10 @@ def test_missing_unit_is_not_served_and_its_destination_is_untouched():
     with a, b:
         _seed(a, {(0, 0): 1, (1, 0): 3})
         held = [a.units[(0, 0)], a.units[(1, 0)]]
-        assert isinstance(a.finish(a.backend.publish(extent(held))), Delivered)
+        assert isinstance(a.outcome_of(a.backend.publish(extent(held))), Delivered)
         for unit in b.units.values():
             b.fill(unit, 0xEE)
-        fetched = b.finish(b.backend.fetch(extent(b.units.values())))
+        fetched = b.outcome_of(b.backend.fetch(extent(b.units.values())))
         assert fetched == Delivered(frozenset(u.name for u in held))
         assert b.read(b.units[(0, 1)]) == bytes([0xEE]) * 64  # SPEC §5.1 inv. 5
         assert b.read(b.units[(0, 0)]) == pattern(1, 64)
@@ -76,7 +76,7 @@ def test_missing_unit_is_not_served_and_its_destination_is_untouched():
 def test_fetch_of_nothing_held_is_delivered_empty_not_failed():
     a, b = _pair()
     with a, b:
-        fetched = b.finish(b.backend.fetch(extent(b.units.values())))
+        fetched = b.outcome_of(b.backend.fetch(extent(b.units.values())))
         assert fetched == Delivered(frozenset())
         assert b.backend.counters.fetch_misses == 3 and b.backend.counters.failed_attempts == 0
 
@@ -86,12 +86,12 @@ def test_republish_merges_present_units_without_rewriting():
     with a, b:
         _seed(a, {(0, 0): 1})
         first = a.units[(0, 0)]
-        assert isinstance(a.finish(a.backend.publish(extent([first], name=b"p1"))), Delivered)
+        assert isinstance(a.outcome_of(a.backend.publish(extent([first], name=b"p1"))), Delivered)
         stored = dict(a.store.objects)
         # The same content under the same name, plus a new unit, from a rewritten source.
         a.fill(first, 0x00)
         _seed(a, {(0, 1): 2})
-        second = a.finish(a.backend.publish(extent([first, a.units[(0, 1)]], name=b"p1")))
+        second = a.outcome_of(a.backend.publish(extent([first, a.units[(0, 1)]], name=b"p1")))
         assert second == Delivered(frozenset({first.name, a.units[(0, 1)].name}))
         assert a.store.objects[a.key(first)] == stored[a.key(first)] == pattern(1, 64)
         assert a.store.objects[a.key(a.units[(0, 1)])] == pattern(2, 64)
@@ -104,10 +104,10 @@ def test_republish_merges_present_units_without_rewriting():
 def test_publish_where_the_store_declines_a_unit_is_not_served_not_failed():
     # A declined put with a clean lookup afterwards is "not taken" (SPEC §5.1 inv. 2, publish
     # direction): the store simply does not hold it, and the caller learns so from ``served``.
-    with make_rank() as rank:
+    with device_rank() as rank:
         a, b = rank.unit(0, 0, 8), rank.unit(0, 1, 8)
         rank.store.put = lambda keys, buffers: [PutStatus.DECLINED for _ in keys]
-        outcome = rank.finish(rank.backend.publish(extent([a, b])))
+        outcome = rank.outcome_of(rank.backend.publish(extent([a, b])))
         assert outcome == Delivered(frozenset())
         assert rank.backend.counters.publish_stored == 0
         assert rank.backend.counters.publish_declined == 2  # declined and not held
@@ -119,10 +119,10 @@ def test_publish_where_the_store_declines_a_unit_is_not_served_not_failed():
 def test_publish_where_a_unit_fails_to_write_is_failed():
     # FAILED is not DECLINED: a unit the store could not write fails the attempt, and the store
     # is not asked whether it holds it. Units stored in the same call still count as stored.
-    with make_rank() as rank:
+    with device_rank() as rank:
         a, b = rank.unit(0, 0, 8), rank.unit(0, 1, 8)
         rank.store.put = lambda keys, buffers: [PutStatus.STORED, PutStatus.FAILED]
-        outcome = rank.finish(rank.backend.publish(extent([a, b])))
+        outcome = rank.outcome_of(rank.backend.publish(extent([a, b])))
         assert isinstance(outcome, Failed) and "1 of 2 units could not be written" in outcome.reason
         assert rank.store.count("contains") == 1  # the lookup before the put; none after
         assert rank.backend.counters.publish_stored == 1
@@ -133,12 +133,12 @@ def test_put_transport_failure_is_failed_not_declined():
     """A put call that raises (the transport, not the store's answer about a unit) fails the
     attempt: nothing is read as declined, the store is not asked whether it holds the units
     afterwards, and the failure is counted."""
-    with make_rank() as rank:
+    with device_rank() as rank:
         u = rank.unit(0, 0, 8)
         rank.write(u, pattern(1, 8))
         rank.store.fail_next("put", BlobStoreError("rpc failed"))
         attempt = rank.backend.publish(extent([u]))
-        outcome = rank.finish(attempt)
+        outcome = rank.outcome_of(attempt)
         assert isinstance(outcome, Failed) and "rpc failed" in outcome.reason
         assert rank.store.count("contains") == 1  # the lookup before the put; none after
         assert rank.backend.counters.publish_declined == 0
@@ -151,11 +151,11 @@ def test_put_transport_failure_is_failed_not_declined():
 def test_publish_whose_lookup_fails_is_failed():
     """A lookup the store cannot answer is a failed lookup, not "absent": the publish is
     Failed and nothing is put (the contract forbids reading a failure as a miss, §5.2)."""
-    with make_rank() as rank:
+    with device_rank() as rank:
         u = rank.unit(0, 0, 8)
         rank.write(u, pattern(1, 8))
         rank.store.fail_next("contains", BlobStoreError("down"))
-        outcome = rank.finish(rank.backend.publish(extent([u])))
+        outcome = rank.outcome_of(rank.backend.publish(extent([u])))
         assert isinstance(outcome, Failed) and "lookup failed" in outcome.reason
         assert rank.store.count("put") == 0
         assert rank.store.objects == {}
@@ -178,13 +178,13 @@ def test_declined_put_for_a_unit_another_publisher_made_present_counts_as_taken(
             # declines our write of it and takes the other. One-shot: the store is shared, so
             # ``b``'s own put must see the real method again.
             a.store.put = orig
-            assert isinstance(b.finish(b.backend.publish(extent([b.units[(0, 0)]]))), Delivered)
+            assert isinstance(b.outcome_of(b.backend.publish(extent([b.units[(0, 0)]]))), Delivered)
             results = list(orig(keys, buffers))
             results[keys.index(a.key(first))] = PutStatus.DECLINED
             return results
 
         a.store.put = raced_put
-        outcome = a.finish(a.backend.publish(extent([first, second])))
+        outcome = a.outcome_of(a.backend.publish(extent([first, second])))
         assert outcome == Delivered(frozenset({first.name, second.name}))
         assert a.backend.counters.publish_stored == 1  # ``second``, written by us
         assert a.backend.counters.publish_raced == 1  # ``first``, held thanks to ``b``
@@ -194,15 +194,15 @@ def test_declined_put_for_a_unit_another_publisher_made_present_counts_as_taken(
 
 
 def test_declined_put_then_lookup_trouble_is_failed():
-    with make_rank() as rank:
+    with device_rank() as rank:
         u = rank.unit(0, 0, 8)
         rank.store.put = lambda keys, buffers: [PutStatus.DECLINED for _ in keys]
         # The lookup after a declined put raises something unforeseen ...
         rank.store.fail_at("contains", 2)
-        assert isinstance(rank.finish(rank.backend.publish(extent([u]))), Failed)
+        assert isinstance(rank.outcome_of(rank.backend.publish(extent([u]))), Failed)
         # ... or fails as a store lookup does (the second ``contains``: the one after the put) ...
         rank.store.fail_at("contains", 2, BlobStoreError("down"))
-        outcome = rank.finish(rank.backend.publish(extent([u])))
+        outcome = rank.outcome_of(rank.backend.publish(extent([u])))
         assert (
             isinstance(outcome, Failed) and "lookup failed after a declined put" in outcome.reason
         )
@@ -215,16 +215,16 @@ def test_declined_put_then_lookup_trouble_is_failed():
             return orig(keys) if len(calls) == 1 else []
 
         rank.store.contains = short_after_decline
-        assert isinstance(rank.finish(rank.backend.publish(extent([u]))), Failed)
+        assert isinstance(rank.outcome_of(rank.backend.publish(extent([u]))), Failed)
         assert rank.backend.counters.publish_stored == 0
         assert rank.backend.counters.failed_attempts == 3
 
 
 def test_put_answering_the_wrong_count_is_failed():
-    with make_rank() as rank:
+    with device_rank() as rank:
         u = rank.unit(0, 0, 8)
         rank.store.put = lambda keys, buffers: []
-        outcome = rank.finish(rank.backend.publish(extent([u])))
+        outcome = rank.outcome_of(rank.backend.publish(extent([u])))
         assert isinstance(outcome, Failed) and "answered 0 of 1" in outcome.reason
 
 
@@ -235,22 +235,22 @@ def test_lookup_outage_is_failed_not_a_miss():
     a, b = _pair()
     with a, b:
         b.store.fail_next("contains")
-        outcome = b.finish(b.backend.fetch(extent(b.units.values())))
+        outcome = b.outcome_of(b.backend.fetch(extent(b.units.values())))
         assert isinstance(outcome, Failed) and "RuntimeError" in outcome.reason
         assert b.backend.counters.fetch_misses == 0
         assert b.backend.counters.failed_attempts == 1
         # A lookup the store reports as failed is the same outage, named as such.
         b.store.fail_next("contains", BlobStoreError("down"))
-        outcome = b.finish(b.backend.fetch(extent(b.units.values())))
+        outcome = b.outcome_of(b.backend.fetch(extent(b.units.values())))
         assert isinstance(outcome, Failed) and "lookup failed" in outcome.reason
 
 
 def test_lookup_answering_the_wrong_count_is_failed():
-    with make_rank() as rank:
+    with device_rank() as rank:
         u = rank.unit(0, 0, 8)
         rank.store.contains = lambda keys: []
-        assert isinstance(rank.finish(rank.backend.fetch(extent([u]))), Failed)
-        assert isinstance(rank.finish(rank.backend.publish(extent([u]))), Failed)
+        assert isinstance(rank.outcome_of(rank.backend.fetch(extent([u]))), Failed)
+        assert isinstance(rank.outcome_of(rank.backend.publish(extent([u]))), Failed)
 
 
 def test_present_at_lookup_but_unreadable_is_failed():
@@ -258,9 +258,9 @@ def test_present_at_lookup_but_unreadable_is_failed():
     with a, b:
         _seed(a, {(0, 0): 1, (1, 0): 3})
         held = [a.units[(0, 0)], a.units[(1, 0)]]
-        assert isinstance(a.finish(a.backend.publish(extent(held))), Delivered)
+        assert isinstance(a.outcome_of(a.backend.publish(extent(held))), Delivered)
         b.store.fail_next("get")
-        outcome = b.finish(b.backend.fetch(extent(b.units.values())))
+        outcome = b.outcome_of(b.backend.fetch(extent(b.units.values())))
         assert isinstance(outcome, Failed)
         # And when the get answers FAILED for one present unit (unreadable), the whole attempt
         # fails rather than serving fewer.
@@ -272,7 +272,7 @@ def test_present_at_lookup_but_unreadable_is_failed():
             return results
 
         b.store.get = one_bad
-        outcome = b.finish(b.backend.fetch(extent(b.units.values())))
+        outcome = b.outcome_of(b.backend.fetch(extent(b.units.values())))
         assert isinstance(outcome, Failed) and "1 of 2 present units" in outcome.reason
         assert b.backend.counters.failed_attempts == 2
 
@@ -284,7 +284,7 @@ def test_unit_gone_between_lookup_and_get_is_a_miss_with_destination_untouched()
     with a, b:
         _seed(a, {(0, 0): 1, (1, 0): 3})
         held = [a.units[(0, 0)], a.units[(1, 0)]]
-        assert isinstance(a.finish(a.backend.publish(extent(held))), Delivered)
+        assert isinstance(a.outcome_of(a.backend.publish(extent(held))), Delivered)
         gone, kept = b.units[(0, 0)], b.units[(1, 0)]
         for unit in b.units.values():
             b.fill(unit, 0xEE)
@@ -295,7 +295,7 @@ def test_unit_gone_between_lookup_and_get_is_a_miss_with_destination_untouched()
             return orig(keys, buffers)
 
         b.store.get = evict_then_get
-        outcome = b.finish(b.backend.fetch(extent(b.units.values())))
+        outcome = b.outcome_of(b.backend.fetch(extent(b.units.values())))
         assert outcome == Delivered(frozenset({kept.name}))
         assert b.read(gone) == bytes([0xEE]) * 64
         assert b.read(kept) == pattern(3, 16)
@@ -308,9 +308,9 @@ def test_failed_read_of_a_present_unit_is_failed():
     a, b = _pair()
     with a, b:
         _seed(a, {(0, 0): 1})
-        assert isinstance(a.finish(a.backend.publish(extent([a.units[(0, 0)]]))), Delivered)
+        assert isinstance(a.outcome_of(a.backend.publish(extent([a.units[(0, 0)]]))), Delivered)
         b.store.get = lambda keys, buffers: [GetStatus.FAILED for _ in keys]
-        outcome = b.finish(b.backend.fetch(extent([b.units[(0, 0)]])))
+        outcome = b.outcome_of(b.backend.fetch(extent([b.units[(0, 0)]])))
         assert isinstance(outcome, Failed) and "could not be read" in outcome.reason
         assert b.backend.counters.fetch_misses == 0
 
@@ -319,33 +319,33 @@ def test_get_answering_the_wrong_count_is_failed():
     a, b = _pair()
     with a, b:
         _seed(a, {(0, 0): 1})
-        assert isinstance(a.finish(a.backend.publish(extent([a.units[(0, 0)]]))), Delivered)
+        assert isinstance(a.outcome_of(a.backend.publish(extent([a.units[(0, 0)]]))), Delivered)
         b.store.get = lambda keys, buffers: []
-        assert isinstance(b.finish(b.backend.fetch(extent([b.units[(0, 0)]]))), Failed)
+        assert isinstance(b.outcome_of(b.backend.fetch(extent([b.units[(0, 0)]]))), Failed)
 
 
 def test_short_read_is_failed_not_served():
     # A name that matches but a destination another size: SPEC §5.2 inv. 1b. What the
     # destination holds after the failure is undefined (§5.2 inv. 3) and not asserted.
     store = FakeBlobStore()
-    a = make_rank(store)
-    b = make_rank(store)
+    a = device_rank(store)
+    b = device_rank(store)
     with a, b:
         ua = a.unit(0, 0, 32)
         ub = b.unit(0, 0, 64)  # same name, larger unit on the fetching side
         a.write(ua, pattern(1, 32))
-        assert isinstance(a.finish(a.backend.publish(extent([ua]))), Delivered)
-        outcome = b.finish(b.backend.fetch(extent([ub])))
+        assert isinstance(a.outcome_of(a.backend.publish(extent([ua]))), Delivered)
+        outcome = b.outcome_of(b.backend.fetch(extent([ub])))
         assert isinstance(outcome, Failed)
     store2 = FakeBlobStore()
-    a = make_rank(store2)
-    b = make_rank(store2)
+    a = device_rank(store2)
+    b = device_rank(store2)
     with a, b:
         ua = a.unit(0, 0, 64)
         ub = b.unit(0, 0, 32)  # smaller destination: the object does not fit
         a.write(ua, pattern(1, 64))
-        assert isinstance(a.finish(a.backend.publish(extent([ua]))), Delivered)
-        outcome = b.finish(b.backend.fetch(extent([ub])))
+        assert isinstance(a.outcome_of(a.backend.publish(extent([ua]))), Delivered)
+        outcome = b.outcome_of(b.backend.fetch(extent([ub])))
         assert isinstance(outcome, Failed)
 
 
@@ -355,7 +355,7 @@ def test_failure_in_a_later_batch_fails_the_whole_attempt():
     a, b = _pair(transfer_batch_size=1)
     with a, b:
         _seed(a, {(0, 0): 1, (0, 1): 2, (1, 0): 3})
-        assert isinstance(a.finish(a.backend.publish(extent(a.units.values()))), Delivered)
+        assert isinstance(a.outcome_of(a.backend.publish(extent(a.units.values()))), Delivered)
         orig = b.store.contains
         seen = []
 
@@ -366,7 +366,7 @@ def test_failure_in_a_later_batch_fails_the_whole_attempt():
             return orig(keys)
 
         b.store.contains = second_lookup_fails
-        outcome = b.finish(b.backend.fetch(extent(b.units.values())))
+        outcome = b.outcome_of(b.backend.fetch(extent(b.units.values())))
         assert isinstance(outcome, Failed)
         assert b.store.count("get") == 1  # first batch was written
 
@@ -379,7 +379,7 @@ def test_probe_answers_none_then_the_set_once_then_asks_again():
     with a, b:
         _seed(a, {(0, 0): 1, (1, 0): 3})
         held = [a.units[(0, 0)], a.units[(1, 0)]]
-        assert isinstance(a.finish(a.backend.publish(extent(held))), Delivered)
+        assert isinstance(a.outcome_of(a.backend.publish(extent(held))), Delivered)
         names = [u.name for u in b.units.values()]
         before = b.store.count("contains")  # the publisher's own lookup is on it too
         assert b.backend.probe(b"n", names) is None
@@ -398,7 +398,7 @@ def test_probe_answers_none_then_the_set_once_then_asks_again():
 
 
 def test_probe_repeated_while_pending_does_not_requeue():
-    with make_rank() as rank:
+    with device_rank() as rank:
         u = rank.unit(0, 0, 8)
         rank.store.block("contains")
         assert rank.backend.probe(b"n", [u.name]) is None
@@ -412,7 +412,7 @@ def test_probe_repeated_while_pending_does_not_requeue():
 
 
 def test_probe_answer_expires_after_ttl():
-    with make_rank(probe_ttl_s=0.05) as rank:
+    with device_rank(probe_ttl_s=0.05) as rank:
         u = rank.unit(0, 0, 8)
         assert rank.backend.probe(b"n", [u.name]) is None
         wait_until(lambda: rank.backend.counters.probe_misses == 1)
@@ -425,7 +425,7 @@ def test_probe_answer_expires_after_ttl():
 
 
 def test_probe_lookup_failure_raises_once_and_never_reads_as_empty():
-    with make_rank() as rank:
+    with device_rank() as rank:
         u = rank.unit(0, 0, 8)
         rank.store.fail_next("contains")
         assert rank.backend.probe(b"n", [u.name]) is None
@@ -467,7 +467,7 @@ def test_probe_lookup_the_store_reports_failed_is_an_outage_not_an_empty_answer(
     ``probe_failed``; nothing is read as a miss."""
     from disaggregation.backends.blob.backend import PROBE_RETRIES
 
-    with make_rank() as rank:
+    with device_rank() as rank:
         u = rank.unit(0, 0, 8)
         for _ in range(PROBE_RETRIES + 5):  # more failures armed than tries allowed
             rank.store.fail_next("contains", BlobStoreError("down"))
@@ -482,9 +482,9 @@ def test_probe_lookup_the_store_reports_failed_is_an_outage_not_an_empty_answer(
 def test_probe_lookup_that_fails_once_is_retried_and_answers():
     """One RPC hiccup does not fail the probe: the lookup is asked again and the first answer
     the caller sees is the full one, with no ``probe_failed`` counted."""
-    with make_rank() as rank:
+    with device_rank() as rank:
         a, b = rank.unit(0, 0, 8), rank.unit(0, 1, 8)
-        assert isinstance(rank.finish(rank.backend.publish(extent([a, b]))), Delivered)
+        assert isinstance(rank.outcome_of(rank.backend.publish(extent([a, b]))), Delivered)
         lookups_before = rank.store.count("contains")  # the publish's own lookup
         rank.store.fail_next("contains", BlobStoreError("hiccup"))
         assert rank.backend.probe(b"n", [a.name, b.name]) is None
@@ -497,9 +497,9 @@ def test_probe_lookup_that_fails_once_is_retried_and_answers():
 
 def test_probe_is_answered_while_every_delivery_worker_is_blocked():
     # Lookups run on their own thread, so a probe is not queued behind deliveries in flight.
-    with make_rank(num_workers=2) as rank:
+    with device_rank(num_workers=2) as rank:
         a, b, c = rank.unit(0, 0, 8), rank.unit(0, 1, 8), rank.unit(0, 2, 8)
-        assert isinstance(rank.finish(rank.backend.publish(extent([a]))), Delivered)
+        assert isinstance(rank.outcome_of(rank.backend.publish(extent([a]))), Delivered)
         rank.store.block("put")
         busy = [rank.backend.publish(extent([b])), rank.backend.publish(extent([c]))]
         # One put already happened for ``a``; both workers are parked once two more have entered.
@@ -514,13 +514,13 @@ def test_probe_is_answered_while_every_delivery_worker_is_blocked():
         assert all(attempt.poll() is None for attempt in busy)
         rank.store.unblock()
         for attempt in busy:
-            assert isinstance(rank.finish(attempt), Delivered)
+            assert isinstance(rank.outcome_of(attempt), Delivered)
 
 
 def test_probe_answer_never_names_units_it_was_not_asked_about():
-    with make_rank() as rank:
+    with device_rank() as rank:
         a, b = rank.unit(0, 0, 8), rank.unit(0, 1, 8)
-        assert isinstance(rank.finish(rank.backend.publish(extent([a, b]))), Delivered)
+        assert isinstance(rank.outcome_of(rank.backend.publish(extent([a, b]))), Delivered)
         assert rank.backend.probe(b"n", [a.name]) is None
         wait_until(lambda: rank.backend.counters.probe_hits == 1)
         assert rank.backend.probe(b"n", [a.name]) == frozenset({a.name})
@@ -530,7 +530,7 @@ def test_probe_answer_never_names_units_it_was_not_asked_about():
 
 
 def test_probe_keys_units_like_fetch_does():
-    with make_rank() as rank:
+    with device_rank() as rank:
         u = rank.unit(0, 0, 8)
         assert rank.backend.probe(b"n", [u.name]) is None
         wait_until(lambda: rank.store.count("contains") == 1)
@@ -557,9 +557,9 @@ def test_store_never_reads_is_last_on_either_path():
     a, b = _pair()
     with a, b:
         _seed(a, {(0, 0): 1})
-        published = a.finish(a.backend.publish(_ExtentThatForbidsIsLast([a.units[(0, 0)]])))
+        published = a.outcome_of(a.backend.publish(_ExtentThatForbidsIsLast([a.units[(0, 0)]])))
         assert published == Delivered(frozenset({a.units[(0, 0)].name}))
-        fetched = b.finish(b.backend.fetch(_ExtentThatForbidsIsLast(b.units.values())))
+        fetched = b.outcome_of(b.backend.fetch(_ExtentThatForbidsIsLast(b.units.values())))
         assert fetched == Delivered(frozenset({b.units[(0, 0)].name}))
         assert b.read(b.units[(0, 0)]) == pattern(1, 64)
         # Failure paths do not read it either.
@@ -577,7 +577,7 @@ def test_store_never_reads_is_last_on_either_path():
 def test_probe_table_is_bounded_and_a_new_lookup_past_the_bound_raises():
     from disaggregation.backends.blob.backend import MAX_PROBES
 
-    with make_rank() as rank:
+    with device_rank() as rank:
         rank.store.block("contains")  # every lookup stays pending
         for i in range(MAX_PROBES):
             assert rank.backend.probe(f"n{i}".encode(), [b"u"]) is None
@@ -587,7 +587,7 @@ def test_probe_table_is_bounded_and_a_new_lookup_past_the_bound_raises():
 
 
 def test_pending_probe_past_the_ttl_is_dropped_and_asked_again():
-    with make_rank(probe_ttl_s=0.05) as rank:
+    with device_rank(probe_ttl_s=0.05) as rank:
         rank.store.block("contains")
         assert rank.backend.probe(b"n", [b"u"]) is None
         rank.store.wait_entered(2)  # register_span, then the lookup parked at the gate
@@ -602,10 +602,10 @@ def test_pending_probe_past_the_ttl_is_dropped_and_asked_again():
 
 
 def test_answered_probe_past_the_ttl_is_forgotten():
-    with make_rank(probe_ttl_s=0.05) as rank:
+    with device_rank(probe_ttl_s=0.05) as rank:
         u = rank.unit(0, 0, 8)
         rank.write(u, pattern(1, 8))
-        assert isinstance(rank.finish(rank.backend.publish(extent([u]))), Delivered)
+        assert isinstance(rank.outcome_of(rank.backend.publish(extent([u]))), Delivered)
         assert rank.backend.probe(b"n", [u.name]) is None
         wait_until(lambda: rank.backend.counters.probe_hits == 1, what="lookup")
         time.sleep(0.1)  # nobody collected the answer

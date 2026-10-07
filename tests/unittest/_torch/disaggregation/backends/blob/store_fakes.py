@@ -93,7 +93,8 @@ class ArenaResolver:
     """A ``RegionResolver`` over a table: ``(local_group, local) -> segments``.
 
     ``add`` carves fresh segments from the arena; ``sizes`` has one entry per segment, so a unit
-    of two segments is ``add(g, l, 64, 64)``.
+    of two segments is ``add(g, l, 64, 64)``. ``map`` points coordinates at memory the arena did
+    not carve: another arena's, a span straddling a registration, or none at all.
     """
 
     def __init__(self, arena: MemoryArena) -> None:
@@ -107,6 +108,10 @@ class ArenaResolver:
         self._table[(local_group, local)] = segments
         return segments
 
+    def map(self, local_group: int, local: int, *segments: Segment) -> None:
+        """Resolve ``(local_group, local)`` to exactly ``segments``, replacing any earlier entry."""
+        self._table[(local_group, local)] = tuple(segments)
+
     def segments(self, local_group: int, local: int) -> tuple[Segment, ...]:
         return self._table[(local_group, local)]
 
@@ -119,8 +124,10 @@ class ArenaResolver:
 # ---------------------------------------------------------------------------------------------
 
 
-class _Knobs:
-    """``block(*methods)`` holds every listed call (all calls when none are listed) at its entry
+class _GatedCalls:
+    """Call recording with a gate and scripted failures, shared by the store and the copier.
+
+    ``block(*methods)`` holds every listed call (all calls when none are listed) at its entry
     until ``unblock``; ``entered`` counts calls that reached the gate so a test can wait for a
     worker to be inside. ``fail_next(method)`` makes that method's next call raise."""
 
@@ -192,7 +199,7 @@ class _Knobs:
 # ---------------------------------------------------------------------------------------------
 
 
-class FakeBlobStore(_Knobs):
+class FakeBlobStore(_GatedCalls):
     """The knobs in front of an in-memory ``BlobStore``: every protocol method passes the gate
     (``block`` / ``fail_next`` / ``fail_at``, recorded in ``calls``) and then forwards to
     ``inner``. ``objects`` / ``registered`` read through to it."""
@@ -255,7 +262,7 @@ class FakeBlobStore(_Knobs):
 # ---------------------------------------------------------------------------------------------
 
 
-class FakeCopier(_Knobs):
+class FakeCopier(_GatedCalls):
     """A ``Copier`` over ``memmove``; ``copies`` lists ``(kind, dst, src, size)``."""
 
     def __init__(self) -> None:
@@ -431,7 +438,7 @@ class Rank:
 
     def place(self, landing, units: Iterable[Unit], name: bytes = b"ext"):
         """Host shape: place the units out of ``landing`` and return the placement's outcome."""
-        return self.finish(landing.place(extent(units, name=name)))
+        return self.outcome_of(landing.place(extent(units, name=name)))
 
     def free_landing_slots(self) -> int:
         """The pool keeps no public free count; its ``_free`` list is the one place to read it."""
@@ -450,12 +457,12 @@ class Rank:
     def key(self, unit: Unit) -> str:
         return self.backend.key_for(unit.name)
 
-    def finish(self, attempt):
+    def outcome_of(self, attempt):
         """Settle one attempt and return its outcome."""
         self.backend.settle([attempt])
         return attempt.poll()
 
-    # ``with make_rank() as rank:`` closes the backend inside the test body. The repository's
+    # ``with device_rank() as rank:`` closes the backend inside the test body. The repository's
     # ``threadleak`` check runs before fixture teardown, so a backend closed there would count
     # its ``blob-store-{i}`` workers as leaked; closing here also asserts ``close`` joins them.
     def __enter__(self) -> Rank:
@@ -471,7 +478,7 @@ class Rank:
         self.backend.close()
 
 
-def make_rank(
+def device_rank(
     store: FakeBlobStore | None = None,
     *,
     arena_bytes: int = 1 << 16,
@@ -481,7 +488,7 @@ def make_rank(
     **config_overrides,
 ) -> Rank:
     """A ``landing: device`` backend over ``store`` (a fresh one when ``None``) with its pool
-    registered. ``publish_pool`` builds the inner backend of a host shape; ``make_host_rank`` is the
+    registered. ``publish_pool`` builds the inner backend of a host shape; ``host_rank`` is the
     usual way there."""
     store = store if store is not None else FakeBlobStore()
     arena = MemoryArena(arena_bytes)
@@ -494,7 +501,7 @@ def make_rank(
     return rank
 
 
-def make_host_rank(
+def host_rank(
     store: FakeBlobStore | None = None,
     *,
     publish_slots: int = 4,
@@ -514,7 +521,7 @@ def make_host_rank(
         store, slots=publish_slots, slot_bytes=slot_bytes
     )
     landing_pool = fake_open_slot_pool(store, slot_bytes=slot_bytes, num_slots=landing_slots)
-    rank = make_rank(
+    rank = device_rank(
         store,
         arena_bytes=arena_bytes,
         publish_pool=publish_pool,

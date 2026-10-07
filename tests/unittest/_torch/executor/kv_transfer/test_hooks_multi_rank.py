@@ -20,8 +20,8 @@ import threading
 import time
 
 import pytest
-from engine_fakes import make_request
-from multi_rank_fakes import CLOSE_TIMEOUT_S, FakeDistGroup, RankRig
+from engine_fakes import PROMPT_LEN, TOKEN_END, make_request
+from multi_rank_rig import CLOSE_TIMEOUT_S, FakeDistGroup, RankEngineRig
 
 from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.engine_protocols import (
     PlanAuthority,
@@ -31,8 +31,6 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 
 pytestmark = pytest.mark.cpu_only
 
-PROMPT_LEN = 100
-TOKEN_END = 96  # 3 nameable blocks of 32
 UNLAUNCHED_TIMEOUT_S = 10.0
 
 
@@ -56,7 +54,7 @@ def paces_idle(hooks, monkeypatch) -> bool:
 
 def make_world(world_size: int, **rig_kwargs):
     group = FakeDistGroup(world_size=world_size, tp_size=world_size)
-    rigs = [RankRig(group, rank, **rig_kwargs) for rank in range(world_size)]
+    rigs = [RankEngineRig(group, rank, **rig_kwargs) for rank in range(world_size)]
     return group, rigs
 
 
@@ -145,7 +143,7 @@ class Stage0:
     exports after its ``advance_round``; the follower blocks until that round's answers arrive.
     Answers cross pickled, as they do inside ``SerializableSchedulerOutput``."""
 
-    def __init__(self, owner: RankRig) -> None:
+    def __init__(self, owner: RankEngineRig) -> None:
         self._owner = owner
         self._wire: queue.Queue = queue.Queue()
         self.sent: list = []
@@ -162,8 +160,8 @@ class Stage0:
 
 def test_pp_follower_adopts_the_owners_plans_and_lands_in_the_same_round(monkeypatch):
     group = FakeDistGroup(world_size=2, tp_size=1, pp_size=2)
-    owner = RankRig(group, 0, plan_authority=PlanAuthority.OWNER)
-    follower = RankRig(group, 1, plan_authority=PlanAuthority.FOLLOWER)
+    owner = RankEngineRig(group, 0, plan_authority=PlanAuthority.OWNER)
+    follower = RankEngineRig(group, 1, plan_authority=PlanAuthority.FOLLOWER)
     requests = rank_local_requests(2)
     stage0 = Stage0(owner)
 
@@ -198,8 +196,8 @@ def test_pp_follower_adopts_the_owners_plans_and_lands_in_the_same_round(monkeyp
 
 def test_pp_follower_without_pages_launches_a_round_late_and_both_land_together():
     group = FakeDistGroup(world_size=2, tp_size=1, pp_size=2)
-    owner = RankRig(group, 0, plan_authority=PlanAuthority.OWNER)
-    follower = RankRig(group, 1, plan_authority=PlanAuthority.FOLLOWER)
+    owner = RankEngineRig(group, 0, plan_authority=PlanAuthority.OWNER)
+    follower = RankEngineRig(group, 1, plan_authority=PlanAuthority.FOLLOWER)
     follower.kv.reserve_answer = False  # round 1: adopted, but its scheduler finds no pages
     requests = rank_local_requests(2)
     stage0 = Stage0(owner)
@@ -241,8 +239,8 @@ def test_pp_follower_without_pages_launches_a_round_late_and_both_land_together(
 
 def test_pp_follower_without_an_answer_counts_the_candidate_as_deferred(monkeypatch):
     group = FakeDistGroup(world_size=2, tp_size=1, pp_size=2)
-    owner = RankRig(group, 0, plan_authority=PlanAuthority.OWNER)
-    follower = RankRig(group, 1, plan_authority=PlanAuthority.FOLLOWER)
+    owner = RankEngineRig(group, 0, plan_authority=PlanAuthority.OWNER)
+    follower = RankEngineRig(group, 1, plan_authority=PlanAuthority.FOLLOWER)
     owner.store.probe_answer = None  # the owner's store has not answered: it defers
     requests = rank_local_requests(2)
     stage0 = Stage0(owner)
@@ -370,8 +368,8 @@ def skewed_world(clock_skew_s: float):
     ahead, so it reaches its deadline a round before rank 1 does."""
     group = FakeDistGroup(world_size=2, tp_size=2)
     rigs = [
-        RankRig(group, 0, close_timeout_s=CLOSE_TIMEOUT_S),
-        RankRig(group, 1, close_timeout_s=CLOSE_TIMEOUT_S + clock_skew_s),
+        RankEngineRig(group, 0, close_timeout_s=CLOSE_TIMEOUT_S),
+        RankEngineRig(group, 1, close_timeout_s=CLOSE_TIMEOUT_S + clock_skew_s),
     ]
     for rig in rigs:
         rig.executor.is_shutdown = True

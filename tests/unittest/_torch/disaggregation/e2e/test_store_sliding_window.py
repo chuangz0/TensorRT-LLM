@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The store path on a variable-sliding-window model.
 
-Two engines, one prompt, one store, as ``test_store_e2e_tinyllama``, on a Gemma3 whose layers
+Two engines, one prompt, one store, as ``test_store_round_trip``, on a Gemma3 whose layers
 alternate sliding and full attention, so the KV cache has a windowed group and a full-attention
 group. The main path builds a random-weight four-layer Gemma3 with ``transformers`` in a temporary
 directory (no model files needed); the real Gemma-3-1b-it runs when its weights are present.
@@ -32,17 +32,15 @@ import os
 
 import pytest
 import torch
-from mooncake_cluster import (
+from status_dumps import assert_no_leftover_records, counters
+from store_engine import (
+    GEMMA3_PATH_ENV,
     KV_TRANSFER_CONFIG_ENV,
-    KV_TRANSFER_STATUS_DUMP_ENV,
     MAX_TOKENS,
     TOKENS_PER_BLOCK,
-    assert_no_leftover_records,
-    counters,
-    dump_template,
-    kv_cache_config,
+    gemma3_1b_path_from_env,
     prompt_token_ids,
-    read_status_dump,
+    run_engine,
     timeout_mark,
     write_kv_transfer_yaml,
 )
@@ -82,51 +80,6 @@ def tiny_gemma3_path(tmp_path_factory) -> str:
     return path
 
 
-def real_gemma3_path() -> str | None:
-    """``$GEMMA3_MODEL_PATH``, else ``gemma/gemma-3-1b-it`` under ``$LLM_MODELS_ROOT``."""
-    explicit = os.environ.get("GEMMA3_MODEL_PATH")
-    if explicit:
-        return explicit
-    root = os.environ.get("LLM_MODELS_ROOT")
-    if root:
-        candidate = os.path.join(root, "gemma", "gemma-3-1b-it")
-        if os.path.isdir(candidate):
-            return candidate
-    return None
-
-
-def run_engine(
-    tmp_path, monkeypatch, tag: str, model_path: str, prompt, *, max_seq_len: int, **llm_kwargs
-):
-    """One ``LLM()`` on integer prompts that generates once and shuts down; returns
-    (tokens, first-step logits, status dump)."""
-    from tensorrt_llm import LLM
-    from tensorrt_llm.sampling_params import SamplingParams
-
-    monkeypatch.setenv(KV_TRANSFER_STATUS_DUMP_ENV, dump_template(tmp_path, tag))
-    llm = LLM(
-        model=model_path,
-        skip_tokenizer_init=True,
-        kv_cache_config=kv_cache_config(),
-        max_seq_len=max_seq_len,
-        disable_overlap_scheduler=True,
-        **llm_kwargs,
-    )
-    # No tokenizer, so the end id is given by hand (Gemma's <eos>); ignored anyway, so that every
-    # run generates the same number of tokens whatever the random weights produce.
-    sampling = SamplingParams(
-        max_tokens=MAX_TOKENS, end_id=1, ignore_eos=True, return_context_logits=True
-    )
-    try:
-        (output,) = llm.generate([prompt], sampling)
-        tokens = list(output.outputs[0].token_ids)
-        # The last prompt position: the only one whose logits both engines compute themselves.
-        first_step_logits = output.context_logits[-1].detach().float().cpu()
-    finally:
-        llm.shutdown()
-    return tokens, first_step_logits, read_status_dump(tmp_path, tag)
-
-
 def run_two_engines_and_check(
     mooncake_cluster,
     tmp_path,
@@ -139,31 +92,42 @@ def run_two_engines_and_check(
     **llm_kwargs,
 ) -> None:
     """A then B on one prompt, both with ``llm_kwargs``; the exact counters, equal tokens and
-    first-step logits within bfloat16 tolerance."""
+    first-step logits within bfloat16 tolerance. No tokenizer, so the end id is given by hand
+    (Gemma's <eos>) and ignored anyway, so that every run generates the same number of tokens
+    whatever the random weights produce."""
     nameable = (prompt_len - 1) // TOKENS_PER_BLOCK
     config_path = write_kv_transfer_yaml(tmp_path, mooncake_cluster.master_address, namespace)
     monkeypatch.setenv(KV_TRANSFER_CONFIG_ENV, config_path)
     prompt = prompt_token_ids(prompt_len=prompt_len)
 
-    tokens_a, logits_a, dump_a = run_engine(
-        tmp_path, monkeypatch, "a", model_path, prompt, **llm_kwargs
-    )
-    tokens_b, logits_b, dump_b = run_engine(
-        tmp_path, monkeypatch, "b", model_path, prompt, **llm_kwargs
-    )
+    runs = [
+        run_engine(
+            tmp_path,
+            monkeypatch,
+            tag,
+            model_path,
+            [prompt],
+            return_logits=True,
+            sampling_overrides=dict(end_id=1, ignore_eos=True),
+            skip_tokenizer_init=True,
+            **llm_kwargs,
+        )
+        for tag in ("a", "b")
+    ]
+    a, b = runs
 
-    assert len(tokens_a) == MAX_TOKENS
-    assert tokens_a == tokens_b
-    assert logits_a.shape == logits_b.shape
-    torch.testing.assert_close(logits_b, logits_a, atol=1e-2, rtol=1e-2)
+    assert len(a.tokens[0]) == MAX_TOKENS
+    assert a.tokens == b.tokens
+    assert a.logits[0].shape == b.logits[0].shape
+    torch.testing.assert_close(b.logits[0], a.logits[0], atol=1e-2, rtol=1e-2)
 
-    counters_a = counters(dump_a)
+    counters_a = counters(a.dump)
     assert counters_a["publish_stored"] == published_by_a, counters_a
     assert counters_a["fetch_hits"] == 0 and counters_a["fetch_misses"] == 0, counters_a
     assert counters_a["failed_attempts"] == 0, counters_a
-    assert_no_leftover_records(dump_a)
+    assert_no_leftover_records(a.dump)
 
-    counters_b = counters(dump_b)
+    counters_b = counters(b.dump)
     # B asks about every nameable block of both groups; the store holds what A published.
     assert counters_b["probe_hits"] == published_by_a, counters_b
     assert counters_b["probe_misses"] == 2 * nameable - published_by_a, counters_b
@@ -172,7 +136,7 @@ def run_two_engines_and_check(
     assert counters_b["failed_attempts"] == 0, counters_b
     # Whether fetched or recomputed, what B offers at the end is already in the store.
     assert counters_b["publish_stored"] == 0, counters_b
-    assert_no_leftover_records(dump_b)
+    assert_no_leftover_records(b.dump)
 
 
 CASES = [
@@ -185,7 +149,7 @@ CASES = [
 
 @timeout_mark(900)
 @pytest.mark.parametrize("model, prompt_len, published_by_a, fetched_by_b", CASES)
-def test_store_fetch_on_a_vswa_model(
+def test_sliding_window_model_fetches_exactly_the_published_window_and_full_blocks(
     mooncake_cluster,
     tmp_path,
     monkeypatch,
@@ -198,15 +162,15 @@ def test_store_fetch_on_a_vswa_model(
     if model == "tiny":
         model_path = request.getfixturevalue("tiny_gemma3_path")
     else:
-        model_path = real_gemma3_path()
+        model_path = gemma3_1b_path_from_env()
         if model_path is None:
-            pytest.skip("Gemma-3-1b-it weights not found (GEMMA3_MODEL_PATH or LLM_MODELS_ROOT)")
+            pytest.skip(f"Gemma-3-1b-it weights not found ({GEMMA3_PATH_ENV} or LLM_MODELS_ROOT)")
     run_two_engines_and_check(
         mooncake_cluster,
         tmp_path,
         monkeypatch,
         model_path,
-        f"e3-{os.getpid()}-{model}-{prompt_len}",
+        f"sliding-window-{os.getpid()}-{model}-{prompt_len}",
         prompt_len,
         published_by_a,
         fetched_by_b,
@@ -220,7 +184,7 @@ the fetch lands at 320, in one on B."""
 
 
 @timeout_mark(900)
-def test_store_fetch_on_a_vswa_model_with_chunked_prefill(
+def test_sliding_window_model_with_chunked_prefill_fetches_as_the_unchunked_run_does(
     mooncake_cluster, tmp_path, monkeypatch, tiny_gemma3_path
 ):
     """Chunked prefill on both engines, on the tiny model's window-aligned case: A publishes
@@ -231,7 +195,7 @@ def test_store_fetch_on_a_vswa_model_with_chunked_prefill(
         tmp_path,
         monkeypatch,
         tiny_gemma3_path,
-        f"e3-chunked-{os.getpid()}",
+        f"sliding-window-chunked-{os.getpid()}",
         330,
         14,
         14,

@@ -276,7 +276,7 @@ def test_servable_block_end_with_nothing_nameable_is_zero():
 
 
 def test_publisher_window_one_block_ahead_of_the_fetch_target_serves_nothing():
-    # F6: a publisher with prompt_len L = 28 (L % tpb == 0) named the window from
+    # A publisher with prompt_len L = 28 (L % tpb == 0) named the window from
     # stale_end(28) = 4 on, a fetcher's largest target is B = 24 and needs from stale_end(24) = 3.
     # Every smaller target needs an even earlier block, so without sink blocks nothing serves.
     window = windowed(1, window_blocks=3, sink_blocks=0)

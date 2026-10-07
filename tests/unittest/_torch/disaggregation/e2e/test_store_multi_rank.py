@@ -17,29 +17,23 @@ KV pools directly through the NIC) and ``rdma_host`` (pinned host landing over t
 ``KV_TRANSFER_E2E_RDMA=1``; ``KV_TRANSFER_E2E_RDMA_DEVICES`` lists the HCAs (empty: Mooncake
 discovers them). GPU memory is registered through dma-buf: the Mooncake wheel registers it with
 ``ibv_reg_mr`` (the nvidia-peermem path) unless ``WITH_NVIDIA_PEERMEM=0``. The model is
-``KV_TRANSFER_E2E_MODELS`` (``MODELS`` in ``mooncake_cluster.py``, TinyLlama by default).
+``KV_TRANSFER_E2E_MODELS`` (``MODELS`` in ``store_engine.py``, TinyLlama by default).
 """
 
 import os
 
 import pytest
-from mooncake_cluster import (
+from mooncake_cluster import TRANSPORTS
+from status_dumps import assert_no_leftover_records, counters, landing_of
+from store_engine import (
     KV_TRANSFER_CONFIG_ENV,
-    KV_TRANSFER_STATUS_DUMP_ENV,
     LAYOUTS,
     MODELS,
     SELECTED_MODELS,
     TOKENS_PER_BLOCK,
-    TRANSPORTS,
-    assert_no_leftover_records,
-    counters,
-    dump_template,
-    generate_ids,
-    kv_cache_config,
-    landing_of,
     model_path_for,
     prompt_token_ids,
-    read_rank_dumps,
+    run_engine,
     timeout_mark,
     world_size_of,
     write_kv_transfer_yaml,
@@ -54,48 +48,21 @@ def torch_device_count() -> int:
     return torch.cuda.device_count()
 
 
-def run_engine(
-    tmp_path,
-    monkeypatch,
-    tag,
-    model_path,
-    prompt,
-    layout,
-    *,
-    disable_overlap,
-    max_seq_len=None,
-):
-    from tensorrt_llm import LLM
-
-    monkeypatch.setenv(KV_TRANSFER_STATUS_DUMP_ENV, dump_template(tmp_path, tag))
-    extra = {} if max_seq_len is None else {"max_seq_len": max_seq_len}
-    llm = LLM(
-        model=model_path,
-        kv_cache_config=kv_cache_config(),
-        disable_overlap_scheduler=disable_overlap,
-        **LAYOUTS[layout],
-        **extra,
-    )
-    try:
-        tokens = generate_ids(llm, prompt)
-    finally:
-        llm.shutdown()
-    return tokens
-
-
 @timeout_mark(1500)
 @pytest.mark.parametrize("transport_store", TRANSPORTS, indirect=True)
 @pytest.mark.parametrize("layout", list(LAYOUTS))
 @pytest.mark.parametrize("model", SELECTED_MODELS)
-def test_store_fetch_multi_rank(transport_store, layout, model, request, tmp_path, monkeypatch):
+def test_every_rank_of_engine_b_fetches_its_shard_of_what_engine_a_published(
+    transport_store, layout, model, request, tmp_path, monkeypatch
+):
     params = LAYOUTS[layout]
     world_size = world_size_of(params)
     if torch_device_count() < world_size:
         pytest.skip(f"needs {world_size} GPUs")
-    _, prompt_len, max_seq_len, vswa = MODELS[model]
+    case = MODELS[model]
     model_path = model_path_for(request, model)
     protocol, landing, master_address = transport_store
-    namespace = f"e4-{os.getpid()}-{model}-{layout}-{protocol}-{landing}"
+    namespace = f"multi-rank-{os.getpid()}-{model}-{layout}-{protocol}-{landing}"
     monkeypatch.setenv(
         KV_TRANSFER_CONFIG_ENV,
         write_kv_transfer_yaml(
@@ -104,39 +71,36 @@ def test_store_fetch_multi_rank(transport_store, layout, model, request, tmp_pat
     )
     if protocol == "rdma":
         monkeypatch.setenv("WITH_NVIDIA_PEERMEM", os.environ.get("WITH_NVIDIA_PEERMEM", "0"))
-    prompt = prompt_token_ids(prompt_len=prompt_len)
-    nameable = (prompt_len - 1) // TOKENS_PER_BLOCK
+    prompt = prompt_token_ids(prompt_len=case.prompt_len)
+    nameable = (case.prompt_len - 1) // TOKENS_PER_BLOCK
 
-    tokens_a = run_engine(
+    a = run_engine(
         tmp_path,
         monkeypatch,
         "a",
         model_path,
-        prompt,
-        layout,
-        disable_overlap=True,
-        max_seq_len=max_seq_len,
+        [prompt],
+        layout=params,
+        max_seq_len=case.max_seq_len,
     )
-    tokens_b = run_engine(
+    b = run_engine(
         tmp_path,
         monkeypatch,
         "b",
         model_path,
-        prompt,
-        layout,
-        disable_overlap=False,
-        max_seq_len=max_seq_len,
+        [prompt],
+        layout=params,
+        max_seq_len=case.max_seq_len,
+        disable_overlap_scheduler=False,
     )
-    assert len(tokens_a) > 0
-    assert tokens_a == tokens_b, (tokens_a, tokens_b)
+    assert len(a.tokens[0]) > 0
+    assert a.tokens == b.tokens, (a.tokens, b.tokens)
 
-    dumps_a = read_rank_dumps(tmp_path, "a", world_size)
-    dumps_b = read_rank_dumps(tmp_path, "b", world_size)
     expected_landing = landing or "host"
-    for dump in dumps_a + dumps_b:
+    for dump in a.dumps + b.dumps:
         assert landing_of(dump) == expected_landing
-    counters_a = [counters(d) for d in dumps_a]
-    counters_b = [counters(d) for d in dumps_b]
+    counters_a = [counters(d) for d in a.dumps]
+    counters_b = [counters(d) for d in b.dumps]
 
     for per_rank in counters_a + counters_b:
         assert per_rank["failed_attempts"] == 0, per_rank
@@ -147,15 +111,15 @@ def test_store_fetch_multi_rank(transport_store, layout, model, request, tmp_pat
         published = sum(c["publish_stored"] for c in counters_a)
         fetched = sum(c["fetch_hits"] for c in counters_b)
         assert published == fetched > 0, (counters_a, counters_b)
-        if not vswa:
+        if not case.has_sliding_window:
             assert fetched == nameable, counters_b
     else:
         for ca, cb in zip(counters_a, counters_b):
             assert ca["publish_stored"] == cb["fetch_hits"] > 0, (counters_a, counters_b)
             assert ca["fetch_hits"] == 0 and cb["publish_stored"] == 0, (counters_a, counters_b)
-            if vswa:
+            if case.has_sliding_window:
                 assert cb["fetch_hits"] > nameable, counters_b
             else:
                 assert cb["fetch_hits"] == nameable, counters_b
-    for dump in dumps_a + dumps_b:
+    for dump in a.dumps + b.dumps:
         assert_no_leftover_records(dump)

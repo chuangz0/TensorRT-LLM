@@ -14,12 +14,19 @@ import pytest
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.orchestration.kv_transfer.engine_protocols import PlanAuthority  # noqa: E402
 from disaggregation.remote_cache import DEFER, FetchPlan  # noqa: E402
-from fakes import FakeRequest, LockstepWorld, Rig, plan_unit_names, worker_request  # noqa: E402
+from fakes import (  # noqa: E402
+    END,
+    CoordinatorRig,
+    FakeRequest,
+    LockstepWorld,
+    plan_unit_names,
+    store_request,
+    worker_request,
+)
 
 pytestmark = pytest.mark.cpu_only
 
 OWNER, FOLLOWER = 0, 1
-END = 28  # 7 nameable blocks of 4
 UNLAUNCHED_TIMEOUT_S = 10.0
 
 
@@ -35,26 +42,10 @@ def world():
 @pytest.fixture
 def rigs(world):
     """Store-only ranks whose store holds the whole prompt."""
-    rigs = [
-        Rig(sources=("store",), unlaunched_timeout_s=UNLAUNCHED_TIMEOUT_S, **world.rig_kwargs(r))
-        for r in range(world.n)
-    ]
+    rigs = world.make_rigs(sources=("store",), unlaunched_timeout_s=UNLAUNCHED_TIMEOUT_S)
     for rig in rigs:
         rig.store.probe_default = rig.reader.unit_names(store_request(), range(7))
     return rigs
-
-
-def store_request() -> FakeRequest:
-    return FakeRequest(1, prompt_len=29)
-
-
-def advance_all(world, rigs, req, now):
-    """Every rank advances as its hooks would: the request is a candidate where deferred."""
-    world.run(
-        lambda r: rigs[r].coord.advance(
-            [req] if rigs[r].coord.fetch_answer(req) is DEFER else [], now
-        )
-    )
 
 
 def propagate(rigs, req):
@@ -64,27 +55,16 @@ def propagate(rigs, req):
     return answers
 
 
-def launch_on(rig, req, now):
-    plan = rig.coord.fetch_answer(req)
-    assert isinstance(plan, FetchPlan)
-    rig.coord.launch_reserved_fetches([req], now)
-    return rig.store.attempts[-1]
-
-
-def plan_section(rig):
-    return rig.payloads()[-1][2]
-
-
 # ---- decide, export, adopt ----
 
 
 def test_owner_decides_and_the_follower_adopts_without_planning(world, rigs):
     req = store_request()
-    advance_all(world, rigs, req, 0.0)
+    world.advance_as_hooks_would(rigs, req, 0.0)
 
     assert isinstance(rigs[OWNER].coord.fetch_answer(req), FetchPlan)
     assert rigs[FOLLOWER].coord.fetch_answer(req) is DEFER  # nothing decided here yet
-    assert plan_section(rigs[OWNER]) == [] and plan_section(rigs[FOLLOWER]) == []
+    assert rigs[OWNER].last_plan_answers == [] and rigs[FOLLOWER].last_plan_answers == []
     assert rigs[FOLLOWER].store.count("probe") == 0
 
     answers = propagate(rigs, req)
@@ -104,7 +84,7 @@ def test_owner_exports_a_local_decision_and_the_follower_releases_its_candidate(
     req = store_request()
     for rig in rigs:
         rig.store.probe_default = frozenset()  # the store holds nothing: compute locally
-    advance_all(world, rigs, req, 0.0)
+    world.advance_as_hooks_would(rigs, req, 0.0)
     assert rigs[OWNER].coord.fetch_answer(req) is None
 
     assert propagate(rigs, req) == [(1, None)]
@@ -120,17 +100,17 @@ def test_follower_holds_an_answer_until_its_request_appears_then_both_land(world
     answers = rigs[OWNER].coord.export_plan_answers()
     rigs[FOLLOWER].coord.adopt_plan_answers([], answers)  # not a candidate here yet
     assert rigs[FOLLOWER].records() == [] and rigs[FOLLOWER].coord.fetch_answer(req) is DEFER
-    launch_on(rigs[OWNER], req, 0.0).deliver_all()
+    rigs[OWNER].launch_reserved(req, 0.0).deliver_all()
 
-    advance_all(world, rigs, req, 1.0)  # the follower's engine now holds the request
+    world.advance_as_hooks_would(rigs, req, 1.0)  # the follower's engine now holds the request
     assert rigs[OWNER].coord.export_plan_answers() == []  # decided once, not exported again
     rigs[FOLLOWER].coord.adopt_plan_answers([req], [])  # this round's answers: none
     assert isinstance(rigs[FOLLOWER].coord.fetch_answer(req), FetchPlan)
-    launch_on(rigs[FOLLOWER], req, 1.0).deliver_all()
+    rigs[FOLLOWER].launch_reserved(req, 1.0).deliver_all()
 
-    advance_all(world, rigs, req, 2.0)
+    world.advance_as_hooks_would(rigs, req, 2.0)
     for rig in rigs:
-        assert rig.effects.only("unpark") == [(req, END, False, None)]
+        assert rig.effects.args_of("unpark") == [(req, END, False, None)]
 
 
 def test_follower_drops_a_held_answer_when_the_request_ends(rigs):
@@ -151,23 +131,20 @@ def test_follower_counts_a_held_answer_it_applies_as_decided():
     """``adopt_plan_answers`` returns how many of the views got no answer and stay deferred; a
     view whose answer was held from an earlier round gets that answer now and is decided."""
     world = LockstepWorld(2, authority_of=authority_of)
-    rig = Rig(sources=("store",), **world.rig_kwargs(FOLLOWER))
+    rig = CoordinatorRig(sources=("store",), **world.rig_kwargs(FOLLOWER))
     req = store_request()
     rig.coord.adopt_plan_answers([], [(1, (END, "store"))])  # held: not a candidate yet
     assert rig.coord.adopt_plan_answers([req], []) == 0
     assert isinstance(rig.coord.fetch_answer(req), FetchPlan)
 
 
-def test_follower_refuses_an_answer_for_a_staging_record(world):
+def test_follower_refuses_an_answer_for_a_landing_record(world):
     """The owner decides a request once; an answer that nevertheless reaches the follower again
     while the record it decided is landing on the host must not start a second landing (the
     first would be forgotten without a release) or restart the record's clock."""
-    rigs = [
-        Rig(sources=("host",), unlaunched_timeout_s=UNLAUNCHED_TIMEOUT_S, **world.rig_kwargs(r))
-        for r in range(world.n)
-    ]
+    rigs = world.make_rigs(sources=("host",), unlaunched_timeout_s=UNLAUNCHED_TIMEOUT_S)
     req = store_request()
-    advance_all(world, rigs, req, 0.0)
+    world.advance_as_hooks_would(rigs, req, 0.0)
     answers = rigs[OWNER].coord.export_plan_answers()
     follower = rigs[FOLLOWER]
     follower.coord.adopt_plan_answers([req], answers, 0.0)
@@ -176,12 +153,12 @@ def test_follower_refuses_an_answer_for_a_staging_record(world):
     follower.coord.adopt_plan_answers([req], answers, 0.5)  # the same answer once more
 
     assert follower.host.count("fetch_to_host") == 1
-    assert len(follower.host.landings) == 1 and follower.host.closes() == 0
+    assert len(follower.host.landings) == 1 and follower.host.total_closes() == 0
     assert follower.record(1)["state"] == "LANDING" and follower.record(1)["has_landing"]
 
 
 def test_materialize_refuses_a_routed_source(world):
-    rig = Rig(**world.rig_kwargs(FOLLOWER))  # worker (routed) and store
+    rig = CoordinatorRig(**world.rig_kwargs(FOLLOWER))  # worker (routed) and store
     with pytest.raises(ValueError, match="routed source 'worker'"):
         rig.planner.plan_from_answer(worker_request(), END, "worker")
     with pytest.raises(ValueError, match="no fetch source named 'nowhere'"):
@@ -190,12 +167,12 @@ def test_materialize_refuses_a_routed_source(world):
 
 def test_voted_ranks_still_carry_plans_in_the_payload():
     world = LockstepWorld(2)
-    rigs = [Rig(sources=("store",), **world.rig_kwargs(r)) for r in range(2)]
+    rigs = world.make_rigs(sources=("store",))
     req = store_request()
     for rig in rigs:
         rig.store.probe_default = rig.reader.unit_names(req, range(7))
-    advance_all(world, rigs, req, 0.0)
-    assert plan_section(rigs[0]) == [(1, (END, "store"))]
+    world.advance_as_hooks_would(rigs, req, 0.0)
+    assert rigs[0].last_plan_answers == [(1, (END, "store"))]
     assert rigs[0].coord.export_plan_answers() == []
 
 
@@ -204,35 +181,35 @@ def test_voted_ranks_still_carry_plans_in_the_payload():
 
 def test_follower_launching_one_round_late_lands_both_once(world, rigs):
     req = store_request()
-    advance_all(world, rigs, req, 0.0)
+    world.advance_as_hooks_would(rigs, req, 0.0)
     propagate(rigs, req)
-    owner_attempt = launch_on(rigs[OWNER], req, 0.0)  # round R: the owner launches at Stage 0
+    owner_attempt = rigs[OWNER].launch_reserved(req, 0.0)  # round R: the owner launches at Stage 0
     owner_attempt.deliver_all()
 
-    advance_all(world, rigs, req, 1.0)  # owner TERMINAL, follower UNLAUNCHED: no landing
+    world.advance_as_hooks_would(rigs, req, 1.0)  # owner TERMINAL, follower UNLAUNCHED: no landing
     assert [rig.effects.count("unpark") for rig in rigs] == [0, 0]
     assert rigs[OWNER].record(1)["state"] == "IN_FLIGHT"
     assert rigs[FOLLOWER].record(1)["peer_launch_seen_at"] == 1.0
 
-    follower_attempt = launch_on(rigs[FOLLOWER], req, 1.0)  # round R+1: pages found here now
+    follower_attempt = rigs[FOLLOWER].launch_reserved(req, 1.0)  # round R+1: pages found here now
     follower_attempt.deliver_all()
     assert rigs[FOLLOWER].record(1)["peer_launch_seen_at"] is None
 
-    advance_all(world, rigs, req, 2.0)  # both TERMINAL: both land in the same round
+    world.advance_as_hooks_would(rigs, req, 2.0)  # both TERMINAL: both land in the same round
     for rig in rigs:
-        assert rig.effects.only("unpark") == [(req, END, False, None)]
+        assert rig.effects.args_of("unpark") == [(req, END, False, None)]
         assert rig.effects.count("revert_fetch_pages") == 0
         assert [r["state"] for r in rig.records()] == ["DELIVERED"]
 
 
 def test_follower_that_never_launches_resets_both_ranks_and_the_owner_exports_again(world, rigs):
     req = store_request()
-    advance_all(world, rigs, req, 0.0)
+    world.advance_as_hooks_would(rigs, req, 0.0)
     propagate(rigs, req)
-    launch_on(rigs[OWNER], req, 0.0).deliver_all()
+    rigs[OWNER].launch_reserved(req, 0.0).deliver_all()
 
-    advance_all(world, rigs, req, 1.0)  # the follower's clock starts
-    advance_all(world, rigs, req, 1.0 + UNLAUNCHED_TIMEOUT_S)  # the follower votes FAILED
+    world.advance_as_hooks_would(rigs, req, 1.0)  # the follower's clock starts
+    world.advance_as_hooks_would(rigs, req, 1.0 + UNLAUNCHED_TIMEOUT_S)  # the follower votes FAILED
     assert rigs[OWNER].store.count("quiesce") == 1
     assert rigs[OWNER].effects.count("revert_fetch_pages") == 1
     assert rigs[FOLLOWER].store.count("quiesce") == 0
@@ -242,7 +219,9 @@ def test_follower_that_never_launches_resets_both_ranks_and_the_owner_exports_ag
         assert rig.record(1)["retries_left"] == 0
         assert rig.coord.fetch_answer(req) is DEFER  # planned again next round
 
-    advance_all(world, rigs, req, 2.0 + UNLAUNCHED_TIMEOUT_S)  # the owner decides once more
+    world.advance_as_hooks_would(
+        rigs, req, 2.0 + UNLAUNCHED_TIMEOUT_S
+    )  # the owner decides once more
     assert isinstance(rigs[OWNER].coord.fetch_answer(req), FetchPlan)
     assert rigs[FOLLOWER].coord.fetch_answer(req) is DEFER
     assert propagate(rigs, req) == [(1, (END, "store"))]
@@ -254,12 +233,9 @@ def test_follower_that_never_launches_resets_both_ranks_and_the_owner_exports_ag
 
 
 def test_follower_starts_its_landing_when_it_adopts_a_host_first_answer(world):
-    rigs = [
-        Rig(sources=("host",), unlaunched_timeout_s=UNLAUNCHED_TIMEOUT_S, **world.rig_kwargs(r))
-        for r in range(world.n)
-    ]
+    rigs = world.make_rigs(sources=("host",), unlaunched_timeout_s=UNLAUNCHED_TIMEOUT_S)
     req = store_request()
-    advance_all(world, rigs, req, 0.0)
+    world.advance_as_hooks_would(rigs, req, 0.0)
     assert rigs[OWNER].record(1)["state"] == "LANDING"  # decided here: landing started here
     assert rigs[FOLLOWER].records() == [] and rigs[FOLLOWER].host.count("fetch_to_host") == 0
 
@@ -272,7 +248,7 @@ def test_follower_starts_its_landing_when_it_adopts_a_host_first_answer(world):
 
     for rig in rigs:
         rig.host.landings[-1].deliver_all()
-    advance_all(world, rigs, req, 1.0)
+    world.advance_as_hooks_would(rigs, req, 1.0)
     for rig in rigs:
         assert rig.record(1)["state"] == "LANDED" and isinstance(
             rig.coord.fetch_answer(req), FetchPlan

@@ -3,7 +3,7 @@
 """The store path when something is short or goes away: the engine must finish every request
 with the right tokens, fail nothing it could compute itself, hang nowhere, and leave no record.
 
-Engine A publishes, engine B fetches, as in ``test_store_e2e_tinyllama``; what differs is what
+Engine A publishes, engine B fetches, as in ``test_store_round_trip``; what differs is what
 B meets: a store too small for the prompt (its publish partly declined, the oldest objects
 evicted), a master that is gone before the fetch, a landing pool too small for the plan, a
 request aborted while its fetch may be in flight, and a shutdown with a fetch possibly in flight.
@@ -13,20 +13,17 @@ Counters come from the status dumps; the fixture's teardown proves no Mooncake p
 import os
 
 import pytest
-from mooncake_cluster import (
+from status_dumps import assert_no_leftover_records, counters, read_single_rank_dump
+from store_engine import (
     KV_TRANSFER_CONFIG_ENV,
-    KV_TRANSFER_STATUS_DUMP_ENV,
     MAX_TOKENS,
     NAMEABLE_BLOCKS,
     TOKENS_PER_BLOCK,
-    assert_no_leftover_records,
-    counters,
-    dump_template,
     generate_ids,
-    kv_cache_config,
     prompt_token_ids,
-    read_status_dump,
+    run_engine,
     sampling_params,
+    start_engine,
     timeout_mark,
     write_kv_transfer_yaml,
 )
@@ -39,28 +36,6 @@ SMALL_SEGMENT_BYTES = 16 << 20
 blocks and the master evicts the oldest objects once it is 90% full."""
 OVERFLOW_PROMPT_LEN = 24 * TOKENS_PER_BLOCK + 2
 """24 nameable blocks: more than the small segment holds."""
-
-
-def start_engine(tmp_path, monkeypatch, tag: str, model_path: str, **llm_kwargs):
-    from tensorrt_llm import LLM
-
-    monkeypatch.setenv(KV_TRANSFER_STATUS_DUMP_ENV, dump_template(tmp_path, tag))
-    return LLM(
-        model=model_path,
-        kv_cache_config=kv_cache_config(),
-        disable_overlap_scheduler=True,
-        **llm_kwargs,
-    )
-
-
-def run_engine(tmp_path, monkeypatch, tag: str, model_path: str, prompt):
-    """One ``LLM()`` that generates once and shuts down; returns (tokens, status dump)."""
-    llm = start_engine(tmp_path, monkeypatch, tag, model_path)
-    try:
-        tokens = generate_ids(llm, prompt)
-    finally:
-        llm.shutdown()
-    return tokens, read_status_dump(tmp_path, tag)
 
 
 def write_config(tmp_path, monkeypatch, cluster, namespace: str, **yaml_kwargs) -> None:
@@ -80,20 +55,20 @@ def test_store_too_small_for_the_prompt_declines_the_overflow_and_the_rest_is_co
     prompt = prompt_token_ids(prompt_len=OVERFLOW_PROMPT_LEN)
     blocks = (OVERFLOW_PROMPT_LEN - 1) // TOKENS_PER_BLOCK
 
-    tokens_a, dump_a = run_engine(tmp_path, monkeypatch, "a", tinyllama_path, prompt)
-    tokens_b, dump_b = run_engine(tmp_path, monkeypatch, "b", tinyllama_path, prompt)
+    a = run_engine(tmp_path, monkeypatch, "a", tinyllama_path, [prompt])
+    b = run_engine(tmp_path, monkeypatch, "b", tinyllama_path, [prompt])
 
-    assert len(tokens_a) == MAX_TOKENS and tokens_a == tokens_b
-    counters_a = counters(dump_a)
+    assert len(a.tokens[0]) == MAX_TOKENS and a.tokens == b.tokens
+    counters_a = counters(a.dump)
     assert 0 < counters_a["publish_stored"] < blocks, counters_a
     assert counters_a["publish_declined"] >= 1, counters_a
     assert counters_a["publish_stored"] + counters_a["publish_declined"] == blocks, counters_a
     assert counters_a["failed_attempts"] == 0, counters_a
-    assert_no_leftover_records(dump_a)
-    counters_b = counters(dump_b)
+    assert_no_leftover_records(a.dump)
+    counters_b = counters(b.dump)
     assert counters_b["fetch_hits"] <= counters_b["probe_hits"] < blocks, counters_b
     assert counters_b["failed_attempts"] == 0, counters_b
-    assert_no_leftover_records(dump_b)
+    assert_no_leftover_records(b.dump)
 
 
 def assert_settled_or_one_publish_still_in_flight(dump: dict) -> None:
@@ -127,8 +102,8 @@ def test_master_gone_before_the_fetch_computes_locally_and_does_not_hang(
     write_config(tmp_path, monkeypatch, mooncake_cluster, f"fault-master-{os.getpid()}")
     prompt = prompt_token_ids()
 
-    tokens_a, dump_a = run_engine(tmp_path, monkeypatch, "a", tinyllama_path, prompt)
-    assert counters(dump_a)["publish_stored"] == NAMEABLE_BLOCKS
+    a = run_engine(tmp_path, monkeypatch, "a", tinyllama_path, [prompt])
+    assert counters(a.dump)["publish_stored"] == NAMEABLE_BLOCKS
 
     llm_b = start_engine(tmp_path, monkeypatch, "b", tinyllama_path)
     try:
@@ -136,9 +111,9 @@ def test_master_gone_before_the_fetch_computes_locally_and_does_not_hang(
         tokens_b = generate_ids(llm_b, prompt)
     finally:
         llm_b.shutdown()
-    dump_b = read_status_dump(tmp_path, "b")
+    dump_b = read_single_rank_dump(tmp_path, "b")
 
-    assert tokens_b == tokens_a
+    assert tokens_b == a.tokens[0]
     counters_b = counters(dump_b)
     assert counters_b["fetch_hits"] == 0 and counters_b["fetch_misses"] == 0, counters_b
     assert counters_b["probe_hits"] == 0, counters_b
@@ -165,18 +140,18 @@ def test_landing_pool_too_small_for_the_plan_gives_the_fetch_up_and_computes_loc
     )
     prompt = prompt_token_ids()
 
-    tokens_a, dump_a = run_engine(tmp_path, monkeypatch, "a", tinyllama_path, prompt)
-    tokens_b, dump_b = run_engine(tmp_path, monkeypatch, "b", tinyllama_path, prompt)
+    a = run_engine(tmp_path, monkeypatch, "a", tinyllama_path, [prompt])
+    b = run_engine(tmp_path, monkeypatch, "b", tinyllama_path, [prompt])
 
-    assert tokens_a == tokens_b
-    assert counters(dump_a)["publish_stored"] == NAMEABLE_BLOCKS
-    counters_b = counters(dump_b)
+    assert a.tokens == b.tokens
+    assert counters(a.dump)["publish_stored"] == NAMEABLE_BLOCKS
+    counters_b = counters(b.dump)
     assert counters_b["probe_hits"] == NAMEABLE_BLOCKS, counters_b
     assert counters_b["fetch_hits"] == 0 and counters_b["fetch_misses"] == 0, counters_b
     assert counters_b["failed_attempts"] == 2, counters_b  # the plan and its one retry
     assert counters_b["landings_held"] == 0, counters_b
     assert counters_b["publish_stored"] == 0, counters_b  # the store already holds them
-    assert_no_leftover_records(dump_b)
+    assert_no_leftover_records(b.dump)
 
 
 @timeout_mark(600)
@@ -190,8 +165,9 @@ def test_abort_right_after_a_concurrent_submit_terminates_once_and_the_next_requ
     write_config(tmp_path, monkeypatch, mooncake_cluster, f"fault-abort-{os.getpid()}")
     prompt = prompt_token_ids()
 
-    tokens_a, dump_a = run_engine(tmp_path, monkeypatch, "a", tinyllama_path, prompt)
-    assert counters(dump_a)["publish_stored"] == NAMEABLE_BLOCKS
+    a = run_engine(tmp_path, monkeypatch, "a", tinyllama_path, [prompt])
+    (tokens_a,) = a.tokens
+    assert counters(a.dump)["publish_stored"] == NAMEABLE_BLOCKS
 
     llm_b = start_engine(tmp_path, monkeypatch, "b", tinyllama_path)
     try:
@@ -203,7 +179,7 @@ def test_abort_right_after_a_concurrent_submit_terminates_once_and_the_next_requ
         later = generate_ids(llm_b, prompt)
     finally:
         llm_b.shutdown()
-    dump_b = read_status_dump(tmp_path, "b")
+    dump_b = read_single_rank_dump(tmp_path, "b")
 
     assert list(kept_output.outputs[0].token_ids) == tokens_a
     assert later == tokens_a
@@ -228,15 +204,15 @@ def test_shutdown_with_a_fetch_possibly_in_flight_returns_and_writes_the_dump(
     write_config(tmp_path, monkeypatch, mooncake_cluster, f"fault-shutdown-{os.getpid()}")
     prompt = prompt_token_ids()
 
-    tokens_a, dump_a = run_engine(tmp_path, monkeypatch, "a", tinyllama_path, prompt)
-    assert counters(dump_a)["publish_stored"] == NAMEABLE_BLOCKS
+    a = run_engine(tmp_path, monkeypatch, "a", tinyllama_path, [prompt])
+    assert counters(a.dump)["publish_stored"] == NAMEABLE_BLOCKS
 
     llm_b = start_engine(tmp_path, monkeypatch, "b", tinyllama_path)
     try:
         llm_b.generate_async(prompt, sampling_params())
     finally:
         llm_b.shutdown()
-    dump_b = read_status_dump(tmp_path, "b")
+    dump_b = read_single_rank_dump(tmp_path, "b")
 
     counters_b = counters(dump_b)
     assert counters_b["failed_attempts"] == 0, counters_b

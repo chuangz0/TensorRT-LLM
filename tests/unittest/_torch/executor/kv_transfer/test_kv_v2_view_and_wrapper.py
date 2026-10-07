@@ -180,7 +180,7 @@ class TestContextBlockKeys:
 # ---------------------------------------------------------------------------------------------
 
 
-class TestPrepareDisaggGenInitTokenEnd:
+class TestReserveTransferPages:
     def test_history_is_declared_to_token_end_only(self, manager):
         request = make_request(1, prompt_tokens(1))
         assert manager.reserve_transfer_pages(request, 128)
@@ -386,7 +386,7 @@ class TestFetchExtent:
 # ---------------------------------------------------------------------------------------------
 
 
-class TestPublishDescription:
+class TestPublishExtent:
     def test_two_identical_committed_requests_publish_identical_names(self, manager, reader):
         a = make_request(1, prompt_tokens(1))
         compute_and_commit(manager, a)

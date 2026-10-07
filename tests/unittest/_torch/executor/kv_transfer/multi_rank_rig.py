@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""One real ``KVTransferHooks`` per rank, over the fakes of ``engine_fakes``, for the threaded
-multi-rank tests: ``RankRig`` is one rank; its collective is a ``FakeDistRank`` of the
-``FakeDistGroup`` all the rigs of a world share, reached through the real ``EngineCollective``.
+"""One real ``KVTransferHooks`` per rank for the threaded multi-rank tests: ``RankEngineRig`` is
+an ``EngineRig`` whose collective is a ``FakeDistRank`` of the ``FakeDistGroup`` all the rigs of a
+world share, reached through the real ``EngineCollective``, with ``schedule_round`` standing in for
+what the engine loop and the V2 scheduler do per round.
 """
 
 from __future__ import annotations
@@ -10,43 +11,23 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Sequence
 
-from engine_fakes import (
-    TPB,
-    FakeFetches,
-    FakeKVCache,
-    FakeKVCacheManager,
-    FakePublishes,
-    FakeReader,
-    FakeSlotManager,
-    finish_prefill,
-    make_executor,
-)
+from engine_fakes import EngineRig
 
-from tensorrt_llm._torch.disaggregation.backends.config import (
-    DEFAULT_FETCH_WAIT_TIMEOUT_S,
-    BackendEntry,
-)
-from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.coordinator import (
-    KVTransferCoordinator,
-)
 from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.engine_protocols import (
     PlanAuthority,
 )
-from tensorrt_llm._torch.disaggregation.remote_cache import FetchPlan, FetchSource, Planner
+from tensorrt_llm._torch.disaggregation.remote_cache import FetchPlan
 from tensorrt_llm._torch.disaggregation.resource.region import parallel_shard_tag
 from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import (
     EngineCollective,
     EngineKVTransferEffects,
-    EngineWorkQueue,
 )
-from tensorrt_llm._torch.pyexecutor.kv_transfer.hooks import KVTransferHooks
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
 __extra_import_path__ = ["../../disaggregation"]
 from fake_dist import FakeDistGroup, FakeDistRank  # noqa: E402
 
-__all__ = ["CLOSE_TIMEOUT_S", "CountingEffects", "FakeDistGroup", "RankRig", "rank_mapping"]
+__all__ = ["CLOSE_TIMEOUT_S", "CountingEffects", "FakeDistGroup", "RankEngineRig", "rank_mapping"]
 
 CLOSE_TIMEOUT_S = 5.0
 """Every rig's ``close_timeout_s``: how long its shutdown drain counts its own pending work."""
@@ -88,15 +69,13 @@ def rank_mapping(dist: FakeDistRank, *, enable_attention_dp: bool = False) -> Si
     )
 
 
-class RankRig:
-    """One rank of a world: real coordinator, planner, effects and hooks over the fakes, with
-    ``schedule_round`` standing in for what the engine loop and the V2 scheduler do per round.
+class RankEngineRig(EngineRig):
+    """One rank of a world: an ``EngineRig`` over ``CountingEffects`` and the real
+    ``EngineCollective`` of this rank's ``FakeDistRank``.
 
     ``unlaunched_timeout_s``, ``fetch_timeout_s`` and ``plan_authority`` go to the coordinator,
     ``close_timeout_s`` to the hooks (a per-rig value plays clock skew between ranks); the store
-    answers every probe and every fetch stays in flight until ``deliver_all``. The executor's
-    ``_free_request_resources`` frees the fake cache, so an eviction is observable in
-    ``kv.kv_cache_map``.
+    answers every probe and every fetch stays in flight until ``deliver_all``.
     """
 
     def __init__(
@@ -114,47 +93,14 @@ class RankRig:
         self.dist = group.rank(rank)
         self.mapping = rank_mapping(self.dist, enable_attention_dp=enable_attention_dp)
         self.shard_tag = parallel_shard_tag(self.mapping)
-        self.kv = FakeKVCacheManager(TPB)
-        self.slots = FakeSlotManager()
-        self.executor = make_executor(self.kv, self.slots)
-        self.reader = FakeReader(self.kv)
-        self.store = FakeFetches(name="store")
-        self.publisher = FakePublishes()
-        sources = [FetchSource("store", self.store, None)]
-        self.planner = Planner(sources, self.reader, TPB, probe_timeout_s=0.05)
-        self.effects = CountingEffects(self.executor)
-        self.coord = KVTransferCoordinator(
-            sources,
-            [self.publisher],
-            self.planner,
-            self.reader,
-            self.effects,
-            EngineWorkQueue(),
-            EngineCollective(self.dist, self.mapping),
-            fetch_timeout_s=fetch_timeout_s,
+        super().__init__(
+            collective=EngineCollective(self.dist, self.mapping),
+            effects_class=CountingEffects,
             unlaunched_timeout_s=unlaunched_timeout_s,
-            fetch_wait_timeout_s=DEFAULT_FETCH_WAIT_TIMEOUT_S,
+            fetch_timeout_s=fetch_timeout_s,
             plan_authority=plan_authority,
-        )
-        handle = BackendHandle(
-            name="store",
-            hint_key=None,
-            fetcher=self.store,
-            publisher=self.publisher,
-            pool_registrar=None,
-            close=lambda: None,
-        )
-        entry = BackendEntry.from_dict({"name": "store", "type": "fake"})
-        self.hooks = KVTransferHooks(
-            self.executor,
-            self.coord,
-            self.effects,
-            [handle],
-            [entry],
             close_timeout_s=close_timeout_s,
         )
-        self.executor.kv_transfer = self.hooks
-        self.executor._free_request_resources.side_effect = self.kv.free_resources
 
     # -- one round of the loop on this rank --
 
@@ -181,7 +127,7 @@ class RankRig:
         launch_queue = []
         for request in active:
             plan = self.hooks.fetch_answer(request)
-            if isinstance(plan, FetchPlan) and self.reserve(request, plan.token_end):
+            if isinstance(plan, FetchPlan) and self.try_reserve(request, plan.token_end):
                 launch_queue.append(request)
         self.hooks.launch_reserved_fetches(launch_queue)
         if recompute_pause:
@@ -189,43 +135,17 @@ class RankRig:
                 SimpleNamespace(recompute_paused_requests=list(recompute_pause))
             )
 
-    def reserve(self, request: LlmRequest, token_end: int) -> bool:
+    def try_reserve(self, request: LlmRequest, token_end: int) -> bool:
+        """The scheduler's reservation through the fake manager, which ``reserve_answer`` can
+        refuse (unlike ``reserve``, which leaves the pages behind unconditionally)."""
         if not self.kv.reserve_transfer_pages(request, token_end):
             return False
         request.py_ctx_pre_resize_cap = 0
         self.slots.add(request)
         return True
 
-    def deliver_all(self) -> None:
-        """Every fetch and publish attempt of this rank's backends still in flight completes."""
-        for attempt in (*self.store.attempts, *self.publisher.attempts):
-            if attempt.poll() is None:
-                attempt.deliver_all()
-
-    def publish(self, request: LlmRequest) -> None:
-        """Prefill ended this step: offer the request's blocks."""
-        finish_prefill(request)
-        self.kv.kv_cache_map.setdefault(
-            request.py_request_id, FakeKVCache(history_length=request.prompt_len)
-        )
-        self.hooks.publish_committed_blocks([request])
-
     # -- what a scenario reads --
 
     def gathers(self) -> list[str]:
         """The collectives this rank entered, in order."""
         return [name for name, _ in self.dist.calls]
-
-    def records(self) -> list[dict]:
-        return self.coord.status_dump()["records"]
-
-    def record(self, request_id: int, direction: str = "fetch") -> dict | None:
-        for rec in self.records():
-            if rec["request_id"] == request_id and rec["direction"] == direction:
-                return rec
-        return None
-
-    def published_unit_names(self) -> frozenset[bytes]:
-        return frozenset(
-            unit.name for attempt in self.publisher.attempts for unit in attempt.payload.units
-        )

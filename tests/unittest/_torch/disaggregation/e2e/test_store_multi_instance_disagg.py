@@ -25,22 +25,19 @@ What the test proves, over two identical rounds:
 """
 
 import os
-import time
 
 import pytest
-from mooncake_cluster import (
+from status_dumps import assert_no_leftover_records, counters, read_single_rank_dump
+from store_engine import (
     KV_TRANSFER_CONFIG_ENV,
-    KV_TRANSFER_STATUS_DUMP_ENV,
     NAMEABLE_BLOCKS,
-    assert_no_leftover_records,
-    counters,
-    dump_template,
     generate_ids,
-    kv_cache_config,
     prompt_token_ids,
-    read_status_dump,
+    run_engine,
     sampling_params,
+    start_engine,
     timeout_mark,
+    used_num_blocks_settled,
     write_kv_transfer_yaml,
 )
 
@@ -50,46 +47,7 @@ CTX_ENGINES = ("ctx_a", "ctx_b")
 GEN_ENGINES = ("gen_a", "gen_b")
 FREE_GPU_MEMORY_FRACTION = 0.08
 """Of the memory free at each engine's start: four TinyLlama engines must fit on one GPU."""
-STATS_SETTLE_RETRIES = 15
 ROUNDS = 2
-
-
-def used_num_blocks_settled(llm) -> int:
-    """The last ``usedNumBlocks`` the engine reported once no further iterations run."""
-    time.sleep(1.0)
-    last = None
-    quiet_polls = 0
-    for _ in range(STATS_SETTLE_RETRIES):
-        stats = llm.get_stats(2)
-        if stats:
-            last = stats[-1]["kvCacheStats"]["usedNumBlocks"]
-            quiet_polls = 0
-        else:
-            quiet_polls += 1
-            if last is not None and quiet_polls >= 2:
-                return last
-        time.sleep(1.0)
-    if last is None:
-        pytest.fail("the engine reported no iteration stats")
-    return last
-
-
-def start_engine(tmp_path, monkeypatch, tag: str, model_path: str):
-    """One ``LLM()`` with the shared store config and the transceiver, dumping its status as
-    ``tag`` at shutdown."""
-    from tensorrt_llm import LLM
-    from tensorrt_llm.llmapi import CacheTransceiverConfig
-
-    monkeypatch.setenv(KV_TRANSFER_STATUS_DUMP_ENV, dump_template(tmp_path, tag))
-    return LLM(
-        model=model_path,
-        kv_cache_config=kv_cache_config(FREE_GPU_MEMORY_FRACTION),
-        disable_overlap_scheduler=True,
-        enable_iter_perf_stats=True,
-        cache_transceiver_config=CacheTransceiverConfig(
-            backend="NIXL", transceiver_runtime="PYTHON", kv_transfer_timeout_ms=30000
-        ),
-    )
 
 
 def context_then_generate(llm_ctx, llm_gen, prompt, expected) -> None:
@@ -110,25 +68,19 @@ def context_then_generate(llm_ctx, llm_gen, prompt, expected) -> None:
 
 
 @timeout_mark(900)
-def test_store_multi_instance_disagg(mooncake_cluster, tinyllama_path, tmp_path, monkeypatch):
-    from tensorrt_llm import LLM
-
+def test_context_instances_share_one_store_and_generation_instances_never_touch_it(
+    mooncake_cluster, tinyllama_path, tmp_path, monkeypatch
+):
     prompts = {"P1": prompt_token_ids(seed=1), "P2": prompt_token_ids(seed=2)}
 
-    # O0: one plain engine, no store, no transceiver; created and gone before the four.
+    # One plain engine, no store, no transceiver; created and gone before the four.
     monkeypatch.delenv(KV_TRANSFER_CONFIG_ENV, raising=False)
-    monkeypatch.delenv(KV_TRANSFER_STATUS_DUMP_ENV, raising=False)
-    plain = LLM(
-        model=tinyllama_path, kv_cache_config=kv_cache_config(), disable_overlap_scheduler=True
-    )
-    try:
-        expected = {name: generate_ids(plain, prompt) for name, prompt in prompts.items()}
-    finally:
-        plain.shutdown()
+    plain = run_engine(tmp_path, monkeypatch, None, tinyllama_path, list(prompts.values()))
+    expected = dict(zip(prompts, plain.tokens))
     assert all(len(tokens) > 0 for tokens in expected.values())
     assert expected["P1"] != expected["P2"]
 
-    namespace = f"e3-{os.getpid()}"
+    namespace = f"multi-instance-{os.getpid()}"
     config_path = write_kv_transfer_yaml(tmp_path, mooncake_cluster.master_address, namespace)
     monkeypatch.setenv(KV_TRANSFER_CONFIG_ENV, config_path)
 
@@ -136,7 +88,15 @@ def test_store_multi_instance_disagg(mooncake_cluster, tinyllama_path, tmp_path,
     dumps = {}
     try:
         for tag in CTX_ENGINES + GEN_ENGINES:
-            engines[tag] = start_engine(tmp_path, monkeypatch, tag, tinyllama_path)
+            engines[tag] = start_engine(
+                tmp_path,
+                monkeypatch,
+                tag,
+                tinyllama_path,
+                cache_transceiver=True,
+                enable_iter_perf_stats=True,
+                free_gpu_memory_fraction=FREE_GPU_MEMORY_FRACTION,
+            )
         ctx_a, ctx_b = (engines[tag] for tag in CTX_ENGINES)
         gen_a, gen_b = (engines[tag] for tag in GEN_ENGINES)
 
@@ -167,7 +127,7 @@ def test_store_multi_instance_disagg(mooncake_cluster, tinyllama_path, tmp_path,
     finally:
         for tag, llm in engines.items():
             llm.shutdown()
-            dumps[tag] = read_status_dump(tmp_path, tag)
+            dumps[tag] = read_single_rank_dump(tmp_path, tag)
 
     assert set(dumps) == set(CTX_ENGINES + GEN_ENGINES)
     assert len({dump["pid"] for dump in dumps.values()}) == len(dumps)
