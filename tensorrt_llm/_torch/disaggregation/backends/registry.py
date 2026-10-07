@@ -31,7 +31,7 @@ from typing import Callable, Mapping, Optional, Sequence
 from ..base.cache_backend import Fetches, Publishes, RegistersPools
 from ..base.capabilities import LandsOnHost
 from ..base.region import RegionResolver
-from .config import DEFAULT_LANDING_WAIT_TIMEOUT_S, BackendEntry, KVTransferConfig
+from .config import DEFAULT_FETCH_WAIT_TIMEOUT_S, BackendEntry, KVTransferConfig
 
 __all__ = [
     "BackendBuildContext",
@@ -61,7 +61,7 @@ class BackendBuildContext:
         max_request_blocks: Blocks the longest request spans (``max_seq_len`` over
             ``tokens_per_block``), so a backend can warn when its landing memory is short of
             one fetch. ``None`` when unknown.
-        landing_wait_timeout_s: ``KVTransferConfig.landing_wait_timeout_s``, so a backend that
+        fetch_wait_timeout_s: ``KVTransferConfig.fetch_wait_timeout_s``, so a backend that
             queues landings for its own memory bounds that wait with the same clock the
             coordinator uses for pages; ``None`` for no bound. Defaults to the config's default.
     """
@@ -72,7 +72,7 @@ class BackendBuildContext:
     device_index: Optional[int] = None
     unit_bytes_of: Optional[Callable[[bytes], int]] = None
     max_request_blocks: Optional[int] = None
-    landing_wait_timeout_s: Optional[float] = DEFAULT_LANDING_WAIT_TIMEOUT_S
+    fetch_wait_timeout_s: Optional[float] = DEFAULT_FETCH_WAIT_TIMEOUT_S
 
 
 @dataclass(frozen=True)
@@ -177,4 +177,4 @@ def close_backends(handles: Sequence[BackendHandle]) -> None:
         try:
             handle.close()
         except Exception:  # noqa: BLE001
-            logger.exception("kv transfer backend %r failed to close", handle.name)
+            logger.exception("backend %r failed to close", handle.name)

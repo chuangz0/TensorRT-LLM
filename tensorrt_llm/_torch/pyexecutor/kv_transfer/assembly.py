@@ -15,10 +15,12 @@
 """Assembling the KV transfer layer onto one ``PyExecutor``.
 
 ``attach_kv_transfer`` runs once at creation when ``TRTLLM_KV_TRANSFER_CONFIG`` is set: it checks
-the engine is in scope, builds the resource reader and region resolver, names the model for the
-store's namespace, builds the configured backends and registers the KV pools with those that
-need it, builds the coordinator, forwards the import-light layers' stdlib logging to the TRT-LLM
-logger, and attaches the ``KVTransferHooks`` to the executor and its scheduler.
+the engine is in scope, views the engine's KV cache as the layer reads and addresses it, names
+the model for the store's namespace, builds the configured backends and registers the KV pools
+with those that need it, builds the coordinator, forwards the import-light layers' stdlib
+logging to the TRT-LLM logger, and attaches the ``KVTransferHooks`` to the executor and its
+scheduler. The module reads top-down: the entry point, the steps it takes in order, then the
+helpers of those steps in call order.
 """
 
 from __future__ import annotations
@@ -28,7 +30,8 @@ import json
 import logging
 import os
 import time
-from typing import TYPE_CHECKING, Callable, NamedTuple, Sequence, TypeVar
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Callable, Iterator, NamedTuple, Sequence
 
 from tensorrt_llm.logger import logger
 
@@ -45,13 +48,14 @@ from ...disaggregation.orchestration.kv_transfer.engine_protocols import PlanAut
 from ...disaggregation.resource.kv_extractor import build_page_table_from_manager
 from ...disaggregation.resource.kv_v2_view import KVv2ResourceView
 from ...disaggregation.resource.naming import GROUP_TAG_BYTES
+from ...disaggregation.resource.page import KVCachePageTable
 from ...disaggregation.resource.region import (
     KVv2RegionResolver,
     layout_fingerprint,
     parallel_shard_tag,
 )
 from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from .effects import EngineCollective, EngineWorkQueue, PyExecutorKVTransferEffects
+from .effects import EngineCollective, EngineKVTransferEffects, EngineWorkQueue
 from .hooks import KVTransferHooks
 
 if TYPE_CHECKING:
@@ -66,49 +70,56 @@ __all__ = [
     "plan_authority_for",
 ]
 
+# The other environment seam, ``KV_TRANSFER_CONFIG_ENV``, lives in ``backends.config``.
 KV_TRANSFER_STATUS_DUMP_ENV = "TRTLLM_KV_TRANSFER_STATUS_DUMP"
 """Test seam: a path (``{pid}`` replaced by the worker's pid) where ``close`` writes a JSON dump."""
 
-_DISAGGREGATION_LOGGER_NAME = "tensorrt_llm._torch.disaggregation"
-"""The stdlib logger namespace of the import-light layers below the engine (coordinator, backends).
-They log through ``logging`` because they do not import ``tensorrt_llm``; the engine forwards
-their WARNING+ records to the TRT-LLM logger so a store outage shows up in the engine's log."""
 
+def attach_kv_transfer(
+    executor: PyExecutor,
+    config_path: str,
+    *,
+    mapping,
+    spec_config,
+    kv_connector_manager,
+    max_beam_width: int,
+) -> KVTransferHooks:
+    """Guard, build, attach. Raises ``ValueError`` for a configuration out of scope or
+    a malformed config file.
 
-class _ForwardToTrtllmLogger(logging.Handler):
-    """Re-emits each stdlib record it receives through ``tensorrt_llm.logger.logger`` at the
-    matching severity. Installed once per process by ``install_log_forwarding``."""
-
-    def __init__(self) -> None:
-        super().__init__(level=logging.WARNING)
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            message = record.getMessage()
-        except Exception:  # noqa: BLE001 - a malformed record must not break the caller's log
-            self.handleError(record)
-            return
-        if record.levelno >= logging.CRITICAL:
-            logger.critical(message)
-        elif record.levelno >= logging.ERROR:
-            logger.error(message)
-        else:
-            logger.warning(message)
-
-
-def install_log_forwarding() -> None:
-    """Attach the forwarding handler to the disaggregation logger namespace unless one is there
-    already. Process-wide and idempotent: the handler outlives any one engine, so nothing
-    removes it."""
-    target = logging.getLogger(_DISAGGREGATION_LOGGER_NAME)
-    if not any(isinstance(handler, _ForwardToTrtllmLogger) for handler in target.handlers):
-        target.addHandler(_ForwardToTrtllmLogger())
-
-
-def _refuse(reason: str) -> None:
-    raise ValueError(
-        f"KV transfer backends are configured but the engine cannot host them: {reason}"
+    Disaggregated serving may be on at the same time: the transceiver keeps owning gen-init
+    receives and context sends; this layer adds store fetch and publish for context requests.
+    """
+    started_at = time.time()
+    check_engine_supports_kv_transfer(
+        executor,
+        mapping=mapping,
+        spec_config=spec_config,
+        kv_connector_manager=kv_connector_manager,
+        max_beam_width=max_beam_width,
     )
+    config = load_kv_transfer_config(config_path)
+    views = _build_resource_views(executor)
+    model_identity = model_identity_for(executor)
+    build_context = _build_backend_context(
+        executor, config, views, mapping=mapping, model_identity=model_identity
+    )
+    backends = build_backends(config, build_context)
+    with _closing_backends_on_failure(backends):
+        hooks = _build_hooks(
+            executor, config, views, backends, mapping=mapping, started_at=started_at
+        )
+    executor.scheduler.kv_transfer = hooks
+    executor.kv_transfer = hooks
+    logger.info(
+        "KV transfer attached: backends=%s pools=%d model=%r layout=%s plan_authority=%s",
+        [(entry.name, entry.type, sorted(entry.roles)) for entry in config.backends],
+        len(views.resolver.pool_memory_spans()),
+        model_identity,
+        build_context.layout_fingerprint.hex(),
+        hooks.coordinator.plan_authority.value,
+    )
+    return hooks
 
 
 def check_engine_supports_kv_transfer(
@@ -151,49 +162,121 @@ def check_engine_supports_kv_transfer(
         )
 
 
-def plan_authority_for(mapping) -> PlanAuthority:
-    """Who plans on this rank, from the loop the engine runs.
+class _ResourceViews(NamedTuple):
+    """This rank's KV cache as the transfer layer sees it: the page table both views are built
+    over, the ``reader`` the coordinator reads through, the ``resolver`` the backends address
+    through."""
 
-    Without pipeline parallelism every rank runs the scheduler and the answers are voted. With
-    it, the rank that calls ``_schedule`` in ``_pp_schedule_and_propagate`` owns the answers:
-    rank 0, or under attention DP every first pipeline rank (one per replica, whose collective
-    is its own pipeline group). Every other rank, the owner's tensor-parallel peers included,
-    receives the schedule and follows.
+    page_table: KVCachePageTable
+    reader: KVv2ResourceView
+    resolver: KVv2RegionResolver
 
-    The owner judges a store answer over its own layer groups; a follower on a pipeline stage
-    whose groups differ (one holding only windowed layers, say) rebuilds the ask over its own and
-    may name units the store never held. That fetch comes up short and, after one retry, the
-    request computes locally; no stage hangs. Gathering every stage's group set at attach time
-    to refuse such a model would trade an occasional local compute for a refused engine.
+
+def _build_resource_views(executor: PyExecutor) -> _ResourceViews:
+    """View the engine's KV cache manager through its page table, refusing a model with a
+    recurrent layer group."""
+    kv_cache_manager = executor.kv_cache_manager
+    page_table = build_page_table_from_manager(kv_cache_manager)
+    reader = KVv2ResourceView(kv_cache_manager, page_table)
+    _check_layer_groups_are_paged(reader)
+    return _ResourceViews(page_table, reader, KVv2RegionResolver(page_table))
+
+
+def _build_backend_context(
+    executor: PyExecutor, config, views: _ResourceViews, *, mapping, model_identity: str
+) -> BackendBuildContext:
+    """What every backend factory needs of this rank's cache: how to address it, the layout
+    fingerprint naming the model and its shard, the unit sizes, and the fetch wait bound."""
+    return BackendBuildContext(
+        resolver=views.resolver,
+        layout_fingerprint=layout_fingerprint(
+            executor.kv_cache_manager,
+            views.page_table,
+            parallel_shard=parallel_shard_tag(mapping),
+            model_identity=model_identity,
+        ),
+        max_unit_bytes=views.resolver.max_unit_bytes(),
+        device_index=executor.device_id,
+        unit_bytes_of=_unit_bytes_of(views.reader, views.resolver),
+        max_request_blocks=-(-executor.max_seq_len // views.reader.tokens_per_block),
+        fetch_wait_timeout_s=config.fetch_wait_timeout_s,
+    )
+
+
+@contextmanager
+def _closing_backends_on_failure(backends: Sequence[BackendHandle]) -> Iterator[None]:
+    """The assembly steps after ``build_backends`` run inside this: a failure in any of them
+    closes the built backends before it propagates, so no transport thread outlives a refused
+    engine."""
+    try:
+        yield
+    except Exception:
+        close_backends(backends)
+        raise
+
+
+def _build_hooks(
+    executor: PyExecutor,
+    config,
+    views: _ResourceViews,
+    backends: Sequence[BackendHandle],
+    *,
+    mapping,
+    started_at: float,
+) -> KVTransferHooks:
+    """Check the built backends fit the engine's parallelism, register the KV pools with those
+    that need it, build the coordinator over them, and wrap it in the hooks. A pure builder:
+    ``attach_kv_transfer`` attaches what it returns."""
+    _check_followers_can_rebuild_plans(mapping, backends)
+    _register_kv_pools(backends, views.resolver)
+    effects = EngineKVTransferEffects(executor)
+    coordinator = build_coordinator(
+        config,
+        backends,
+        views.reader,
+        effects,
+        EngineWorkQueue(),
+        EngineCollective(executor.dist, mapping),
+        plan_authority=plan_authority_for(mapping),
+    )
+    install_log_forwarding()
+    return KVTransferHooks(
+        executor,
+        coordinator,
+        effects,
+        backends,
+        config.backends,
+        close_timeout_s=config.close_timeout_s,
+        status_dump_path=_status_dump_path(),
+        started_at=started_at,
+        rank=mapping.rank,
+    )
+
+
+# ---- helpers, in call order ----
+
+
+def _refuse(reason: str) -> None:
+    raise ValueError(
+        f"KV transfer backends are configured but the engine cannot host them: {reason}"
+    )
+
+
+def _check_layer_groups_are_paged(reader: KVv2ResourceView) -> None:
+    """Every layer group must be paged: full attention or sliding window (with or without sink
+    blocks), whose blocks the store path names and fetches per group. A recurrent group is
+    refused because nothing publishes its state snapshots.
+
+    A model without sliding attention given windows through ``kv_cache_config.max_attention_window``
+    (a Llama, say) passes too: KV v2 drops pages by that window while attention masks nothing,
+    and the store path follows the cache's own life cycle exactly as the local path does.
     """
-    if mapping.pp_size == 1:
-        return PlanAuthority.ALL_RANKS
-    schedules_for_its_replica = mapping.enable_attention_dp and mapping.tp_size > 1
-    if mapping.rank == 0 or (mapping.pp_rank == 0 and schedules_for_its_replica):
-        return PlanAuthority.OWNER
-    return PlanAuthority.FOLLOWER
-
-
-_CONFIG_KEYS_NOT_PART_OF_THE_MODEL = ("transformers_version", "_name_or_path", "_commit_hash")
-"""Keys of a Hugging Face config that change without the model changing."""
-
-
-def _pretrained_config_of(executor: PyExecutor):
-    """The Hugging Face config behind the engine's model, or ``None`` on an engine without one."""
-    model = getattr(getattr(executor, "model_engine", None), "model", None)
-    return getattr(getattr(model, "model_config", None), "pretrained_config", None)
-
-
-def _digest_of_config(config) -> str:
-    """A stable digest of a Hugging Face config's contents, naming the model when its path
-    does not."""
-    contents = {
-        key: value
-        for key, value in config.to_dict().items()
-        if key not in _CONFIG_KEYS_NOT_PART_OF_THE_MODEL
-    }
-    serialized = json.dumps(contents, sort_keys=True, default=str).encode()
-    return hashlib.blake2b(serialized, digest_size=8).hexdigest()
+    for group_spec in reader.group_specs():
+        if group_spec.kind is not CacheKind.PAGED:
+            _refuse(
+                "SSM/recurrent layer groups are not supported: the store path names no state "
+                "snapshots"
+            )
 
 
 def model_identity_for(executor: PyExecutor) -> str:
@@ -226,21 +309,46 @@ def model_identity_for(executor: PyExecutor) -> str:
     return f"{architecture}#{_digest_of_config(config)}"
 
 
-def _check_layer_groups_are_paged(reader: KVv2ResourceView) -> None:
-    """Every layer group must be paged: full attention or sliding window (with or without sink
-    blocks), whose blocks the store path names and fetches per group. A recurrent group is
-    refused because nothing publishes its state snapshots.
+def _pretrained_config_of(executor: PyExecutor):
+    """The Hugging Face config behind the engine's model, or ``None`` on an engine without one."""
+    model = getattr(getattr(executor, "model_engine", None), "model", None)
+    return getattr(getattr(model, "model_config", None), "pretrained_config", None)
 
-    A model without sliding attention given windows through ``kv_cache_config.max_attention_window``
-    (a Llama, say) passes too: KV v2 drops pages by that window while attention masks nothing,
-    and the store path follows the cache's own life cycle exactly as the local path does.
-    """
-    for group_spec in reader.group_specs():
-        if group_spec.kind is not CacheKind.PAGED:
-            _refuse(
-                "SSM/recurrent layer groups are not supported: the store path names no state "
-                "snapshots"
-            )
+
+_CONFIG_KEYS_NOT_PART_OF_THE_MODEL = ("transformers_version", "_name_or_path", "_commit_hash")
+"""Keys of a Hugging Face config that change without the model changing."""
+
+
+def _digest_of_config(config) -> str:
+    """A stable digest of a Hugging Face config's contents, naming the model when its path
+    does not."""
+    contents = {
+        key: value
+        for key, value in config.to_dict().items()
+        if key not in _CONFIG_KEYS_NOT_PART_OF_THE_MODEL
+    }
+    serialized = json.dumps(contents, sort_keys=True, default=str).encode()
+    return hashlib.blake2b(serialized, digest_size=8).hexdigest()
+
+
+def _unit_bytes_of(
+    reader: KVv2ResourceView, resolver: KVv2RegionResolver
+) -> Callable[[bytes], int]:
+    """Size of a unit from its name: the name starts with its layer group's tag, and every unit
+    of a group is one page of that group's pools. For a backend that lands units in its own
+    memory before their pages exist."""
+    bytes_by_tag = {
+        spec.tag: sum(size for _, size in resolver(spec.local_group, 0))
+        for spec in reader.group_specs()
+    }
+
+    def unit_bytes(name: bytes) -> int:
+        try:
+            return bytes_by_tag[name[:GROUP_TAG_BYTES]]
+        except KeyError:
+            raise KeyError(f"unit {name.hex()} belongs to no layer group of this rank") from None
+
+    return unit_bytes
 
 
 def _check_followers_can_rebuild_plans(mapping, backends: Sequence[BackendHandle]) -> None:
@@ -262,37 +370,58 @@ def _register_kv_pools(backends: Sequence[BackendHandle], resolver: KVv2RegionRe
             handle.pool_registrar.register_pool(address, size)
 
 
-T = TypeVar("T")
+def plan_authority_for(mapping) -> PlanAuthority:
+    """Who plans on this rank, from the loop the engine runs.
+
+    Without pipeline parallelism every rank runs the scheduler and the answers are voted. With
+    it, the rank that calls ``_schedule`` in ``_pp_schedule_and_propagate`` owns the answers:
+    rank 0, or under attention DP every first pipeline rank (one per replica, whose collective
+    is its own pipeline group). Every other rank, the owner's tensor-parallel peers included,
+    receives the schedule and follows.
+    """
+    if mapping.pp_size == 1:
+        return PlanAuthority.ALL_RANKS
+    schedules_for_its_replica = mapping.enable_attention_dp and mapping.tp_size > 1
+    if mapping.rank == 0 or (mapping.pp_rank == 0 and schedules_for_its_replica):
+        return PlanAuthority.OWNER
+    return PlanAuthority.FOLLOWER
 
 
-def _closing_backends_on_failure(backends: Sequence[BackendHandle], assemble: Callable[[], T]) -> T:
-    """Run the assembly steps that follow ``build_backends``; a failure in any of them closes
-    the built backends before it propagates, so no transport thread outlives a refused engine."""
-    try:
-        return assemble()
-    except Exception:
-        close_backends(backends)
-        raise
+_DISAGGREGATION_LOGGER_NAME = "tensorrt_llm._torch.disaggregation"
+"""The stdlib logger namespace of the import-light layers below the engine (coordinator, backends).
+They log through ``logging`` because they do not import ``tensorrt_llm``; the engine forwards
+their WARNING+ records to the TRT-LLM logger so a store outage shows up in the engine's log."""
 
 
-def _unit_bytes_by_name(
-    reader: KVv2ResourceView, resolver: KVv2RegionResolver
-) -> Callable[[bytes], int]:
-    """Size of a unit from its name: the name starts with its layer group's tag, and every unit
-    of a group is one page of that group's pools. For a backend that lands units in its own
-    memory before their pages exist."""
-    bytes_by_tag = {
-        spec.tag: sum(size for _, size in resolver(spec.local_group, 0))
-        for spec in reader.group_specs()
-    }
+def install_log_forwarding() -> None:
+    """Attach the forwarding handler to the disaggregation logger namespace unless one is there
+    already. Process-wide and idempotent: the handler outlives any one engine, so nothing
+    removes it."""
+    target = logging.getLogger(_DISAGGREGATION_LOGGER_NAME)
+    if not any(isinstance(handler, _ForwardToTrtllmLogger) for handler in target.handlers):
+        target.addHandler(_ForwardToTrtllmLogger())
 
-    def unit_bytes(name: bytes) -> int:
+
+class _ForwardToTrtllmLogger(logging.Handler):
+    """Re-emits each stdlib record it receives through ``tensorrt_llm.logger.logger`` at the
+    matching severity, tagged ``kv transfer:`` so the engine log says which feature the line
+    came from. Installed once per process by ``install_log_forwarding``."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+
+    def emit(self, record: logging.LogRecord) -> None:
         try:
-            return bytes_by_tag[name[:GROUP_TAG_BYTES]]
-        except KeyError:
-            raise KeyError(f"unit {name.hex()} belongs to no layer group of this rank") from None
-
-    return unit_bytes
+            message = f"kv transfer: {record.getMessage()}"
+        except Exception:  # noqa: BLE001 - a malformed record must not break the caller's log
+            self.handleError(record)
+            return
+        if record.levelno >= logging.CRITICAL:
+            logger.critical(message)
+        elif record.levelno >= logging.ERROR:
+            logger.error(message)
+        else:
+            logger.warning(message)
 
 
 def _status_dump_path() -> str | None:
@@ -300,122 +429,3 @@ def _status_dump_path() -> str | None:
     if not template:
         return None
     return template.replace("{pid}", str(os.getpid()))
-
-
-class _ResourceViews(NamedTuple):
-    """This rank's KV cache as the transfer layer sees it: read by the coordinator through
-    ``reader``, addressed by the backends through ``resolver`` and ``build_context``."""
-
-    reader: KVv2ResourceView
-    resolver: KVv2RegionResolver
-    model_identity: str
-    build_context: BackendBuildContext
-
-
-def _build_resource_views(executor: PyExecutor, config, mapping) -> _ResourceViews:
-    """Build the reader and the region resolver over the engine's KV cache manager, refusing a
-    model with a recurrent layer group, and gather what every backend factory needs from them."""
-    kv_cache_manager = executor.kv_cache_manager
-    page_table = build_page_table_from_manager(kv_cache_manager)
-    reader = KVv2ResourceView(kv_cache_manager, page_table)
-    _check_layer_groups_are_paged(reader)
-    resolver = KVv2RegionResolver(page_table)
-    model_identity = model_identity_for(executor)
-    build_context = BackendBuildContext(
-        resolver=resolver,
-        layout_fingerprint=layout_fingerprint(
-            kv_cache_manager,
-            page_table,
-            parallel_shard=parallel_shard_tag(mapping),
-            model_identity=model_identity,
-        ),
-        max_unit_bytes=resolver.max_unit_bytes(),
-        device_index=executor.device_id,
-        unit_bytes_of=_unit_bytes_by_name(reader, resolver),
-        max_request_blocks=-(-executor.max_seq_len // reader.tokens_per_block),
-        landing_wait_timeout_s=config.landing_wait_timeout_s,
-    )
-    return _ResourceViews(reader, resolver, model_identity, build_context)
-
-
-def _build_hooks(
-    executor: PyExecutor,
-    config,
-    views: _ResourceViews,
-    backends: Sequence[BackendHandle],
-    *,
-    mapping,
-    started_at: float,
-) -> KVTransferHooks:
-    """Check the built backends fit the engine's parallelism, register the KV pools with those
-    that need it, build the coordinator over them, and attach the hooks to the executor and its
-    scheduler."""
-    _check_followers_can_rebuild_plans(mapping, backends)
-    _register_kv_pools(backends, views.resolver)
-    effects = PyExecutorKVTransferEffects(executor)
-    coordinator = build_coordinator(
-        config,
-        backends,
-        views.reader,
-        effects,
-        EngineWorkQueue(),
-        EngineCollective(executor.dist, mapping),
-        plan_authority=plan_authority_for(mapping),
-    )
-    install_log_forwarding()
-    hooks = KVTransferHooks(
-        executor,
-        coordinator,
-        effects,
-        backends,
-        config.backends,
-        close_timeout_s=config.close_timeout_s,
-        status_dump_path=_status_dump_path(),
-        started_at=started_at,
-        rank=mapping.rank,
-    )
-    executor.scheduler.kv_transfer_hooks = hooks
-    executor.kv_transfer = hooks
-    logger.info(
-        "KV transfer attached: backends=%s pools=%d model=%r layout=%s plan_authority=%s",
-        [(entry.name, entry.type, sorted(entry.roles)) for entry in config.backends],
-        len(views.resolver.pool_memory_spans()),
-        views.model_identity,
-        views.build_context.layout_fingerprint.hex(),
-        coordinator.plan_authority.value,
-    )
-    return hooks
-
-
-def attach_kv_transfer(
-    executor: PyExecutor,
-    config_path: str,
-    *,
-    mapping,
-    spec_config,
-    kv_connector_manager,
-    max_beam_width: int,
-) -> KVTransferHooks:
-    """Guard, build, register, attach. Raises ``ValueError`` for a configuration out of scope or
-    a malformed config file.
-
-    Disaggregated serving may be on at the same time: the transceiver keeps owning gen-init
-    receives and context sends; this layer adds store fetch and publish for context requests.
-    """
-    started_at = time.time()
-    check_engine_supports_kv_transfer(
-        executor,
-        mapping=mapping,
-        spec_config=spec_config,
-        kv_connector_manager=kv_connector_manager,
-        max_beam_width=max_beam_width,
-    )
-    config = load_kv_transfer_config(config_path)
-    views = _build_resource_views(executor, config, mapping)
-    backends = build_backends(config, views.build_context)
-    return _closing_backends_on_failure(
-        backends,
-        lambda: _build_hooks(
-            executor, config, views, backends, mapping=mapping, started_at=started_at
-        ),
-    )

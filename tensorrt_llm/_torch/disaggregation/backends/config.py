@@ -18,7 +18,7 @@ The executor creator reads ``TRTLLM_KV_TRANSFER_CONFIG`` and hands the YAML path
 which loads it here; this module reads no environment. The ``backends`` list is the assembly
 table: its order is the fetch priority, each entry names a registered backend type and carries
 that type's own settings unread. The timeouts have their one default each here; the assembly
-passes them to the coordinator and, for ``landing_wait_timeout_s``, to the backends. Nothing here
+passes them to the coordinator and, for ``fetch_wait_timeout_s``, to the backends. Nothing here
 imports a backend.
 """
 
@@ -32,7 +32,7 @@ import yaml
 
 __all__ = [
     "BACKEND_ROLES",
-    "DEFAULT_LANDING_WAIT_TIMEOUT_S",
+    "DEFAULT_FETCH_WAIT_TIMEOUT_S",
     "DEFAULT_UNLAUNCHED_TIMEOUT_S",
     "KV_TRANSFER_CONFIG_ENV",
     "BackendEntry",
@@ -55,7 +55,7 @@ _COORDINATOR_KEYS = (
     "fetch_timeout_s",
     "publish_timeout_s",
     "unlaunched_timeout_s",
-    "landing_wait_timeout_s",
+    "fetch_wait_timeout_s",
     "probe_timeout_s",
     "close_timeout_s",
 )
@@ -71,8 +71,8 @@ _DEFAULT_CLOSE_TIMEOUT_S = 30.0
 DEFAULT_UNLAUNCHED_TIMEOUT_S = 30.0
 """The one default for ``unlaunched_timeout_s``; ``KVTransferConfig`` carries it and the assembly
 passes it on."""
-DEFAULT_LANDING_WAIT_TIMEOUT_S = 30.0
-"""The one default for ``landing_wait_timeout_s``; ``KVTransferConfig`` carries it and the
+DEFAULT_FETCH_WAIT_TIMEOUT_S = 30.0
+"""The one default for ``fetch_wait_timeout_s``; ``KVTransferConfig`` carries it and the
 assembly passes it on, to the coordinator and to the backends alike."""
 
 _Dataclass = TypeVar("_Dataclass")
@@ -154,12 +154,12 @@ class KVTransferConfig:
             reserved) after another rank has launched it, before the ranks give the fetch up
             and plan again. Independent of ``fetch_timeout_s``; ``None`` disables and must be
             given explicitly.
-        landing_wait_timeout_s: Longest a rank waits for the scheduler's pages for a planned
-            fetch (from the plan's decision, or from landing on the host) or, host-first, for
-            the backend's landing memory (``fetch_to_host`` refused), before it votes the fetch
-            failed so that the ranks give it up, release the landing and plan again; out of
-            retries the request computes locally. ``None`` disables and must be given
-            explicitly.
+        fetch_wait_timeout_s: How long a planned fetch may wait for pages, or for landing
+            memory, before it is given up: the scheduler's pages (from the plan's decision, or
+            from landing on the host) or, host-first, the backend's landing memory
+            (``fetch_to_host`` refused). Past it the rank votes the fetch failed so that the
+            ranks give it up, release the landing and plan again; out of retries the request
+            computes locally. ``None`` disables and must be given explicitly.
         probe_timeout_s: Longest a request waits for a store lookup before it plans without
             the store (wall-clock, from its first deferral).
         close_timeout_s: Longest ``close`` waits for the backends to finish before it gives them
@@ -173,7 +173,7 @@ class KVTransferConfig:
     fetch_timeout_s: float | None = _DEFAULT_FETCH_TIMEOUT_S
     publish_timeout_s: float | None = _DEFAULT_PUBLISH_TIMEOUT_S
     unlaunched_timeout_s: float | None = DEFAULT_UNLAUNCHED_TIMEOUT_S
-    landing_wait_timeout_s: float | None = DEFAULT_LANDING_WAIT_TIMEOUT_S
+    fetch_wait_timeout_s: float | None = DEFAULT_FETCH_WAIT_TIMEOUT_S
     probe_timeout_s: float = _DEFAULT_PROBE_TIMEOUT_S
     close_timeout_s: float = _DEFAULT_CLOSE_TIMEOUT_S
 
@@ -187,7 +187,7 @@ class KVTransferConfig:
             "fetch_timeout_s",
             "publish_timeout_s",
             "unlaunched_timeout_s",
-            "landing_wait_timeout_s",
+            "fetch_wait_timeout_s",
         ):
             value = getattr(self, key)
             if value is not None and value <= 0:

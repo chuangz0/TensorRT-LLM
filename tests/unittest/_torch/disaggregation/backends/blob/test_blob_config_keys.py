@@ -32,7 +32,7 @@ def test_backend_fields_are_the_documented_nine():
         "publish_buffer_bytes",
         "landing_buffer_bytes",
         "max_landed_units",
-        "max_inflight_ops",
+        "max_inflight_deliveries",
         "num_workers",
         "probe_ttl_s",
     }
@@ -44,7 +44,7 @@ def test_backend_fields_are_the_documented_nine():
 def test_backend_config_defaults_are_the_documented_ones():
     cfg = BlobStoreConfig()
     assert cfg.namespace == "trtllm" and cfg.landing == "device" and not cfg.lands_on_host
-    assert cfg.transfer_batch_size > 0 and cfg.max_inflight_ops > 0 and cfg.num_workers > 0
+    assert cfg.transfer_batch_size > 0 and cfg.max_inflight_deliveries > 0 and cfg.num_workers > 0
     assert cfg.probe_ttl_s > 0
     assert cfg.publish_buffer_bytes == 512 << 20 and cfg.landing_buffer_bytes == 2 << 30
     assert cfg.max_landed_units is None  # every slot the landing budget affords
@@ -62,7 +62,7 @@ def test_configs_are_frozen():
     [
         ({"namespace": ""}, "namespace"),
         ({"transfer_batch_size": 0}, "transfer_batch_size"),
-        ({"max_inflight_ops": 0}, "max_inflight_ops"),
+        ({"max_inflight_deliveries": 0}, "max_inflight_deliveries"),
         ({"num_workers": -2}, "num_workers"),
         ({"probe_ttl_s": 0.0}, "probe_ttl_s"),
         ({"landing": "gpu"}, "landing"),
@@ -110,7 +110,9 @@ def test_backend_from_dict_round_trips_known_keys():
     assert cfg.num_workers == 3 and cfg.lands_on_host and cfg.max_landed_units == 16
 
 
-@pytest.mark.parametrize("old_key", ["stage_through_host", "staging_buffer_bytes"])
+@pytest.mark.parametrize(
+    "old_key", ["stage_through_host", "staging_buffer_bytes", "max_inflight_ops"]
+)
 def test_backend_from_dict_refuses_a_retired_key_by_name(old_key):
     with pytest.raises(ValueError, match=old_key):
         BlobStoreConfig.from_dict({old_key: 4096})

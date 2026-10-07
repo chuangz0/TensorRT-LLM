@@ -49,7 +49,7 @@ def store_request() -> FakeRequest:
 
 
 def advance_all(world, rigs, req, now):
-    """Every rank advances as its hooks would: the request is a candidate where undecided."""
+    """Every rank advances as its hooks would: the request is a candidate where deferred."""
     world.run(
         lambda r: rigs[r].coord.advance(
             [req] if rigs[r].coord.fetch_answer(req) is DEFER else [], now
@@ -140,7 +140,7 @@ def test_follower_drops_a_held_answer_when_the_request_ends(rigs):
     rigs[FOLLOWER].coord.adopt_plan_answers([], [(7, (END, "store")), (8, None)])
     assert rigs[FOLLOWER].records() == [] and rigs[FOLLOWER].coord.fetch_answer(stray) is DEFER
     assert rigs[FOLLOWER].coord.status_dump()["decided_plans"] == 0  # a None is held too
-    rigs[FOLLOWER].coord.notify_request_finished(stray)
+    rigs[FOLLOWER].coord.holds_finished_request(stray)
     rigs[FOLLOWER].coord.adopt_plan_answers([stray, late], [])
     assert rigs[FOLLOWER].coord.fetch_answer(stray) is DEFER  # its answer is gone
     assert rigs[FOLLOWER].coord.fetch_answer(late) is None  # its answer was kept
@@ -221,7 +221,7 @@ def test_follower_launching_one_round_late_lands_both_once(world, rigs):
     advance_all(world, rigs, req, 2.0)  # both TERMINAL: both land in the same round
     for rig in rigs:
         assert rig.effects.only("unpark") == [(req, END, False, None)]
-        assert rig.effects.count("give_back_fetch_pages") == 0
+        assert rig.effects.count("revert_fetch_pages") == 0
         assert [r["state"] for r in rig.records()] == ["DELIVERED"]
 
 
@@ -234,9 +234,9 @@ def test_follower_that_never_launches_resets_both_ranks_and_the_owner_exports_ag
     advance_all(world, rigs, req, 1.0)  # the follower's clock starts
     advance_all(world, rigs, req, 1.0 + UNLAUNCHED_TIMEOUT_S)  # the follower votes FAILED
     assert rigs[OWNER].store.count("quiesce") == 1
-    assert rigs[OWNER].effects.count("give_back_fetch_pages") == 1
+    assert rigs[OWNER].effects.count("revert_fetch_pages") == 1
     assert rigs[FOLLOWER].store.count("quiesce") == 0
-    assert rigs[FOLLOWER].effects.count("give_back_fetch_pages") == 0
+    assert rigs[FOLLOWER].effects.count("revert_fetch_pages") == 0
     for rig in rigs:
         assert rig.effects.count("unpark") == 0
         assert rig.record(1)["retries_left"] == 0

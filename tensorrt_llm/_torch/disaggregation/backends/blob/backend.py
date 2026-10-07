@@ -125,9 +125,9 @@ class BlobStoreConfig:
         landing_buffer_bytes: Ceiling on the pinned landing pool when ``landing`` is ``host``.
         max_landed_units: Cap on the landing pool's slot count; ``None`` takes every slot the
             budget affords. A landing holds one slot per unit until it is released.
-        max_inflight_ops: Deliveries that may be queued or running at once. A submission past
-            this bound is refused with ``SubmissionRejected``. Landings are bounded by their
-            slots instead and do not count.
+        max_inflight_deliveries: Deliveries that may be queued or running at once. A
+            submission past this bound is refused with ``SubmissionRejected``. Landings are
+            bounded by their slots instead and do not count.
         num_workers: Threads that drive store calls.
         probe_ttl_s: Seconds an unconsumed probe answer is kept before it is dropped.
     """
@@ -138,7 +138,7 @@ class BlobStoreConfig:
     publish_buffer_bytes: int = _DEFAULT_PUBLISH_BUFFER_BYTES
     landing_buffer_bytes: int = _DEFAULT_LANDING_BUFFER_BYTES
     max_landed_units: Optional[int] = None
-    max_inflight_ops: int = 256
+    max_inflight_deliveries: int = 256
     num_workers: int = 2
     probe_ttl_s: float = 30.0
 
@@ -147,13 +147,13 @@ class BlobStoreConfig:
             raise ValueError(f"namespace must be a non-empty string, got {self.namespace!r}")
         for name in (
             "transfer_batch_size",
-            "max_inflight_ops",
+            "max_inflight_deliveries",
             "num_workers",
             "publish_buffer_bytes",
             "landing_buffer_bytes",
         ):
             _require_int(name, getattr(self, name))
-        for name in ("transfer_batch_size", "max_inflight_ops", "num_workers"):
+        for name in ("transfer_batch_size", "max_inflight_deliveries", "num_workers"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be > 0")
         if self.landing not in ("device", "host"):
@@ -360,7 +360,7 @@ class BlobStoreBackend:
         self._pending: set[tuple[int, int]] = set()
         """Spans whose ``register_span`` call is in progress; they refuse overlaps like live ones."""
         self._probes: dict[tuple[bytes, tuple[bytes, ...]], _Probe] = {}
-        self._inflight = threading.BoundedSemaphore(config.max_inflight_ops)
+        self._inflight = threading.BoundedSemaphore(config.max_inflight_deliveries)
         # Daemon workers: a store call that never returns must not keep the process alive once
         # the engine has given the backend up.
         self._pool = DaemonWorkerPool(config.num_workers, thread_name_prefix="blob-store")
@@ -611,7 +611,7 @@ class BlobStoreBackend:
         outcome on the worker, through ``_run``."""
         if not self._inflight.acquire(blocking=False):
             raise SubmissionRejected(
-                f"{self._config.max_inflight_ops} deliveries already in flight"
+                f"{self._config.max_inflight_deliveries} deliveries already in flight"
             )
         try:
             self._pool.submit(self._run, attempt, run, tasks)

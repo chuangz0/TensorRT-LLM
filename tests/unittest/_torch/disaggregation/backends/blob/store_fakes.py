@@ -27,7 +27,7 @@ from disaggregation.backends.blob.drivers.memory import MemoryBlobStore  # noqa:
 from disaggregation.backends.blob.host_landing import HostLandingBlobBackend  # noqa: E402
 from disaggregation.backends.blob.slot_pool import HostSlotPool  # noqa: E402
 from disaggregation.backends.blob.store import GetStatus, PutStatus  # noqa: E402
-from disaggregation.backends.config import DEFAULT_LANDING_WAIT_TIMEOUT_S  # noqa: E402
+from disaggregation.backends.config import DEFAULT_FETCH_WAIT_TIMEOUT_S  # noqa: E402
 from disaggregation.base.cache_backend import CacheExtent, Unit  # noqa: E402
 from disaggregation.base.region import Segment  # noqa: E402
 
@@ -499,7 +499,7 @@ def make_host_rank(
     publish_slots: int = 4,
     landing_slots: int = 4,
     slot_bytes: int = SLOT,
-    landing_wait_timeout_s: float | None = DEFAULT_LANDING_WAIT_TIMEOUT_S,
+    fetch_wait_timeout_s: float | None = DEFAULT_FETCH_WAIT_TIMEOUT_S,
     arena_bytes: int = 1 << 16,
     unit_bytes: Callable[[bytes], int] | None = None,
     **config_overrides,
@@ -524,7 +524,7 @@ def make_host_rank(
         rank.inner,
         landing_pool,
         unit_bytes or rank.unit_bytes,
-        landing_wait_timeout_s=landing_wait_timeout_s,
+        fetch_wait_timeout_s=fetch_wait_timeout_s,
     )
     rank.publish_pool, rank.publish_copier, rank.trace = publish_pool, publish_copier, trace
     # The pool does not expose its copier; the fake one is read back here so tests can gate it.

@@ -109,7 +109,7 @@ class TransferRecord:
             across tries on retry.
         retries_left: Fetch only; how many more times the plan may be dropped and the request
             planned again. Every failed verdict spends one, whatever its cause: a failed or short
-            delivery, a launch given up, or a wait that ran out (``landing_wait_timeout_s``,
+            delivery, a launch given up, or a wait that ran out (``fetch_wait_timeout_s``,
             ``unlaunched_timeout_s``). At zero the next failure releases the record and the
             request computes locally.
         deadline: Monotonic time after which the record expires; ``None`` means no timeout. Set
@@ -147,7 +147,7 @@ class TransferRecord:
         resource_wait_since: Fetch only; when this rank started waiting for something the
             scheduler or the backend has yet to give: the pages (from the plan's decision for a
             device-direct fetch, from ``LANDED`` for a host-first one) or the landing memory
-            (``fetch_to_host`` refused). Bounded by ``landing_wait_timeout_s``; cleared when
+            (``fetch_to_host`` refused). Bounded by ``fetch_wait_timeout_s``; cleared when
             the wait ends.
     """
 

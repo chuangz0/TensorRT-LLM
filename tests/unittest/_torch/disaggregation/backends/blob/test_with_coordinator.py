@@ -17,7 +17,7 @@ import pytest
 __extra_import_path__ = ["~/tensorrt_llm/_torch", "../../orchestration/kv_transfer"]
 from disaggregation.backends.blob.store import BlobStoreError  # noqa: E402
 from disaggregation.backends.config import (  # noqa: E402
-    DEFAULT_LANDING_WAIT_TIMEOUT_S,
+    DEFAULT_FETCH_WAIT_TIMEOUT_S,
     DEFAULT_UNLAUNCHED_TIMEOUT_S,
 )
 from disaggregation.orchestration.kv_transfer.coordinator import KVTransferCoordinator  # noqa: E402
@@ -74,7 +74,7 @@ class Side:
             self.queue,
             FakeCollective(),
             unlaunched_timeout_s=DEFAULT_UNLAUNCHED_TIMEOUT_S,
-            landing_wait_timeout_s=DEFAULT_LANDING_WAIT_TIMEOUT_S,
+            fetch_wait_timeout_s=DEFAULT_FETCH_WAIT_TIMEOUT_S,
         )
 
     @property
@@ -160,7 +160,7 @@ def test_publish_on_one_rank_then_probe_plan_launch_and_land_on_another():
         assert gen.backend.counters.failed_attempts == 0
 
         # The request's end is the release point: one quiesce (True), record gone, no hold.
-        gen.coord.notify_request_finished(req)
+        gen.coord.holds_finished_request(req)
         assert gen.records() == [] and gen.effects.count("hold_for_transfer") == 0
         assert gen.coord.status_dump() == {
             "plan_authority": "ALL_RANKS",
@@ -186,12 +186,12 @@ def test_content_gone_between_probe_and_fetch_is_a_short_serve_retried_once_then
         gen.fill_all(0xEE)
         gen.coord.launch_reserved_fetches([req], 1.0)
 
-        gen.advance_until("give_back_fetch_pages")
+        gen.advance_until("revert_fetch_pages")
         # Delivered(∅) is a miss, not a failure: quiesce, give the pages back, keep one retry.
         assert gen.effects.names() == [
             "prepare_fetch_resources",
             "park_for_fetch",
-            "give_back_fetch_pages",
+            "revert_fetch_pages",
         ]
         rec = gen.records()[0]
         assert rec["state"] == "PLANNED" and rec["outcomes"] == ["Delivered"]
@@ -221,7 +221,7 @@ def test_store_outage_during_fetch_is_failed_gives_pages_back_and_the_retry_land
         store.fail_next("contains")  # the fetch's own lookup, not the probe's
         gen.coord.launch_reserved_fetches([req], 1.0)
 
-        gen.advance_until("give_back_fetch_pages")
+        gen.advance_until("revert_fetch_pages")
         rec = gen.records()[0]
         assert rec["state"] == "PLANNED" and rec["outcomes"] == ["Failed"]
         assert gen.backend.counters.failed_attempts == 1
@@ -340,7 +340,7 @@ class HostSide(Side):
             self.queue,
             FakeCollective(),
             unlaunched_timeout_s=DEFAULT_UNLAUNCHED_TIMEOUT_S,
-            landing_wait_timeout_s=DEFAULT_LANDING_WAIT_TIMEOUT_S,
+            fetch_wait_timeout_s=DEFAULT_FETCH_WAIT_TIMEOUT_S,
         )
 
 
@@ -390,7 +390,7 @@ def test_host_landing_rank_lands_first_then_places_after_the_scheduler_reserves(
         assert counters.fetch_hits == BLOCKS and counters.fetch_misses == 0
         assert counters.failed_attempts == 0
 
-        gen.coord.notify_request_finished(req)
+        gen.coord.holds_finished_request(req)
         assert gen.records() == [] and gen.effects.count("hold_for_transfer") == 0
     finally:
         gen.close()

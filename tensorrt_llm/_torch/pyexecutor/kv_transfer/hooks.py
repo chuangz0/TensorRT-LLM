@@ -37,15 +37,15 @@ from ...disaggregation.orchestration.kv_transfer.consensus import PlanAnswers
 from ...disaggregation.orchestration.kv_transfer.coordinator import DEFER, KVTransferCoordinator
 from ...disaggregation.orchestration.kv_transfer.engine_protocols import PlanAuthority
 from ..llm_request import LlmRequest, LlmRequestState
-from .effects import EngineRequestView, PyExecutorKVTransferEffects
+from .effects import EngineKVTransferEffects, EngineRequestView
 
 if TYPE_CHECKING:
     from ..py_executor import PyExecutor
 
 __all__ = ["KVTransferHooks"]
 
-_IDLE_BACKEND_WAIT_S = 0.001
-"""How long an idle loop pass sleeps while only a backend can make progress."""
+_IDLE_PASS_SLEEP_S = 0.001
+"""How long an idle loop pass sleeps while only this layer can make progress."""
 
 _CONTEXT_INIT_STATE_VALUE = LlmRequestState.CONTEXT_INIT.value
 
@@ -76,7 +76,7 @@ class KVTransferHooks:
         self,
         executor: PyExecutor,
         coordinator: KVTransferCoordinator,
-        effects: PyExecutorKVTransferEffects,
+        effects: EngineKVTransferEffects,
         backends: Sequence[BackendHandle],
         backend_entries: Sequence[BackendEntry],
         *,
@@ -96,7 +96,7 @@ class KVTransferHooks:
         self._rank = rank
         self._is_closed = False
         self._num_deferred_requests = 0
-        """Requests still undecided after the last advance (or, on a follower, after the last
+        """Requests still deferred after the last advance (or, on a follower, after the last
         adoption); each is waiting on a store lookup."""
         self._peer_pending = False
         """Attention DP: whether some replica reported pending work in this round's rank-state
@@ -108,10 +108,10 @@ class KVTransferHooks:
     # ---- loop entry points ----
 
     def advance_round(self, active_requests: Sequence[LlmRequest]) -> None:
-        """Loop head, once per round: pick the undecided candidates, then
-        ``coordinator.advance`` reaps landed transfers and plans them. A follower plans nothing
-        here; its undecided count is set when it adopts the owner's answers."""
-        candidates = self._undecided_candidates(active_requests)
+        """Loop head, once per round: pick the deferred candidates, then
+        ``coordinator.advance`` polls outcomes into votes and plans them. A follower plans
+        nothing here; its deferred count is set when it adopts the owner's answers."""
+        candidates = self._deferred_candidates(active_requests)
         now = time.monotonic()
         self._start_drain_clock_at_quiescence(now)
         num_deferred = self.coordinator.advance(
@@ -129,8 +129,8 @@ class KVTransferHooks:
         self, active_requests: Sequence[LlmRequest], answers: PlanAnswers
     ) -> None:
         """Follower of the pipeline-parallel loop, before it runs its local scheduler: take the
-        owner's answers; every undecided candidate without one stays deferred."""
-        candidates = self._undecided_candidates(active_requests)
+        owner's answers; every deferred candidate without one stays deferred."""
+        candidates = self._deferred_candidates(active_requests)
         self._num_deferred_requests = self.coordinator.adopt_plan_answers(candidates, answers)
 
     def fetch_answer(self, request: LlmRequest):
@@ -158,10 +158,11 @@ class KVTransferHooks:
 
     # ---- release gate, cancel path, idle pacing ----
 
-    def on_request_finished(self, request: LlmRequest) -> bool:
-        """The release gate: ``True`` when the engine may terminate the request
-        now, ``False`` when this layer holds it and will terminate it later, or already has."""
-        return self.coordinator.notify_request_finished(EngineRequestView(request))
+    def holds_finished_request(self, request: LlmRequest) -> bool:
+        """The release gate: ``True`` when this layer keeps the finished request, so the engine
+        must not free it yet (this layer terminates it later, or already has); ``False`` when
+        the engine may terminate it now."""
+        return self.coordinator.holds_finished_request(EngineRequestView(request))
 
     def owns(self, request: LlmRequest) -> bool:
         """Whether this layer owns the request right now: parked for a fetch, or held after it
@@ -237,7 +238,7 @@ class KVTransferHooks:
         lookup a request is deferred on, a fetch waiting for pages, a held request waiting for
         the ranks, here or on a peer) yields briefly instead of spinning through the budgets."""
         if self._num_deferred_requests or self.has_pending_work():
-            time.sleep(_IDLE_BACKEND_WAIT_S)
+            time.sleep(_IDLE_PASS_SLEEP_S)
 
     # ---- shutdown ----
 
@@ -313,7 +314,7 @@ class KVTransferHooks:
 
     # ---- request selection ----
 
-    def _undecided_candidates(
+    def _deferred_candidates(
         self, active_requests: Sequence[LlmRequest]
     ) -> list[EngineRequestView]:
         """Fetch candidates whose plan is not decided yet."""

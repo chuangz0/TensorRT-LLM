@@ -272,7 +272,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # context request before any cache is prepared for it, and answering a plan, None
         # (compute locally) or its ``DEFER`` (skip this round). Duck-typed and attached by
         # the executor assembly; None keeps every request on the local compute path.
-        self.kv_transfer_hooks = None
+        self.kv_transfer = None
         # Set per ``schedule_request`` call; see its docstring.
         self._protected_from_eviction_request_ids: frozenset[int] = frozenset()
 
@@ -567,7 +567,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     deferred_behind_contributor = True
                     continue
             # KV transfer seam: asked before any cache is prepared.
-            fetch_path = self._try_take_fetch_path(req)
+            fetch_path = self._try_fetch_path(req)
             if fetch_path is FetchPathAction.RESERVED:
                 fetch_launch_queue.append(req)
             if fetch_path is not FetchPathAction.NOT_A_FETCH:
@@ -607,12 +607,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
 
-        # A request on the KV transfer path is progress in the making, whatever it waits for:
-        # a store lookup, a landing, the ranks' agreement, or pages for a planned fetch. Each
-        # wait is bounded by that layer's own clocks, after which the request computes locally
-        # and a true pool exhaustion shows up here as before. A steady stream of new fetch
-        # candidates can keep deferring the detector by up to two wait budgets per request
-        # (one per try); that is acceptable, since every one of them returns to the local path.
+        # A request waiting on the KV transfer layer counts as progress: that layer bounds every
+        # wait and returns the request to the local path.
         self._detect_deadlock(
             active_requests,
             inflight_request_ids,
@@ -643,21 +639,10 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     # ---- KV transfer seam ----
 
-    def _try_take_fetch_path(self, req: LlmRequest) -> FetchPathAction:
-        """Ask the KV transfer hooks whether a pending context request fetches its prefix.
-
-        The hooks own the candidate rule (first chunk, not dummy, not disagg); they
-        answer ``None`` for anything else. ``NOT_A_FETCH``: no hooks, not a
-        candidate, or "compute locally"; the request takes the ordinary context
-        path. ``DEFERRED``: the transfer layer has no answer yet; ``RESERVE_FAILED``:
-        no pages for the fetch. Either way the request stays in ``CONTEXT_INIT`` and
-        is asked again next round, and neither is a stall for the deadlock detector:
-        the transfer layer bounds both waits and gives the fetch up. ``RESERVED``:
-        pages reserved up to the plan's target; the request goes to the fetch launch
-        queue and, like a disagg gen-init, joins neither the request nor the token
-        budget of this forward pass.
-        """
-        hooks = self.kv_transfer_hooks
+    def _try_fetch_path(self, req: LlmRequest) -> FetchPathAction:
+        """Ask the KV transfer layer whether a pending context request fetches its prefix,
+        and reserve the pages when it does; see ``FetchPathAction`` for the answers."""
+        hooks = self.kv_transfer
         if hooks is None:
             return FetchPathAction.NOT_A_FETCH
         plan = hooks.fetch_answer(req)
@@ -691,9 +676,6 @@ class KVCacheV2Scheduler(RequestScheduler):
         rewind_context_after_cache_drop(req, self.tokens_per_block)
         return FetchPathAction.RESERVE_FAILED
 
-    def _is_first_chunk_context(self, req: LlmRequest) -> bool:
-        return req.state_value == self._context_init_state_value and req.is_first_context_chunk
-
     # ---- Prefix-aware skip ----
 
     def _is_prefix_skip_candidate(self, req: LlmRequest) -> bool:
@@ -703,7 +685,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         be skipped, and an encoder request contributes to the cross pool, which
         the skip deliberately leaves alone.
         """
-        return self._is_first_chunk_context(req)
+        return req.state_value == self._context_init_state_value and req.is_first_context_chunk
 
     def _skip_pays_off_under_reuse_policy(self) -> bool:
         """Whether a one-iteration deferral can actually be repaid by a reuse hit.

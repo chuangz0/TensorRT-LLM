@@ -101,11 +101,12 @@ class KVTransferCoordinator:
         unlaunched_timeout_s: Longest this rank may stay unlaunched on a fetch another rank has
             already launched before it votes the fetch failed. ``None`` disables. Never starts
             counting on a single rank. Required: the default lives in ``KVTransferConfig``.
-        landing_wait_timeout_s: Longest this rank waits for the scheduler's pages (from the
-            plan's decision, or from landing on the host) or, host-first, for the backend's
-            landing memory, before it votes the fetch failed. Counts on a single rank too, so a
-            fetch the scheduler can never find pages for is given up and the request computes
-            locally instead of stalling. ``None`` disables. Required, as above.
+        fetch_wait_timeout_s: How long a planned fetch may wait for pages, or for landing
+            memory, before it is given up: the scheduler's pages (from the plan's decision, or
+            from landing on the host) or, host-first, the backend's landing memory. Past it
+            this rank votes the fetch failed. Counts on a single rank too, so a fetch the
+            scheduler can never find pages for is given up and the request computes locally
+            instead of stalling. ``None`` disables. Required, as above.
         plan_authority: Who decides plan answers on this rank. ``ALL_RANKS``: planned here and
             reduced in the collective. ``OWNER``: planned here alone, not carried in the
             payload, handed out with ``export_plan_answers``. ``FOLLOWER``: never planned or
@@ -113,7 +114,7 @@ class KVTransferCoordinator:
             the collective in every mode.
         queue_budget: How many posted callables one ``advance`` runs.
 
-    The engine must call ``notify_request_finished`` for every request it ever passed in, so that
+    The engine must call ``holds_finished_request`` for every request it ever passed in, so that
     fetch records reach their release point and per-request state is dropped. Landings still
     held when the engine shuts down (``hooks.close`` frees parked and held requests only) are
     closed by the backend's own ``close``.
@@ -138,7 +139,7 @@ class KVTransferCoordinator:
         dist: Collective,
         *,
         unlaunched_timeout_s: float | None,
-        landing_wait_timeout_s: float | None,
+        fetch_wait_timeout_s: float | None,
         fetch_timeout_s: float | None = None,
         publish_timeout_s: float | None = None,
         plan_authority: PlanAuthority = PlanAuthority.ALL_RANKS,
@@ -166,14 +167,14 @@ class KVTransferCoordinator:
         self._fetch_timeout_s = fetch_timeout_s
         self._publish_timeout_s = publish_timeout_s
         self._unlaunched_timeout_s = unlaunched_timeout_s
-        self._landing_wait_timeout_s = landing_wait_timeout_s
+        self._fetch_wait_timeout_s = fetch_wait_timeout_s
         self._plan_authority = plan_authority
         self._queue_budget = queue_budget
 
         self._records: dict[RecordKey, TransferRecord] = {}
         self._requests: dict[int, RequestView] = {}
         self._plan_answers: dict[int, FetchPlan | None] = {}
-        """Decided answers ``fetch_answer`` reads. A request with no entry is undecided (DEFER)."""
+        """Decided answers ``fetch_answer`` reads. A request with no entry is deferred (DEFER)."""
         self._answers_to_export: dict[int, FetchPlan | None] = {}
         """OWNER only: the answers the last ``advance`` decided, for ``export_plan_answers``."""
         self._pending_answers: dict[int, EncodedPlanAnswer] = {}
@@ -206,7 +207,7 @@ class KVTransferCoordinator:
         ``drained`` is whether this rank has waited long enough for its own pending work at
         shutdown; it goes in this rank's message, and a drained rank reports no pending work.
 
-        Returns how many candidates are still undecided afterwards (``fetch_answer`` answers
+        Returns how many candidates are still deferred afterwards (``fetch_answer`` answers
         ``DEFER``): each is waiting on a store lookup, or on the ranks' agreement.
         """
         votes, expired = self._poll_and_vote(now)
@@ -242,7 +243,7 @@ class KVTransferCoordinator:
     ) -> None:
         """After a context step, before the response pass: offer the blocks each request committed.
 
-        A request that ended this step is reported separately through ``notify_request_finished``
+        A request that ended this step is reported separately through ``holds_finished_request``
         (the engine's release gate); a publish still in flight then holds it.
         """
         now = time.monotonic() if now is None else now
@@ -269,7 +270,7 @@ class KVTransferCoordinator:
     ) -> int:
         """FOLLOWER: take the owner's answers. ``None`` decides a request local; ``(token_end,
         source)`` becomes this rank's own plan over its own layer groups. An answer for a request
-        not yet among ``candidates`` (the undecided candidates here) is held until its request
+        not yet among ``candidates`` (the deferred candidates here) is held until its request
         appears as a candidate, or is dropped when the request ends: the owner decides a request
         once and does not export it again. Returns how many of ``candidates`` got no answer and
         stay deferred."""
@@ -319,18 +320,18 @@ class KVTransferCoordinator:
 
     # ---- control ----
 
-    def notify_request_finished(self, request: RequestView, now: float | None = None) -> bool:
-        """The engine's release gate: the request ended. Returns whether the engine may terminate
-        it now: ``False`` while this coordinator holds it (it terminates the request itself once
-        every record of it is gone), and ``False`` once for a request this coordinator failed and
-        already terminated before the gate asked."""
+    def holds_finished_request(self, request: RequestView, now: float | None = None) -> bool:
+        """The engine's release gate: the request ended. Returns whether this coordinator keeps
+        it, so the engine must not terminate it now: ``True`` while a record of it remains (the
+        coordinator terminates the request itself once every record is gone), and ``True`` once
+        for a request this coordinator failed and already terminated before the gate asked."""
         request_id = request.py_request_id
         if request_id in self._terminated_before_gate:
             self._terminated_before_gate.discard(request_id)
-            return False
+            return True
         self._finished_by_gate.add(request_id)
         self._finish_request(request, time.monotonic() if now is None else now)
-        return request_id not in self._held
+        return request_id in self._held
 
     def _finish_request(self, request: RequestView, now: float) -> None:
         """What a request's end does to its records; the request is held while any remains."""
@@ -624,7 +625,7 @@ class KVTransferCoordinator:
         """A planned record without an attempt here: UNLAUNCHED holds the others until this rank
         gets what it waits for (the scheduler's pages; for a host-first fetch, the landing memory
         first), FAILED once it gave up launching or waited too long by either clock: the peers'
-        (``unlaunched_timeout_s``) or its own (``landing_wait_timeout_s``)."""
+        (``unlaunched_timeout_s``) or its own (``fetch_wait_timeout_s``)."""
         if (
             record.gave_up_launching
             or self._unlaunched_too_long(record, now)
@@ -642,9 +643,9 @@ class KVTransferCoordinator:
 
     def _waited_too_long(self, record: TransferRecord, now: float) -> bool:
         return (
-            self._landing_wait_timeout_s is not None
+            self._fetch_wait_timeout_s is not None
             and record.resource_wait_since is not None
-            and now - record.resource_wait_since >= self._landing_wait_timeout_s
+            and now - record.resource_wait_since >= self._fetch_wait_timeout_s
         )
 
     @staticmethod
@@ -1006,7 +1007,7 @@ class KVTransferCoordinator:
             return
         self._close_routes(record)
         request = self._requests[record.request_id]
-        self._effects.give_back_fetch_pages([request])
+        self._effects.revert_fetch_pages([request])
         self._retry_or_give_up(record, cap=cap, reason=reason)
 
     def _reset_for_replan(self, record: TransferRecord) -> None:
@@ -1211,7 +1212,7 @@ class KVTransferCoordinator:
         self, request: RequestView, record: TransferRecord
     ) -> None:
         """Give the reserved pages back and count a launch that never started."""
-        self._effects.give_back_fetch_pages([request])
+        self._effects.revert_fetch_pages([request])
         record.consecutive_launch_failures += 1
 
     @staticmethod

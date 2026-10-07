@@ -355,7 +355,7 @@ class SerializableSchedulerOutput:
     scheduled_mm_encoder_items: dict[int, list[int]] | None = None
     recompute_paused_requests: list[int] = dataclasses.field(default_factory=list)
     """Request ids of recompute-paused requests."""
-    kv_fetch_answers: list = dataclasses.field(default_factory=list)
+    kv_plan_answers: list = dataclasses.field(default_factory=list)
     """KV transfer plan answers the scheduling rank decided this iteration, ``[(request_id, plan
     wire)]``, for the other ranks to adopt (``KVTransferHooks.adopt_plan_answers``)."""
 
@@ -366,7 +366,7 @@ class SerializableSchedulerOutput:
         fitting_disagg_gen_init_requests: RequestList,
         num_fitting_requests: int,
         wait_for_disagg_gen_transfer_progress: bool = False,
-        kv_fetch_answers=(),
+        kv_plan_answers=(),
     ) -> "SerializableSchedulerOutput":
         return cls(
             encoder_requests=[req.request_id for req in scheduled_requests.encoder_requests],
@@ -387,7 +387,7 @@ class SerializableSchedulerOutput:
             recompute_paused_requests=[
                 req.request_id for req in scheduled_requests.recompute_paused_requests
             ],
-            kv_fetch_answers=list(kv_fetch_answers),
+            kv_plan_answers=list(kv_plan_answers),
         )
 
     def to_scheduler_result(

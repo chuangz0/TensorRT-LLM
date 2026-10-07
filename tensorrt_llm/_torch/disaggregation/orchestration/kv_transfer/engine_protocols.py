@@ -82,7 +82,7 @@ class KVTransferEffects(Protocol):
         requests may refuse it."""
         ...
 
-    def give_back_fetch_pages(self, requests: Sequence[RequestView]) -> None:
+    def revert_fetch_pages(self, requests: Sequence[RequestView]) -> None:
         """Revert the context allocation the scheduler made for a fetch; request ->
         ``CONTEXT_INIT``. Called only after ``quiesce`` answered true for the attempts that
         named those pages."""
@@ -95,9 +95,10 @@ class KVTransferEffects(Protocol):
     def hold_for_transfer(self, requests: Sequence[RequestView]) -> None:
         """Requests that ended while a record of theirs remains (a transfer in flight in either
         direction, or a record waiting for the ranks' agreement): move the request to the
-        engine's "held for transfer" state (the engine side names it ``KV_PUBLISH_IN_PROGRESS``,
-        an alias of an existing state; a fetch hold uses the same value); release seq slot and
-        spec resources; keep the pages, which a backend may still be reading or writing.
+        engine's "held for transfer" state (the engine side names it ``KV_HELD_FOR_TRANSFER``,
+        an alias of an existing state, written for a fetch hold and a publish hold alike);
+        release seq slot and spec resources; keep the pages, which a backend may still be
+        reading or writing.
         ``terminate_request`` follows once every record of the request is released."""
         ...
 

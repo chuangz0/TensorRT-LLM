@@ -73,6 +73,6 @@ def build_coordinator(
         fetch_timeout_s=config.fetch_timeout_s,
         publish_timeout_s=config.publish_timeout_s,
         unlaunched_timeout_s=config.unlaunched_timeout_s,
-        landing_wait_timeout_s=config.landing_wait_timeout_s,
+        fetch_wait_timeout_s=config.fetch_wait_timeout_s,
         plan_authority=plan_authority,
     )

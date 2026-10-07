@@ -14,11 +14,11 @@
 # limitations under the License.
 """The engine side of the KV transfer coordination layer's protocols.
 
-``EngineRequestView`` is the ``RequestView`` over one ``LlmRequest``; ``PyExecutorKVTransferEffects``
+``EngineRequestView`` is the ``RequestView`` over one ``LlmRequest``; ``EngineKVTransferEffects``
 is the ``KVTransferEffects`` over one ``PyExecutor`` and the only place that writes a request's
-transfer state; ``EngineWorkQueue`` and ``EngineCollective`` complete the contract. The two state
-constants are the coordination layer's two request states, each an alias of an existing disagg
-state of ``LlmRequestState``.
+transfer state; ``EngineWorkQueue`` and ``EngineCollective`` complete the contract. The two
+state constants are the coordination layer's two request states, each an alias of an existing
+disagg state of ``LlmRequestState``.
 """
 
 from __future__ import annotations
@@ -43,11 +43,11 @@ __all__ = [
     # The two state aliases are exported for the tests, which pin their values; no module
     # imports them.
     "KV_FETCH_IN_PROGRESS",
-    "KV_PUBLISH_IN_PROGRESS",
+    "KV_HELD_FOR_TRANSFER",
     "EngineCollective",
+    "EngineKVTransferEffects",
     "EngineRequestView",
     "EngineWorkQueue",
-    "PyExecutorKVTransferEffects",
 ]
 
 # Both aliases lie outside the V2 scheduler's schedulable range. The disagg transceiver writes
@@ -55,8 +55,8 @@ __all__ = [
 # by each layer's own record table, never by reading the state.
 KV_FETCH_IN_PROGRESS = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
 """A context request whose KV prefix is being fetched; the scheduler does not touch it."""
-KV_PUBLISH_IN_PROGRESS = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-"""A finished request kept alive because a transfer still touches its pages."""
+KV_HELD_FOR_TRANSFER = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+"""A finished request kept alive because a transfer, fetch or publish, still touches its pages."""
 
 
 class EngineRequestView:
@@ -92,7 +92,8 @@ def _engine_request(request_or_view) -> LlmRequest:
 
 
 class EngineWorkQueue:
-    """``EngineQueue``: callables posted from backend threads, run on the engine thread.
+    """The engine's ``EngineQueue``: work posted for the engine thread by backend threads, run
+    there when the coordinator drains it.
 
     No backend in this assembly posts to it yet; it exists so the contract is complete.
     """
@@ -140,7 +141,7 @@ class EngineCollective:
         return self._allgather(payload)
 
 
-class PyExecutorKVTransferEffects:
+class EngineKVTransferEffects:
     """``KVTransferEffects`` over a ``PyExecutor``.
 
     Stateless: which requests are parked or held is the coordinator's record table to answer.
@@ -177,6 +178,9 @@ class PyExecutorKVTransferEffects:
         # CONTEXT_INIT first: the C++ request only lets a context-phase request move its cursor.
         engine_request.state = LlmRequestState.CONTEXT_INIT
         self._settle_landed_cursor(engine_request, token_end)
+        # The pages now hold real content and are committed next: a later revert must not
+        # shrink them away.
+        engine_request.py_ctx_pre_resize_cap = None
         # Only the primary manager commits: a draft KV cache manager is refused at assembly, so
         # there is no paired pool whose commit would have to agree with this one.
         self._executor.kv_cache_manager.try_commit_blocks(engine_request)
@@ -188,7 +192,7 @@ class PyExecutorKVTransferEffects:
             engine_request.context_current_position,
         )
 
-    def give_back_fetch_pages(self, requests: Sequence) -> None:
+    def revert_fetch_pages(self, requests: Sequence) -> None:
         """Revert the pages the scheduler reserved for a fetch; back to ``CONTEXT_INIT``.
 
         A cache that survives the revert with history declared to the fetch target but no data
@@ -206,7 +210,7 @@ class PyExecutorKVTransferEffects:
                 kv_cache_manager.free_resources(engine_request)
                 rewind_context_after_cache_drop(engine_request, kv_cache_manager.tokens_per_block)
         logger.debug(
-            "kv transfer: gave back fetch pages of %s",
+            "kv transfer: reverted the fetch pages of %s",
             [request.py_request_id for request in engine_requests],
         )
 
@@ -229,7 +233,7 @@ class PyExecutorKVTransferEffects:
             engine_request = _engine_request(request)
             self._release_seq_slot(engine_request)
             self._release_index_slot(engine_request)
-            engine_request.state = KV_PUBLISH_IN_PROGRESS
+            engine_request.state = KV_HELD_FOR_TRANSFER
 
     def terminate_request(self, request) -> None:
         """Final release of a held request once every transfer of it is done.
@@ -269,18 +273,15 @@ class PyExecutorKVTransferEffects:
 
     def _settle_landed_cursor(self, engine_request: LlmRequest, token_end: int) -> None:
         """Settle the context cursor at ``max(token_end, committed)``, the way a local reuse hit
-        is settled, and let the pages keep their size.
+        is settled.
 
         Fetched content always ends short of the prompt. Local reuse may already reach past
-        ``token_end`` (a plan trimmed to an empty ask is still a plan); the
-        cursor never moves below what is committed, and the commit that follows is then a no-op
-        for that part. The pages now hold real content and are committed next, so a later
-        revert must not shrink them away."""
+        ``token_end`` (a plan trimmed to an empty ask is still a plan); the cursor never moves
+        below what is committed, and the commit that follows is then a no-op for that part."""
         kv_cache_manager = self._executor.kv_cache_manager
         kv_cache = kv_cache_manager.kv_cache_map[engine_request.py_request_id]
         settle_at = max(token_end, int(kv_cache.num_committed_tokens))
         settle_context_cursor(engine_request, settle_at, kv_cache_manager.tokens_per_block)
-        engine_request.py_ctx_pre_resize_cap = None
 
     def _check_history_declared(self, engine_request: LlmRequest, token_end: int) -> None:
         """The scheduler reserved the fetch with ``reserve_transfer_pages(token_end)``, which

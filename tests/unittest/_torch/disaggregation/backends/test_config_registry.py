@@ -121,7 +121,7 @@ def test_minimal_entry_defaults_to_both_roles_and_finite_timeouts(tmp_path):
     # Every wait on a peer or a store is bounded by default; ``null`` must be asked for.
     assert config.fetch_timeout_s == 30.0 and config.publish_timeout_s == 60.0
     assert config.unlaunched_timeout_s == 30.0
-    assert config.landing_wait_timeout_s == 30.0
+    assert config.fetch_wait_timeout_s == 30.0
     assert config.probe_timeout_s == 1.0
     assert config.backends[0].roles == frozenset(BACKEND_ROLES)
     assert config.backends[0].options == {}
@@ -162,6 +162,19 @@ def test_unknown_top_level_key_is_refused(tmp_path):
             probe_timeout: 1
             backends:
               - {name: a, type: fake}
+            """,
+        )
+
+
+@pytest.mark.parametrize("old_key", ["landing_wait_timeout_s"])
+def test_retired_top_level_key_is_refused_by_name(tmp_path, old_key):
+    with pytest.raises(ValueError, match=f"unknown kv transfer config keys.*{old_key}"):
+        load(
+            tmp_path,
+            f"""
+            {old_key}: 30
+            backends:
+              - {{name: a, type: fake}}
             """,
         )
 
@@ -224,7 +237,7 @@ def test_duplicate_backend_names_are_refused(tmp_path):
         ("fetch_timeout_s: 0", "fetch_timeout_s must be > 0 or null"),
         ("publish_timeout_s: -1", "publish_timeout_s must be > 0 or null"),
         ("unlaunched_timeout_s: 0", "unlaunched_timeout_s must be > 0 or null"),
-        ("landing_wait_timeout_s: 0", "landing_wait_timeout_s must be > 0 or null"),
+        ("fetch_wait_timeout_s: 0", "fetch_wait_timeout_s must be > 0 or null"),
         ("probe_timeout_s: -0.1", "probe_timeout_s must be >= 0"),
         ("close_timeout_s: 0", "close_timeout_s must be > 0"),
     ],
@@ -241,14 +254,14 @@ def test_null_timeouts_and_zero_probe_are_allowed(tmp_path):
         fetch_timeout_s: null
         publish_timeout_s: null
         unlaunched_timeout_s: null
-        landing_wait_timeout_s: null
+        fetch_wait_timeout_s: null
         probe_timeout_s: 0
         backends:
           - {name: a, type: fake}
         """,
     )
     assert config.fetch_timeout_s is None and config.probe_timeout_s == 0
-    assert config.unlaunched_timeout_s is None and config.landing_wait_timeout_s is None
+    assert config.unlaunched_timeout_s is None and config.fetch_wait_timeout_s is None
 
 
 def test_missing_file_raises_os_error(tmp_path):
@@ -628,12 +641,12 @@ def test_mooncake_host_landing_opens_two_pools_with_their_own_geometry(
 def test_mooncake_host_landing_takes_the_wait_bound_from_the_context(
     mooncake_module, fake_pools, bound
 ):
-    """The queue-wait bound is the coordinator's ``landing_wait_timeout_s``, carried by the
+    """The queue-wait bound is the coordinator's ``fetch_wait_timeout_s``, carried by the
     build context; ``None`` means a landing waits without bound."""
     config = KVTransferConfig(backends=(entry("store", "mooncake", **TCP_OPTIONS),))
-    handles = build_backends(config, make_context(landing_wait_timeout_s=bound))
+    handles = build_backends(config, make_context(fetch_wait_timeout_s=bound))
     try:
-        assert handles[0].fetcher.landing_wait_timeout_s == bound
+        assert handles[0].fetcher.fetch_wait_timeout_s == bound
     finally:
         close_backends(handles)
 

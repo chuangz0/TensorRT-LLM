@@ -36,7 +36,7 @@ from engine_fakes import (
 )
 
 from tensorrt_llm._torch.disaggregation.backends.config import (
-    DEFAULT_LANDING_WAIT_TIMEOUT_S,
+    DEFAULT_FETCH_WAIT_TIMEOUT_S,
     DEFAULT_UNLAUNCHED_TIMEOUT_S,
     BackendEntry,
 )
@@ -49,10 +49,10 @@ from tensorrt_llm._torch.disaggregation.remote_cache import DEFER, FetchPlan, Fe
 from tensorrt_llm._torch.pyexecutor.kv_transfer import effects, hooks
 from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import (
     KV_FETCH_IN_PROGRESS,
-    KV_PUBLISH_IN_PROGRESS,
+    KV_HELD_FOR_TRANSFER,
+    EngineKVTransferEffects,
     EngineRequestView,
     EngineWorkQueue,
-    PyExecutorKVTransferEffects,
 )
 from tensorrt_llm._torch.pyexecutor.kv_transfer.hooks import KVTransferHooks
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -91,7 +91,7 @@ class Rig:
         self.publisher = FakePublishes()
         sources = [FetchSource("store", self.store, None)]
         self.planner = Planner(sources, self.reader, TPB, probe_timeout_s=0.05)
-        self.effects = PyExecutorKVTransferEffects(self.executor)
+        self.effects = EngineKVTransferEffects(self.executor)
         self.coord = KVTransferCoordinator(
             sources,
             [self.publisher] if publish else [],
@@ -101,7 +101,7 @@ class Rig:
             EngineWorkQueue(),
             SingleRankCollective(),
             unlaunched_timeout_s=DEFAULT_UNLAUNCHED_TIMEOUT_S,
-            landing_wait_timeout_s=DEFAULT_LANDING_WAIT_TIMEOUT_S,
+            fetch_wait_timeout_s=DEFAULT_FETCH_WAIT_TIMEOUT_S,
             fetch_timeout_s=fetch_timeout_s,
             publish_timeout_s=publish_timeout_s,
         )
@@ -249,12 +249,12 @@ def hooks_logger(monkeypatch):
 
 def test_alias_states_are_the_disagg_transfer_states_and_outside_the_schedulable_range():
     assert KV_FETCH_IN_PROGRESS is LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
-    assert KV_PUBLISH_IN_PROGRESS is LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-    assert KV_FETCH_IN_PROGRESS.value == 9 and KV_PUBLISH_IN_PROGRESS.value == 21
+    assert KV_HELD_FOR_TRANSFER is LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+    assert KV_FETCH_IN_PROGRESS.value == 9 and KV_HELD_FOR_TRANSFER.value == 21
     # The V2 scheduler schedules [CONTEXT_INIT, GENERATION_COMPLETE); neither alias is inside.
     lo, hi = LlmRequestState.CONTEXT_INIT.value, LlmRequestState.GENERATION_COMPLETE.value
     assert not lo <= KV_FETCH_IN_PROGRESS.value < hi
-    assert not lo <= KV_PUBLISH_IN_PROGRESS.value < hi
+    assert not lo <= KV_HELD_FOR_TRANSFER.value < hi
 
 
 def test_request_view_has_constant_plan_inputs_and_passes_everything_else_through():
@@ -399,7 +399,7 @@ class TestGiveBackFetchPages:
         assert req.state == CONTEXT_INIT
         assert not rig.hooks.owns(req)
         assert rig.store.count("quiesce") == 1  # quiesced before the pages were given back
-        # One retry: the request is undecided again and the record is kept for the budget.
+        # One retry: the request is deferred again and the record is kept for the budget.
         assert rig.hooks.fetch_answer(req) is DEFER
         assert rig.records()[0]["state"] == "PLANNED" and rig.records()[0]["try_index"] == 0
         plan2 = rig.plan(req)
@@ -500,7 +500,7 @@ class TestHoldForTransfer:
         assert rig.slots.slots == {1}
         assert rig.executor._terminate_request(req) is None
         assert rig.terminations() == 0
-        assert req.state == KV_PUBLISH_IN_PROGRESS
+        assert req.state == KV_HELD_FOR_TRANSFER
         assert rig.coord.held_request_ids() == {1}
         assert rig.coord.parked_request_ids() == frozenset()
         assert rig.slots.freed == [1] and rig.slots.slots == set()
@@ -521,7 +521,7 @@ class TestHoldForTransfer:
         rig.executor._terminate_request(req)
         assert rig.slots.freed == [1, 1] and rig.slots.slots == set()
         assert rig.kv.count("release_index_slot") == 2  # the wrapper makes the second a no-op
-        assert req.state == KV_PUBLISH_IN_PROGRESS
+        assert req.state == KV_HELD_FOR_TRANSFER
 
     def test_hold_without_a_cache_skips_the_index_slot(self, rig):
         req = make_request(1, 100)
@@ -684,7 +684,7 @@ class TestReleaseGate:
         rig.executor._terminate_request(req)
 
         rig.executor._do_terminate_request.assert_called_once_with(req)
-        assert req.state != KV_PUBLISH_IN_PROGRESS
+        assert req.state != KV_HELD_FOR_TRANSFER
         assert not rig.hooks.owns(req)
         assert rig.kv.count("free_resources") == 0  # _do_terminate_request owns that
         assert rig.coord.status_dump()["finished_pending"] == []
@@ -696,7 +696,7 @@ class TestReleaseGate:
         rig.executor._terminate_request(req)  # _handle_responses' release point
 
         assert rig.terminations() == 0
-        assert req.state == KV_PUBLISH_IN_PROGRESS
+        assert req.state == KV_HELD_FOR_TRANSFER
         assert rig.hooks.owns(req) and rig.hooks.has_pending_work()
         rig.advance()  # still in flight
         assert rig.terminations() == 0
@@ -729,7 +729,7 @@ class TestReleaseGate:
         index slots already released by the send; the gate holds until the publish lands."""
         req = make_request(1, 100)
         attempt = rig.publish(req)
-        req.state = KV_PUBLISH_IN_PROGRESS  # disagg start_transfer wrote 21 already
+        req.state = KV_HELD_FOR_TRANSFER  # disagg start_transfer wrote 21 already
         rig.slots.free_resources(req)
         rig.kv.release_index_slot(1)
 
@@ -752,7 +752,7 @@ class TestReleaseGate:
         rig.advance()
         assert rig.records() == []
         assert rig.terminations() == 0  # _conclude_publish did nothing for an unfinished request
-        req.state = KV_PUBLISH_IN_PROGRESS  # the disagg send still holds it
+        req.state = KV_HELD_FOR_TRANSFER  # the disagg send still holds it
 
         rig.executor._terminate_request(req)  # release_transfer, send complete
 
@@ -778,7 +778,7 @@ class TestReleaseGate:
         if publish_landed_first:
             rig.executor._do_terminate_request.assert_called_once_with(req)
         else:
-            assert rig.terminations() == 0 and req.state == KV_PUBLISH_IN_PROGRESS
+            assert rig.terminations() == 0 and req.state == KV_HELD_FOR_TRANSFER
             attempt.deliver_all()
             rig.advance()
             rig.executor._do_terminate_request.assert_called_once_with(req)
@@ -830,7 +830,7 @@ class TestReleaseGate:
         plan, attempt = rig.plan_reserve_launch(req)
         rig.executor._terminate_request(req)
         assert rig.terminations() == 0
-        assert req.state == KV_PUBLISH_IN_PROGRESS  # held
+        assert req.state == KV_HELD_FOR_TRANSFER  # held
         assert rig.coord.parked_request_ids() == frozenset()
         assert rig.coord.held_request_ids() == {1}
         attempt.deliver_all()
@@ -859,16 +859,16 @@ class TestReleaseGate:
         rig.kv.kv_cache_map[1] = FakeKVCache(history_length=100)
         rig.hooks.publish_committed_blocks([req])  # never offered (rule 4) ...
         assert rig.publisher.count("publish") == 0
-        notify = Mock(wraps=rig.coord.notify_request_finished)
-        rig.coord.notify_request_finished = notify
+        notify = Mock(wraps=rig.coord.holds_finished_request)
+        rig.coord.holds_finished_request = notify
         rig.executor._terminate_request(req)  # ... and the gate is not even asked
         notify.assert_not_called()
         rig.executor._do_terminate_request.assert_called_once_with(req)
         assert rig.reader.forgotten == []
 
-    def test_gate_answers_true_for_a_request_this_layer_never_saw(self, rig):
+    def test_gate_does_not_hold_a_request_this_layer_never_saw(self, rig):
         req = make_request(9, 100)
-        assert rig.hooks.on_request_finished(req) is True
+        assert rig.hooks.holds_finished_request(req) is False
         assert rig.reader.forgotten == [9]
         assert rig.coord.status_dump()["finished_pending"] == []
 
@@ -1328,7 +1328,7 @@ class TestFetchExpiry:
         # be written by the backend.
         assert rig.terminations() == 0
         assert rig.coord.held_request_ids() == {1}
-        assert req.state == KV_PUBLISH_IN_PROGRESS
+        assert req.state == KV_HELD_FOR_TRANSFER
         assert 1 in rig.kv.kv_cache_map
         rig.executor._revert_ctx_alloc.assert_not_called()
         return req, attempt
@@ -1415,7 +1415,7 @@ class TestEngineErrorPathWithParkedRequests:
         # The gate held it: fetch in flight, abandoned; terminated when the outcome arrives.
         assert rig.terminations() == 0
         assert rig.coord.held_request_ids() == {1} and rig.coord.parked_request_ids() == frozenset()
-        assert req.state == KV_PUBLISH_IN_PROGRESS
+        assert req.state == KV_HELD_FOR_TRANSFER
         return req, attempt
 
     def test_parked_request_is_held_then_terminated_once_when_the_outcome_arrives(self, rig):
@@ -1453,7 +1453,7 @@ class TestDeferredEngineTermination:
         now[0] += 10.5
         rig.advance(req)
         rig.executor._handle_errors.assert_called_once()
-        assert rig.coord.held_request_ids() == {1} and req.state == KV_PUBLISH_IN_PROGRESS
+        assert rig.coord.held_request_ids() == {1} and req.state == KV_HELD_FOR_TRANSFER
 
         attempt.deliver_all()
         rig.advance()
@@ -1462,7 +1462,7 @@ class TestDeferredEngineTermination:
 
         rig.executor._terminate_request(req)  # the deferred flush reaches the gate now
         rig.executor._do_terminate_request.assert_called_once_with(req)
-        assert rig.hooks.on_request_finished(req) is True  # and once only: a fresh id after
+        assert rig.hooks.holds_finished_request(req) is False  # and once only: a fresh id after
         assert rig.terminations() == 1
 
     def test_outcome_in_the_same_round_as_the_expiry_terminates_once_before_the_deferred_gate(
@@ -1487,7 +1487,7 @@ class TestDeferredEngineTermination:
 
         rig.executor._terminate_request(req)  # the deferred flush
         rig.executor._do_terminate_request.assert_called_once_with(req)
-        assert rig.hooks.on_request_finished(req) is True
+        assert rig.hooks.holds_finished_request(req) is False
         assert rig.terminations() == 1
 
 
@@ -1628,7 +1628,7 @@ class TestResponsePass:
         (responses,), _ = rig.executor._enqueue_responses.call_args
         assert [rid for rid, _ in responses] == [1]
         assert rig.terminations() == 0  # held
-        assert req.state == KV_PUBLISH_IN_PROGRESS
+        assert req.state == KV_HELD_FOR_TRANSFER
         assert rig.coord.held_request_ids() == {1}
 
         attempt.deliver_all()

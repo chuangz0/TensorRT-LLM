@@ -15,7 +15,7 @@ SPDX-License-Identifier: Apache-2.0
 2. 共享引擎文件只加**一行调用 + 一行注释**,现有 22 处(py_executor 18:§5 的 9 行共 10 处(`pace_idle` 两条循环各一处)+ PP 循环的 advance / export / adopt / launch / publish / pace 6 处 + `inflight_request_ids` 2 处(驱逐保护、`_terminate_recompute_paused_requests` 跳过);scheduler_v2 2、scheduler 1、creator 1);全部受 `self.kv_transfer is not None` 保护,环境变量不设即零行为差异。`tests/unittest/_torch/executor/kv_transfer/test_hook_points.py` 按源码文本守着每一处。
 3. 后端由 `TRTLLM_KV_TRANSFER_CONFIG=<yaml>` 描述,`backends:` 列表经注册表按 `type` 构造;本特性范围内 "mooncake" 只出现在 `backends/blob/drivers/mooncake.py`(驱动)与注册表的一行内置项里。
 4. 与现有 disagg 协调器共存:gen-init 请求仍全归 `DisaggTransferCoordinator`;disagg ctx-only 请求对 fetch 路径是普通 context 请求,context 结束后**既发给 gen worker 又发布到 store**。终止由**释放门**把关(§9):门只问本层的记录表,**不问 disagg 发送**——disagg 已有自己的释放点,且在 partial-reuse 早终止模式下发送方根本不会来终止请求。
-5. 请求状态用设计§12.2 的别名表:`KV_FETCH_IN_PROGRESS ≡ DISAGG_GENERATION_TRANS_IN_PROGRESS(9)`、`KV_PUBLISH_IN_PROGRESS ≡ DISAGG_CONTEXT_TRANS_IN_PROGRESS(21)`,两者都在调度器可调度区间之外,调度器排除逻辑**零改动**。
+5. 请求状态用设计§12.2 的别名表:`KV_FETCH_IN_PROGRESS ≡ DISAGG_GENERATION_TRANS_IN_PROGRESS(9)`、`KV_HELD_FOR_TRANSFER ≡ DISAGG_CONTEXT_TRANS_IN_PROGRESS(21)`,两者都在调度器可调度区间之外,调度器排除逻辑**零改动**。
 6. KV v2 wrapper 只改三处(§7);调度器只多问一个只读钩子 `fetch_answer`,多回一个 `fetch_launch_queue`。
 7. 范围守卫:KV v2 + `enable_block_reuse` + 分页层组(full attention 与滑窗,含 sink;拒绝 SSM/recurrent,见 `KV_TRANSFER_VSWA_PLAN.zh.md`)+ CP=1(TP、PP、ADP 均接受,见 `KV_TRANSFER_MULTI_RANK_PLAN.zh.md`;PP>1 下不接受带路由提示的后端)+ 无 spec-decode + 无 KV connector + 无 draft 管理器 + beam 1;其余装配期拒绝并说明原因。
 8. 测试三层:GPU 上对真 `KVCacheManagerV2` 的 reader/resolver/fingerprint 单测;假执行器的 effects 单测;e2e 两个(双实例同 prompt、disagg 共存),按 `test_llm_pytorch.py::test_llm_disagg_gen_cancelled` 的单进程双 `LLM()` 模式写,自起 `mooncake_master` 与长寿命 segment provider,计数经 `TRTLLM_KV_TRANSFER_STATUS_DUMP` 写 JSON 读取。
@@ -38,10 +38,10 @@ SPDX-License-Identifier: Apache-2.0
 ```text
  PyExecutor 循环 / KVCacheV2Scheduler            (共享文件:每处一行调用)
       │ advance_round · launch_reserved_fetches · publish_committed_blocks
-      │ on_request_finished · owns · fetch_answer · pace_idle · close
+      │ holds_finished_request · owns · fetch_answer · pace_idle · close
       ▼
  pyexecutor/kv_transfer/hooks.py     KVTransferHooks          ← 循环看到的唯一对象
- pyexecutor/kv_transfer/effects.py   PyExecutorKVTransferEffects · EngineRequestView
+ pyexecutor/kv_transfer/effects.py   EngineKVTransferEffects · EngineRequestView
  pyexecutor/kv_transfer/assembly.py  attach_kv_transfer · check_engine_supports_kv_transfer
       │ Protocol(RequestView / KVTransferEffects / EngineQueue / Collective)
       ▼
@@ -61,7 +61,7 @@ SPDX-License-Identifier: Apache-2.0
 
 边界规则(设计§3.1 四条边界的落地):
 
-- 循环与调度器只 import `kv_transfer/hooks.py` 的**类型**(`TYPE_CHECKING`)或完全不 import(scheduler_v2 用鸭子类型 `self.kv_transfer_hooks`),协调层不经包顶层被引入 —— `orchestration/kv_transfer/test_contract_fakes.py` 的导入卫生断言保持成立。
+- 循环与调度器只 import `kv_transfer/hooks.py` 的**类型**(`TYPE_CHECKING`)或完全不 import(scheduler_v2 用鸭子类型 `self.kv_transfer`),协调层不经包顶层被引入 —— `orchestration/kv_transfer/test_contract_fakes.py` 的导入卫生断言保持成立。
 - 只有 `kv_transfer/effects.py` 写请求状态;只有 `resource/kv_v2_view.py` 与 `resource/region.py` 调 KV v2 wrapper;后端只见 `RegionResolver` 给的 `(address, size)`。
 - `EngineRequestView` 包住 `LlmRequest`,给协调层三个常量属性(`is_disagg_generation_init=False`、`is_generation_first_context=False`、`route_hints={}`),其余属性透传;effects 用 `.request` 解包后写。
 
@@ -75,7 +75,7 @@ SPDX-License-Identifier: Apache-2.0
 | `BackendEntry` | dataclass | 同上 | 装配表一行:`name, type, hint_key, roles, options`;`serves_fetch` / `serves_publish` 是 roles 的布尔视图 |
 | `load_kv_transfer_config(path)` | 函数 | 同上 | 读 YAML,校验,返回 `KVTransferConfig` |
 | `fetch_timeout_s` / `publish_timeout_s` | 配置键 | YAML 顶层 | 记录 deadline,秒;缺省 30 / 60,显式 `null` 才不超时 |
-| `unlaunched_timeout_s` / `landing_wait_timeout_s` | 配置键 | YAML 顶层 | 同伴已发起而本 rank 未发起的上界 / 等调度器给页或等后端落地内存的上界,秒;缺省各 30,到了投 FAILED;显式 `null` 才不超时 |
+| `unlaunched_timeout_s` / `fetch_wait_timeout_s` | 配置键 | YAML 顶层 | 同伴已发起而本 rank 未发起的上界 / 计划好的 fetch 等调度器给页或等后端落地内存的上界,秒;缺省各 30,到了投 FAILED;显式 `null` 才不超时 |
 | `probe_timeout_s` | 配置键 | YAML 顶层 | 请求等 store 查找的最长时间(秒,缺省 1.0),过后按本地计算 |
 | `close_timeout_s` | 配置键 | YAML 顶层 | `close()` 等后端关闭的上限(秒,缺省 30);超时放弃后端、继续释放请求资源 |
 | `BackendRegistry` | 类 | `backends/registry.py` | `type` 名 → `BackendFactory`;内置类型按名懒加载 |
@@ -91,9 +91,9 @@ SPDX-License-Identifier: Apache-2.0
 | `KVv2RegionResolver` | 类 | `resource/region.py` | `(local_group, page) → [(address, size)]`;也给出 pool 跨度与最大 unit 字节数 |
 | `layout_fingerprint(manager, page_table)` | 函数 | 同上 | 布局摘要,进 store key;两侧字节含义不同则必不同 |
 | `KV_FETCH_IN_PROGRESS` | 常量 | `pyexecutor/kv_transfer/effects.py` | 别名 `DISAGG_GENERATION_TRANS_IN_PROGRESS`:前缀在取回中,调度器不碰 |
-| `KV_PUBLISH_IN_PROGRESS` | 常量 | 同上 | 别名 `DISAGG_CONTEXT_TRANS_IN_PROGRESS`:请求已结束,页被传输占着 |
+| `KV_HELD_FOR_TRANSFER` | 常量 | 同上 | 别名 `DISAGG_CONTEXT_TRANS_IN_PROGRESS`:请求已结束,页被传输(fetch 或 publish)占着 |
 | `EngineRequestView` | 类 | 同上 | `RequestView` 实现,包一个 `LlmRequest` |
-| `PyExecutorKVTransferEffects` | 类 | 同上 | `KVTransferEffects` 实现,无状态;parked/held 由协调层记录表回答(`coordinator.parked_request_ids()/held_request_ids()/owned_requests()`) |
+| `EngineKVTransferEffects` | 类 | 同上 | `KVTransferEffects` 实现,无状态;parked/held 由协调层记录表回答(`coordinator.parked_request_ids()/held_request_ids()/owned_requests()`) |
 | `EngineWorkQueue` | 类 | 同上 | `EngineQueue` 实现(后端线程 post,引擎线程 drain);本轮无 poster,为契约完整而存在 |
 | `SingleRankCollective` | 测试 fake | `tests/.../executor/kv_transfer/engine_fakes.py` | `Collective`,单 rank:gather 结果就是自己;生产用 `EngineCollective` |
 | `KVTransferHooks` | 类 | `pyexecutor/kv_transfer/hooks.py` | 循环调用的对象,引擎循环每个钩子点一个方法:选请求、包 view、转调协调层、管后端关闭(原名 `KVTransferEngineBinding`,与 nanobind 的 "binding" 易混,见 `KV_TRANSFER_SIMPLIFICATION_PLAN.zh.md` R0) |
@@ -101,7 +101,7 @@ SPDX-License-Identifier: Apache-2.0
 | `.fetch_answer(req)` / `.DEFER` | 方法/属性 | 同上 | 调度器钩子(设计§5);gen-init 答 None |
 | `.launch_reserved_fetches(queue)` | 方法 | 同上 | 调度后(设计§3.2 ③) |
 | `.publish_committed_blocks(ctx_requests)` | 方法 | 同上 | context 提交且 forward 完成后(设计§3.2 ④);筛掉 gen-only / dummy / 已失败,转调协调层同名方法 |
-| `.on_request_finished(req) -> bool` | 方法 | 同上 | 释放门:告知请求结束;True = 引擎现在可以终止,False = 本层扣住,稍后由本层终止 |
+| `.holds_finished_request(req) -> bool` | 方法 | 同上 | 释放门:告知请求结束;True = 本层扣住,稍后由本层终止,False = 引擎现在可以终止 |
 | `.owns(req) -> bool` | 方法 | 同上 | 请求有本层记录(fetch 在飞或被扣住);取消路径用,不看状态;dummy 从不进记录表,故调用方无需先过滤 dummy |
 | `.pace_idle()` | 方法 | 同上 | 空转且只有后端能推进时睡 1 ms |
 | `.has_pending_work()` | 方法 | 同上 | 空闲判定与 `pace_idle` 用:在飞、等页、等共识的记录任一存在即为真 |
@@ -113,7 +113,7 @@ SPDX-License-Identifier: Apache-2.0
 | `check_engine_supports_kv_transfer(…)` | 函数 | 同上 | 范围守卫;不满足抛 `ValueError`,消息含原因 |
 | `PyExecutor.kv_transfer` | 属性 | `py_executor.py` | 类级缺省 `None`,类型 `Optional[KVTransferHooks]`;`attach_kv_transfer` 赋值 |
 | `PyExecutor._kv_fetch_launch_queue` | 属性 | 同上 | 本轮调度器为 fetch 预留了页的请求 |
-| `KVCacheV2Scheduler.kv_transfer_hooks` | 属性 | `scheduler_v2.py` | 鸭子类型,缺省 `None` |
+| `KVCacheV2Scheduler.kv_transfer` | 属性 | `scheduler_v2.py` | 鸭子类型,缺省 `None`;与 executor 的 `kv_transfer` 是同一对象 |
 | `SchedulerOutput.fetch_launch_queue` | 字段 | `scheduler.py` | 缺省空列表;V1 调度器不感知 |
 | `reserve_transfer_pages(req, token_end)` | 方法 | `kv_cache_manager_v2.py` | 设计§8.1 #1:为一次传输预留页;`token_end=None` 即 gen-init 的整 prompt |
 | `prepare_disagg_gen_init(req)` | 方法(别名) | 同上 | `reserve_transfer_pages(req, None)`;gen-init 调用点与 transceiver 的报错文字不改 |
@@ -130,12 +130,12 @@ SPDX-License-Identifier: Apache-2.0
 | 2 | 同函数 3799 `_schedule()` 返回之后 | `self.kv_transfer.launch_reserved_fetches(self._kv_fetch_launch_queue)` | 设计§3.2 ③;`_schedule` 6322 把 `scheduler_output.fetch_launch_queue` 存到 `self._kv_fetch_launch_queue` | 单测:队列非空 → 请求进 `KV_FETCH_IN_PROGRESS` |
 | 3 | `py_executor.py:_executor_loop` 4382,`_update_v2_context_resources` 之后、`_send_kv_async` 4383 之前 | `self.kv_transfer.publish_committed_blocks(scheduled_batch.context_requests)` | **发布不变量:只在产生这些页的 forward 已在 host 侧完成、且 commit 之后发布**(设计§8.1)。非 overlap 循环里 4370 `_update_requests(sample_state)` 已同步过采样结果,forward 必已完成;4382 提交本 batch。放在 `_send_kv_async` 前,ctx-only 请求两条发送同轮启动 | e2e E1:`publish_stored == 已提交整块数` |
 | 4 | `py_executor.py:_executor_loop_overlap` 5213,`_update_requests(self.previous_batch.sample_state)` 5204 之后、紧邻 `_send_kv_async(self.previous_batch...)` | `self.kv_transfer.publish_committed_blocks(self.previous_batch.scheduled_requests.context_requests)` | 同一不变量。overlap 下 5276 的 `_update_v2_context_resources(scheduled_batch)` 提交的是**当前** batch,其 forward 仍在执行流上;store 后端在自己的线程/流上拷页,无事件依赖 → 此处发布会读到未写完的页。`previous_batch` 的 commit 发生在上一轮 5276,其 forward 在 5204 `_update_requests` 同步采样结果时已完成,因此发布 `previous_batch` 是唯一安全点(与探索分支一致) | e2e E1 以 `disable_overlap_scheduler=False` 跑一遍(输出相同 + `fetch_hits` 满即证明发布的页是完整的) |
-| 5 | `py_executor.py:_terminate_request` 7860 函数首行 | `if not request.is_dummy_request and not self.kv_transfer.on_request_finished(request): return` | 设计§4.3 释放点、§4.2 规则 1:门只问本层记录表(§9);dummy 请求不参与传输,与 7865 对 PP 终止处理器的豁免同理 | 释放门单测(§11 U2 五种情形);e2e E2 |
+| 5 | `py_executor.py:_terminate_request` 7860 函数首行 | `if not request.is_dummy_request and self.kv_transfer.holds_finished_request(request): return` | 设计§4.3 释放点、§4.2 规则 1:门只问本层记录表(§9);dummy 请求不参与传输,与 7865 对 PP 终止处理器的豁免同理 | 释放门单测(§11 U2 五种情形);e2e E2 |
 | 6 | `py_executor.py:_fetch_and_enqueue_requests` 5646 `idle = (...)` | 追加 `and not self.kv_transfer.has_pending_work()` | 被扣住的请求不算 live;不加则空闲时阻塞在请求队列上,publish 永不被 reap | 单测:一个 held 请求 + 空队列 → timeout 为 0 |
 | 7 | `py_executor.py:_executor_loop` 4441 与 `_executor_loop_overlap` 5332,`self.disagg.pace_idle()` 之后 | `self.kv_transfer.pace_idle()` | 空转轮约 1 ms;不睡则 probe 等待期间 CPU 空转、日志刷屏 | 单测:in-flight 或 deferred 时 sleep 被调 |
 | 8 | `py_executor.py:_try_cancel_request` 7924,`kv_cache_transceiver is None` 判断之前 | `if self.kv_transfer.owns(request): return False`(无需 dummy 过滤:dummy 不会进记录表,答 False 只针对被跟踪的请求) | `_is_request_in_transmission` 7911 按状态判断,会把我们 parked 的请求交给 transceiver 取消。归属看记录不看状态;取回落地/失败后下一轮取消照常进行 | 单测:parked 请求取消 → 保留在 `canceled_req_ids`;落地后被取消 |
 | 9 | `py_executor.py:shutdown` 1690,`torch.cuda.synchronize()` 之后、managers `shutdown()` 之前 | `self.kv_transfer.close()` | 后端可能登记了 KV pool,且可能仍有 parked / 扣住的请求占着页:`close()` 先在 `close_timeout_s` 内等后端关闭(`BlobStoreBackend.close` 的 `pool.shutdown(wait=True)` 即静默;Mooncake 客户端调用与 `drivers/mooncake.py`/`backend.py` 均**无**自带超时,所以这个上限是唯一的兜底,超时则记 ERROR、放弃后端、继续),再对每个仍被跟踪的请求调 `_free_request_resources`,最后写 status dump;全部在 `manager.shutdown()` 之前 | e2e 干净退出;U2:关闭时一个 held 请求 → `free_resources` 被调一次;后端 `close` 挂住 → 超时后仍释放 |
-| 10 | `scheduler_v2.py:_schedule_loop` 493,`peft_pages = budget.peft_pages_needed(req)` 之前(pending_ctx 循环内) | `answer = self.kv_transfer_hooks.fetch_answer(req)`;`DEFER → continue`;有计划 → `_try_reserve_fetch_pages(req, plan)` 成功则 `fetch_launch_queue.append(req); continue` | 设计§5:在 `prepare_context_cache` 之前问,DEFER 不付建/删 cache;有计划的请求像 gen-init(371–396)一样不计 `num_requests/num_tokens`。注意该循环里两处**既有** `continue` 先于本钩子:465–470(chunking 开启且 chunk token 预算耗尽)与 483–491(首个新块已被本轮某请求贡献)—— 此时请求本轮不被规划,下一轮仍是候选,不影响正确性,只是取回晚一轮 | `test_kv_cache_v2_scheduler.py` 现有用例不变;新增:planner 答 plan → 请求进 `fetch_launch_queue`、不进 `scheduled_ctx`;chunk 预算耗尽时 planner 不被调用 |
+| 10 | `scheduler_v2.py:_schedule_loop` 493,`peft_pages = budget.peft_pages_needed(req)` 之前(pending_ctx 循环内) | `answer = self.kv_transfer.fetch_answer(req)`;`DEFER → continue`;有计划 → `_try_reserve_fetch_pages(req, plan)` 成功则 `fetch_launch_queue.append(req); continue` | 设计§5:在 `prepare_context_cache` 之前问,DEFER 不付建/删 cache;有计划的请求像 gen-init(371–396)一样不计 `num_requests/num_tokens`。注意该循环里两处**既有** `continue` 先于本钩子:465–470(chunking 开启且 chunk token 预算耗尽)与 483–491(首个新块已被本轮某请求贡献)—— 此时请求本轮不被规划,下一轮仍是候选,不影响正确性,只是取回晚一轮 | `test_kv_cache_v2_scheduler.py` 现有用例不变;新增:planner 答 plan → 请求进 `fetch_launch_queue`、不进 `scheduled_ctx`;chunk 预算耗尽时 planner 不被调用 |
 | 11 | `scheduler_v2.py` 新方法 `_try_reserve_fetch_pages`(放在 `_try_schedule_disagg_gen_init` 713 旁) | 调 `reserve_transfer_pages(req, plan.token_end)`;失败则 `free_resources` + `rewind_context_after_cache_drop`,返回 `SKIP`;调用方对 `SKIP` 执行 `continue`(本轮不调度该请求,下一轮计划仍在,再试) | 与 gen-init 同一条分配路径(730),多传 `token_end`;SKIP 语义与 731–733 一致 | 同上 |
 | 12 | `scheduler.py:SchedulerOutput` 79 | 字段 `fetch_launch_queue`,缺省 `[]` | V1 调度器继续构造八字段输出 | 现有 scheduler 单测 |
 | 13 | `py_executor_creator.py:_create_py_executor`,`start_worker()` 之前 | `if os.environ.get("TRTLLM_KV_TRANSFER_CONFIG"): from .kv_transfer.assembly import attach_kv_transfer; attach_kv_transfer(...)`(字面字符串,不在模块顶层 import 常量,保持懒加载) | 设计§7.4:装配期一次性构造;懒 import 保持导入卫生 | 未设环境变量时 `grep` 确认无协调层模块被加载 |
@@ -186,7 +186,7 @@ SPDX-License-Identifier: Apache-2.0
 fetch_timeout_s: 30          # 可选;缺省 30;显式 null 才不超时
 publish_timeout_s: 60        # 可选;缺省 60;显式 null 才不超时
 unlaunched_timeout_s: 30     # 可选;缺省 30;同伴已发起而本 rank 未发起的上界,到了投 FAILED
-landing_wait_timeout_s: 30   # 可选;缺省 30;等调度器给页 / 等后端落地内存的上界,到了投 FAILED
+fetch_wait_timeout_s: 30     # 可选;缺省 30;计划好的 fetch 等调度器给页 / 等后端落地内存的上界,到了投 FAILED
 probe_timeout_s: 1.0         # 可选;缺省 1.0;等 store 查找的时间上限,过后按本地计算
 
 backends:                    # 顺序即 fetch 优先级(设计§7.4)
@@ -221,7 +221,7 @@ backends:                    # 顺序即 fetch 优先级(设计§7.4)
 
 **释放门的原则:门只问本层。** `_terminate_request` 是引擎对一个请求的释放点;谁调它,就是在说"引擎这边不再需要它"。disagg 发送有自己的释放点(`release_transfer` 520–557 → `effects.terminate_request`),并且 disagg 已经处理了"页在发送中而请求被终止"的情形:`start_transfer`(`transfer_manager.py` 58–91)把块 `store_blocks_for_reuse` 钉进 reuse tree,`free_resources` 不会碰它们。因此本层**不**查 `requests_in_transfer()`:查了反而在下面情形 E 中把请求扣死(评审第 1 轮的发现)。
 
-释放门 `on_request_finished(R)` 的行为:`coordinator.notify_request_finished(view)`;若 R 随后在 `coordinator.held_request_ids()`(publish 仍在飞 → `hold_for_transfer` 被调)则返回 False,否则 True。`effects.terminate_request(R)`(协调层在记录全部 RELEASED 后调)直接调 `executor._do_terminate_request(R)`(7877)—— 此时 R 必已离开 `active_requests`(`_handle_responses` 8238 只把未完成的请求放回,被扣住的请求都是已完成的),所以不做任何 `active_requests` 操作;**不**经 `_terminate_request`(否则重入门时 `held_request_ids` 尚未清除,误判为仍扣住),**不**查 disagg。
+释放门 `holds_finished_request(R)` 的行为:`coordinator.holds_finished_request(view)`;若 R 随后在 `coordinator.held_request_ids()`(publish 仍在飞 → `hold_for_transfer` 被调)则返回 True(本层扣住),否则 False。`effects.terminate_request(R)`(协调层在记录全部 RELEASED 后调)直接调 `executor._do_terminate_request(R)`(7877)—— 此时 R 必已离开 `active_requests`(`_handle_responses` 8238 只把未完成的请求放回,被扣住的请求都是已完成的),所以不做任何 `active_requests` 操作;**不**经 `_terminate_request`(否则重入门时 `held_request_ids` 尚未清除,误判为仍扣住),**不**查 disagg。
 
 五种情形(`R` 为请求;"publish"指本层记录;"send"指 disagg 发送):
 
@@ -240,20 +240,20 @@ backends:                    # 顺序即 fetch 优先级(设计§7.4)
 ② 调度器: prepare_context_cache(本地 reuse) → reserve_transfer_pages(R, token_end) → fetch_launch_queue
 ③ launch_reserved_fetches: fetch(extent) → park_for_fetch: state = KV_FETCH_IN_PROGRESS(9)
 ④ advance: Delivered → unpark: state = CONTEXT_INIT; settle_context_cursor(R, max(token_end, committed), tpb); try_commit_blocks
-   (失败: quiesce → give_back_fetch_pages → 重试一次或按本地计算)
+   (失败: quiesce → revert_fetch_pages → 重试一次或按本地计算)
 ⑤ 调度器按 num_committed_tokens 落游标,算剩余 [token_end, prompt_len)
 ⑥ context 结束同一轮:
    _update_v2_context_resources(commit) → publish_committed_blocks(R) → publish 记录 IN_FLIGHT
    _send_kv_async → send_completed_context: release_index_slot, start_transfer(state=21), respond_and_send_async
    _handle_responses: is_disagg_context_transmission_state → 不终止,移出 active_requests(既有行为 8226)
 ⑦ 情形 C:disagg 发送完 → reap_context_sends → release_transfer → end_transfer=True → effects.terminate_request → _terminate_request(R)
-        → on_request_finished(R): notify_request_finished → publish 仍在飞 → hold_for_transfer(R) → False → return
+        → holds_finished_request(R) → publish 仍在飞 → hold_for_transfer(R) → True → return
    之后 store 发布完 → advance → _conclude_publish → _terminate_if_no_records → effects.terminate_request(R) → _do_terminate_request(R)
-   情形 D:store 先落地 → 记录 RELEASED,R 未结束,无动作;disagg 发送完 → _terminate_request(R) → 门答 True → _do_terminate_request(R)
+   情形 D:store 先落地 → 记录 RELEASED,R 未结束,无动作;disagg 发送完 → _terminate_request(R) → 门答 False → _do_terminate_request(R)
 ⑧ free_resources 恰好一次
 ```
 
-`hold_for_transfer` 效果**不读** `requests_in_transfer()`,无条件释放 seq slot 并调 `release_index_slot`:`SlotManager.remove_slot`(`resource_manager.py` 2694–2697)对未知 id 是 no-op,所以 disagg `start_transfer` 已释放过的 seq slot 再释放一次无害;spec 资源管理器不在范围内(守卫拒绝);`release_index_slot` 因 §7 #3 幂等。本层因此对 disagg 记录表零读取。状态写 `KV_PUBLISH_IN_PROGRESS` 与 disagg 已写的值相同,无副作用。
+`hold_for_transfer` 效果**不读** `requests_in_transfer()`,无条件释放 seq slot 并调 `release_index_slot`:`SlotManager.remove_slot`(`resource_manager.py` 2694–2697)对未知 id 是 no-op,所以 disagg `start_transfer` 已释放过的 seq slot 再释放一次无害;spec 资源管理器不在范围内(守卫拒绝);`release_index_slot` 因 §7 #3 幂等。本层因此对 disagg 记录表零读取。状态写 `KV_HELD_FOR_TRANSFER` 与 disagg 已写的值相同,无副作用。
 
 **关闭时的释放**(§5 #9):`close()` 顺序 = 在 `close_timeout_s` 内关后端(在飞交付结束即静默;超时则记 ERROR 放弃)→ 对 `coordinator.owned_requests()`(held 与 parked)各调一次 `executor._free_request_resources` → 写 status dump。这些请求此时已不在 `active_requests`(held)或不会再被调度(parked),不走 `_do_terminate_request` 以免动 `result_wait_queues`。
 
@@ -273,7 +273,7 @@ backends:                    # 顺序即 fetch 优先级(设计§7.4)
 | 10 | 有 `FetchPlan` 的请求受 `if budget.requests_full: break`(460)影响,gen-init 因在更早阶段(371)不受 | 本轮接受(取回请求少);记录为后续项 |
 | 11 | fetch 落地的请求 `context_current_position` 直接来自游标,`unpark` 后 `py_ctx_pre_resize_cap` 必须清空 | `unpark` 置 `R.py_ctx_pre_resize_cap = None`,否则后续 `_revert_ctx_alloc` 会把已有内容的页缩掉 |
 | 12 | TCP 传输能否直接读 GPU 登记内存未验证 | e2e 不写 `landing`,tcp 下解析为 `host`(status dump 断言);`landing: device` + RDMA 路径留待有网卡的环境 |
-| 13 | `revert_allocate_context` 3379 在 `py_ctx_pre_resize_cap is None` 时直接返回 True(`reserve_transfer_pages` 只在容量真的增长时才记 pre_cap;cache 被 resume 且容量够时不记)→ `give_back_fetch_pages` 后 cache 仍活着、history 仍声明到 `token_end`,而页里没有数据 | `give_back_fetch_pages` 在 `_revert_ctx_alloc` 之后检查:请求仍在 `kv_cache_map` 则 `kv_cache_manager.free_resources(R)` + `rewind_context_after_cache_drop(R, tpb)`(`llm_request.py` 1666;与 `_try_reserve_fetch_pages` 失败路径同一套),请求作为全新首 chunk 重入。full attention 下 history 偏高本身不致错(无 stale 范围、默认 `all_reusable` 不要求 commit 终点等于 history),但重新走 reuse match 更简单也更省页,统一丢弃 |
+| 13 | `revert_allocate_context` 3379 在 `py_ctx_pre_resize_cap is None` 时直接返回 True(`reserve_transfer_pages` 只在容量真的增长时才记 pre_cap;cache 被 resume 且容量够时不记)→ `revert_fetch_pages` 后 cache 仍活着、history 仍声明到 `token_end`,而页里没有数据 | `revert_fetch_pages` 在 `_revert_ctx_alloc` 之后检查:请求仍在 `kv_cache_map` 则 `kv_cache_manager.free_resources(R)` + `rewind_context_after_cache_drop(R, tpb)`(`llm_request.py` 1666;与 `_try_reserve_fetch_pages` 失败路径同一套),请求作为全新首 chunk 重入。full attention 下 history 偏高本身不致错(无 stale 范围、默认 `all_reusable` 不要求 commit 终点等于 history),但重新走 reuse match 更简单也更省页,统一丢弃 |
 | 14 | `unpark` 之后请求以 `is_first_context_chunk` 重入调度,`reserve_transfer_pages`/`prepare_context_cache` 会按 `num_committed_tokens` 重新落游标;若 `try_commit_blocks` 没提交到 `token_end`,游标会回退到本地 reuse 深度、已取回的页被当作未算 | 范围守卫加 `enable_block_reuse=True`(`try_commit_blocks` 5013 在关闭 reuse 时直接返回);`unpark` 在 commit 后检查 `kv_cache.num_committed_tokens >= token_end`,不满足记 WARNING 并继续(请求退回按本地 reuse 深度重算,慢但正确;不用硬断言,避免一个请求拖垮引擎) |
 | 15 | 时间来源不一致会让 deadline 与 probe 预算各说各话 | hooks 每轮取一次 `now = time.monotonic()` 传 `advance(candidates, now)`;协调层把同一个 `now` 传给 `Planner.decide(..., now=)`,Planner 没有自己的时钟;测试直接给 `advance`/`decide` 传 `now` |
 | 16 | 多 rank 下 `_handle_errors` 可由单 rank 本地触发(`_respond_if_invalid`)→ 该 rank 走释放门、记录释放,同伴对同一记录永远 `seen<n` | **既有隐患**。已结束一侧不受影响(设计 §7.1"齐":已结束请求的记录不投票、本地落地);未结束一侧的记录等到 `fetch_timeout_s` / `publish_timeout_s` 过期才落地,期间 `has_pending_work()` 为真挡住空闲判定。`status_dump` 的 `peer_launched_at` / `launch_gave_up` 可诊断;修法(释放前先把结局作为票多投一轮)留为后续项 |
@@ -286,7 +286,7 @@ backends:                    # 顺序即 fetch 优先级(设计§7.4)
 |---|---|---|
 | U0 | `tests/unittest/_torch/disaggregation/backends/test_config_registry.py` | YAML 解析/校验;注册表:未知 type、重复登记、假工厂、失败回滚 `close`;`mooncake` 内置项按名懒加载(用 monkeypatched `MooncakeBlobStore.open`,断言模块名 `disaggregation.backends.blob.drivers.mooncake`);后端键拼错报 `type mooncake` 而非驱动配置类 |
 | U1 | `tests/unittest/_torch/executor/kv_transfer/test_kv_v2_reader_layout.py`(GPU) | 对真 `KVCacheManagerV2`(小配置,如 4 层 / tpb 32 / 256 页):`context_block_keys` 数量与一致性;`layout_fingerprint` 同配置稳定、改 tpb/dtype/头数即变;`KVv2RegionResolver` 段数 = pool 数、跨度不重叠;`reserve_transfer_pages(token_end)` 后 `fetch_extent_and_committed` 的 unit 数 = `(token_end/tpb - reuse_end)`;两请求经 `try_commit_blocks` 后 `publish_extent_and_chunk` 命名相同 |
-| U2 | `tests/unittest/_torch/executor/kv_transfer/test_hooks.py`(另有 `test_assembly_guard.py` 守卫、`test_hook_points.py` 按源码文本核对全部接线点) | `object.__new__(PyExecutor)` + 假 `resource_manager`/`kv_cache_manager`(不需要假 `async_transfer_manager`:本层不读它),真 `KVTransferCoordinator` + `orchestration/kv_transfer/fakes.py` 的 `FakeFetches/FakePublishes`:park/unpark 状态与游标(含 §10 #14 的 WARNING 路径);`give_back_fetch_pages` 调 `_revert_ctx_alloc`,cache 残留时 `free_resources` + rewind(§10 #13);释放门五种情形 A–E(§9)各 `_do_terminate_request` 恰好一次,E 下 `release_transfer` 不再来也不泄漏;`owns` 对 parked 为 True;dummy 请求绕过门;`has_pending_work` 影响 idle;`close()` 释放 held 请求并写 dump,后端 `close` 挂住时超时后仍释放。overlap 发布只取 `previous_batch` 这一点不在此单测(需要整条循环),由 E1 的 `disable_overlap_scheduler=False` 参数化覆盖 |
+| U2 | `tests/unittest/_torch/executor/kv_transfer/test_hooks.py`(另有 `test_assembly_guard.py` 守卫、`test_hook_points.py` 按源码文本核对全部接线点) | `object.__new__(PyExecutor)` + 假 `resource_manager`/`kv_cache_manager`(不需要假 `async_transfer_manager`:本层不读它),真 `KVTransferCoordinator` + `orchestration/kv_transfer/fakes.py` 的 `FakeFetches/FakePublishes`:park/unpark 状态与游标(含 §10 #14 的 WARNING 路径);`revert_fetch_pages` 调 `_revert_ctx_alloc`,cache 残留时 `free_resources` + rewind(§10 #13);释放门五种情形 A–E(§9)各 `_do_terminate_request` 恰好一次,E 下 `release_transfer` 不再来也不泄漏;`owns` 对 parked 为 True;dummy 请求绕过门;`has_pending_work` 影响 idle;`close()` 释放 held 请求并写 dump,后端 `close` 挂住时超时后仍释放。overlap 发布只取 `previous_batch` 这一点不在此单测(需要整条循环),由 E1 的 `disable_overlap_scheduler=False` 参数化覆盖 |
 | U3 | `tests/unittest/_torch/executor/kv_transfer/test_scheduler_kv_fetch_seam.py`(`test_kv_cache_v2_scheduler.py` 不改) | planner 答 DEFER → 不建 cache;答 plan → 进 `fetch_launch_queue`、不计 `num_requests`;`reserve_transfer_pages` 失败 → 请求留在 CONTEXT_INIT;gen-init 仍走 `prepare_disagg_gen_init(req)` 原调用形状;导入卫生(monkeypatch 字串含 `disaggregation.remote_cache`) |
 | U4 | `orchestration/kv_transfer/test_planner_time_budget.py` | `probe_timeout_s` 按 `decide(now=)` 计:超时后无 store 答案 → None |
 | U5 | `backends/blob/test_worker_pool.py` | `DaemonWorkerPool`:daemon 线程、`shutdown(wait=True)` 等在飞任务、异常不吞 |
@@ -313,7 +313,7 @@ e2e(`tests/unittest/_torch/disaggregation/e2e/`,GPU,`pytest.importorskip("moonca
 | S4 | e2e 夹具 + E1;**先验证**环境变量能否到达 MPI spawn 的 worker(不能则改为在 YAML 路径上用固定约定,如 `~/.trtllm/kv_transfer.yaml`,并记录) | E1 两个参数化用例绿;探索分支的 20 块结果复现 |
 | S5 | E2 + 释放门情形 C/D/E 补强 | E2 绿;`usedNumBlocks` 回到基线 |
 | S6 | 收尾:三个新模块的模块 docstring 即目录说明(`tensorrt_llm/_torch/disaggregation/` 下无 README,不新建);PR 描述写 rationale 与 grep 结论 | pre-commit 通过 |
-| S7 | 多 rank(`KV_TRANSFER_MULTI_RANK_PLAN.zh.md` S0–S5):票型归约与发起投票、`EngineCollective`、分片进指纹、放开 TP/ADP;PP 的 `PlanAuthority`(owner 导出 / follower 采纳,`SerializableSchedulerOutput.kv_fetch_answers`)与 `_executor_loop_pp` 六处接线;守卫只剩 `cp_size>1` | T1 + T3 绿(`status_dump` 顶层加 `rank`/`plan_authority`,记录加 `launch_gave_up`/`peer_launched_at`);`test_disagg_loop_transcript.py` PP 首/非首 rank 空闲轮集合调用序列一致且各含 1 次 `kv_transfer.advance_round`;`test_hook_points.py` 三处 PP 顺序断言;`test_multi_rank_hooks_threads.py` `pp_size=2` follower 晚一轮落地;E1/E2 TP=1 不变 |
+| S7 | 多 rank(`KV_TRANSFER_MULTI_RANK_PLAN.zh.md` S0–S5):票型归约与发起投票、`EngineCollective`、分片进指纹、放开 TP/ADP;PP 的 `PlanAuthority`(owner 导出 / follower 采纳,`SerializableSchedulerOutput.kv_plan_answers`)与 `_executor_loop_pp` 六处接线;守卫只剩 `cp_size>1` | T1 + T3 绿(`status_dump` 顶层加 `rank`/`plan_authority`,记录加 `launch_gave_up`/`peer_launched_at`);`test_disagg_loop_transcript.py` PP 首/非首 rank 空闲轮集合调用序列一致且各含 1 次 `kv_transfer.advance_round`;`test_hook_points.py` 三处 PP 顺序断言;`test_multi_rank_hooks_threads.py` `pp_size=2` follower 晚一轮落地;E1/E2 TP=1 不变 |
 
 ## 13. 风险与回滚
 
@@ -340,7 +340,7 @@ e2e(`tests/unittest/_torch/disaggregation/e2e/`,GPU,`pytest.importorskip("moonca
 
 **已核实**:
 - `py_executor.py`:`_prepare_and_schedule_batch`(`poll_gen_transfers()` → `advance_round` → `check_transfer_timeouts()`;`_schedule()` 之后 `launch_reserved_fetches(self._kv_fetch_launch_queue)`);非 overlap `_executor_loop`(`_update_requests(sample_state)` → `_update_v2_context_resources(scheduled_batch)` → `publish_committed_blocks(scheduled_batch.context_requests)` → `_send_kv_async`);overlap `_executor_loop_overlap`(`_update_requests(self.previous_batch.sample_state)` → `publish_committed_blocks(self.previous_batch.scheduled_requests.context_requests)` → `_send_kv_async(previous_batch)`;当前 batch 的 `_update_v2_context_resources(scheduled_batch)` 在其后);两循环末尾 `self.disagg.pace_idle()` → `self.kv_transfer.pace_idle()`;`_fetch_and_enqueue_requests` 的 idle 判定追加 `has_pending_work()`;`_terminate_request` 首行的释放门(dummy 豁免同函数);`_do_terminate_request`;`_try_cancel_request` 在 `kv_cache_transceiver is None` 判断前的 `owns`;`_is_request_in_transmission`;`_handle_responses` 的 `force_terminate_for_partial_reuse` 分支与 ctx-only 不终止分支;`force_terminate_ctx_for_partial_reuse` 及其前提 `enable_partial_reuse_for_disagg`(含 `not _is_kv_manager_v2`);`_schedule` 存 `fetch_launch_queue` 并传 `protected_from_eviction_request_ids=self.kv_transfer.inflight_request_ids()`;`_terminate_recompute_paused_requests` 跳过在飞请求;`shutdown` 里 `torch.cuda.synchronize()` 之后、managers `shutdown()` 之前的 `kv_transfer.close()`。
-- `scheduler_v2.py`:`_schedule_loop` pending_ctx 循环里 `_try_take_fetch_path` 先于 `peft_pages_needed`,两处既有 `continue`(chunk 预算耗尽、首个新块已被贡献)在其前;gen-init 分支调 `prepare_disagg_gen_init(req)`;`_try_reserve_fetch_pages` 调 `reserve_transfer_pages(req, plan.token_end)`,失败 `free_resources` + `rewind_context_after_cache_drop`。
+- `scheduler_v2.py`:`_schedule_loop` pending_ctx 循环里 `_try_fetch_path` 先于 `peft_pages_needed`,两处既有 `continue`(chunk 预算耗尽、首个新块已被贡献)在其前;gen-init 分支调 `prepare_disagg_gen_init(req)`;`_try_reserve_fetch_pages` 调 `reserve_transfer_pages(req, plan.token_end)`,失败 `free_resources` + `rewind_context_after_cache_drop`。
 - `kv_cache_manager_v2.py`:`settle_context_cursor`(模块级函数);`revert_allocate_context`(`py_ctx_pre_resize_cap is None → return True`);`probe_context_reuse`;`reserve_transfer_pages`(只在容量增长时记 pre_cap;`prepare_disagg_gen_init` 为其别名);`get_history_length`;`stale_block_range`;`try_commit_blocks`(关 reuse 即返回);`release_index_slot` 对 `_early_freed_index_requests` 幂等;`context_block_keys`。`rewind_context_after_cache_drop` 在 `llm_request.py`。`py_executor_creator._create_py_executor` 在 `start_worker()` 之前懒 import `attach_kv_transfer`。
 - 状态枚举值 7 / 8 / 9 / 10 / 21。`AsyncTransferManager.start_transfer` 钉块 + 状态写法;`release_transfer` 在 `force_terminate` 下不调 `terminate_request`(情形 E 的依据);`SchedulerOutput` 八字段 + `fetch_launch_queue`。协调层 API 与 `_terminate_if_no_records` 的终止调用顺序;`Planner.decide` 的 `probe_timeout_s` 预算(按 `now=` 计)。`test_llm_pytorch.py::test_llm_disagg_gen_cancelled` 在一个进程内创建 ctx 与 gen 两个 `LLM()`(`private_mpi_session`),并用 `get_stats` 的 `usedNumBlocks` 等待释放。`BlobStoreBackend.close` 以 `pool.shutdown(wait=True)` 等在飞交付,`blob/drivers/mooncake.py`/`blob/backend.py` 中无任何超时参数。`SlotManager.remove_slot` 对未知 id 无操作。`_flush_pending_transfer_responses` 经 `_terminate_request` 终止 staged 请求。`tensorrt_llm/_torch/disaggregation/` 下无 README。本机:A6000 一块、`mooncake.store` 可导入、`~/.local/bin/mooncake_master` 存在、TinyLlama 权重在位。既有测试数见 §11。
 

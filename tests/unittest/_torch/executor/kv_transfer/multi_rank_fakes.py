@@ -23,7 +23,7 @@ from engine_fakes import (
 )
 
 from tensorrt_llm._torch.disaggregation.backends.config import (
-    DEFAULT_LANDING_WAIT_TIMEOUT_S,
+    DEFAULT_FETCH_WAIT_TIMEOUT_S,
     BackendEntry,
 )
 from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
@@ -37,8 +37,8 @@ from tensorrt_llm._torch.disaggregation.remote_cache import FetchPlan, FetchSour
 from tensorrt_llm._torch.disaggregation.resource.region import parallel_shard_tag
 from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import (
     EngineCollective,
+    EngineKVTransferEffects,
     EngineWorkQueue,
-    PyExecutorKVTransferEffects,
 )
 from tensorrt_llm._torch.pyexecutor.kv_transfer.hooks import KVTransferHooks
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -52,7 +52,7 @@ CLOSE_TIMEOUT_S = 5.0
 """Every rig's ``close_timeout_s``: how long its shutdown drain counts its own pending work."""
 
 
-class CountingEffects(PyExecutorKVTransferEffects):
+class CountingEffects(EngineKVTransferEffects):
     """The real engine effects, counting the ones a multi-rank scenario asserts on."""
 
     def __init__(self, executor) -> None:
@@ -65,9 +65,9 @@ class CountingEffects(PyExecutorKVTransferEffects):
         self.unparks += 1
         super().unpark(request, token_end, no_local_fallback, aux)
 
-    def give_back_fetch_pages(self, requests) -> None:
+    def revert_fetch_pages(self, requests) -> None:
         self.give_backs += 1
-        super().give_back_fetch_pages(requests)
+        super().revert_fetch_pages(requests)
 
     def fail_requests(self, requests, reason: str) -> None:
         self.failed.append((tuple(r.py_request_id for r in requests), reason))
@@ -133,7 +133,7 @@ class RankRig:
             EngineCollective(self.dist, self.mapping),
             fetch_timeout_s=fetch_timeout_s,
             unlaunched_timeout_s=unlaunched_timeout_s,
-            landing_wait_timeout_s=DEFAULT_LANDING_WAIT_TIMEOUT_S,
+            fetch_wait_timeout_s=DEFAULT_FETCH_WAIT_TIMEOUT_S,
             plan_authority=plan_authority,
         )
         handle = BackendHandle(

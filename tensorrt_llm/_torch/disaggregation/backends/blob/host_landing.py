@@ -110,7 +110,7 @@ class _Landing:
                 if self._backend.landing_pool.dequeue(self):
                     self._set_outcome_locked(
                         Failed(
-                            f"waited {self._backend.landing_wait_timeout_s:g} s for "
+                            f"waited {self._backend.fetch_wait_timeout_s:g} s for "
                             f"{len(self.units)} landing slots"
                         )
                     )
@@ -241,7 +241,7 @@ class _Landing:
     # -- helpers, caller holds the lock --
 
     def _waited_too_long(self) -> bool:
-        bound = self._backend.landing_wait_timeout_s
+        bound = self._backend.fetch_wait_timeout_s
         return bound is not None and time.monotonic() - self.enqueued_at > bound
 
     def _set_outcome_locked(self, outcome: Outcome) -> None:
@@ -288,9 +288,9 @@ class HostLandingBlobBackend:
         inner: The backend over the store, built with its publish pool.
         landing_pool: The landing pool; every slot is at least ``max_unit_bytes`` wide.
         unit_bytes: Byte size of a unit by its name, to size the get into a slot.
-        landing_wait_timeout_s: Longest a landing waits for slots before it fails; ``None`` for
-            no bound. The assembly passes the coordinator's ``landing_wait_timeout_s``
-            (``KVTransferConfig.landing_wait_timeout_s``), so queue waits and page waits share
+        fetch_wait_timeout_s: Longest a landing waits for slots before it fails; ``None`` for
+            no bound. The assembly passes the coordinator's ``fetch_wait_timeout_s``
+            (``KVTransferConfig.fetch_wait_timeout_s``), so queue waits and page waits share
             one bound.
     """
 
@@ -300,14 +300,14 @@ class HostLandingBlobBackend:
         landing_pool: HostSlotPool,
         unit_bytes: UnitBytes,
         *,
-        landing_wait_timeout_s: float | None,
+        fetch_wait_timeout_s: float | None,
     ) -> None:
-        if landing_wait_timeout_s is not None and landing_wait_timeout_s <= 0:
-            raise ValueError("landing_wait_timeout_s must be > 0 or None")
+        if fetch_wait_timeout_s is not None and fetch_wait_timeout_s <= 0:
+            raise ValueError("fetch_wait_timeout_s must be > 0 or None")
         self._inner = inner
         self.landing_pool = landing_pool
         self._unit_bytes = unit_bytes
-        self.landing_wait_timeout_s = landing_wait_timeout_s
+        self.fetch_wait_timeout_s = fetch_wait_timeout_s
         self._lock = threading.Lock()
         self._landings: set[_Landing] = set()
         """Landings that are queued or hold slots; ``close`` releases them."""

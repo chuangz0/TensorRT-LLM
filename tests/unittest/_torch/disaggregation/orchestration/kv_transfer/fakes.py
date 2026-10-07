@@ -20,7 +20,7 @@ from typing import Callable, Iterable, Mapping, Sequence
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.backends.config import (  # noqa: E402
-    DEFAULT_LANDING_WAIT_TIMEOUT_S,
+    DEFAULT_FETCH_WAIT_TIMEOUT_S,
     DEFAULT_UNLAUNCHED_TIMEOUT_S,
 )
 from disaggregation.base.backend import CacheKind  # noqa: E402
@@ -561,8 +561,8 @@ class RecordingEffects:
     def unpark(self, request, token_end, no_local_fallback, aux) -> None:
         self._record("unpark", request, token_end, no_local_fallback, aux)
 
-    def give_back_fetch_pages(self, requests) -> None:
-        self._record("give_back_fetch_pages", tuple(requests))
+    def revert_fetch_pages(self, requests) -> None:
+        self._record("revert_fetch_pages", tuple(requests))
 
     def prepare_fetch_resources(self, requests) -> None:
         self._record("prepare_fetch_resources", tuple(requests))
@@ -879,7 +879,7 @@ class Rig:
         self.dist = dist if dist is not None else FakeCollective()
         self.planner = Planner(self.sources, self.reader, tpb, probe_timeout_s=probe_timeout_s)
         coordinator_kwargs.setdefault("unlaunched_timeout_s", DEFAULT_UNLAUNCHED_TIMEOUT_S)
-        coordinator_kwargs.setdefault("landing_wait_timeout_s", DEFAULT_LANDING_WAIT_TIMEOUT_S)
+        coordinator_kwargs.setdefault("fetch_wait_timeout_s", DEFAULT_FETCH_WAIT_TIMEOUT_S)
         self.coord = KVTransferCoordinator(
             self.sources,
             self.publishers,

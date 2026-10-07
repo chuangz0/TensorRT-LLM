@@ -275,7 +275,7 @@ def test_landings_take_no_inflight_slot_but_placements_do():
     back once the placement has landed (the second placement is then accepted)."""
     store = FakeBlobStore()
     direct, theirs = _published(store, 2)
-    with direct, make_host_rank(store, max_inflight_ops=1) as rank:
+    with direct, make_host_rank(store, max_inflight_deliveries=1) as rank:
         a, b = _mirror(rank, theirs)
         rank.store.block("get")
         first = rank.backend.fetch_to_host([a.name])
@@ -387,7 +387,7 @@ def test_release_during_an_in_flight_placement_returns_slots_after_the_copy():
 def test_queue_wait_past_the_bound_fails_the_landing_and_dequeues_it():
     store = FakeBlobStore()
     direct, theirs = _published(store, 2)
-    with direct, make_host_rank(store, landing_slots=1, landing_wait_timeout_s=30.0) as rank:
+    with direct, make_host_rank(store, landing_slots=1, fetch_wait_timeout_s=30.0) as rank:
         a, b = _mirror(rank, theirs)
         first = rank.land([a])
         second = rank.backend.fetch_to_host([b.name])
@@ -548,7 +548,7 @@ def test_quiesce_and_settle_only_know_placements():
 def test_no_wait_bound_keeps_a_queued_landing_waiting():
     store = FakeBlobStore()
     direct, theirs = _published(store, 2)
-    with direct, make_host_rank(store, landing_slots=1, landing_wait_timeout_s=None) as rank:
+    with direct, make_host_rank(store, landing_slots=1, fetch_wait_timeout_s=None) as rank:
         a, b = _mirror(rank, theirs)
         first = rank.land([a])
         second = rank.backend.fetch_to_host([b.name])

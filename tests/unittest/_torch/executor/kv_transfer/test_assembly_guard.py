@@ -302,8 +302,8 @@ def test_two_model_identities_give_two_layout_fingerprints_through_the_assembly_
 
     assert fingerprint_for("meta-llama/Llama-3.1-8B") != fingerprint_for("mistralai/Mistral-7B")
     assert fingerprint_for("meta-llama/Llama-3.1-8B") == fingerprint_for("meta-llama/Llama-3.1-8B")
-    assert "model_identity=model_identity" in inspect.getsource(assembly._build_resource_views)
-    assert "model=%r" in inspect.getsource(assembly._build_hooks)
+    assert "model_identity=model_identity" in inspect.getsource(assembly._build_backend_context)
+    assert "model=%r" in inspect.getsource(assembly.attach_kv_transfer)
 
 
 def test_the_failure_guard_closes_the_built_backends_and_nothing_on_success():
@@ -314,9 +314,11 @@ def test_the_failure_guard_closes_the_built_backends_and_nothing_on_success():
         raise ValueError("coordinator refused")
 
     with pytest.raises(ValueError, match="coordinator refused"):
-        assembly._closing_backends_on_failure(handles, refuse)
+        with assembly._closing_backends_on_failure(handles):
+            refuse()
     assert closed == ["store", "worker"]
-    assert assembly._closing_backends_on_failure(handles, lambda: "hooks") == "hooks"
+    with assembly._closing_backends_on_failure(handles):
+        pass
     assert closed == ["store", "worker"]
 
 
@@ -394,7 +396,7 @@ def test_a_build_backends_that_raises_closes_nothing(monkeypatch, tmp_path):
             monkeypatch, tmp_path, executor, build_backends=build_backends, build_coordinator=never
         )
     assert calls == ["build raised"]
-    assert executor.kv_transfer is None and not hasattr(executor.scheduler, "kv_transfer_hooks")
+    assert executor.kv_transfer is None and not hasattr(executor.scheduler, "kv_transfer")
 
 
 def test_a_failure_after_build_backends_closes_what_was_built(monkeypatch, tmp_path):
@@ -416,7 +418,7 @@ def test_a_failure_after_build_backends_closes_what_was_built(monkeypatch, tmp_p
             build_coordinator=refuse,
         )
     assert closed == ["store", "worker"]
-    assert executor.kv_transfer is None and not hasattr(executor.scheduler, "kv_transfer_hooks")
+    assert executor.kv_transfer is None and not hasattr(executor.scheduler, "kv_transfer")
 
 
 def test_attach_refuses_a_malformed_config_before_building_anything(tmp_path):
@@ -433,7 +435,7 @@ def test_attach_refuses_a_malformed_config_before_building_anything(tmp_path):
             max_beam_width=1,
         )
     assert executor.kv_transfer is None
-    assert not hasattr(executor.scheduler, "kv_transfer_hooks")
+    assert not hasattr(executor.scheduler, "kv_transfer")
 
 
 def test_attach_refuses_an_out_of_scope_engine_before_reading_the_config(tmp_path):
@@ -475,7 +477,9 @@ def test_two_attaches_install_one_forwarding_handler(monkeypatch):
             "tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.coordinator"
         )
         layer_logger.warning("probe on %s failed, answer stays pending: %s", "store", "down")
-        forwarded.assert_called_once_with("probe on store failed, answer stays pending: down")
+        forwarded.assert_called_once_with(
+            "kv transfer: probe on store failed, answer stays pending: down"
+        )
         layer_logger.info("not forwarded: below WARNING")
         assert forwarded.call_count == 1
     finally:

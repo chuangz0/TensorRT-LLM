@@ -435,7 +435,7 @@ def test_close_wakes_a_worker_parked_for_a_slot_and_fails_its_delivery():
 
 
 def test_submissions_racing_close_are_rejected_or_reach_an_outcome():
-    rank = _staged(slots=2, max_inflight_ops=64, num_workers=2)
+    rank = _staged(slots=2, max_inflight_deliveries=64, num_workers=2)
     units = [rank.unit(0, i, 16) for i in range(40)]
     attempts, rejected = [], []
     go = threading.Event()

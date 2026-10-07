@@ -38,7 +38,7 @@ def test_serializable_scheduler_output_round_trip():
     num_fitting_requests = 3
     # KV transfer plan answers as the owning rank exports them: (request id, plan wire), the
     # wire being (token_end, source) or None for "compute locally".
-    kv_fetch_answers = [(1, (64, "store")), (2, None)]
+    kv_plan_answers = [(1, (64, "store")), (2, None)]
 
     # Create serializable scheduler output from scheduler result
     serializable_output = SerializableSchedulerOutput.from_scheduler_result(
@@ -46,7 +46,7 @@ def test_serializable_scheduler_output_round_trip():
         fitting_disagg_gen_init_requests,
         num_fitting_requests,
         wait_for_disagg_gen_transfer_progress=True,
-        kv_fetch_answers=kv_fetch_answers,
+        kv_plan_answers=kv_plan_answers,
     )
 
     # Serialize and deserialize the serializable scheduler output
@@ -85,14 +85,14 @@ def test_serializable_scheduler_output_round_trip():
         scheduled_requests.recompute_paused_requests
     )
     assert _request_ids(restored_fitting) == _request_ids(fitting_disagg_gen_init_requests)
-    assert len(restored_output.kv_fetch_answers) == len(kv_fetch_answers)
-    for restored, sent in zip(restored_output.kv_fetch_answers, kv_fetch_answers):
+    assert len(restored_output.kv_plan_answers) == len(kv_plan_answers)
+    for restored, sent in zip(restored_output.kv_plan_answers, kv_plan_answers):
         assert restored == sent
 
 
-def test_serializable_scheduler_output_carries_no_kv_fetch_answers_by_default():
+def test_serializable_scheduler_output_carries_no_kv_plan_answers_by_default():
     serializable_output = SerializableSchedulerOutput.from_scheduler_result(
         ScheduledRequests(), [], 0
     )
-    assert serializable_output.kv_fetch_answers == []
-    assert pickle.loads(pickle.dumps(serializable_output)).kv_fetch_answers == []
+    assert serializable_output.kv_plan_answers == []
+    assert pickle.loads(pickle.dumps(serializable_output)).kv_plan_answers == []

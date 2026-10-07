@@ -1202,11 +1202,12 @@ def _create_py_executor(
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
 
-    if os.environ.get("TRTLLM_KV_TRANSFER_CONFIG"):
+    kv_transfer_config_path = os.environ.get("TRTLLM_KV_TRANSFER_CONFIG")
+    if kv_transfer_config_path:
         # Assemble the KV transfer layer once, before the loop starts.
         from .kv_transfer.assembly import attach_kv_transfer
         attach_kv_transfer(py_executor,
-                           os.environ["TRTLLM_KV_TRANSFER_CONFIG"],
+                           kv_transfer_config_path,
                            mapping=mapping,
                            spec_config=spec_config,
                            kv_connector_manager=kv_connector_manager,

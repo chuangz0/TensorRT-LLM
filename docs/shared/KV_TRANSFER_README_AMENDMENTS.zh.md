@@ -43,7 +43,7 @@ README §4 把 blob 后端拆成 `fetch.py` 与 `publish.py`。本分支的 `Blo
 
 **B5. 契约的落点。** README §4 的契约文件是 `base/backend.py`。本分支上 SPEC §7 的十三个名字从 `base/cache_backend.py` 导出,与 kv-shared-draft 的 `base/backend.py` **逐字节同步**(模块 docstring 末尾有核对命令);本分支的 `base/backend.py` 仍是配对路径(`transceiver.py`、`native/`)的旧契约,直到配对路径迁到新类型后换名(ALIGNMENT_PLAN §6 第 4 步)。`resource/naming.py` 与 kv-shared-draft 只差一行 import。协调层消费的只读视图 `RequestView` / `GroupSpec` / `ResourceView` 在 `base/views.py`,README 无对应条目。
 
-**B6. 引擎侧三文件。** `pyexecutor/kv_transfer/effects.py`(唯一写请求状态处)、`kv_transfer/hooks.py`(循环每轮调用的对象 `KVTransferHooks`,引擎循环每个钩子点一个方法:`advance_round` / `export_plan_answers` / `adopt_plan_answers` / `fetch_answer` / `launch_reserved_fetches` / `publish_committed_blocks` / `on_request_finished` / `owns` / `has_pending_work` / `inflight_request_ids` / `pace_idle` / `close`)、`kv_transfer/assembly.py`(装配与范围守卫)。README §7 的 "Executor / Coordinator 即架构中的请求编排"对应这一层;旧路对应 `pyexecutor/disagg_adapter.py`。
+**B6. 引擎侧三文件。** `pyexecutor/kv_transfer/effects.py`(唯一写请求状态处)、`kv_transfer/hooks.py`(循环每轮调用的对象 `KVTransferHooks`,引擎循环每个钩子点一个方法:`advance_round` / `export_plan_answers` / `adopt_plan_answers` / `fetch_answer` / `launch_reserved_fetches` / `publish_committed_blocks` / `holds_finished_request` / `owns` / `has_pending_work` / `inflight_request_ids` / `pace_idle` / `close`)、`kv_transfer/assembly.py`(装配与范围守卫)。README §7 的 "Executor / Coordinator 即架构中的请求编排"对应这一层;旧路对应 `pyexecutor/disagg_adapter.py`。
 
 **B7. "在飞传输的登记"有两份。** 旧路 `orchestration/transfer_manager.py`(`AsyncTransferManager`,服务 transceiver),新路 `orchestration/kv_transfer/records.py`(`TransferRecord` 表,服务 `KVTransferCoordinator`)。统一后后者取代前者(设计 §12.1)。
 

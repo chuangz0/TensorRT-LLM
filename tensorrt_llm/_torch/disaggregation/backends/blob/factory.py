@@ -108,7 +108,7 @@ def _host_landing_handle(
         inner,
         landing_pool,
         context.unit_bytes_of,
-        landing_wait_timeout_s=context.landing_wait_timeout_s,
+        fetch_wait_timeout_s=context.fetch_wait_timeout_s,
     )
     return BackendHandle(
         name=entry.name,

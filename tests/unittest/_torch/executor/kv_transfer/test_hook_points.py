@@ -20,7 +20,7 @@ import textwrap
 import pytest
 
 from tensorrt_llm._torch.pyexecutor import py_executor, py_executor_creator
-from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import PyExecutorKVTransferEffects
+from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import EngineKVTransferEffects
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import scheduler_v2
 
@@ -156,10 +156,12 @@ def test_pp_loop_advances_at_the_head_launches_after_stage_0_and_paces_idle():
         "self._pp_schedule_and_propagate(microbatch_id)",
         "if self.dist.rank != 0:",
         "local_scheduler_output = self._schedule_active_requests()",
+        GUARD,
+        "self._kv_fetch_launch_queue = local_scheduler_output.fetch_launch_queue",
         "self.disagg.revert_deferred_gen_init(",
         GUARD,
-        "self.kv_transfer.launch_reserved_fetches( self._kv_fetch_launch_queue if self.dist.rank "
-        "== 0 else local_scheduler_output.fetch_launch_queue)",
+        "self.kv_transfer.launch_reserved_fetches(",
+        "self._kv_fetch_launch_queue)",
         "self.disagg.pace_idle()",
         GUARD,
         "self.kv_transfer.pace_idle()",
@@ -181,13 +183,13 @@ def test_pp_schedule_propagation_exports_on_the_owner_and_adopts_on_the_follower
         "self._schedule(",
         "self.disagg.admit(",
         GUARD,
-        "kv_fetch_answers = self.kv_transfer.export_plan_answers()",
+        "kv_plan_answers = self.kv_transfer.export_plan_answers()",
         "SerializableSchedulerOutput.from_scheduler_result(",
-        "kv_fetch_answers=kv_fetch_answers",
+        "kv_plan_answers=kv_plan_answers",
         "if scheduled_batch is None:",
         GUARD,
         "self.kv_transfer.adopt_plan_answers(",
-        "self.active_requests, serializable_schedule.kv_fetch_answers",
+        "self.active_requests, serializable_schedule.kv_plan_answers",
         "serializable_schedule.to_scheduler_result(",
     )
 
@@ -226,7 +228,7 @@ def test_release_gate_precedes_everything_that_frees_the_request():
         statements[gate_index],
         GUARD,
         "not request.is_dummy_request",
-        "not self.kv_transfer.on_request_finished(request)",
+        "self.kv_transfer.holds_finished_request(request)",
         "return",
     )
     before = " ".join(statements[:gate_index])
@@ -242,8 +244,8 @@ def test_deferred_release_takes_the_same_exits_as_the_statements_after_the_gate(
     must choose between the pipeline-parallel termination handler and ``_do_terminate_request``
     exactly as ``_terminate_request`` does after its gate; otherwise a held request under PP
     would be freed on one rank while its peers wait for the ring."""
-    gate_exits = source_of(PyExecutor._terminate_request).split("on_request_finished")[1]
-    effect = source_of(PyExecutorKVTransferEffects.terminate_request)
+    gate_exits = source_of(PyExecutor._terminate_request).split("holds_finished_request")[1]
+    effect = source_of(EngineKVTransferEffects.terminate_request)
     for text in (gate_exits, effect):
         ordered(
             text,
@@ -380,9 +382,9 @@ def test_scheduler_asks_the_planner_after_the_prefix_probe_and_before_any_cache_
         text,
         "_has_context_chunk_budget(budget)",
         "probe_first_new_block_key(req)",
-        "self._try_take_fetch_path(req)",
+        "self._try_fetch_path(req)",
         "fetch_launch_queue.append(req)",
         "budget.peft_pages_needed(req)",
         "self._try_schedule_context(",
     )
-    assert "kv_transfer_hooks = None" in source_of(scheduler_v2.KVCacheV2Scheduler.__init__)
+    assert "self.kv_transfer = None" in source_of(scheduler_v2.KVCacheV2Scheduler.__init__)

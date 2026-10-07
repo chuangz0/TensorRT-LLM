@@ -400,10 +400,8 @@ class PyExecutor:
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
 
-    # KV transfer coordination layer over the configured cache backends;
-    # attached by kv_transfer.assembly when TRTLLM_KV_TRANSFER_CONFIG is
-    # set. A class default so that partially
-    # constructed executors read None too.
+    # The KV transfer layer, attached by kv_transfer.assembly when
+    # TRTLLM_KV_TRANSFER_CONFIG is set; None on a partially built executor too.
     kv_transfer: Optional["KVTransferHooks"] = None
 
     def __init__(
@@ -2803,17 +2801,17 @@ class PyExecutor:
             )
             fitting_disagg_gen_init_requests, wait_for_disagg_gen_transfer_progress = (
                 self.disagg.admit(fitting_disagg_gen_init_requests))
-            kv_fetch_answers = ()
+            kv_plan_answers = ()
             if self.kv_transfer is not None:
                 # The scheduling rank owns the KV fetch plans; they ride
                 # with the schedule to the ranks that follow it.
-                kv_fetch_answers = self.kv_transfer.export_plan_answers()
+                kv_plan_answers = self.kv_transfer.export_plan_answers()
             serializable_schedule = SerializableSchedulerOutput.from_scheduler_result(
                 scheduled_batch,
                 fitting_disagg_gen_init_requests,
                 num_fitting_reqs,
                 wait_for_disagg_gen_transfer_progress,
-                kv_fetch_answers=kv_fetch_answers)
+                kv_plan_answers=kv_plan_answers)
 
         # Broadcast within first tp+cp group before send/recv chain to other tp+cp groups
         if self.dist.is_first_pp_rank:
@@ -2847,8 +2845,7 @@ class PyExecutor:
                 # A following rank takes the owner's KV fetch plans before
                 # its local scheduler reserves pages for them.
                 self.kv_transfer.adopt_plan_answers(
-                    self.active_requests,
-                    serializable_schedule.kv_fetch_answers)
+                    self.active_requests, serializable_schedule.kv_plan_answers)
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = serializable_schedule.to_scheduler_result(
                 self.active_requests)
             wait_for_disagg_gen_transfer_progress = (
@@ -2956,6 +2953,9 @@ class PyExecutor:
                         self.kv_cache_manager.prepare_expect_snapshot_points(
                             self.active_requests)
                     local_scheduler_output = self._schedule_active_requests()
+                    if self.kv_transfer is not None:
+                        # This rank launches from its own scheduler pass.
+                        self._kv_fetch_launch_queue = local_scheduler_output.fetch_launch_queue
                     local_disagg_candidates = getattr(
                         local_scheduler_output,
                         "fitting_disagg_gen_init_requests", [])
@@ -2963,11 +2963,9 @@ class PyExecutor:
                         local_disagg_candidates,
                         fitting_disagg_gen_init_requests)
                 if self.kv_transfer is not None:
-                    # Rank 0 is the only rank that does not rerun the
-                    # scheduler; every other rank launches from its local pass.
+                    # Start the fetches the scheduler reserved pages for.
                     self.kv_transfer.launch_reserved_fetches(
-                        self._kv_fetch_launch_queue if self.dist.rank ==
-                        0 else local_scheduler_output.fetch_launch_queue)
+                        self._kv_fetch_launch_queue)
 
                 if (self._mm_encoder_item_scheduling_enabled
                         and scheduled_batch.scheduled_mm_encoder_items):
@@ -4773,7 +4771,7 @@ class PyExecutor:
                 if not can_queue:
                     self.disagg.pace_idle()
                     if self.kv_transfer is not None:
-                        # Sleep ~1 ms while only the KV transfer layer can make progress.
+                        # Yield while only the KV transfer layer can make progress.
                         self.kv_transfer.pace_idle()
 
                 self.iter_counter += 1
@@ -5677,7 +5675,7 @@ class PyExecutor:
                 if not can_queue:
                     self.disagg.pace_idle()
                     if self.kv_transfer is not None:
-                        # Sleep ~1 ms while only the KV transfer layer can make progress.
+                        # Yield while only the KV transfer layer can make progress.
                         self.kv_transfer.pace_idle()
 
                 self.iter_counter += 1
@@ -8316,7 +8314,7 @@ class PyExecutor:
                     request.py_request_id in transfers.requests_in_transfer()):
                 return
         if (self.kv_transfer is not None and not request.is_dummy_request
-                and not self.kv_transfer.on_request_finished(request)):
+                and self.kv_transfer.holds_finished_request(request)):
             # The KV transfer release gate: that layer holds the request and terminates it later.
             return
         # Dummy requests don't participate in disagg KV cache transfers,
@@ -8794,14 +8792,13 @@ class PyExecutor:
         requests = scheduled_batch.recompute_paused_requests
         if not requests:
             return
+        in_kv_transfer = frozenset()
+        if self.kv_transfer is not None:
+            # Requests a KV transfer still touches keep their resources here; their
+            # normal termination releases them, through the release gate.
+            in_kv_transfer = self.kv_transfer.inflight_request_ids()
         for req in requests:
-            if (self.kv_transfer is not None and req.py_request_id
-                    in self.kv_transfer.inflight_request_ids()):
-                # Freeing here bypasses the KV transfer release gate while a store backend may
-                # still read the pages; the scheduler excludes such requests from recompute
-                # pause, so this is a guard against poisoning the store, not an expected path.
-                # Nothing leaks: the request keeps running and its resources are released by
-                # its normal termination, through the gate.
+            if req.py_request_id in in_kv_transfer:
                 logger.warning(
                     "request %d: recompute pause skipped its resource release, a KV transfer "
                     "is in flight", req.py_request_id)

@@ -418,8 +418,8 @@ def test_quiesce_is_true_once_done_and_blocks_while_running():
 # ---- back-pressure ----
 
 
-def test_max_inflight_ops_rejects_the_excess_and_nothing_escapes():
-    with make_rank(max_inflight_ops=1, num_workers=2) as rank:
+def test_max_inflight_deliveries_rejects_the_excess_and_nothing_escapes():
+    with make_rank(max_inflight_deliveries=1, num_workers=2) as rank:
         a, b = rank.unit(0, 0, 8), rank.unit(0, 1, 8)
         rank.write(b, pattern(2, 8))
         rank.store.block("contains")
@@ -440,7 +440,7 @@ def test_max_inflight_ops_rejects_the_excess_and_nothing_escapes():
 
 def test_rejected_submission_succeeds_once_an_in_flight_delivery_finishes():
     # The semaphore is restored by the finishing delivery, whatever its outcome.
-    with make_rank(max_inflight_ops=2, num_workers=2) as rank:
+    with make_rank(max_inflight_deliveries=2, num_workers=2) as rank:
         units = [rank.unit(0, i, 8) for i in range(3)]
         rank.store.block("contains")
         first = rank.backend.publish(extent([units[0]]))
@@ -458,7 +458,7 @@ def test_rejected_submission_succeeds_once_an_in_flight_delivery_finishes():
 
 
 def test_failed_delivery_releases_its_inflight_slot():
-    with make_rank(max_inflight_ops=1) as rank:
+    with make_rank(max_inflight_deliveries=1) as rank:
         u = rank.unit(0, 0, 8)
         rank.store.fail_next("contains")
         assert isinstance(rank.finish(rank.backend.fetch(extent([u]))), Failed)
@@ -466,7 +466,7 @@ def test_failed_delivery_releases_its_inflight_slot():
 
 
 def test_pre_submission_failure_does_not_consume_an_inflight_slot():
-    with make_rank(max_inflight_ops=1, register=False) as rank:
+    with make_rank(max_inflight_deliveries=1, register=False) as rank:
         u = rank.unit(0, 0, 8)
         for _ in range(3):
             assert isinstance(rank.backend.fetch(extent([u])).poll(), Failed)
