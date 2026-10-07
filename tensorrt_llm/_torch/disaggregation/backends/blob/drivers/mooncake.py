@@ -151,6 +151,10 @@ def _allocation_spans(address: int, size: int) -> list[Segment]:
     try:
         import cuda.bindings.driver as cuda
     except ImportError:
+        logger.debug(
+            "registering %s whole: the CUDA driver bindings are unavailable",
+            _span_text(address, size),
+        )
         return [(address, size)]
     spans = []
     cursor, end = address, address + size
@@ -159,9 +163,16 @@ def _allocation_spans(address: int, size: int) -> list[Segment]:
         if err != cuda.CUresult.CUDA_SUCCESS:
             return [(address, size)]
         stop = min(int(base) + int(length), end)
+        if stop <= cursor:  # an allocation that does not reach past the cursor cannot be walked
+            return [(address, size)]
         spans.append((cursor, stop - cursor))
         cursor = stop
     return spans
+
+
+def _span_text(address: int, size: int) -> str:
+    """``[start, end)`` in hex, as the backend's own messages write spans."""
+    return f"[{address:#x}, {address + size:#x})"
 
 
 def _split(buffers: Sequence[Sequence[Segment]]) -> tuple[list[list[int]], list[list[int]]]:
@@ -192,15 +203,15 @@ class MooncakeBlobStore:
     ``--memory_allocator=cachelib`` stores an object as one allocation of at most one slab (16 MiB
     minus 16 bytes) and answers ``INVALID_PARAMS`` for a unit whose segments add up to more,
     however they are cut, where the default ``offset`` allocator has no such cap. An answer of
-    the wrong length from any batch call raises ``BlobStoreError``. A span is registered one CUDA allocation at a time
-    (``_allocation_spans``) and unregistered the same way.
+    the wrong length from any batch call raises ``BlobStoreError``. A span is registered one
+    CUDA allocation at a time (``_allocation_spans``) and unregistered the same way.
     """
 
     def __init__(self, client: Any, config: MooncakeStoreConfig) -> None:
         self._client = client
         self._config = config
-        self._pieces: dict[int, list[int]] = {}
-        """Start of every piece each registered span was cut into, by the span's address."""
+        self._pieces: dict[int, list[Segment]] = {}
+        """The pieces each registered span was cut into and still holds, by the span's address."""
 
     @classmethod
     def open(cls, config: MooncakeStoreConfig) -> MooncakeBlobStore:
@@ -252,13 +263,16 @@ class MooncakeBlobStore:
         for start, length in pieces:
             status = self._client.register_buffer(start, length)
             if status != 0:
-                for done in registered:
+                for done, _ in registered:
                     self._client.unregister_buffer(done)
                 where = (
                     f" (piece {len(registered) + 1} of {len(pieces)})" if len(pieces) > 1 else ""
                 )
-                raise BlobStoreError(f"register_buffer failed with status {status}{where}")
-            registered.append(start)
+                raise BlobStoreError(
+                    f"register_buffer failed with status {status} for "
+                    f"{_span_text(start, length)}{where}"
+                )
+            registered.append((start, length))
         self._pieces[address] = registered
         if len(pieces) > 1:
             logger.info(
@@ -266,10 +280,23 @@ class MooncakeBlobStore:
             )
 
     def unregister_span(self, address: int, size: int) -> None:
-        for start in self._pieces.pop(address, [address]):
+        """Every piece is asked to unregister even after one fails. The pieces that failed stay
+        on the books, so a retry asks for those alone; one error names them all."""
+        pieces = self._pieces.get(address, [(address, size)])
+        failed = []
+        for start, length in pieces:
             status = self._client.unregister_buffer(start)
             if status != 0:
-                raise BlobStoreError(f"unregister_buffer failed with status {status}")
+                failed.append((start, length, status))
+        if not failed:
+            self._pieces.pop(address, None)
+            return
+        self._pieces[address] = [(start, length) for start, length, _ in failed]
+        failures = ", ".join(
+            f"status {status} for {_span_text(start, length)}" for start, length, status in failed
+        )
+        where = f" ({len(failed)} of {len(pieces)} pieces)" if len(pieces) > 1 else ""
+        raise BlobStoreError(f"unregister_buffer failed with {failures}{where}")
 
     @staticmethod
     def _check_count(call: str, statuses: Sequence[int], keys: Sequence[str]) -> None:

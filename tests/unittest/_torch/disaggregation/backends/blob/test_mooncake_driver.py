@@ -4,6 +4,7 @@
 bindings' status codes into the ``BlobStore`` protocol, and ``open`` over the lazily imported
 bindings. No backend, no threads, no master."""
 
+import contextlib
 import logging
 import sys
 import types
@@ -173,7 +174,9 @@ def test_a_piece_that_fails_to_register_unregisters_the_pieces_before_it(monkeyp
     pieces = [(0x1000, 0x100), (0x1100, 0x100), (0x1200, 0x80)]
     monkeypatch.setattr(driver_module, "_allocation_spans", lambda address, size: pieces)
     store = _store(register_buffer=deque([0, 0, -600]), unregister_buffer=0)
-    with pytest.raises(BlobStoreError, match=r"status -600 \(piece 3 of 3\)"):
+    with pytest.raises(
+        BlobStoreError, match=r"status -600 for \[0x1200, 0x1280\) \(piece 3 of 3\)"
+    ):
         store.register_span(0x1000, 0x280)
     assert store.raw.calls[3:] == [
         ("unregister_buffer", (0x1000,)),
@@ -181,84 +184,130 @@ def test_a_piece_that_fails_to_register_unregisters_the_pieces_before_it(monkeyp
     ]
 
 
-def _map_chunks(cuda, device: int, count: int):
-    """``count`` chunks mapped back to back into one reserved range, with the properties KV cache
-    manager V2 prefers (an exportable handle, GPU-direct RDMA capable). Returns (base, chunk,
-    handles), or None when no such property is supported."""
-    handle_types = [
-        cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
-        cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
-        cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE,
-    ]
-    for handle_type in handle_types:
-        prop = cuda.CUmemAllocationProp()
-        prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-        prop.location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
-        prop.location.id = device
-        prop.requestedHandleTypes = handle_type
-        prop.allocFlags.gpuDirectRDMACapable = 1
-        err, granularity = cuda.cuMemGetAllocationGranularity(
-            prop, cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM
-        )
-        if err != cuda.CUresult.CUDA_SUCCESS:
-            continue
-        err, handle = cuda.cuMemCreate(granularity, prop, 0)
-        if err != cuda.CUresult.CUDA_SUCCESS:
-            continue
+def test_a_piece_that_fails_to_unregister_is_kept_for_a_retry_and_the_rest_are_released(
+    monkeypatch,
+):
+    """A failed piece does not stop the pieces after it from being released, and only it stays on
+    the books: the backend keeps the handle live after the error, and the retry it allows asks
+    the bindings for that piece alone."""
+    pieces = [(0x1000, 0x100), (0x1100, 0x100), (0x1200, 0x80)]
+    monkeypatch.setattr(driver_module, "_allocation_spans", lambda address, size: pieces)
+    store = _store(register_buffer=0, unregister_buffer=deque([0, -6, 0, 0]))
+    store.register_span(0x1000, 0x280)
+    with pytest.raises(BlobStoreError, match=r"status -6 for \[0x1100, 0x1200\) \(1 of 3 pieces\)"):
+        store.unregister_span(0x1000, 0x280)
+    assert store.raw.calls[3:] == [("unregister_buffer", (start,)) for start, _ in pieces]
+    store.unregister_span(0x1000, 0x280)
+    assert store.raw.calls[6:] == [("unregister_buffer", (0x1100,))]
+
+
+_HANDLE_TYPES = (
+    "CU_MEM_HANDLE_TYPE_FABRIC",
+    "CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR",
+    "CU_MEM_HANDLE_TYPE_NONE",
+)
+"""The exportable handle types KV cache manager V2 asks for, most preferred first."""
+
+
+def _chunk_property(cuda, device: int, handle_type):
+    prop = cuda.CUmemAllocationProp()
+    prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
+    prop.location.id = device
+    prop.requestedHandleTypes = handle_type
+    prop.allocFlags.gpuDirectRDMACapable = 1
+    return prop
+
+
+@contextlib.contextmanager
+def _mapped_chunks(cuda, device: int, count: int):
+    """``count`` chunks of one allocation granularity each, mapped back to back into one reserved
+    range, with the properties KV cache manager V2 prefers (an exportable handle, GPU-direct RDMA
+    capable). Yields ``(base, chunk)``, or ``None`` when the device supports no such property.
+    The mappings, the reservation and the handles are released on exit however the body ended."""
+    ok = cuda.CUresult.CUDA_SUCCESS
+    minimum = cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM
+    with contextlib.ExitStack() as release:
+        for name in _HANDLE_TYPES:
+            prop = _chunk_property(cuda, device, getattr(cuda.CUmemAllocationHandleType, name))
+            err, chunk = cuda.cuMemGetAllocationGranularity(prop, minimum)
+            if err != ok:
+                continue
+            err, handle = cuda.cuMemCreate(chunk, prop, 0)
+            if err == ok:
+                break
+        else:
+            yield None
+            return
+        release.callback(cuda.cuMemRelease, handle)
         handles = [handle]
         for _ in range(count - 1):
-            err, handle = cuda.cuMemCreate(granularity, prop, 0)
-            assert err == cuda.CUresult.CUDA_SUCCESS
+            err, handle = cuda.cuMemCreate(chunk, prop, 0)
+            assert err == ok
+            release.callback(cuda.cuMemRelease, handle)
             handles.append(handle)
-        err, base = cuda.cuMemAddressReserve(granularity * count, 0, 0, 0)
-        assert err == cuda.CUresult.CUDA_SUCCESS
+        err, reserved = cuda.cuMemAddressReserve(chunk * count, 0, 0, 0)
+        assert err == ok
+        release.callback(cuda.cuMemAddressFree, reserved, chunk * count)
+        base = int(reserved)
         for i, handle in enumerate(handles):
-            (err,) = cuda.cuMemMap(int(base) + i * granularity, granularity, 0, handle, 0)
-            assert err == cuda.CUresult.CUDA_SUCCESS
+            (err,) = cuda.cuMemMap(base + i * chunk, chunk, 0, handle, 0)
+            assert err == ok
+            release.callback(cuda.cuMemUnmap, base + i * chunk, chunk)
         access = cuda.CUmemAccessDesc()
         access.location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         access.location.id = device
         access.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-        (err,) = cuda.cuMemSetAccess(base, granularity * count, [access], 1)
+        (err,) = cuda.cuMemSetAccess(base, chunk * count, [access], 1)
+        assert err == ok
+        yield base, chunk
+
+
+def _reported_allocations(cuda, base: int, chunk: int, count: int) -> list[tuple[int, int]]:
+    """The allocations ``cuMemGetAddressRange`` reports for the chunks at ``base``, each once, in
+    address order."""
+    ranges = []
+    for i in range(count):
+        err, start, length = cuda.cuMemGetAddressRange(base + i * chunk)
         assert err == cuda.CUresult.CUDA_SUCCESS
-        return int(base), granularity, handles
-    return None
+        if (int(start), int(length)) not in ranges:
+            ranges.append((int(start), int(length)))
+    return ranges
 
 
-def test_allocation_spans_tile_a_vmm_range_one_allocation_per_piece():
+def _cut(start: int, size: int, ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """``[start, start + size)`` cut at the boundaries of ``ranges``: the part inside each."""
+    pieces = []
+    for base, length in ranges:
+        lo, hi = max(start, base), min(start + size, base + length)
+        if lo < hi:
+            pieces.append((lo, hi - lo))
+    return pieces
+
+
+def test_allocation_spans_cut_a_vmm_range_at_the_allocations_the_driver_reports():
     """Over a range of ``cuMemCreate`` chunks mapped back to back, as KV cache manager V2 lays out
-    a pool, the pieces tile the span exactly and none crosses an allocation the driver reports.
-    (Whether neighbouring chunks are reported as one allocation is the driver's business.)"""
+    a pool, the pieces are exactly the span cut at the boundaries ``cuMemGetAddressRange`` reports
+    for the chunks, whether the driver reports every chunk as its own allocation or merges some.
+    A driver that reports the whole range as one allocation leaves nothing to cut, so the test
+    skips. Pinned host memory, as the staging pool uses, comes back whole."""
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
     cuda = pytest.importorskip("cuda.bindings.driver")
     torch.zeros(1, device="cuda")
     count = 4
-    mapped = _map_chunks(cuda, torch.cuda.current_device(), count)
-    if mapped is None:
-        pytest.skip("no supported VMM allocation property")
-    base, chunk, handles = mapped
-    try:
+    with _mapped_chunks(cuda, torch.cuda.current_device(), count) as mapped:
+        if mapped is None:
+            pytest.skip("no supported VMM allocation property")
+        base, chunk = mapped
+        ranges = _reported_allocations(cuda, base, chunk, count)
+        if len(ranges) == 1:
+            pytest.skip("the CUDA driver reports the mapped chunks as one allocation")
         for start, size in ((base, chunk * count), (base + chunk // 2, chunk * 2)):
-            pieces = driver_module._allocation_spans(start, size)
-            assert len(pieces) > 1, pieces  # a whole span back means the lookup failed
-            assert pieces[0][0] == start
-            assert sum(length for _, length in pieces) == size
-            for (a, la), (b, _) in zip(pieces, pieces[1:]):
-                assert a + la == b
-            for piece_start, length in pieces:
-                err, alloc_base, alloc_size = cuda.cuMemGetAddressRange(piece_start)
-                assert err == cuda.CUresult.CUDA_SUCCESS
-                assert int(alloc_base) <= piece_start
-                assert piece_start + length <= int(alloc_base) + int(alloc_size)
-        host = torch.empty(4096, dtype=torch.uint8)
+            assert driver_module._allocation_spans(start, size) == _cut(start, size, ranges)
+        host = torch.empty(4096, dtype=torch.uint8, pin_memory=True)
         assert driver_module._allocation_spans(host.data_ptr(), 4096) == [(host.data_ptr(), 4096)]
-    finally:
-        for i, handle in enumerate(handles):
-            cuda.cuMemUnmap(base + i * chunk, chunk)
-            cuda.cuMemRelease(handle)
-        cuda.cuMemAddressFree(base, chunk * count)
 
 
 # ---- open ----
