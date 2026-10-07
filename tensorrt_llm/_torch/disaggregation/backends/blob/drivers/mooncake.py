@@ -122,6 +122,31 @@ def _default_hostname() -> str:
     return socket.gethostbyname(socket.gethostname())
 
 
+def _allocation_spans(address: int, size: int) -> list[Segment]:
+    """The span cut at the boundaries of the CUDA allocations it covers.
+
+    KV cache manager V2 maps one ``cuMemCreate`` chunk after another into a reserved address
+    range, so a KV pool is many allocations. Without nvidia-peermem the Mooncake client registers
+    GPU memory through a dma-buf of the one allocation holding the address it is given, and a span
+    over several chunks fails to register; chunk by chunk it registers. Memory the driver cannot
+    look up (host memory, or no CUDA driver) comes back whole.
+    """
+    try:
+        import cuda.bindings.driver as cuda
+    except ImportError:
+        return [(address, size)]
+    spans = []
+    cursor, end = address, address + size
+    while cursor < end:
+        err, base, length = cuda.cuMemGetAddressRange(cursor)
+        if err != cuda.CUresult.CUDA_SUCCESS:
+            return [(address, size)]
+        stop = min(int(base) + int(length), end)
+        spans.append((cursor, stop - cursor))
+        cursor = stop
+    return spans
+
+
 def _split(buffers: Sequence[Sequence[Segment]]) -> tuple[list[list[int]], list[list[int]]]:
     """The bindings take addresses and sizes as two parallel lists per key."""
     ptrs = [[address for address, _ in segments] for segments in buffers]
@@ -146,12 +171,15 @@ class MooncakeBlobStore:
     ``-600`` for a unit whose segments add up to more, however they are cut; the default
     ``offset`` allocator has no such cap (both observed against a real master, see
     ``test_real_master.py``). An answer of the wrong length from any batch call raises
-    ``BlobStoreError``.
+    ``BlobStoreError``. A span is registered one CUDA allocation at a time (``_allocation_spans``)
+    and unregistered the same way.
     """
 
     def __init__(self, client: Any, config: MooncakeStoreConfig) -> None:
         self._client = client
         self._config = config
+        self._pieces: dict[int, list[int]] = {}
+        """Start of every piece each registered span was cut into, by the span's address."""
 
     @classmethod
     def open(cls, config: MooncakeStoreConfig) -> MooncakeBlobStore:
@@ -198,14 +226,29 @@ class MooncakeBlobStore:
         )
 
     def register_span(self, address: int, size: int) -> None:
-        status = self._client.register_buffer(address, size)
-        if status != 0:
-            raise BlobStoreError(f"register_buffer failed with status {status}")
+        pieces = _allocation_spans(address, size)
+        registered = []
+        for start, length in pieces:
+            status = self._client.register_buffer(start, length)
+            if status != 0:
+                for done in registered:
+                    self._client.unregister_buffer(done)
+                where = (
+                    f" (piece {len(registered) + 1} of {len(pieces)})" if len(pieces) > 1 else ""
+                )
+                raise BlobStoreError(f"register_buffer failed with status {status}{where}")
+            registered.append(start)
+        self._pieces[address] = registered
+        if len(pieces) > 1:
+            logger.info(
+                "%s: registered %d bytes as %d CUDA allocations", self.describe(), size, len(pieces)
+            )
 
     def unregister_span(self, address: int, size: int) -> None:
-        status = self._client.unregister_buffer(address)
-        if status != 0:
-            raise BlobStoreError(f"unregister_buffer failed with status {status}")
+        for start in self._pieces.pop(address, [address]):
+            status = self._client.unregister_buffer(start)
+            if status != 0:
+                raise BlobStoreError(f"unregister_buffer failed with status {status}")
 
     @staticmethod
     def _check_count(call: str, statuses: Sequence[int], keys: Sequence[str]) -> None:
