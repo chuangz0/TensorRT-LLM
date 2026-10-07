@@ -1979,6 +1979,15 @@ class PyExecutor:
                 or (transfers is not None
                     and transfers.has_any_inflight_requests()))
 
+    def _has_pending_transfers(self) -> bool:
+        """A KV transfer the loop must keep reaping: a connector load still
+        pending, or a context send (transceiver or connector save) still in
+        flight."""
+        transfers = getattr(self, "async_transfer_manager", None)
+        return (self._has_pending_connector_transfers()
+                or (transfers is not None
+                    and transfers.has_any_inflight_requests()))
+
     @contextmanager
     def _profiler(self):
         """Per-iteration profile bookkeeping driver.
@@ -5991,8 +6000,7 @@ class PyExecutor:
         # on `shutdown_event`.
         idle = (
             total_num_live_requests == 0 and len(waiting_queue) == 0
-            and not self.is_shutdown
-            and not self._has_pending_connector_transfers()
+            and not self.is_shutdown and not self._has_pending_transfers()
             # A request held or parked for a KV transfer is not live, yet only the loop can
             # move it on: never block on the queue while that layer has pending work.
             and not (self.kv_transfer is not None

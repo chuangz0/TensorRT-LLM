@@ -12,6 +12,7 @@ to PyExecutor, including:
 - Event-loop crash propagation to await_responses callers (nvbug 6038228)
 """
 
+import datetime
 import threading
 import time
 import types
@@ -1071,6 +1072,64 @@ class TestIdleDisaggLoopPacing:
         executor.disagg.pace_idle()
 
         assert sleep.called is expect_sleep
+
+
+def _idle_gate_executor(*, send_in_flight: bool) -> PyExecutor:
+    """Bare rank-0 executor with no KV connector and nothing active or waiting; a
+    transceiver send is in flight when ``send_in_flight``. The request queue is empty."""
+    executor = object.__new__(PyExecutor)
+    executor.dist = Mock(rank=0, tp_size=1, cp_size=1, has_pp=False)
+    executor.kv_connector_manager = None
+    executor.kv_transfer = None
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.has_any_inflight_requests.return_value = send_in_flight
+    executor.active_requests = []
+    executor.waiting_queue = FCFSWaitingQueue()
+    executor.control_requests = []
+    executor.request_accumulated = []
+    executor.is_shutdown = False
+    executor._disable_mpi = False
+    executor.hang_detector = MagicMock()
+    executor.executor_request_queue = Mock()
+    executor.executor_request_queue.get_from_request_queue.return_value = []
+    executor.request_broadcaster = Mock()
+    executor.request_broadcaster.broadcast.return_value = ([], None)
+    return executor
+
+
+def test_idle_gate_keeps_the_loop_awake_while_a_transceiver_send_is_in_flight():
+    """A context-only request whose KV the transceiver is still sending has already
+    left ``active_requests``, and only an awake loop reaps the send and releases it:
+    the gate must not block on the request queue, with or without a KV connector."""
+    executor = _idle_gate_executor(send_in_flight=True)
+
+    executor._fetch_and_enqueue_requests(executor.waiting_queue, total_num_live_requests=0)
+
+    executor.executor_request_queue.get_from_request_queue.assert_called_once_with(
+        datetime.timedelta(0)
+    )
+
+
+def test_idle_gate_blocks_on_the_request_queue_once_nothing_is_in_flight():
+    executor = _idle_gate_executor(send_in_flight=False)
+
+    executor._fetch_and_enqueue_requests(executor.waiting_queue, total_num_live_requests=0)
+
+    executor.executor_request_queue.get_from_request_queue.assert_called_once_with(None)
+
+
+def test_shutdown_does_not_wait_for_transceiver_sends_without_a_connector():
+    """Finishing or cancelling a disagg send at shutdown is the transceiver's decision
+    (``kv_transfer_timeout_ms``); the stop check waits on in-flight transfers only
+    through a KV connector, which does need them to land."""
+    executor = _idle_gate_executor(send_in_flight=True)
+    executor.is_shutdown = True
+
+    assert executor.should_stop_processing
+
+    executor.kv_connector_manager = Mock()
+    executor.kv_connector_manager.has_pending_loads.return_value = False
+    assert not executor.should_stop_processing
 
 
 class TestDisaggTransferAdmissionPP:

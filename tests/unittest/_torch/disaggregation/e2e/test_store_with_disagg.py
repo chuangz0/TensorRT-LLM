@@ -6,10 +6,10 @@ A context engine and a generation engine live in one process, as in
 ``test_llm_pytorch.py::test_llm_disagg_gen_cancelled``, both with the same KV transfer config.
 A ``context_only`` request is sent to the gen engine by the transceiver *and* published to the
 store; the same prompt again probes the store on the context side. The generation output equals
-a plain single-engine run. The release gate is checked from the outside: the context engine's
-``usedNumBlocks`` is the same after the second round as after the first, so every request freed
-its resources exactly once. The generation engine publishes nothing: gen-init requests belong to
-the transceiver.
+a plain single-engine run. Nothing but the ``context_only`` requests is sent to the context
+engine: it reaps each disagg send on its own once the generation engine has pulled, so the
+request is released through the gate and no coordinator record is left behind at shutdown.
+The generation engine publishes nothing: gen-init requests belong to the transceiver.
 """
 
 import os
@@ -24,7 +24,6 @@ from store_engine import (
     sampling_params,
     start_engine,
     timeout_mark,
-    used_num_blocks_settled,
     write_kv_transfer_yaml,
 )
 
@@ -47,31 +46,22 @@ def test_context_engine_publishes_to_the_store_while_sending_kv_to_the_generatio
     assert len(expected) > 0
 
     namespace = f"with-disagg-{os.getpid()}"
-    config_path = write_kv_transfer_yaml(tmp_path, mooncake_cluster.master_address, namespace)
+    # The planner waits longer than the standard 1 s for the store's answer: a cold engine's
+    # first lookup can outlast that, and the backend then hands the unclaimed answer to the next
+    # ask for the same prompt instead of looking the blocks up again, which would leave the
+    # second request's probe uncounted (``probe_hits`` below).
+    config_path = write_kv_transfer_yaml(
+        tmp_path, mooncake_cluster.master_address, namespace, probe_timeout_s=10.0
+    )
     monkeypatch.setenv(KV_TRANSFER_CONFIG_ENV, config_path)
 
-    llm_ctx = start_engine(
-        tmp_path,
-        monkeypatch,
-        "ctx",
-        tinyllama_path,
-        cache_transceiver=True,
-        enable_iter_perf_stats=True,
-    )
+    llm_ctx = start_engine(tmp_path, monkeypatch, "ctx", tinyllama_path, cache_transceiver=True)
     llm_gen = None
     dump_ctx = dump_gen = None
     try:
-        llm_gen = start_engine(
-            tmp_path,
-            monkeypatch,
-            "gen",
-            tinyllama_path,
-            cache_transceiver=True,
-            enable_iter_perf_stats=True,
-        )
+        llm_gen = start_engine(tmp_path, monkeypatch, "gen", tinyllama_path, cache_transceiver=True)
 
         outputs = []
-        used_after_round = []
         for _ in range(ROUNDS):
             (ctx_output,) = llm_ctx.generate(
                 [prompt],
@@ -83,18 +73,9 @@ def test_context_engine_publishes_to_the_store_while_sending_kv_to_the_generatio
             disaggregated_params = ctx_output.disaggregated_params
             disaggregated_params.request_type = "generation_only"
             outputs.append(generate_ids(llm_gen, prompt, disaggregated_params=disaggregated_params))
-            # Once nothing is active the context loop blocks on its request queue, and the
-            # disagg send of the last context-only request is reaped (and the request released
-            # through the gate) only when the loop next wakes. Wake it with a plain request for
-            # the same prompt: it reuses the same blocks, so it adds nothing to the block count.
-            assert generate_ids(llm_ctx, prompt, max_tokens=1) == expected[:1]
-            used_after_round.append(used_num_blocks_settled(llm_ctx))
 
         assert outputs[0] == expected, (outputs[0], expected)
         assert outputs[1] == expected, (outputs[1], expected)
-        # Release gate, seen from outside: the second round left the context engine exactly
-        # where the first did -- every request freed its pages once, none was held forever.
-        assert used_after_round[1] == used_after_round[0], used_after_round
     finally:
         llm_ctx.shutdown()
         dump_ctx = read_single_rank_dump(tmp_path, "ctx")

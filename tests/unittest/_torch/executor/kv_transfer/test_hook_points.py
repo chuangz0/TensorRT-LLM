@@ -274,7 +274,7 @@ def test_idle_detection_counts_a_transfer_in_flight_as_live():
         idle.group(1),
         "total_num_live_requests == 0",
         "not self.is_shutdown",
-        "not self._has_pending_connector_transfers()",
+        "not self._has_pending_transfers()",
         GUARD,
         "self.kv_transfer.has_pending_work()",
     )

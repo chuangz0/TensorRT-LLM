@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import time
 from dataclasses import dataclass
 
 import pytest
@@ -362,26 +361,3 @@ def run_engine(
     else:
         dumps = read_rank_dumps(tmp_path, tag, world_size_of(layout))
     return EngineRun(tokens, logits, dumps)
-
-
-STATS_SETTLE_RETRIES = 15
-
-
-def used_num_blocks_settled(llm) -> int:
-    """The last ``usedNumBlocks`` the engine reported once no further iterations run."""
-    time.sleep(1.0)
-    last = None
-    quiet_polls = 0
-    for _ in range(STATS_SETTLE_RETRIES):
-        stats = llm.get_stats(2)
-        if stats:
-            last = stats[-1]["kvCacheStats"]["usedNumBlocks"]
-            quiet_polls = 0
-        else:
-            quiet_polls += 1
-            if last is not None and quiet_polls >= 2:
-                return last
-        time.sleep(1.0)
-    if last is None:
-        pytest.fail("the engine reported no iteration stats")
-    return last
