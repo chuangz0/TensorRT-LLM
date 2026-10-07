@@ -133,13 +133,13 @@ class FakeFetches:
 
 
 class FakeLanding:
-    """A ``Landing`` the test finishes; ``place`` returns a pending attempt; ``releases`` counts."""
+    """A ``Landing`` the test finishes; ``place`` returns a pending attempt; ``closes`` counts."""
 
     def __init__(self, backend: FakeLandsOnHost, units: Sequence[bytes]) -> None:
         self.backend = backend
         self.units = tuple(units)
         self._outcome: Outcome | None = None
-        self.releases = 0
+        self.closes = 0
 
     def poll(self) -> Outcome | None:
         return self._outcome
@@ -156,8 +156,8 @@ class FakeLanding:
         self.backend.attempts.append(attempt)
         return attempt
 
-    def release(self) -> None:
-        self.releases += 1
+    def close(self) -> None:
+        self.closes += 1
 
 
 class FakeLandsOnHost:
@@ -170,8 +170,8 @@ class FakeLandsOnHost:
         self.landings: list[FakeLanding] = []
         self.attempts: list[FakeAttempt] = []
 
-    def fetch_to_host(self, name: bytes, units: Sequence[bytes]) -> FakeLanding:
-        self.calls.append(("fetch_to_host", (name, tuple(units))))
+    def fetch_to_host(self, units: Sequence[bytes]) -> FakeLanding:
+        self.calls.append(("fetch_to_host", (tuple(units),)))
         landing = FakeLanding(self, units)
         self.landings.append(landing)
         return landing
@@ -369,7 +369,7 @@ def make_executor(kv: FakeKVCacheManager, slots: FakeSlotManager) -> PyExecutor:
 
 
 class FakeReader:
-    """``ResourceReader`` over ``FakeKVCacheManager``: keys by request seed, one full-attention
+    """``ResourceView`` over ``FakeKVCacheManager``: keys by request seed, one full-attention
     group, units addressed by block ordinal."""
 
     def __init__(self, kv_cache_manager: FakeKVCacheManager) -> None:
@@ -399,14 +399,14 @@ class FakeReader:
     def group_specs(self) -> Sequence[GroupSpec]:
         return self.groups
 
-    def gen_first_ready(self, request) -> bool:
+    def generation_first_ready(self, request) -> bool:
         return True
 
-    def fetch_extent(self, request, plan) -> tuple[CacheExtent, frozenset[bytes]]:
+    def fetch_extent_and_committed(self, request, plan) -> tuple[CacheExtent, frozenset[bytes]]:
         """As the real reader: a block the cache already committed is returned by name instead
         of being fetched over."""
         rid = request.py_request_id
-        self.calls.append(("fetch_extent", rid))
+        self.calls.append(("fetch_extent_and_committed", rid))
         kv_cache = self.kv.kv_cache_map.get(rid)
         committed = (
             0 if kv_cache is None else kv_cache.num_committed_tokens // self.tokens_per_block

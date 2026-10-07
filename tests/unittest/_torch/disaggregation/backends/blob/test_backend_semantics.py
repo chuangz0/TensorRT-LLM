@@ -124,7 +124,7 @@ def test_publish_where_a_unit_fails_to_write_is_failed():
         rank.store.put = lambda keys, buffers: [PutStatus.STORED, PutStatus.FAILED]
         outcome = rank.finish(rank.backend.publish(extent([a, b])))
         assert isinstance(outcome, Failed) and "1 of 2 units could not be written" in outcome.reason
-        assert rank.store.count("holds") == 1  # the lookup before the put; none after
+        assert rank.store.count("contains") == 1  # the lookup before the put; none after
         assert rank.backend.counters.publish_stored == 1
         assert rank.backend.counters.failed_attempts == 1
 
@@ -140,7 +140,7 @@ def test_put_transport_failure_is_failed_not_declined():
         attempt = rank.backend.publish(extent([u]))
         outcome = rank.finish(attempt)
         assert isinstance(outcome, Failed) and "rpc failed" in outcome.reason
-        assert rank.store.count("holds") == 1  # the lookup before the put; none after
+        assert rank.store.count("contains") == 1  # the lookup before the put; none after
         assert rank.backend.counters.publish_declined == 0
         assert rank.backend.counters.publish_stored == 0
         assert rank.backend.counters.failed_attempts == 1
@@ -154,7 +154,7 @@ def test_publish_whose_lookup_fails_is_failed():
     with make_rank() as rank:
         u = rank.unit(0, 0, 8)
         rank.write(u, pattern(1, 8))
-        rank.store.fail_next("holds", BlobStoreError("down"))
+        rank.store.fail_next("contains", BlobStoreError("down"))
         outcome = rank.finish(rank.backend.publish(extent([u])))
         assert isinstance(outcome, Failed) and "lookup failed" in outcome.reason
         assert rank.store.count("put") == 0
@@ -198,23 +198,23 @@ def test_declined_put_then_lookup_trouble_is_failed():
         u = rank.unit(0, 0, 8)
         rank.store.put = lambda keys, buffers: [PutStatus.DECLINED for _ in keys]
         # The lookup after a declined put raises something unforeseen ...
-        rank.store.fail_at("holds", 2)
+        rank.store.fail_at("contains", 2)
         assert isinstance(rank.finish(rank.backend.publish(extent([u]))), Failed)
-        # ... or fails as a store lookup does (the second ``holds``: the one after the put) ...
-        rank.store.fail_at("holds", 2, BlobStoreError("down"))
+        # ... or fails as a store lookup does (the second ``contains``: the one after the put) ...
+        rank.store.fail_at("contains", 2, BlobStoreError("down"))
         outcome = rank.finish(rank.backend.publish(extent([u])))
         assert (
             isinstance(outcome, Failed) and "lookup failed after a declined put" in outcome.reason
         )
         # ... or answers the wrong number of keys.
-        orig = rank.store.holds
+        orig = rank.store.contains
         calls = []
 
         def short_after_decline(keys):
             calls.append(keys)
             return orig(keys) if len(calls) == 1 else []
 
-        rank.store.holds = short_after_decline
+        rank.store.contains = short_after_decline
         assert isinstance(rank.finish(rank.backend.publish(extent([u]))), Failed)
         assert rank.backend.counters.publish_stored == 0
         assert rank.backend.counters.failed_attempts == 3
@@ -234,13 +234,13 @@ def test_put_answering_the_wrong_count_is_failed():
 def test_lookup_outage_is_failed_not_a_miss():
     a, b = _pair()
     with a, b:
-        b.store.fail_next("holds")
+        b.store.fail_next("contains")
         outcome = b.finish(b.backend.fetch(extent(b.units.values())))
         assert isinstance(outcome, Failed) and "RuntimeError" in outcome.reason
         assert b.backend.counters.fetch_misses == 0
         assert b.backend.counters.failed_attempts == 1
         # A lookup the store reports as failed is the same outage, named as such.
-        b.store.fail_next("holds", BlobStoreError("down"))
+        b.store.fail_next("contains", BlobStoreError("down"))
         outcome = b.finish(b.backend.fetch(extent(b.units.values())))
         assert isinstance(outcome, Failed) and "lookup failed" in outcome.reason
 
@@ -248,7 +248,7 @@ def test_lookup_outage_is_failed_not_a_miss():
 def test_lookup_answering_the_wrong_count_is_failed():
     with make_rank() as rank:
         u = rank.unit(0, 0, 8)
-        rank.store.holds = lambda keys: []
+        rank.store.contains = lambda keys: []
         assert isinstance(rank.finish(rank.backend.fetch(extent([u]))), Failed)
         assert isinstance(rank.finish(rank.backend.publish(extent([u]))), Failed)
 
@@ -278,7 +278,7 @@ def test_present_at_lookup_but_unreadable_is_failed():
 
 
 def test_unit_gone_between_lookup_and_get_is_a_miss_with_destination_untouched():
-    # ``holds`` said yes, the get says MISS. The store wrote nothing, so this is a miss (SPEC
+    # ``contains`` said yes, the get says MISS. The store wrote nothing, so this is a miss (SPEC
     # §5.1 inv. 2), counted as one, and the other present unit is still served.
     a, b = _pair()
     with a, b:
@@ -356,7 +356,7 @@ def test_failure_in_a_later_batch_fails_the_whole_attempt():
     with a, b:
         _seed(a, {(0, 0): 1, (0, 1): 2, (1, 0): 3})
         assert isinstance(a.finish(a.backend.publish(extent(a.units.values()))), Delivered)
-        orig = b.store.holds
+        orig = b.store.contains
         seen = []
 
         def second_lookup_fails(keys):
@@ -365,7 +365,7 @@ def test_failure_in_a_later_batch_fails_the_whole_attempt():
                 raise RuntimeError("store went away")
             return orig(keys)
 
-        b.store.holds = second_lookup_fails
+        b.store.contains = second_lookup_fails
         outcome = b.finish(b.backend.fetch(extent(b.units.values())))
         assert isinstance(outcome, Failed)
         assert b.store.count("get") == 1  # first batch was written
@@ -381,17 +381,17 @@ def test_probe_answers_none_then_the_set_once_then_asks_again():
         held = [a.units[(0, 0)], a.units[(1, 0)]]
         assert isinstance(a.finish(a.backend.publish(extent(held))), Delivered)
         names = [u.name for u in b.units.values()]
-        before = b.store.count("holds")  # the publisher's own lookup is on it too
+        before = b.store.count("contains")  # the publisher's own lookup is on it too
         assert b.backend.probe(b"n", names) is None
         wait_until(lambda: b.backend.counters.probe_hits + b.backend.counters.probe_misses == 3)
-        lookups = b.store.count("holds")
+        lookups = b.store.count("contains")
         assert lookups == before + 1
         answer = b.backend.probe(b"n", names)
         assert answer == frozenset(u.name for u in held)
         assert isinstance(answer, frozenset)
         # Consumed: the next call asks the store again.
         assert b.backend.probe(b"n", names) is None
-        wait_until(lambda: b.store.count("holds") == lookups + 1)
+        wait_until(lambda: b.store.count("contains") == lookups + 1)
         # A different unit list under the same name is a different question.
         assert b.backend.probe(b"n", names[:1]) is None
         assert b.backend.probe(b"", []) == frozenset()
@@ -400,12 +400,12 @@ def test_probe_answers_none_then_the_set_once_then_asks_again():
 def test_probe_repeated_while_pending_does_not_requeue():
     with make_rank() as rank:
         u = rank.unit(0, 0, 8)
-        rank.store.block("holds")
+        rank.store.block("contains")
         assert rank.backend.probe(b"n", [u.name]) is None
         rank.store.wait_entered(2)
         for _ in range(5):
             assert rank.backend.probe(b"n", [u.name]) is None
-        assert rank.store.count("holds") == 1
+        assert rank.store.count("contains") == 1
         rank.store.unblock()
         wait_until(lambda: rank.backend.counters.probe_misses == 1, what="lookup")
         assert rank.backend.probe(b"n", [u.name]) == frozenset()
@@ -419,7 +419,7 @@ def test_probe_answer_expires_after_ttl():
         time.sleep(0.1)
         # Expired: the stale answer is dropped and a fresh lookup is queued.
         assert rank.backend.probe(b"n", [u.name]) is None
-        wait_until(lambda: rank.store.count("holds") == 2, what="second lookup")
+        wait_until(lambda: rank.store.count("contains") == 2, what="second lookup")
         wait_until(lambda: rank.backend.counters.probe_misses == 2)
         assert rank.backend.probe(b"n", [u.name]) == frozenset()
 
@@ -427,9 +427,9 @@ def test_probe_answer_expires_after_ttl():
 def test_probe_lookup_failure_raises_once_and_never_reads_as_empty():
     with make_rank() as rank:
         u = rank.unit(0, 0, 8)
-        rank.store.fail_next("holds")
+        rank.store.fail_next("contains")
         assert rank.backend.probe(b"n", [u.name]) is None
-        wait_until(lambda: rank.store.count("holds") == 1)
+        wait_until(lambda: rank.store.count("contains") == 1)
         # The worker has to have recorded the error; poll until the probe is decided.
         deadline = time.monotonic() + 5
         while True:
@@ -470,11 +470,11 @@ def test_probe_lookup_the_store_reports_failed_is_an_outage_not_an_empty_answer(
     with make_rank() as rank:
         u = rank.unit(0, 0, 8)
         for _ in range(LOOKUP_RETRIES + 5):  # more failures armed than tries allowed
-            rank.store.fail_next("holds", BlobStoreError("down"))
+            rank.store.fail_next("contains", BlobStoreError("down"))
         assert rank.backend.probe(b"n", [u.name]) is None
         answer, exc = _probe_until_decided(rank, b"n", [u.name])
         assert answer is None and "lookup failed: down" in str(exc)
-        assert rank.store.count("holds") == 1 + LOOKUP_RETRIES
+        assert rank.store.count("contains") == 1 + LOOKUP_RETRIES
         assert rank.backend.counters.probe_failed == 1
         assert rank.backend.counters.probe_misses == 0
 
@@ -485,12 +485,12 @@ def test_probe_lookup_that_fails_once_is_retried_and_answers():
     with make_rank() as rank:
         a, b = rank.unit(0, 0, 8), rank.unit(0, 1, 8)
         assert isinstance(rank.finish(rank.backend.publish(extent([a, b]))), Delivered)
-        lookups_before = rank.store.count("holds")  # the publish's own lookup
-        rank.store.fail_next("holds", BlobStoreError("hiccup"))
+        lookups_before = rank.store.count("contains")  # the publish's own lookup
+        rank.store.fail_next("contains", BlobStoreError("hiccup"))
         assert rank.backend.probe(b"n", [a.name, b.name]) is None
         answer, exc = _probe_until_decided(rank, b"n", [a.name, b.name])
         assert exc is None and answer == frozenset({a.name, b.name})
-        assert rank.store.count("holds") == lookups_before + 2  # the failed try and the retry
+        assert rank.store.count("contains") == lookups_before + 2  # the failed try and the retry
         assert rank.backend.counters.probe_failed == 0
         assert rank.backend.counters.probe_hits == 2
 
@@ -533,8 +533,8 @@ def test_probe_keys_units_like_fetch_does():
     with make_rank() as rank:
         u = rank.unit(0, 0, 8)
         assert rank.backend.probe(b"n", [u.name]) is None
-        wait_until(lambda: rank.store.count("holds") == 1)
-        (asked,) = [args[0] for m, args in rank.store.calls if m == "holds"]
+        wait_until(lambda: rank.store.count("contains") == 1)
+        (asked,) = [args[0] for m, args in rank.store.calls if m == "contains"]
         assert asked == (rank.key(u),)
 
 
@@ -578,7 +578,7 @@ def test_probe_table_is_bounded_and_a_new_lookup_past_the_bound_raises():
     from disaggregation.backends.blob.backend import MAX_PROBES
 
     with make_rank() as rank:
-        rank.store.block("holds")  # every lookup stays pending
+        rank.store.block("contains")  # every lookup stays pending
         for i in range(MAX_PROBES):
             assert rank.backend.probe(f"n{i}".encode(), [b"u"]) is None
         with pytest.raises(RuntimeError, match=f"{MAX_PROBES} store lookups already remembered"):
@@ -588,14 +588,14 @@ def test_probe_table_is_bounded_and_a_new_lookup_past_the_bound_raises():
 
 def test_pending_probe_past_the_ttl_is_dropped_and_asked_again():
     with make_rank(probe_ttl_s=0.05) as rank:
-        rank.store.block("holds")
+        rank.store.block("contains")
         assert rank.backend.probe(b"n", [b"u"]) is None
         rank.store.wait_entered(2)  # register_span, then the lookup parked at the gate
         time.sleep(0.1)  # past the TTL while still pending
         # The stale pending entry is dropped and the same question is asked afresh.
         assert rank.backend.probe(b"n", [b"u"]) is None
         rank.store.unblock()
-        wait_until(lambda: rank.store.count("holds") == 2, what="second lookup")
+        wait_until(lambda: rank.store.count("contains") == 2, what="second lookup")
         # The fresh lookup answers; an answer is consumed once.
         wait_until(lambda: rank.backend.probe(b"n", [b"u"]) is not None, what="answer")
         assert rank.backend.probe(b"n", [b"u"]) is None  # consumed: asked again

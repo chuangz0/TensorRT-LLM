@@ -25,11 +25,11 @@ The classes depend only on the ``BlobStore`` protocol (``store.py``); a driver u
 opens the store and ``factory.py`` builds the backend over it. One store object per unit. A
 unit's segments go in as that object's buffer list, so it is stored whole or not at all, which is
 what per-unit atomic visibility needs (contract §6.3). Every delivery runs on the backend's own
-threads; they call the store and, when staging, the copier, and nothing else. ``probe`` is
+threads; they call the store and, through a publish pool, the copier, and nothing else. ``probe`` is
 answered the same way on a thread of its own: the first call queues the lookup and answers
 ``None``, a later call returns the answer once.
 
-Reading a unit is two round trips: ``holds`` then ``get``. The first tells a miss from a failure
+Reading a unit is two round trips: ``contains`` then ``get``. The first tells a miss from a failure
 (a lookup that cannot be answered raises, it never answers "absent"); the contract forbids
 reporting either as the other (§5.2). A unit that was present at the lookup and gone by the get is
 a miss (the store wrote nothing); any other trouble reading a present unit fails the whole
@@ -70,7 +70,7 @@ from ...base.cache_backend import (
 from ...base.region import RegionResolver, Segment
 from ..config import strict_from_dict
 from .keys import KeyScheme
-from .staging import HostStagingPool
+from .slot_pool import HostSlotPool
 from .store import BlobStore, BlobStoreError, GetStatus, PutStatus
 from .worker_pool import DaemonWorkerPool
 
@@ -101,7 +101,7 @@ logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-_DEFAULT_STAGING_BUFFER_BYTES = 512 * 1024 * 1024
+_DEFAULT_PUBLISH_BUFFER_BYTES = 512 * 1024 * 1024
 _DEFAULT_LANDING_BUFFER_BYTES = 2 * 1024 * 1024 * 1024
 
 UnitBytes = Callable[[bytes], int]
@@ -121,7 +121,7 @@ class BlobStoreConfig:
             touches pinned host memory of the backend's own; a fetch lands there and is copied
             into pages afterwards (``LandsOnHost``), a publish is gathered there first. The
             caller's pools stay unregistered.
-        staging_buffer_bytes: Ceiling on the pinned publish pool when ``landing`` is ``host``.
+        publish_buffer_bytes: Ceiling on the pinned publish pool when ``landing`` is ``host``.
         landing_buffer_bytes: Ceiling on the pinned landing pool when ``landing`` is ``host``.
         max_landed_units: Cap on the landing pool's slot count; ``None`` takes every slot the
             budget affords. A landing holds one slot per unit until it is released.
@@ -135,7 +135,7 @@ class BlobStoreConfig:
     namespace: str = "trtllm"
     transfer_batch_size: int = 64
     landing: str = "device"
-    staging_buffer_bytes: int = _DEFAULT_STAGING_BUFFER_BYTES
+    publish_buffer_bytes: int = _DEFAULT_PUBLISH_BUFFER_BYTES
     landing_buffer_bytes: int = _DEFAULT_LANDING_BUFFER_BYTES
     max_landed_units: Optional[int] = None
     max_inflight_ops: int = 256
@@ -149,7 +149,7 @@ class BlobStoreConfig:
             "transfer_batch_size",
             "max_inflight_ops",
             "num_workers",
-            "staging_buffer_bytes",
+            "publish_buffer_bytes",
             "landing_buffer_bytes",
         ):
             _require_int(name, getattr(self, name))
@@ -159,7 +159,7 @@ class BlobStoreConfig:
         if self.landing not in ("device", "host"):
             raise ValueError(f"landing must be 'device' or 'host', got {self.landing!r}")
         if self.lands_on_host:
-            for name in ("staging_buffer_bytes", "landing_buffer_bytes"):
+            for name in ("publish_buffer_bytes", "landing_buffer_bytes"):
                 if getattr(self, name) <= 0:
                     raise ValueError(f"{name} must be > 0 when landing is 'host'")
         if self.max_landed_units is not None:
@@ -291,7 +291,7 @@ def _report_outcome_of(work: Callable[[], Outcome], report: Callable[[Outcome], 
 
 
 @contextmanager
-def _drain_copies_on_error(pool: HostStagingPool, warning: str) -> Iterator[None]:
+def _drain_copies_on_error(pool: HostSlotPool, warning: str) -> Iterator[None]:
     """Around copies into or out of ``pool``'s slots: when the body raises, wait for the copies
     issued so far before the error goes on, so that a slot someone else then reuses is not still
     being written and the caller's memory is not still being read. A sync that fails itself is
@@ -326,10 +326,11 @@ class BlobStoreBackend:
         config: Batch sizes, bounds and the landing shape.
         resolver: Maps a unit's local coordinates to its memory segments.
         layout_fingerprint: Folded into every key; see ``KeyScheme``.
-        staging: The publish pool, required when ``config.landing`` is ``host`` and ignored
-            otherwise. Owned from here on: ``close`` shuts it down so that no worker stays parked
-            waiting for a slot. With a publish pool this backend serves ``publish`` only: a fetch
-            of that shape goes through ``HostLandingBlobBackend.fetch_to_host``.
+        publish_pool: The pinned host slots a publish is gathered into before the store is asked
+            to take it; required when ``config.landing`` is ``host`` and ignored otherwise. Owned
+            from here on: ``close`` shuts it down so that no worker stays parked waiting for a
+            slot. With a publish pool this backend serves ``publish`` only: a fetch of that shape
+            goes through ``HostLandingBlobBackend.fetch_to_host``.
     """
 
     def __init__(
@@ -339,21 +340,21 @@ class BlobStoreBackend:
         resolver: RegionResolver,
         layout_fingerprint: bytes,
         *,
-        staging: HostStagingPool | None = None,
+        publish_pool: HostSlotPool | None = None,
     ) -> None:
-        if config.lands_on_host and staging is None:
-            raise ValueError("landing 'host' needs a HostStagingPool for publishes")
+        if config.lands_on_host and publish_pool is None:
+            raise ValueError("landing 'host' needs a HostSlotPool for publishes")
         self._store = store
         self._config = config
         self._resolve = resolver
         self._keys = KeyScheme(config.namespace, layout_fingerprint)
-        self._staging = staging if config.lands_on_host else None
+        self._publish_pool = publish_pool if config.lands_on_host else None
         self._put_batch_size = config.transfer_batch_size
-        """Units per put call. Each unit of a staged put holds a publish-pool slot for the call,
+        """Units per put call. Each unit of a pooled put holds a publish-pool slot for the call,
         so the pool's slot count bounds it too; lookups have no slot and use
         ``transfer_batch_size`` as is."""
-        if self._staging is not None:
-            self._put_batch_size = min(self._put_batch_size, self._staging.num_slots)
+        if self._publish_pool is not None:
+            self._put_batch_size = min(self._put_batch_size, self._publish_pool.num_slots)
         self._lock = threading.Lock()
         self._registrations: list[_Registration] = []
         self._pending: set[tuple[int, int]] = set()
@@ -460,7 +461,7 @@ class BlobStoreBackend:
     def fetch(self, extent: CacheExtent, *, route: Optional[Route] = None) -> Attempt:
         if route is not None:
             raise SubmissionRejected("a store has one source and takes no route")
-        if self._staging is not None:
+        if self._publish_pool is not None:
             raise RuntimeError("a host-landing backend fetches through fetch_to_host")
         return self.submit_delivery(extent, self._fetch_work, self._check_destinations)
 
@@ -525,14 +526,14 @@ class BlobStoreBackend:
     def close(self) -> None:
         """Finish the work in flight, release registrations, then close the store. Idempotent.
 
-        A worker parked for a staging slot is woken and its delivery fails, so this returns.
+        A worker parked for a publish-pool slot is woken and its delivery fails, so this returns.
         """
         with self._lock:
             if self._closed:
                 return
             self._closed = True
-        if self._staging is not None:
-            self._staging.shutdown()
+        if self._publish_pool is not None:
+            self._publish_pool.shutdown()
         self._pool.shutdown(wait=True)
         self._lookups.shutdown(wait=True)
         with self._lock:
@@ -623,7 +624,7 @@ class BlobStoreBackend:
         tasks: Sequence[_Task],
         destinations: Callable[[Sequence[_Task]], Sequence[Sequence[Segment]]],
     ) -> tuple[list[_Task], Optional[str]]:
-        """A whole fetch: ``holds`` then ``get`` per batch of ``transfer_batch_size``, into the
+        """A whole fetch: ``contains`` then ``get`` per batch of ``transfer_batch_size``, into the
         buffers ``destinations`` names. Returns the units read whole, or the first batch's
         reason for failing; counts hits and misses."""
         got: list[_Task] = []
@@ -642,14 +643,15 @@ class BlobStoreBackend:
 
     def _check_destinations(self, tasks: Sequence[_Task]) -> Optional[str]:
         """Whether the store can reach every unit: inside a registration on the device path, or
-        within a publish-pool slot when staging. A unit it cannot reach makes the whole delivery
+        within a publish-pool slot when publishing through the pool. A unit it cannot reach makes
+        the whole delivery
         fail (§6.4 invariant 3d); nothing has escaped yet, but a wiring error is not
         back-pressure, so it is reported through the attempt rather than as
         ``SubmissionRejected``. Caller holds the lock."""
         for task in tasks:
-            if self._staging is not None:
-                if not self._staging.fits(task.total):
-                    return f"unit of {task.total} B exceeds the staging slot"
+            if self._publish_pool is not None:
+                if not self._publish_pool.fits(task.total):
+                    return f"unit of {task.total} B exceeds the publish-pool slot"
             else:
                 bad = self._first_unregistered_segment(task.segments)
                 if bad is not None:
@@ -686,29 +688,29 @@ class BlobStoreBackend:
         self.note_failed_delivery(reason)
         attempt.finish(Failed(reason))
 
-    def _ask_holds(self, keys: Sequence[str]) -> Sequence[bool]:
+    def _ask_contains(self, keys: Sequence[str]) -> Sequence[bool]:
         """Ask the store for ``keys``; an answer of the wrong length is a failed lookup too."""
-        present = self._store.holds(keys)
+        present = self._store.contains(keys)
         if len(present) != len(keys):
-            raise BlobStoreError(f"holds answered {len(present)} of {len(keys)} keys")
+            raise BlobStoreError(f"contains answered {len(present)} of {len(keys)} keys")
         return present
 
     def _with_publish_slots(self, count: int, body: Callable[[list[int]], _T]) -> _T:
         """Run ``body`` with ``count`` publish-pool slots, which go back when it returns or raises.
 
-        Drain contract: ``body`` waits for its own copies (``staging.sync``) before it returns,
+        Drain contract: ``body`` waits for its own copies (``publish_pool.sync``) before it returns,
         so on the normal path the slots are quiet when released. When ``body`` raises, the copies
         are drained here instead: a copy still in flight into a slot someone else then reuses
         would corrupt their delivery, and one out of the caller's memory would break quiescence."""
-        assert self._staging is not None
-        slots = self._staging.acquire(count)
+        assert self._publish_pool is not None
+        slots = self._publish_pool.acquire(count)
         try:
             with _drain_copies_on_error(
-                self._staging, "staging sync failed while unwinding a failed delivery"
+                self._publish_pool, "publish pool sync failed while unwinding a failed delivery"
             ):
                 return body(slots)
         finally:
-            self._staging.release(slots)
+            self._publish_pool.release(slots)
 
     # ---- the work ----
 
@@ -723,11 +725,11 @@ class BlobStoreBackend:
         batch: Sequence[_Task],
         destinations: Callable[[Sequence[_Task]], Sequence[Sequence[Segment]]],
     ) -> tuple[list[_Task], Optional[str]]:
-        """One batch of a fetch: ``holds``, then ``get`` the present units into the buffers
+        """One batch of a fetch: ``contains``, then ``get`` the present units into the buffers
         ``destinations`` names for them. Returns the units read whole, or a reason the batch
         failed; counts hits and misses."""
         try:
-            present = self._ask_holds([task.key for task in batch])
+            present = self._ask_contains([task.key for task in batch])
         except BlobStoreError as exc:
             return [], f"store lookup failed: {exc}"
         hits = [task for task, held in zip(batch, present) if held]
@@ -753,22 +755,22 @@ class BlobStoreBackend:
             # the same answer fails, so the two directions agree).
             return Failed(f"store lookup failed: {exc}")
         served = {task.name for task in present}
-        if self._staging is None:
+        if self._publish_pool is None:
             problem = self._publish_direct(absent, served)
         else:
-            problem = self._publish_staged(attempt, absent, served)
+            problem = self._publish_via_pool(attempt, absent, served)
         if problem is not None:
             return Failed(problem)
         return Delivered(frozenset(served))
 
     def _partition_present(self, tasks: Sequence[_Task]) -> tuple[list[_Task], list[_Task]]:
         """Split ``tasks`` into the units the store lacks and the ones it already holds, asking
-        ``holds`` one batch at a time; counts the present ones. Present units are merged, not
+        ``contains`` one batch at a time; counts the present ones. Present units are merged, not
         rewritten (§6.3 requirement 2). Raises ``BlobStoreError`` when the store cannot answer."""
         absent: list[_Task] = []
         present: list[_Task] = []
         for batch in _batched(tasks, self._config.transfer_batch_size):
-            held = self._ask_holds([task.key for task in batch])
+            held = self._ask_contains([task.key for task in batch])
             for task, is_held in zip(batch, held):
                 (present if is_held else absent).append(task)
         with self._lock:
@@ -785,7 +787,7 @@ class BlobStoreBackend:
             served.update(task.name for task in result.held)
         return None
 
-    def _publish_staged(
+    def _publish_via_pool(
         self, attempt: _StoreAttempt, absent: Sequence[_Task], served: set[bytes]
     ) -> Optional[str]:
         """Write ``absent`` through the publish pool in rounds of the whole slot pool, gathering
@@ -793,13 +795,13 @@ class BlobStoreBackend:
         before its first remote write (design §10.1); a larger extent is quiet only after its
         last round's gather. Adds to ``served`` what the store took; returns the first round's
         reason for failing, if any."""
-        assert self._staging is not None
-        rounds = list(_batched(absent, self._staging.num_slots))
+        assert self._publish_pool is not None
+        rounds = list(_batched(absent, self._publish_pool.num_slots))
         for index, group in enumerate(rounds):
             last = index == len(rounds) - 1
             problem = self._with_publish_slots(
                 len(group),
-                lambda slots, group=group, last=last: self._staged_put(
+                lambda slots, group=group, last=last: self._pooled_put(
                     attempt, group, slots, last, served
                 ),
             )
@@ -807,7 +809,7 @@ class BlobStoreBackend:
                 return problem
         return None
 
-    def _staged_put(
+    def _pooled_put(
         self,
         attempt: _StoreAttempt,
         group: Sequence[_Task],
@@ -815,13 +817,13 @@ class BlobStoreBackend:
         last: bool,
         served: set[bytes],
     ) -> Optional[str]:
-        """One round of a staged publish: gather ``group`` into ``slots``, wait for the copies
+        """One round of a pooled publish: gather ``group`` into ``slots``, wait for the copies
         (the caller's pages are quiet after the last round), then put from the slots batch by
         batch, adding to ``served`` what the store took."""
-        assert self._staging is not None
+        assert self._publish_pool is not None
         for slot, task in zip(slots, group):
-            self._staging.gather(slot, task.segments)
-        self._staging.sync()
+            self._publish_pool.gather(slot, task.segments)
+        self._publish_pool.sync()
         if last:
             attempt.quiet.set()
         for batch, batch_slots in zip(
@@ -830,7 +832,7 @@ class BlobStoreBackend:
             result = self._put_one_batch(
                 batch,
                 [
-                    [(self._staging.slot_address(slot), task.total)]
+                    [(self._publish_pool.slot_address(slot), task.total)]
                     for slot, task in zip(batch_slots, batch)
                 ],
             )
@@ -864,7 +866,7 @@ class BlobStoreBackend:
         raced: list[_Task] = []
         if declined:
             try:
-                present = self._ask_holds([task.key for task in declined])
+                present = self._ask_contains([task.key for task in declined])
             except BlobStoreError as exc:
                 return _PutResult(stored, f"store lookup failed after a declined put: {exc}")
             raced = [task for task, held in zip(declined, present) if held]
@@ -880,14 +882,14 @@ class BlobStoreBackend:
             self.counters.publish_declined += len(declined) - len(raced)
         return _PutResult(stored + raced, None)
 
-    def _ask_holds_with_retry(self, keys: Sequence[str]) -> Sequence[bool]:
-        """``_ask_holds``, asked again up to ``LOOKUP_RETRIES`` times after a ``BlobStoreError``.
+    def _ask_contains_with_retry(self, keys: Sequence[str]) -> Sequence[bool]:
+        """``_ask_contains``, asked again up to ``LOOKUP_RETRIES`` times after a ``BlobStoreError``.
 
         The last try's error propagates; any other exception propagates at once.
         """
         for tried in range(1, LOOKUP_RETRIES + 1):
             try:
-                return self._ask_holds(keys)
+                return self._ask_contains(keys)
             except BlobStoreError as exc:
                 logger.debug(
                     "blob store [%s]: lookup try %d of %d failed, retrying: %s",
@@ -897,13 +899,13 @@ class BlobStoreBackend:
                     exc,
                 )
                 time.sleep(LOOKUP_RETRY_DELAY_S)
-        return self._ask_holds(keys)
+        return self._ask_contains(keys)
 
     def _lookup(self, entry: _Probe, units: Sequence[bytes]) -> None:
         held: set[bytes] = set()
         try:
             for batch in _batched(units, self._config.transfer_batch_size):
-                present = self._ask_holds_with_retry([self._keys.key(u) for u in batch])
+                present = self._ask_contains_with_retry([self._keys.key(u) for u in batch])
                 held.update(u for u, is_held in zip(batch, present) if is_held)
             with self._lock:
                 self.counters.probe_hits += len(held)

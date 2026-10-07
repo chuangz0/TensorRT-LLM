@@ -3,7 +3,7 @@
 """``N`` real ``KVTransferHooks`` on ``N`` threads, one per TP rank, whose coordinators meet in the
 ``FakeDistGroup`` collective through the real ``EngineCollective``.
 
-Each round every rank runs what the loop runs: ``advance_round``, ``plan_fetch``, the scheduler's
+Each round every rank runs what the loop runs: ``advance_round``, ``fetch_answer``, the scheduler's
 page reservation, ``launch_reserved_fetches``; then delivers its own store's attempts; later
 ``publish_committed_blocks``. Asserted: the protocol is symmetric (one ``allgather`` per round
 with the same payload on every rank), every rank lands once, TP shards publish the same unit
@@ -23,7 +23,9 @@ import pytest
 from engine_fakes import make_request
 from multi_rank_fakes import CLOSE_TIMEOUT_S, FakeDistGroup, RankRig
 
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority
+from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.engine_protocols import (
+    PlanAuthority,
+)
 from tensorrt_llm._torch.disaggregation.remote_cache import DEFER
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 
@@ -86,7 +88,7 @@ def test_tp_ranks_land_once_with_one_gather_per_round_and_distinct_shard_tags(wo
         assert request.context_remaining_length == 0  # ... and prefill ran to the end
         assert rig.gathers() == ["allgather"] * 3
         assert rig.dist.calls == rigs[0].dist.calls  # the same word from every rank, every round
-        assert [r["state"] for r in rig.records()] == ["LANDED"]  # the publish is released
+        assert [r["state"] for r in rig.records()] == ["DELIVERED"]  # the publish is released
         assert rig.publisher.count("publish") == 1 and rig.publisher.count("quiesce") == 1
     # Every shard publishes the same unit names; only the shard tag in the layout fingerprint
     # keeps their store entries apart.
@@ -111,7 +113,7 @@ def test_a_rank_without_pages_holds_the_landing_until_the_timeout_restarts_every
     assert [rig.effects.unparks for rig in rigs] == [0, 0]
     assert [r["state"] for r in launched.records()] == ["IN_FLIGHT"]
     assert [r["state"] for r in laggard.records()] == ["PLANNED"]
-    assert laggard.record(1)["peer_launched_at"] == 1001.0
+    assert laggard.record(1)["peer_launch_seen_at"] == 1001.0
 
     clock["t"] += UNLAUNCHED_TIMEOUT_S - 0.1
     group.run(one_round)  # still within the budget
@@ -124,7 +126,7 @@ def test_a_rank_without_pages_holds_the_landing_until_the_timeout_restarts_every
     launched.executor._revert_ctx_alloc.assert_called_once()
     assert laggard.effects.give_backs == 0
     for rig, request in zip(rigs, requests):
-        assert rig.hooks.plan_fetch(request) is DEFER
+        assert rig.hooks.fetch_answer(request) is DEFER
         assert request.state == LlmRequestState.CONTEXT_INIT
 
     laggard.kv.reserve_answer = True
@@ -219,7 +221,7 @@ def test_pp_follower_without_pages_launches_a_round_late_and_both_land_together(
             follower.schedule_round([requests[1]], adopt=stage0.adopt)  # reserves and launches
             after_round[1].wait()
             assert [owner.effects.unparks, follower.effects.unparks] == [0, 0]
-            assert follower.record(1)["peer_launched_at"] is None  # cleared by its launch
+            assert follower.record(1)["peer_launch_seen_at"] is None  # cleared by its launch
             follower.deliver_all()
             follower.schedule_round([requests[1]], adopt=stage0.adopt)
             after_round[2].wait()
@@ -254,8 +256,8 @@ def test_pp_follower_without_an_answer_counts_the_candidate_as_deferred(monkeypa
     group.run(engine_loop)
 
     assert stage0.sent == [[]]
-    assert owner.hooks.plan_fetch(requests[0]) is DEFER
-    assert follower.hooks.plan_fetch(requests[1]) is DEFER
+    assert owner.hooks.fetch_answer(requests[0]) is DEFER
+    assert follower.hooks.fetch_answer(requests[1]) is DEFER
     # Both ranks count the request as deferred: an idle pass yields on each, although neither
     # coordinator has a record (the lookup is the only thing that can move).
     for rig in (owner, follower):

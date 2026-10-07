@@ -29,12 +29,12 @@ from tensorrt_llm._torch.disaggregation.remote_cache import (
     FetchSource,
     Planner,
     _stale_range,
-    merge,
     required_ordinals,
-    servable_blocks,
+    servable_block_end,
+    served_token_end,
 )
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
-from tensorrt_llm._torch.disaggregation.resource.kv_v2_reader import KVv2ResourceReader
+from tensorrt_llm._torch.disaggregation.resource.kv_v2_view import KVv2ResourceView
 from tensorrt_llm._torch.disaggregation.resource.region import (
     KVv2RegionResolver,
     layout_fingerprint,
@@ -120,7 +120,7 @@ def manager():
 
 @pytest.fixture
 def reader(manager):
-    return KVv2ResourceReader(manager, build_page_table_from_manager(manager))
+    return KVv2ResourceView(manager, build_page_table_from_manager(manager))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -273,7 +273,7 @@ class TestPrepareDisaggGenInitTokenEnd:
 
 
 # ---------------------------------------------------------------------------------------------
-# fetch_extent: nameable blocks minus the local reuse prefix
+# fetch_extent_and_committed: nameable blocks minus the local reuse prefix
 # ---------------------------------------------------------------------------------------------
 
 
@@ -295,13 +295,13 @@ class TestFetchExtent:
         answer = frozenset(spec.tag + keys[o] for o in range(6))
         plan = planner.decide(view, {"store": answer}, now=0.0)
         assert isinstance(plan, FetchPlan)
-        assert plan.token_end == 6 * TPB and plan.reuse_end == 2
+        assert plan.token_end == 6 * TPB and plan.reuse_end_blocks == 2
         assert [g.ordinals for g in plan.group_plans] == [(2, 3, 4, 5)]
 
         # The scheduler's reservation, then the extent the coordinator launches.
         assert manager.reserve_transfer_pages(request, plan.token_end)
         assert manager.get_history_length(request) == plan.token_end
-        extent, committed = reader.fetch_extent(view, plan)
+        extent, committed = reader.fetch_extent_and_committed(view, plan)
 
         assert extent.name == b"fetch:2" and extent.is_last is True
         assert len(extent.units) == 6 - 2 == 4
@@ -327,7 +327,7 @@ class TestFetchExtent:
         plan = planner.decide(view, {"store": frozenset(units)}, now=0.0)
         assert plan.token_end == NAMEABLE * TPB == 224
         assert manager.reserve_transfer_pages(request, plan.token_end)
-        extent, committed = reader.fetch_extent(view, plan)
+        extent, committed = reader.fetch_extent_and_committed(view, plan)
         assert len(extent.units) == NAMEABLE
         assert frozenset(u.name for u in extent.units) == frozenset(units)
 
@@ -339,7 +339,7 @@ class TestFetchExtent:
         _, units = planner.probe_query(view)
         plan = planner.decide(view, {"store": frozenset(units)}, now=0.0)
         assert manager.reserve_transfer_pages(request, 3 * TPB)  # fewer pages than planned
-        extent, committed = reader.fetch_extent(view, plan)
+        extent, committed = reader.fetch_extent_and_committed(view, plan)
         assert [u.name for u in extent.units] == [
             reader.group_specs()[0].tag + k for k in reader.block_keys(view)[:3]
         ]
@@ -360,7 +360,7 @@ class TestFetchExtent:
         planner = Planner([FetchSource("store", store, None)], reader, TPB)
         _, units = planner.probe_query(view)
         plan = planner.decide(view, {"store": frozenset(units)}, now=0.0)
-        assert plan.reuse_end == 0 and [g.ordinals for g in plan.group_plans] == [
+        assert plan.reuse_end_blocks == 0 and [g.ordinals for g in plan.group_plans] == [
             tuple(range(NAMEABLE))
         ]
 
@@ -369,11 +369,16 @@ class TestFetchExtent:
         assert manager.reserve_transfer_pages(request, plan.token_end)
         assert manager.kv_cache_map[2].num_committed_tokens == 2 * TPB
 
-        extent, committed = reader.fetch_extent(view, plan)
+        extent, committed = reader.fetch_extent_and_committed(view, plan)
         assert committed == frozenset(spec.tag + keys[o] for o in range(2))
         assert [u.name for u in extent.units] == [spec.tag + keys[o] for o in range(2, NAMEABLE)]
-        assert merge(plan, frozenset(u.name for u in extent.units) | committed) == plan.token_end
-        assert merge(plan, frozenset(u.name for u in extent.units)) == 0  # without the names
+        assert (
+            served_token_end(plan, frozenset(u.name for u in extent.units) | committed)
+            == plan.token_end
+        )
+        assert (
+            served_token_end(plan, frozenset(u.name for u in extent.units)) == 0
+        )  # without the names
 
 
 # ---------------------------------------------------------------------------------------------
@@ -428,7 +433,7 @@ class TestPublishDescription:
         assert spec.local_group == 0 and spec.sink_blocks == 0
         assert len(spec.tag) == 8
         assert reader.tokens_per_block == TPB
-        assert reader.gen_first_ready(None) is True
+        assert reader.generation_first_ready(None) is True
 
 
 # ---------------------------------------------------------------------------------------------
@@ -659,7 +664,7 @@ def vswa_manager():
 
 @pytest.fixture
 def vswa_reader(vswa_manager):
-    return KVv2ResourceReader(vswa_manager, build_page_table_from_manager(vswa_manager))
+    return KVv2ResourceView(vswa_manager, build_page_table_from_manager(vswa_manager))
 
 
 def groups_of(reader):
@@ -703,7 +708,7 @@ class TestVariableSlidingWindow:
         _, units = planner.probe_query(view)
         assert len(units) == 2 * NAMEABLE  # both groups, every nameable block
         plan = planner.decide(view, {"store": frozenset(units)}, now=0.0)
-        assert isinstance(plan, FetchPlan) and plan.token_end == B and plan.reuse_end == 0
+        assert isinstance(plan, FetchPlan) and plan.token_end == B and plan.reuse_end_blocks == 0
         expected = {
             windowed.local_group: tuple(sorted(required_ordinals(windowed, B, 0, TPB))),
             full.local_group: tuple(range(NAMEABLE)),
@@ -713,7 +718,7 @@ class TestVariableSlidingWindow:
 
         assert vswa_manager.reserve_transfer_pages(request, plan.token_end)
         assert vswa_manager.get_history_length(request) == B
-        extent, committed = vswa_reader.fetch_extent(view, plan)
+        extent, committed = vswa_reader.fetch_extent_and_committed(view, plan)
         assert committed == frozenset()
         # Every required ordinal has a page: the reservation skipped exactly the stale range.
         assert len(extent.units) == sum(len(g.ordinals) for g in plan.group_plans) == 9
@@ -778,8 +783,9 @@ class TestVariableSlidingWindow:
         _, units = planner.probe_query(view)
         keys = vswa_reader.block_keys(view)
         assert (
-            servable_blocks(frozenset(units), keys, vswa_reader.group_specs(), NAMEABLE, TPB) == 7
+            servable_block_end(frozenset(units), keys, vswa_reader.group_specs(), NAMEABLE, TPB)
+            == 7
         )
         plan = planner.decide(view, {"store": frozenset(units)}, now=0.0)
-        assert plan.token_end == B and plan.reuse_end == 7
+        assert plan.token_end == B and plan.reuse_end_blocks == 7
         assert all(g.ordinals == () for g in plan.group_plans)

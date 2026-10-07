@@ -45,14 +45,13 @@ offered to anything that addresses by content.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
-from typing import FrozenSet, Iterable, List, Optional, Sequence, Tuple
+from typing import FrozenSet, List, Optional, Sequence
 
 import numpy as np
 
 from ..base.cache_backend import Unit
 
-__all__ = ["GROUP_TAG_BYTES", "GroupNaming", "group_tag", "units_for_extent", "units_for_group"]
+__all__ = ["GROUP_TAG_BYTES", "group_tag", "units_for_group"]
 
 GROUP_TAG_BYTES = 8
 """Width of the group tag prefixed to every unit name.
@@ -133,45 +132,3 @@ def units_for_group(
         seen.add(name)
         units.append(Unit(name=name, local_group=local_group, local=region))
     return units
-
-
-@dataclass(frozen=True)
-class GroupNaming:
-    """One layer group's contribution to an extent: which ids, and which blocks they stand for.
-
-    ``local_group`` is this rank's ordinal for the group and is recorded on each unit but never
-    sent; ``tag`` is the part both sides compute alike.
-    """
-
-    local_group: int
-    tag: bytes
-    region_ids: np.ndarray
-    ordinals: Sequence[int]
-
-
-def units_for_extent(
-    *,
-    block_keys: Sequence[bytes],
-    groups: Iterable[GroupNaming],
-) -> Tuple[Unit, ...]:
-    """Every unit of one extent, in layer-group order.
-
-    Groups do not collide with each other by construction -- the tag is inside every name and two
-    groups with the same tag would be the same group -- so de-duplication stays within a group.
-
-    A group that contributes nothing contributes no units. That is not the same as a group that
-    does not exist, and nothing here records the difference: the placement description alongside
-    keeps one entry per group, and it is what the transfer is driven by.
-    """
-    units: List[Unit] = []
-    for group in groups:
-        units.extend(
-            units_for_group(
-                block_keys=block_keys,
-                region_ids=group.region_ids,
-                ordinals=group.ordinals,
-                tag=group.tag,
-                local_group=group.local_group,
-            )
-        )
-    return tuple(units)

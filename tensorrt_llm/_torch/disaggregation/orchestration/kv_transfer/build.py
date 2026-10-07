@@ -25,10 +25,11 @@ from typing import Sequence
 
 from ...backends.config import KVTransferConfig
 from ...backends.registry import BackendHandle
-from ...base.views import ResourceReader
+from ...base.capabilities import LandsOnHost
+from ...base.views import ResourceView
 from ...remote_cache import FetchSource, Planner
 from .coordinator import KVTransferCoordinator
-from .interfaces import Collective, EngineQueue, KVTransferEffects, LandsOnHost, PlanAuthority
+from .engine_protocols import Collective, EngineQueue, KVTransferEffects, PlanAuthority
 
 __all__ = ["build_coordinator"]
 
@@ -36,12 +37,12 @@ __all__ = ["build_coordinator"]
 def build_coordinator(
     config: KVTransferConfig,
     backends: Sequence[BackendHandle],
-    reader: ResourceReader,
+    reader: ResourceView,
     effects: KVTransferEffects,
     queue: EngineQueue,
     dist: Collective,
     *,
-    plan_authority: PlanAuthority = PlanAuthority.VOTED,
+    plan_authority: PlanAuthority = PlanAuthority.ALL_RANKS,
 ) -> KVTransferCoordinator:
     """One ``FetchSource`` per backend with a fetch role, in config (priority) order; one
     publisher per backend with a publish role; the config's timeouts on the planner and the

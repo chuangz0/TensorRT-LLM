@@ -17,7 +17,7 @@ from disaggregation.base.cache_backend import (  # noqa: E402
     RegistersPools,
     Unit,
 )
-from disaggregation.orchestration.kv_transfer.interfaces import (  # noqa: E402
+from disaggregation.base.capabilities import (  # noqa: E402
     CarriesAux,
     Landing,
     LandsOnHost,
@@ -111,8 +111,8 @@ def test_fake_request_has_the_request_view_surface():
     for attr in (
         "py_request_id",
         "prompt_len",
-        "is_gen_init",
-        "is_gen_first_context",
+        "is_disagg_generation_init",
+        "is_generation_first_context",
         "route_hints",
     ):
         assert hasattr(req, attr)
@@ -125,7 +125,7 @@ def test_lands_on_host_and_landing_are_non_empty_and_disjoint_from_fetches():
     assert not isinstance(host, Fetches)  # no ``fetch``, no ``open_route``
     assert not isinstance(FakeFetches(), LandsOnHost)  # no ``fetch_to_host``
     assert not isinstance(object(), LandsOnHost)
-    landing = host.fetch_to_host(b"fetch:1", [b"u"])
+    landing = host.fetch_to_host([b"u"])
     assert isinstance(landing, Landing)
     assert not isinstance(object(), Landing)
     assert isinstance(landing.place(CacheExtent(name=b"x", units=(), is_last=True)), Attempt)
@@ -155,18 +155,18 @@ def test_fakes_refuse_quiesce_before_outcome():
         publisher.quiesce([pending])
 
     host = FakeLandsOnHost(strict_quiesce=True)
-    placement = host.fetch_to_host(b"n", [b"u"]).place(one_unit_extent())
+    placement = host.fetch_to_host([b"u"]).place(one_unit_extent())
     with pytest.raises(AssertionError, match="live attempt"):
         host.quiesce([placement])
 
 
-def test_fake_landing_refuses_a_placement_after_release():
-    """The coordinator forgets a landing when it releases it; a placement on a released landing
+def test_fake_landing_refuses_a_placement_after_close():
+    """The coordinator forgets a landing when it closes it; a placement on a closed landing
     is a harness invariant broken, and the fake fails the test rather than answering."""
     host = FakeLandsOnHost()
-    landing = host.fetch_to_host(b"n", [b"u"])
-    landing.release()
-    with pytest.raises(AssertionError, match="after release"):
+    landing = host.fetch_to_host([b"u"])
+    landing.close()
+    with pytest.raises(AssertionError, match="after close"):
         landing.place(one_unit_extent())
 
 
@@ -182,6 +182,6 @@ def test_fakes_deliver_an_empty_extent_at_once_without_consuming_a_script():
 
     host = FakeLandsOnHost()
     host.script_place(Delivered(frozenset({b"u"})))
-    landing = host.fetch_to_host(b"n", [b"u"])
+    landing = host.fetch_to_host([b"u"])
     assert landing.place(empty).poll() == Delivered(frozenset())
     assert landing.place(one_unit_extent()).poll() == Delivered(frozenset({b"u"}))

@@ -15,23 +15,22 @@
 """Source policy and the merge rule (design §6.3, §7.2).
 
 The planner is the only place that reads request content in order to *decide*; building extents
-and chunks belongs to ``resource/``. ``servable_blocks`` (how far a store answer can take a request)
-and ``merge`` (how far a delivery did take it) are pure functions of names and sets, so both rules
-can be tested with no engine at all.
+and chunks belongs to ``resource/``. ``servable_block_end`` (how far a store answer can take a
+request) and ``served_token_end`` (how far a delivery did take it) are pure functions of names
+and sets, so both rules can be tested with no engine at all.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import chain
-from typing import TYPE_CHECKING, Iterator, Mapping, NamedTuple, Sequence
+from typing import Iterator, Mapping, NamedTuple, Sequence
 
+# ``backend``: Chunk/CacheKind only; ``cache_backend``: the contract.
 from .base.backend import CacheKind
 from .base.cache_backend import Fetches
-from .base.views import GroupSpec, RequestView, ResourceReader
-
-if TYPE_CHECKING:
-    from .orchestration.kv_transfer.interfaces import LandsOnHost
+from .base.capabilities import LandsOnHost
+from .base.views import GroupSpec, RequestView, ResourceView
 
 __all__ = [
     "DEFER",
@@ -40,9 +39,9 @@ __all__ = [
     "FetchSource",
     "GroupPlan",
     "Planner",
-    "merge",
+    "served_token_end",
     "required_ordinals",
-    "servable_blocks",
+    "servable_block_end",
     "unit_names",
 ]
 
@@ -70,7 +69,7 @@ class FetchSource:
 
     Attributes:
         name: Stable identifier; recorded on plans (``FetchPlan.source``) and attempts
-            (``AttemptRecord.source``), and what the coordinator maps back to the backend for
+            (``AttemptRecord.backend_name``), and what the coordinator maps back to the backend for
             ``quiesce``. The ranks agree on records by ``(request_id, direction)``, not by it.
         backend: The backend itself: one that writes the caller's pages directly (``Fetches``)
             or one that lands in its own host memory first (``LandsOnHost``; a store, so
@@ -102,10 +101,11 @@ class FetchPlan:
         source: ``FetchSource.name``.
         hint: ``open_route`` input; only for a worker source.
         no_local_fallback: True for gen-init: a failure can only fail the request.
-        group_plans: The per-group asks with their specs; what ``merge`` and ``fetch_extent``
-            read. Unit names are ``spec.tag + block_keys[o]`` for every ordinal ``o`` asked.
+        group_plans: The per-group asks with their specs; what ``served_token_end`` and
+            ``fetch_extent_and_committed`` read. Unit names are ``spec.tag + block_keys[o]`` for
+            every ordinal ``o`` asked.
         block_keys: One key per full prompt block, by ordinal.
-        reuse_end: Blocks the local radix tree already serves; nothing below it is asked for.
+        reuse_end_blocks: Blocks the local radix tree already serves; nothing below it is asked for.
         tokens_per_block: ``tpb``.
     """
 
@@ -115,14 +115,14 @@ class FetchPlan:
     no_local_fallback: bool
     group_plans: tuple[GroupPlan, ...]
     block_keys: tuple[bytes, ...]
-    reuse_end: int
+    reuse_end_blocks: int
     tokens_per_block: int
 
 
 def unit_names(plan: FetchPlan) -> tuple[bytes, ...]:
     """Every unit name the plan asks for, group by group and ordinal by ordinal: what a
     ``LandsOnHost`` backend is handed to land, and what a full delivery serves. An ordinal past
-    the last key has no name and is skipped, as ``fetch_extent`` skips it."""
+    the last key has no name and is skipped, as ``fetch_extent_and_committed`` skips it."""
     keys = plan.block_keys
     return tuple(
         group.spec.tag + keys[o]
@@ -147,36 +147,41 @@ def _stale_range(spec: GroupSpec, history: int, tpb: int) -> tuple[int, int]:
     return start, max(start, (history + 1 - spec.window_size) // tpb)
 
 
-def _required_ranges(spec: GroupSpec, history: int, reuse_end: int, tpb: int) -> tuple[range, ...]:
+def _required_ranges(
+    spec: GroupSpec, history: int, reuse_end_blocks: int, tpb: int
+) -> tuple[range, ...]:
     """``required_ordinals`` as at most two non-empty ranges: the sink blocks above the local
-    prefix, then the live window above it (full attention: one range, ``[reuse_end, full)``).
-    ``servable_blocks`` checks each range with one prefix-sum lookup instead of a set walk."""
+    prefix, then the live window above it (full attention: one range,
+    ``[reuse_end_blocks, full)``). ``servable_block_end`` checks each range with one prefix-sum
+    lookup instead of a set walk."""
     full = history // tpb
     if spec.kind is CacheKind.STATE:
-        if history % tpb != 0 or full <= reuse_end:
+        if history % tpb != 0 or full <= reuse_end_blocks:
             return ()
         return (range(full - 1, full),)
     beg, end = _stale_range(spec, history, tpb)
-    ranges = (range(reuse_end, min(beg, full)), range(max(end, reuse_end), full))
+    ranges = (range(reuse_end_blocks, min(beg, full)), range(max(end, reuse_end_blocks), full))
     return tuple(r for r in ranges if len(r) > 0)
 
 
-def required_ordinals(spec: GroupSpec, history: int, reuse_end: int, tpb: int) -> frozenset[int]:
+def required_ordinals(
+    spec: GroupSpec, history: int, reuse_end_blocks: int, tpb: int
+) -> frozenset[int]:
     """Block ordinals ``spec`` must have fetched for the request to stand at ``history``.
 
-    Full attention: ``[reuse_end, full)``. Windowed: the sink blocks plus the live window, minus
-    what is local. State: exactly the snapshot at ``history`` when it is a block boundary past
-    the local prefix; otherwise nothing, because a partial tail's state has no name and moves by
-    position.
+    Full attention: ``[reuse_end_blocks, full)``. Windowed: the sink blocks plus the live window,
+    minus what is local. State: exactly the snapshot at ``history`` when it is a block boundary
+    past the local prefix; otherwise nothing, because a partial tail's state has no name and
+    moves by position.
     """
-    return frozenset(chain.from_iterable(_required_ranges(spec, history, reuse_end, tpb)))
+    return frozenset(chain.from_iterable(_required_ranges(spec, history, reuse_end_blocks, tpb)))
 
 
 def _required_names(plan: FetchPlan, group: GroupPlan, history: int) -> frozenset[bytes]:
     """Unit names ``group`` needs at ``history``. An ordinal past the last key is skipped, exactly
     as ``Planner._build`` and ``naming.units_for_group`` skip it: it has no name and moves by
     position, so nothing named can be waited for."""
-    ordinals = required_ordinals(group.spec, history, plan.reuse_end, plan.tokens_per_block)
+    ordinals = required_ordinals(group.spec, history, plan.reuse_end_blocks, plan.tokens_per_block)
     return frozenset(
         group.spec.tag + plan.block_keys[o] for o in ordinals if o < len(plan.block_keys)
     )
@@ -185,7 +190,7 @@ def _required_names(plan: FetchPlan, group: GroupPlan, history: int) -> frozense
 def _boundaries_down(plan: FetchPlan) -> Iterator[int]:
     """``token_end`` first, then every block boundary below it down to the local prefix."""
     tpb = plan.tokens_per_block
-    floor = plan.reuse_end * tpb
+    floor = plan.reuse_end_blocks * tpb
     b = plan.token_end
     while b >= floor:
         yield b
@@ -194,7 +199,9 @@ def _boundaries_down(plan: FetchPlan) -> Iterator[int]:
         b = (b - 1) // tpb * tpb
 
 
-def _merge(plan: FetchPlan, served: frozenset[bytes], groups: Sequence[GroupPlan]) -> int:
+def _served_token_end(
+    plan: FetchPlan, served: frozenset[bytes], groups: Sequence[GroupPlan]
+) -> int:
     for b in _boundaries_down(plan):
         ok = True
         for group in groups:
@@ -203,59 +210,60 @@ def _merge(plan: FetchPlan, served: frozenset[bytes], groups: Sequence[GroupPlan
                 break
         if ok:
             return b
-    # Reached only by a plan whose ``reuse_end`` lies above ``token_end``, which ``_build`` never
-    # makes: no boundary was walked, nothing was asked for, and B is the local prefix end.
-    return plan.reuse_end * plan.tokens_per_block
+    # Reached only by a plan whose ``reuse_end_blocks`` lies above ``token_end``, which ``_build``
+    # never makes: no boundary was walked, nothing was asked for, and B is the local prefix end.
+    return plan.reuse_end_blocks * plan.tokens_per_block
 
 
-def merge(plan: FetchPlan, served: frozenset[bytes]) -> int:
+def served_token_end(plan: FetchPlan, served: frozenset[bytes]) -> int:
     """The largest B such that, with B as the sequence length, every group's still-needed units
     are in ``served`` (design §6.3). Never below the local prefix end.
 
-    ``merge`` asks which of the units the plan *asked for* arrived: it trims below
-    ``plan.reuse_end`` and walks down from ``plan.token_end``. ``servable_blocks`` asks the other
-    question, which target a probe answer over every nameable block can serve. Under a windowed
-    group any block missing at or above ``stale_end(token_end)`` drags B down to the reuse floor:
-    the window blocks a lower boundary needs were stale at ``token_end``, so they were never
-    asked for and cannot be in ``served``.
+    ``served_token_end`` asks which of the units the plan *asked for* arrived: it trims below
+    ``plan.reuse_end_blocks`` and walks down from ``plan.token_end``. ``servable_block_end`` asks
+    the other question, which target a probe answer over every nameable block can serve. Under a
+    windowed group any block missing at or above ``stale_end(token_end)`` drags B down to the
+    reuse floor: the window blocks a lower boundary needs were stale at ``token_end``, so they
+    were never asked for and cannot be in ``served``.
     """
-    return _merge(plan, served, plan.group_plans)
+    return _served_token_end(plan, served, plan.group_plans)
 
 
-def servable_blocks(
+def servable_block_end(
     answer: frozenset[bytes],
     keys: Sequence[bytes],
     specs: Sequence[GroupSpec],
-    nameable: int,
+    nameable_blocks: int,
     tpb: int,
 ) -> int:
-    """The largest ``e`` in ``[1, nameable]`` such that every paged group has each block it needs
-    at ``e * tpb`` in ``answer``; 0 when there is none (or no paged group).
+    """The largest ``e`` in ``[1, nameable_blocks]`` such that every paged group has each block it
+    needs at ``e * tpb`` in ``answer``; 0 when there is none (or no paged group).
 
-    Computed with ``reuse_end = 0``: the decision must read only inputs every rank shares, and the
-    local reuse depth is per rank. A block the store lacks but the local tree holds therefore
-    still counts as missing, which is conservative (everything in the store implies everything
-    above any local prefix is in the store). State groups are ignored: the assembly guard refuses
-    them, and their snapshots are never published. ``merge`` answers the complementary question
-    about a plan that was fetched; see its docstring for how the two differ on one missing block.
+    Computed with ``reuse_end_blocks = 0``: the decision must read only inputs every rank shares,
+    and the local reuse depth is per rank. A block the store lacks but the local tree holds
+    therefore still counts as missing, which is conservative (everything in the store implies
+    everything above any local prefix is in the store). State groups are ignored: the assembly
+    guard refuses them, and their snapshots are never published. ``served_token_end`` answers
+    the complementary question about a plan that was fetched; see its docstring for how the two
+    differ on one missing block.
 
-    ``O(groups * nameable)``: one prefix sum of held blocks per group, then each candidate ``e``
-    checks its ranges by subtraction instead of rebuilding an ordinal set per ``e``.
+    ``O(groups * nameable_blocks)``: one prefix sum of held blocks per group, then each candidate
+    ``e`` checks its ranges by subtraction instead of rebuilding an ordinal set per ``e``.
 
-    A block past the last key has no name and cannot be held, so ``nameable`` is clamped to
-    ``len(keys)`` rather than indexing past it.
+    A block past the last key has no name and cannot be held, so ``nameable_blocks`` is clamped
+    to ``len(keys)`` rather than indexing past it.
     """
     paged = [s for s in specs if s.kind is CacheKind.PAGED]
-    nameable = min(nameable, len(keys))
-    if not paged or nameable <= 0:
+    nameable_blocks = min(nameable_blocks, len(keys))
+    if not paged or nameable_blocks <= 0:
         return 0
     held_below = []
     for spec in paged:
-        counts = [0] * (nameable + 1)
-        for o in range(nameable):
+        counts = [0] * (nameable_blocks + 1)
+        for o in range(nameable_blocks):
             counts[o + 1] = counts[o] + (spec.tag + keys[o] in answer)
         held_below.append(counts)
-    for e in range(nameable, 0, -1):
+    for e in range(nameable_blocks, 0, -1):
         if all(
             counts[r.stop] - counts[r.start] == len(r)
             for spec, counts in zip(paged, held_below)
@@ -273,7 +281,7 @@ class _SourceChoice(NamedTuple):
     source: FetchSource | None
     hint: Mapping[str, object] | None
     token_end: int
-    pending: bool
+    probe_pending: bool
 
 
 class Planner:
@@ -292,7 +300,7 @@ class Planner:
     def __init__(
         self,
         sources: Sequence[FetchSource],
-        reader: ResourceReader,
+        reader: ResourceView,
         tokens_per_block: int,
         *,
         probe_timeout_s: float | None = None,
@@ -304,129 +312,138 @@ class Planner:
         self._first_deferred_at: dict[int, float] = {}
         """Per deferred request: the ``now`` of its first deferral."""
 
-    def probe_query(self, req: RequestView) -> tuple[bytes, tuple[bytes, ...]] | None:
+    def probe_query(self, request: RequestView) -> tuple[bytes, tuple[bytes, ...]] | None:
         """``(name, unit names)`` to ask a store about, or ``None`` if the request has nothing
         nameable to fetch. Rank-independent: it starts at block 0, not at the local prefix.
 
         Every group is asked about every nameable block, not only the blocks live at the largest
-        target: ``servable_blocks`` may settle on a smaller target whose window needs blocks that
+        target: ``servable_block_end`` may settle on a smaller target whose window needs blocks that
         are stale at the largest one, and one probe is one RPC however many names it carries.
         """
-        if req.is_gen_init:
+        if request.is_disagg_generation_init:
             return None
-        nameable = (req.prompt_len - 1) // self._tpb
-        keys = self._reader.block_keys(req)
-        if nameable <= 0 or nameable > len(keys):
+        nameable_blocks = (request.prompt_len - 1) // self._tpb
+        keys = self._reader.block_keys(request)
+        if nameable_blocks <= 0 or nameable_blocks > len(keys):
             return None
         specs = self._reader.group_specs()
-        units = tuple(s.tag + keys[o] for s in specs for o in range(nameable))
-        return keys[nameable - 1], units
+        units = tuple(s.tag + keys[o] for s in specs for o in range(nameable_blocks))
+        return keys[nameable_blocks - 1], units
 
-    def forget(self, req_id: int) -> None:
+    def forget(self, request_id: int) -> None:
         """Drop per-request planning state once a request is decided or gone."""
-        self._first_deferred_at.pop(req_id, None)
+        self._first_deferred_at.pop(request_id, None)
 
-    def _may_still_wait_for_probe(self, req_id: int, now: float) -> bool:
-        """Whether ``req_id`` may be deferred once more for an unanswered probe.
+    def _may_still_wait_for_probe(self, request_id: int, now: float) -> bool:
+        """Whether ``request_id`` may be deferred once more for an unanswered probe.
 
         The first deferral only starts the clock; the wait ends once ``probe_timeout_s`` has
         passed since then, so a zero budget allows exactly one deferral.
         """
-        first = self._first_deferred_at.get(req_id)
+        first = self._first_deferred_at.get(request_id)
         if first is None:
-            self._first_deferred_at[req_id] = now
+            self._first_deferred_at[request_id] = now
             return True
         return self._probe_timeout_s is None or now - first < self._probe_timeout_s
 
     def decide(
         self,
-        req: RequestView,
+        request: RequestView,
         probe_answers: Mapping[str, frozenset[bytes] | None],
         *,
         now: float,
-        retry_hint: int | None = None,
+        retry_cap: int | None = None,
     ) -> FetchPlan | None | Defer:
         """The decision table of design §7.2 for one candidate.
 
         Args:
-            req: The candidate.
+            request: The candidate.
             probe_answers: Per store source, what it holds; ``None`` or missing means unanswered.
             now: The loop clock this round; the probe wait is measured on it.
-            retry_hint: Upper bound on ``token_end`` after a short ``served`` (fetch retry): the
+            retry_cap: Upper bound on ``token_end`` after a short ``served`` (fetch retry): the
                 merged B of the failed try. It caps the candidate targets before the store's
                 answer is judged, so a retry may land below it, never above.
         """
         tpb = self._tpb
-        reuse_end = self._reader.local_reuse_tokens(req) // tpb
-        keys = tuple(self._reader.block_keys(req))
+        reuse_end_blocks = self._reader.local_reuse_tokens(request) // tpb
+        keys = tuple(self._reader.block_keys(request))
 
-        if req.is_gen_init:
-            return self._gen_init_plan(req, reuse_end, keys)
+        if request.is_disagg_generation_init:
+            return self._gen_init_plan(request, reuse_end_blocks, keys)
 
-        if req.is_gen_first_context and not self._reader.gen_first_ready(req):
+        if request.is_generation_first_context and not self._reader.generation_first_ready(request):
             return DEFER
 
         # The decision below reads only inputs every rank shares (prompt, hints, probe answers).
         # The local reuse depth differs per rank, so it only trims the per-group asks (possibly
         # to nothing, which is still a legal plan) and never decides whether to fetch.
-        nameable = (req.prompt_len - 1) // tpb
-        cap = nameable if retry_hint is None else min(nameable, retry_hint // tpb)
-        if cap <= 0:
+        nameable_blocks = (request.prompt_len - 1) // tpb
+        cap_blocks = (
+            nameable_blocks if retry_cap is None else min(nameable_blocks, retry_cap // tpb)
+        )
+        if cap_blocks <= 0:
             # Nothing nameable to fetch, or a retry with nothing to aim for: compute locally; no
             # probe is worth waiting on.
-            self.forget(req.py_request_id)
+            self.forget(request.py_request_id)
             return None
 
-        choice = self._choose_source(req, probe_answers, cap, keys)
+        choice = self._choose_source(request, probe_answers, cap_blocks, keys)
         if choice.source is None:
-            if choice.pending and self._may_still_wait_for_probe(req.py_request_id, now):
+            if choice.probe_pending and self._may_still_wait_for_probe(request.py_request_id, now):
                 return DEFER
-            self.forget(req.py_request_id)
+            self.forget(request.py_request_id)
             return None
 
-        self.forget(req.py_request_id)
-        return self._build(choice.token_end, choice.source, choice.hint, False, reuse_end, keys)
+        self.forget(request.py_request_id)
+        return self._build(
+            choice.token_end, choice.source, choice.hint, False, reuse_end_blocks, keys
+        )
 
     def _gen_init_plan(
-        self, req: RequestView, reuse_end: int, keys: tuple[bytes, ...]
+        self, request: RequestView, reuse_end_blocks: int, keys: tuple[bytes, ...]
     ) -> FetchPlan | None:
         """A gen-init request's plan: the whole prompt from the context worker its hint names;
         ``None`` (compute locally) when no routed source matches a hint it carries."""
-        source = self._gen_init_source(req)
+        source = self._gen_init_source(request)
         if source is None:
             return None
-        hint = req.route_hints.get(source.hint_key) if source.hint_key is not None else None
-        return self._build(req.prompt_len, source, hint, True, reuse_end, keys)
+        hint = request.route_hints.get(source.hint_key) if source.hint_key is not None else None
+        return self._build(request.prompt_len, source, hint, True, reuse_end_blocks, keys)
 
     def _choose_source(
         self,
-        req: RequestView,
+        request: RequestView,
         probe_answers: Mapping[str, frozenset[bytes] | None],
-        cap: int,
+        cap_blocks: int,
         keys: tuple[bytes, ...],
     ) -> _SourceChoice:
-        """The first source in priority order that can serve the request, up to ``cap`` blocks.
+        """The first source in priority order that can serve the request, up to ``cap_blocks``.
         A routed source serves when the request carries its hint; a store serves as far as its
         probe answer reaches."""
         tpb = self._tpb
-        pending = False
+        probe_pending = False
         for source in self._sources:
             if source.hint_key is not None:
-                if source.hint_key in req.route_hints:
+                if source.hint_key in request.route_hints:
                     return _SourceChoice(
-                        source, req.route_hints[source.hint_key], cap * tpb, pending
+                        source,
+                        request.route_hints[source.hint_key],
+                        cap_blocks * tpb,
+                        probe_pending,
                     )
                 continue
             answer = probe_answers.get(source.name)
             if answer is None:
-                pending = True
+                probe_pending = True
                 continue
-            end = servable_blocks(answer, keys, self._reader.group_specs(), cap, tpb)
-            if end > 0:
-                return _SourceChoice(source, None, end * tpb, pending)
-        return _SourceChoice(None, None, 0, pending)
+            end_blocks = servable_block_end(
+                answer, keys, self._reader.group_specs(), cap_blocks, tpb
+            )
+            if end_blocks > 0:
+                return _SourceChoice(source, None, end_blocks * tpb, probe_pending)
+        return _SourceChoice(None, None, 0, probe_pending)
 
-    def materialize(self, req: RequestView, token_end: int, source: str) -> FetchPlan:
+    def plan_from_answer(self, request: RequestView, token_end: int, source: str) -> FetchPlan:
         """The plan another rank decided, built over this rank's own layer groups and reuse depth:
         what ``decide`` would have built here for ``(token_end, source)``.
 
@@ -438,16 +455,16 @@ class Planner:
             raise ValueError(f"no fetch source named {source!r} on this rank")
         if chosen.hint_key is not None:
             raise ValueError(f"cannot rebuild a plan for the routed source {source!r}")
-        reuse_end = self._reader.local_reuse_tokens(req) // self._tpb
-        keys = tuple(self._reader.block_keys(req))
-        return self._build(token_end, chosen, None, False, reuse_end, keys)
+        reuse_end_blocks = self._reader.local_reuse_tokens(request) // self._tpb
+        keys = tuple(self._reader.block_keys(request))
+        return self._build(token_end, chosen, None, False, reuse_end_blocks, keys)
 
-    def _gen_init_source(self, req: RequestView) -> FetchSource | None:
+    def _gen_init_source(self, request: RequestView) -> FetchSource | None:
         """The first routed source whose hint the request carries. A gen-init fetch has one
         possible origin, the context worker named by its hint; without a matching hint there is
         nothing to route to, and a routeless fetch would read from nowhere in particular."""
         for source in self._sources:
-            if source.hint_key is not None and source.hint_key in req.route_hints:
+            if source.hint_key is not None and source.hint_key in request.route_hints:
                 return source
         return None
 
@@ -457,11 +474,11 @@ class Planner:
         source: FetchSource,
         hint: Mapping[str, object] | None,
         no_local_fallback: bool,
-        reuse_end: int,
+        reuse_end_blocks: int,
         keys: tuple[bytes, ...],
     ) -> FetchPlan:
         # Local reuse may reach past the target; a plan never asks below its own target.
-        reuse_end = min(reuse_end, token_end // self._tpb)
+        reuse_end_blocks = min(reuse_end_blocks, token_end // self._tpb)
         # A gen-init request's recurrent state is live, not a committed snapshot; it arrives by
         # position (PlacesPieces), so state groups are not part of the named ask.
         specs = [
@@ -470,7 +487,9 @@ class Planner:
             if not (no_local_fallback and s.kind is CacheKind.STATE)
         ]
         group_plans = tuple(
-            GroupPlan(s, tuple(sorted(required_ordinals(s, token_end, reuse_end, self._tpb))))
+            GroupPlan(
+                s, tuple(sorted(required_ordinals(s, token_end, reuse_end_blocks, self._tpb)))
+            )
             for s in specs
         )
         return FetchPlan(
@@ -480,6 +499,6 @@ class Planner:
             no_local_fallback=no_local_fallback,
             group_plans=group_plans,
             block_keys=keys,
-            reuse_end=reuse_end,
+            reuse_end_blocks=reuse_end_blocks,
             tokens_per_block=self._tpb,
         )

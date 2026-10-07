@@ -372,7 +372,7 @@ def read_status_dump(directory, tag: str) -> dict:
     with open(paths[0], encoding="utf-8") as f:
         dump = json.load(f)
     assert set(dump) == {"started_at", "pid", "rank", "coordinator", "backends"}
-    assert dump["rank"] == 0 and dump["coordinator"]["plan_authority"] == "VOTED"  # TP=1
+    assert dump["rank"] == 0 and dump["coordinator"]["plan_authority"] == "ALL_RANKS"  # TP=1
     return dump
 
 

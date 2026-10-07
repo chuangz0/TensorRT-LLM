@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Pure-function tests of the merge rule (design §6.3), ``servable_blocks`` (the store decision
+"""Pure-function tests of the merge rule (design §6.3), ``servable_block_end`` (the store decision
 over every paged group) and their shared input ``required_ordinals``.
 
 Synthetic model: tpb = 4, a windowed group of W = 3 blocks (12 tokens) with 1 sink block, and
@@ -29,9 +29,9 @@ from disaggregation.remote_cache import (  # noqa: E402
     FetchSource,
     Planner,
     _stale_range,
-    merge,
     required_ordinals,
-    servable_blocks,
+    servable_block_end,
+    served_token_end,
 )
 from fakes import (  # noqa: E402
     TPB,
@@ -107,7 +107,7 @@ def test_state_required_ordinals_is_exact_snapshot_or_nothing():
 
 
 def test_plan_units_by_group_match_design_example():
-    plan = make_plan([FULL, WINDOW, STATE], token_end=END, keys=KEYS, reuse_end=2)
+    plan = make_plan([FULL, WINDOW, STATE], token_end=END, keys=KEYS, reuse_end_blocks=2)
     assert ordinals_by_group(plan) == {0: (2, 3, 4, 5, 6), 1: (4, 5, 6), 2: (6,)}
     assert plan_unit_names(plan) == (
         names(FULL, KEYS, [2, 3, 4, 5, 6])
@@ -121,138 +121,139 @@ def test_plan_units_by_group_match_design_example():
 
 
 def test_full_attention_all_served_lands_at_token_end():
-    plan = make_plan([FULL], token_end=END, keys=KEYS, reuse_end=2)
-    assert merge(plan, plan_unit_names(plan)) == END
+    plan = make_plan([FULL], token_end=END, keys=KEYS, reuse_end_blocks=2)
+    assert served_token_end(plan, plan_unit_names(plan)) == END
 
 
 def test_full_attention_missing_last_block_steps_down_one_boundary():
-    plan = make_plan([FULL], token_end=END, keys=KEYS, reuse_end=2)
+    plan = make_plan([FULL], token_end=END, keys=KEYS, reuse_end_blocks=2)
     served = plan_unit_names(plan) - names(FULL, KEYS, [6])
-    assert merge(plan, served) == 24
+    assert served_token_end(plan, served) == 24
 
 
 def test_full_attention_gap_in_the_middle_stops_below_the_gap():
-    plan = make_plan([FULL], token_end=END, keys=KEYS, reuse_end=2)
+    plan = make_plan([FULL], token_end=END, keys=KEYS, reuse_end_blocks=2)
     served = plan_unit_names(plan) - names(FULL, KEYS, [3])
-    assert merge(plan, served) == 12  # blocks 2 present, 3 missing -> B = 3 * tpb
+    assert served_token_end(plan, served) == 12  # blocks 2 present, 3 missing -> B = 3 * tpb
 
 
 def test_extra_served_names_are_ignored():
-    plan = make_plan([FULL], token_end=END, keys=KEYS, reuse_end=2)
+    plan = make_plan([FULL], token_end=END, keys=KEYS, reuse_end_blocks=2)
     served = plan_unit_names(plan) | {b"unrelated"}
-    assert merge(plan, served) == END
+    assert served_token_end(plan, served) == END
 
 
 # ---- empty and partial ----
 
 
 def test_empty_served_is_the_local_prefix_end():
-    plan = make_plan([FULL, WINDOW, STATE], token_end=END, keys=KEYS, reuse_end=2)
-    assert merge(plan, frozenset()) == 2 * TPB
+    plan = make_plan([FULL, WINDOW, STATE], token_end=END, keys=KEYS, reuse_end_blocks=2)
+    assert served_token_end(plan, frozenset()) == 2 * TPB
 
 
 def test_empty_served_with_no_local_prefix_is_zero():
-    plan = make_plan([FULL], token_end=END, keys=KEYS, reuse_end=0)
-    assert merge(plan, frozenset()) == 0
+    plan = make_plan([FULL], token_end=END, keys=KEYS, reuse_end_blocks=0)
+    assert served_token_end(plan, frozenset()) == 0
 
 
 # ---- window with sink ----
 
 
 def test_window_all_served_lands():
-    plan = make_plan([WINDOW], token_end=END, keys=KEYS, reuse_end=0)
+    plan = make_plan([WINDOW], token_end=END, keys=KEYS, reuse_end_blocks=0)
     assert ordinals_by_group(plan) == {1: (0, 4, 5, 6)}
-    assert merge(plan, plan_unit_names(plan)) == END
+    assert served_token_end(plan, plan_unit_names(plan)) == END
 
 
 def test_window_missing_a_window_block_falls_to_where_only_the_sink_is_needed():
     # Missing u5: at 24 the window needs {3,4,5}, at 20 {2,3,4} ... none of which were asked for
     # (blocks 1..3 are stale at token_end), down to history 4 where only the sink block is live.
-    plan = make_plan([WINDOW], token_end=END, keys=KEYS, reuse_end=0)
+    plan = make_plan([WINDOW], token_end=END, keys=KEYS, reuse_end_blocks=0)
     served = plan_unit_names(plan) - names(WINDOW, KEYS, [5])
-    assert merge(plan, served) == 4
+    assert served_token_end(plan, served) == 4
 
 
 def test_window_missing_sink_block_lands_nowhere_above_zero():
-    plan = make_plan([WINDOW], token_end=END, keys=KEYS, reuse_end=0)
+    plan = make_plan([WINDOW], token_end=END, keys=KEYS, reuse_end_blocks=0)
     served = plan_unit_names(plan) - names(WINDOW, KEYS, [0])
-    assert merge(plan, served) == 0
+    assert served_token_end(plan, served) == 0
 
 
 def test_window_with_local_sink_short_window_falls_to_local_prefix():
-    plan = make_plan([FULL, WINDOW], token_end=END, keys=KEYS, reuse_end=2)
+    plan = make_plan([FULL, WINDOW], token_end=END, keys=KEYS, reuse_end_blocks=2)
     served = plan_unit_names(plan) - names(WINDOW, KEYS, [4])
     # Full attention alone would allow 28; the window group drags B to the local prefix.
-    assert merge(plan, served) == 2 * TPB
+    assert served_token_end(plan, served) == 2 * TPB
 
 
 def test_combined_model_missing_full_block_drops_to_the_local_prefix():
-    plan = make_plan([FULL, WINDOW, STATE], token_end=END, keys=KEYS, reuse_end=2)
+    plan = make_plan([FULL, WINDOW, STATE], token_end=END, keys=KEYS, reuse_end_blocks=2)
     served = plan_unit_names(plan) - names(FULL, KEYS, [3])
     # Full attention alone would allow 12 (block 2 present, 3 missing); at 12 the window needs
     # block 2, which was never asked for, so B drops to the local prefix.
-    assert merge(plan, served) == 2 * TPB
+    assert served_token_end(plan, served) == 2 * TPB
 
 
 # ---- state group ----
 
 
 def test_state_requires_exact_snapshot():
-    plan = make_plan([FULL, STATE], token_end=END, keys=KEYS, reuse_end=2)
-    assert merge(plan, plan_unit_names(plan)) == END
+    plan = make_plan([FULL, STATE], token_end=END, keys=KEYS, reuse_end_blocks=2)
+    assert served_token_end(plan, plan_unit_names(plan)) == END
     served = plan_unit_names(plan) - names(STATE, KEYS, [6])
     # Every lower boundary needs a different snapshot that was never asked for.
-    assert merge(plan, served) == 2 * TPB
+    assert served_token_end(plan, served) == 2 * TPB
 
 
 def test_state_snapshot_alone_does_not_rescue_a_short_full_group():
-    plan = make_plan([FULL, STATE], token_end=END, keys=KEYS, reuse_end=2)
+    plan = make_plan([FULL, STATE], token_end=END, keys=KEYS, reuse_end_blocks=2)
     served = plan_unit_names(plan) - names(FULL, KEYS, [6])
-    assert merge(plan, served) == 2 * TPB
+    assert served_token_end(plan, served) == 2 * TPB
 
 
 def test_state_only_model_lands_only_on_its_exact_snapshot():
-    plan = make_plan([STATE], token_end=END, keys=KEYS, reuse_end=0)
+    plan = make_plan([STATE], token_end=END, keys=KEYS, reuse_end_blocks=0)
     assert ordinals_by_group(plan) == {2: (6,)}
-    assert merge(plan, plan_unit_names(plan)) == END
-    assert merge(plan, frozenset()) == 0
+    assert served_token_end(plan, plan_unit_names(plan)) == END
+    assert served_token_end(plan, frozenset()) == 0
 
 
 def test_merge_never_exceeds_token_end():
-    plan = make_plan([FULL], token_end=24, keys=KEYS, reuse_end=0)
+    plan = make_plan([FULL], token_end=24, keys=KEYS, reuse_end_blocks=0)
     served = names(FULL, KEYS, range(7))
-    assert merge(plan, served) == 24
+    assert served_token_end(plan, served) == 24
 
 
-# ---- servable_blocks: the store decision over every paged group ----
+# ---- servable_block_end: the store decision over every paged group ----
 
 ALL = range(7)
 
 
-def test_servable_blocks_lands_at_nameable_when_every_group_is_whole():
+def test_servable_block_end_lands_at_nameable_when_every_group_is_whole():
     assert (
-        servable_blocks(held((FULL, ALL), (WINDOW, ALL)), KEYS, [FULL, WINDOW], NAMEABLE, TPB) == 7
+        servable_block_end(held((FULL, ALL), (WINDOW, ALL)), KEYS, [FULL, WINDOW], NAMEABLE, TPB)
+        == 7
     )
 
 
-def test_servable_blocks_steps_down_to_where_the_missing_window_block_is_stale():
+def test_servable_block_end_steps_down_to_where_the_missing_window_block_is_stale():
     # Window block 5 missing: e=7 needs {0,4,5,6}, e=6 needs {0,3,4,5}, e=5 needs {0,2,3,4}.
     answer = held((FULL, ALL), (WINDOW, [0, 1, 2, 3, 4, 6]))
-    assert servable_blocks(answer, KEYS, [FULL, WINDOW], NAMEABLE, TPB) == 5
+    assert servable_block_end(answer, KEYS, [FULL, WINDOW], NAMEABLE, TPB) == 5
     # The same missing block after a fetch to 28: blocks 2 and 3 were stale at 28 and never
     # asked for, so merge cannot stop at 20 and falls to where only the sink block is live.
-    plan = make_plan([FULL, WINDOW], token_end=END, keys=KEYS, reuse_end=0)
-    assert merge(plan, plan_unit_names(plan) - names(WINDOW, KEYS, [5])) == 4
+    plan = make_plan([FULL, WINDOW], token_end=END, keys=KEYS, reuse_end_blocks=0)
+    assert served_token_end(plan, plan_unit_names(plan) - names(WINDOW, KEYS, [5])) == 4
 
 
-def test_servable_blocks_counts_a_block_below_the_local_prefix_as_missing():
+def test_servable_block_end_counts_a_block_below_the_local_prefix_as_missing():
     # Full block 0 is not in the store (the local tree has it): the decision is computed with
-    # reuse_end = 0 for rank agreement, so no target is servable ...
+    # reuse_end_blocks = 0 for rank agreement, so no target is servable ...
     answer = held((FULL, range(1, 7)), (WINDOW, ALL))
-    assert servable_blocks(answer, KEYS, [FULL, WINDOW], NAMEABLE, TPB) == 0
+    assert servable_block_end(answer, KEYS, [FULL, WINDOW], NAMEABLE, TPB) == 0
     # ... while a plan already built above that prefix never asked for block 0 and merges whole.
-    plan = make_plan([FULL, WINDOW], token_end=END, keys=KEYS, reuse_end=2)
-    assert merge(plan, plan_unit_names(plan)) == END
+    plan = make_plan([FULL, WINDOW], token_end=END, keys=KEYS, reuse_end_blocks=2)
+    assert served_token_end(plan, plan_unit_names(plan)) == END
 
 
 @pytest.mark.parametrize(
@@ -266,12 +267,12 @@ def test_servable_blocks_counts_a_block_below_the_local_prefix_as_missing():
     ],
     ids=["sink_missing", "full_tail_missing", "window_only", "state_ignored", "no_paged_group"],
 )
-def test_servable_blocks_table(specs, answer, expected):
-    assert servable_blocks(answer, KEYS, specs, NAMEABLE, TPB) == expected
+def test_servable_block_end_table(specs, answer, expected):
+    assert servable_block_end(answer, KEYS, specs, NAMEABLE, TPB) == expected
 
 
-def test_servable_blocks_with_nothing_nameable_is_zero():
-    assert servable_blocks(held((FULL, ALL)), KEYS, [FULL], 0, TPB) == 0
+def test_servable_block_end_with_nothing_nameable_is_zero():
+    assert servable_block_end(held((FULL, ALL)), KEYS, [FULL], 0, TPB) == 0
 
 
 def test_publisher_window_one_block_ahead_of_the_fetch_target_serves_nothing():
@@ -281,8 +282,10 @@ def test_publisher_window_one_block_ahead_of_the_fetch_target_serves_nothing():
     window = windowed(1, window_blocks=3, sink_blocks=0)
     keys = KEYS[:6]  # nameable = (28 - 1) // 4 = 6
     answer = held((FULL, range(6)), (window, [4, 5]))
-    assert servable_blocks(answer, keys, [FULL, window], 6, TPB) == 0
-    assert servable_blocks(answer, keys, [FULL], 6, TPB) == 6  # the full group alone would allow B
+    assert servable_block_end(answer, keys, [FULL, window], 6, TPB) == 0
+    assert (
+        servable_block_end(answer, keys, [FULL], 6, TPB) == 6
+    )  # the full group alone would allow B
 
 
 # ---- retry: the hint is merge's B, and the store answer is judged again below it ----
@@ -292,12 +295,12 @@ def test_retry_at_merged_b_asks_only_for_units_that_arrived():
     reader = FakeReader(groups=[FULL, WINDOW])
     req = FakeRequest(1, prompt_len=29)
     keys = reader.block_keys(req)
-    plan = make_plan([FULL, WINDOW], token_end=END, keys=keys, reuse_end=0)
+    plan = make_plan([FULL, WINDOW], token_end=END, keys=keys, reuse_end_blocks=0)
     served = plan_unit_names(plan) - names(WINDOW, keys, [5])
-    b = merge(plan, served)
+    b = served_token_end(plan, served)
     assert b == 4
     answer = plan_unit_names(plan) - names(WINDOW, keys, [5])  # what the store told us before
-    retry = store_planner(reader).decide(req, {"store": answer}, now=0.0, retry_hint=b)
+    retry = store_planner(reader).decide(req, {"store": answer}, now=0.0, retry_cap=b)
     assert retry.token_end == b
     assert plan_unit_names(retry) <= served
     assert ordinals_by_group(retry) == {0: (0,), 1: (0,)}
@@ -311,17 +314,17 @@ def test_retry_can_fall_below_the_merged_b_to_a_plan_with_empty_asks():
     keys = reader.block_keys(req)
     answer = names(FULL, keys, ALL) | names(WINDOW, keys, [0, 4, 5, 6])
     plan = store_planner(reader).decide(req, {"store": answer}, now=0.0)
-    assert plan.token_end == END and plan.reuse_end == 2
-    # Full block 6 never arrives. merge trims below reuse_end 2 and walks down from 28: at 24
+    assert plan.token_end == END and plan.reuse_end_blocks == 2
+    # Full block 6 never arrives. merge trims below reuse_end_blocks 2 and walks down from 28: at 24
     # the window needs block 3, never asked for; ... down to the reuse floor 8.
     served = plan_unit_names(plan) - names(FULL, keys, [6])
-    b = merge(plan, served)
+    b = served_token_end(plan, served)
     assert b == 8
-    # The retry judges the cached answer with reuse_end = 0 up to cap 8 // 4 = 2: e=2 needs window
+    # The retry judges the cached answer with reuse_end_blocks = 0 up to cap 8 // 4 = 2: e=2 needs window
     # block 1, which the store never held, so e=1 wins; reuse then trims every ask to nothing.
-    retry = store_planner(reader).decide(req, {"store": answer}, now=0.0, retry_hint=b)
+    retry = store_planner(reader).decide(req, {"store": answer}, now=0.0, retry_cap=b)
     assert retry.token_end == TPB < b
-    assert retry.reuse_end == 1
+    assert retry.reuse_end_blocks == 1
     assert plan_unit_names(retry) == frozenset()
 
 
@@ -355,9 +358,12 @@ def test_required_ordinals_match_mirrored_stale_range_over_a_grid(tpb, sink_bloc
         expected = set(range(min(beg, full))) | set(range(end, full))
         assert required_ordinals(spec, history, 0, tpb) == frozenset(expected), (history,)
         # The local prefix only removes ordinals; it never adds any.
-        for reuse_end in range(0, full + 1):
-            got = required_ordinals(spec, history, reuse_end, tpb)
-            assert got == frozenset(o for o in expected if o >= reuse_end), (history, reuse_end)
+        for reuse_end_blocks in range(0, full + 1):
+            got = required_ordinals(spec, history, reuse_end_blocks, tpb)
+            assert got == frozenset(o for o in expected if o >= reuse_end_blocks), (
+                history,
+                reuse_end_blocks,
+            )
 
 
 @pytest.mark.parametrize("tpb", [1, 4])
@@ -371,5 +377,5 @@ def test_merge_lands_at_token_end_when_everything_asked_is_served(tpb):
             )
             keys = keys_for("grid", token_blocks)
             plan = make_plan([spec, STATE], token_end=token_blocks * tpb, keys=keys, tpb=tpb)
-            assert merge(plan, plan_unit_names(plan)) == token_blocks * tpb
-            assert merge(plan, frozenset()) <= plan.token_end
+            assert served_token_end(plan, plan_unit_names(plan)) == token_blocks * tpb
+            assert served_token_end(plan, frozenset()) <= plan.token_end

@@ -199,7 +199,7 @@ class MooncakeBlobStore:
     Two behaviours observed against a real master (``test_real_master.py``): a put of a key the
     store already holds answers ``0`` and keeps the first object, so a publish that lost a race
     usually reads as ``STORED`` rather than ``DECLINED`` (the backend is correct either way,
-    because it asks ``holds`` before every put); and a master started with
+    because it asks ``contains`` before every put); and a master started with
     ``--memory_allocator=cachelib`` stores an object as one allocation of at most one slab (16 MiB
     minus 16 bytes) and answers ``INVALID_PARAMS`` for a unit whose segments add up to more,
     however they are cut, where the default ``offset`` allocator has no such cap. An answer of
@@ -304,7 +304,7 @@ class MooncakeBlobStore:
         if len(statuses) != len(keys):
             raise BlobStoreError(f"{call} answered {len(statuses)} of {len(keys)} keys")
 
-    def holds(self, keys: Sequence[str]) -> Sequence[bool]:
+    def contains(self, keys: Sequence[str]) -> Sequence[bool]:
         statuses = self._client.batch_is_exist(list(keys))
         self._check_count("batch_is_exist", statuses, keys)
         if any(status < 0 for status in statuses):

@@ -7,7 +7,7 @@ the bindings or the master binary are missing.
 One backend stands for both ranks: a unit's coordinates are local, its name is not, so the same
 name is published from layer group 0 and fetched into layer group 1 of one process. That keeps
 one store per test, whose ``close`` the backend owns. Assertions about what the store itself
-holds go through ``store.raw``, the wrapped bindings object.
+``contains`` calls go through ``store.raw``, the wrapped bindings object.
 """
 
 import ctypes
@@ -140,13 +140,13 @@ def test_host_landing_round_trips_against_the_master(store):
             rank.resolver.add(1, i, 64, 64)  # the same bytes, cut differently on this side
             dst.append(Unit(name=u.name, local_group=1, local=i))
             rank.fill(dst[-1], 0xEE)
-        landing = rank.land(dst, name=b"gen")
+        landing = rank.land(dst)
         assert landing.poll() == Delivered(frozenset(u.name for u in dst))
         assert all(rank.read(u) == bytes([0xEE]) * 128 for u in dst)  # on the host so far
         assert rank.place(landing, dst) == Delivered(frozenset(u.name for u in dst))
         for i, u in enumerate(dst):
             assert rank.read(u) == pattern(i + 1, 128)
-        landing.release()
+        landing.close()
         assert rank.registration is None  # the caller's pool was never registered
         assert rank.backend.landings_held() == 0
         assert rank.backend.counters.fetch_hits == 3 and rank.backend.counters.failed_attempts == 0
@@ -256,7 +256,7 @@ def test_putting_a_key_the_store_already_holds_keeps_the_first_object(store):
         rank.write(second, pattern(4, 64))
         key = rank.key(first)
         assert store.put([key], [rank.segments(first)]) == [PutStatus.STORED]
-        assert store.holds([key]) == [True]
+        assert store.contains([key]) == [True]
         ((address, size),) = rank.segments(second)
         (status,) = store.raw.batch_put_from_multi_buffers([key], [[address]], [[size]])
         assert status == 0, (

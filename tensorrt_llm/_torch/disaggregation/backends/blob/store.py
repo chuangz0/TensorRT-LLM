@@ -49,7 +49,7 @@ class PutStatus(Enum):
     STORED = "stored"
     """The store now holds the object under this key."""
     DECLINED = "declined"
-    """The store chose not to hold this key. Not an error: the backend then asks ``holds`` to learn
+    """The store chose not to hold this key. Not an error: the backend then asks ``contains`` to learn
     whether the key is held all the same."""
     FAILED = "failed"
     """This key could not be written."""
@@ -79,7 +79,7 @@ class BlobStore(Protocol):
     Every segment handed to ``put`` or ``get`` lies inside a span that ``register_span`` accepted.
 
     Calls arrive concurrently: the backend runs ``num_workers`` delivery threads and one probe
-    thread, and any of them may be inside ``holds``, ``put`` or ``get`` at the same time, while
+    thread, and any of them may be inside ``contains``, ``put`` or ``get`` at the same time, while
     ``register_span`` / ``unregister_span`` come from the engine thread. A driver whose client is
     not thread-safe serialises the calls or pools connections itself.
     """
@@ -97,7 +97,7 @@ class BlobStore(Protocol):
         for a store that needs no registration."""
         ...
 
-    def holds(self, keys: Sequence[str]) -> Sequence[bool]:
+    def contains(self, keys: Sequence[str]) -> Sequence[bool]:
         """Whether the store holds each key, in order.
 
         Raises ``BlobStoreError`` when it cannot tell (transport failure, an answer of the wrong

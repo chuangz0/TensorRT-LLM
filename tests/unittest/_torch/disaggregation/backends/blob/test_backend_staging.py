@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The host pools: ``plan_slot_geometry``, ``HostStagingPool`` with a ``FakeCopier`` (blocking
+"""The host pools: ``plan_slot_geometry``, ``HostSlotPool`` with a ``FakeCopier`` (blocking
 and queued hand-out), and the ``landing: host`` backend driving its publish pool.
 
 The property that distinguishes a staged publish is the design's §10.1 split: it is *quiet* (the
@@ -16,7 +16,7 @@ import time
 import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.backends.blob.staging import HostStagingPool, plan_slot_geometry  # noqa: E402
+from disaggregation.backends.blob.slot_pool import HostSlotPool, plan_slot_geometry  # noqa: E402
 from disaggregation.backends.blob.store import PutStatus  # noqa: E402
 from disaggregation.base.cache_backend import Delivered, Failed, SubmissionRejected  # noqa: E402
 from store_fakes import (  # noqa: E402
@@ -64,12 +64,12 @@ def test_plan_slot_geometry_rejects_non_positive_inputs(unit, cap):
         plan_slot_geometry(unit, cap, 1000)
 
 
-# ---- HostStagingPool alone ----
+# ---- HostSlotPool alone ----
 
 
 def test_pool_geometry_and_slot_addresses():
     host = MemoryArena(3 * 16)
-    pool = HostStagingPool(host.address, 16, 3, FakeCopier())
+    pool = HostSlotPool(host.address, 16, 3, FakeCopier())
     assert (pool.slot_bytes, pool.num_slots) == (16, 3)
     assert [pool.slot_address(i) for i in range(3)] == [host.address + 16 * i for i in range(3)]
     for bad in (-1, 3):
@@ -77,14 +77,14 @@ def test_pool_geometry_and_slot_addresses():
             pool.slot_address(bad)
     assert pool.fits(16) and pool.fits(1) and not pool.fits(17) and not pool.fits(0)
     with pytest.raises(ValueError):
-        HostStagingPool(host.address, 0, 3, FakeCopier())
+        HostSlotPool(host.address, 0, 3, FakeCopier())
     with pytest.raises(ValueError):
-        HostStagingPool(host.address, 16, 0, FakeCopier())
+        HostSlotPool(host.address, 16, 0, FakeCopier())
 
 
 def test_pool_acquire_is_all_or_nothing_and_release_wakes_waiters():
     host = MemoryArena(3 * 16)
-    pool = HostStagingPool(host.address, 16, 3, FakeCopier())
+    pool = HostSlotPool(host.address, 16, 3, FakeCopier())
     with pytest.raises(ValueError):
         pool.acquire(0)
     with pytest.raises(ValueError):
@@ -119,7 +119,7 @@ class _Waiter:
 
 def test_pool_enqueue_grants_at_once_queues_in_order_and_grants_on_release():
     host = MemoryArena(3 * 16)
-    pool = HostStagingPool(host.address, 16, 3, FakeCopier())
+    pool = HostSlotPool(host.address, 16, 3, FakeCopier())
     with pytest.raises(ValueError):
         pool.enqueue(_Waiter(), 4)
     first, second, third = _Waiter(), _Waiter(), _Waiter()
@@ -140,14 +140,14 @@ def test_pool_enqueue_grants_at_once_queues_in_order_and_grants_on_release():
 
 def test_pool_dequeue_drops_a_queued_waiter_and_shutdown_refuses_the_rest():
     host = MemoryArena(16)
-    pool = HostStagingPool(host.address, 16, 1, FakeCopier())
+    pool = HostSlotPool(host.address, 16, 1, FakeCopier())
     holder, leaving, staying, late = _Waiter(), _Waiter(), _Waiter(), _Waiter()
     pool.enqueue(holder, 1)
     pool.enqueue(leaving, 1)
     pool.enqueue(staying, 1)
     assert pool.dequeue(leaving) is True and pool.dequeue(leaving) is False
     pool.shutdown()
-    assert staying.refused == "staging pool is shut down" and leaving.refused is None
+    assert staying.refused == "slot pool is shut down" and leaving.refused is None
     pool.enqueue(late, 1)
     assert late.refused is not None and late.granted is None
     pool.release(holder.granted)  # still allowed; nothing is granted to anyone
@@ -159,7 +159,7 @@ def test_pool_dequeue_drops_a_queued_waiter_and_shutdown_refuses_the_rest():
 def test_gather_and_scatter_concatenate_in_resolver_order():
     host = MemoryArena(2 * 32)
     copier = FakeCopier()
-    pool = HostStagingPool(host.address, 32, 2, copier)
+    pool = HostSlotPool(host.address, 32, 2, copier)
     src = MemoryArena(64)
     s1, s2 = src.carve(12), src.carve(20)
     import ctypes
@@ -231,7 +231,7 @@ def test_staged_publish_is_readable_by_a_direct_fetch_and_vice_versa():
         assert staged.place(landing, [ub]) == Delivered(frozenset({ub.name}))
         assert staged.read(ub) == pattern(7, 64)
         assert staged.landing_copier.kinds() == ["h2d", "h2d"]
-        landing.release()
+        landing.close()
 
 
 def test_slot_exhaustion_waits_then_proceeds():
@@ -244,7 +244,7 @@ def test_slot_exhaustion_waits_then_proceeds():
         # The lookup needs no slot and is one call; then the worker parks in ``acquire`` until
         # the slot comes back. (``close`` would wake it with a failed delivery instead; see
         # ``test_close_wakes_a_worker_parked_for_a_slot``.)
-        wait_until(lambda: rank.store.count("holds") == 1)
+        wait_until(lambda: rank.store.count("contains") == 1)
         time.sleep(0.05)
         assert attempt.poll() is None and rank.publish_copier.copies == []
         rank.publish_pool.release(held)
@@ -290,8 +290,8 @@ def test_unit_larger_than_a_slot_fails_before_anything_moves():
     with _staged(slot_bytes=32) as rank:
         big = rank.unit(0, 0, 33)
         outcome = rank.backend.publish(extent([big])).poll()
-        assert isinstance(outcome, Failed) and "exceeds the staging slot" in outcome.reason
-        assert rank.store.count("holds") == 0 and rank.publish_copier.copies == []
+        assert isinstance(outcome, Failed) and "exceeds the publish-pool slot" in outcome.reason
+        assert rank.store.count("contains") == 0 and rank.publish_copier.copies == []
 
 
 def test_staging_does_not_require_the_callers_pool_to_be_registered():
@@ -368,7 +368,7 @@ def test_copier_failing_on_the_second_segment_of_a_placement_drains_and_leaves_m
         # SPEC §5.2 inv. 3: after Failed the destination is undefined. Here the first segment
         # landed and the second never did, which is exactly what the caller must not trust.
         assert rank.read(two_seg) == pattern(1, 64)[:32] + bytes([0xEE]) * 32
-        landing.release()
+        landing.close()
 
 
 # ---- interleaved staged traffic ----
@@ -398,7 +398,7 @@ def test_interleaved_publish_and_landing_use_their_own_pools_and_keep_bytes_exac
         store.block("put")
         pub = staged.backend.publish(extent(outgoing, name=b"out"))
         wait_until(lambda: store.count("put") == 2, what="first put")
-        landing = staged.land(incoming, name=b"in")
+        landing = staged.land(incoming)
         assert landing.poll() == Delivered(frozenset(u.name for u in incoming))
         assert pub.poll() is None
         store.unblock()
@@ -409,7 +409,7 @@ def test_interleaved_publish_and_landing_use_their_own_pools_and_keep_bytes_exac
         for i, u in enumerate(incoming):
             assert staged.read(u) == pattern(20 + i, 64) == direct.read(sources[i])
         staged.trace.check_slot_exclusivity(staged.publish_pool)
-        landing.release()
+        landing.close()
 
 
 # ---- close while parked or racing submissions ----
@@ -420,7 +420,7 @@ def test_close_wakes_a_worker_parked_for_a_slot_and_fails_its_delivery():
     held = rank.publish_pool.acquire(1)
     u = rank.unit(0, 0, 32)
     attempt = rank.backend.publish(extent([u]))
-    wait_until(lambda: rank.store.count("holds") == 1)
+    wait_until(lambda: rank.store.count("contains") == 1)
     time.sleep(0.02)  # let the worker reach acquire
     start = time.monotonic()
     rank.backend.close()
@@ -511,7 +511,7 @@ def test_staged_declined_put_for_a_unit_another_publisher_made_present_counts_as
         staged.trace.check_slot_exclusivity(pool)
 
 
-def test_staged_put_raising_after_the_gather_fails_frees_the_slots_and_is_quiet():
+def test_pooled_put_raising_after_the_gather_fails_frees_the_slots_and_is_quiet():
     """The units were copied into host slots (the caller's memory is done with) when the store
     call raises: the delivery fails, nothing is stored, the slots are released, and ``quiesce``
     answers True because the gather is what read the caller's memory."""

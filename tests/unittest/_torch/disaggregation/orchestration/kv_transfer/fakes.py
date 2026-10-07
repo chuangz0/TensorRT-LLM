@@ -33,7 +33,7 @@ from disaggregation.base.cache_backend import (  # noqa: E402
 )
 from disaggregation.base.views import GroupSpec  # noqa: E402
 from disaggregation.orchestration.kv_transfer.coordinator import KVTransferCoordinator  # noqa: E402
-from disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority  # noqa: E402
+from disaggregation.orchestration.kv_transfer.engine_protocols import PlanAuthority  # noqa: E402
 from disaggregation.remote_cache import (  # noqa: E402
     FetchPlan,
     FetchSource,
@@ -88,14 +88,15 @@ def make_plan(
     *,
     token_end: int,
     keys: Sequence[bytes],
-    reuse_end: int = 0,
+    reuse_end_blocks: int = 0,
     tpb: int = TPB,
     source: str = "worker",
     no_local_fallback: bool = False,
 ) -> FetchPlan:
     """Build a ``FetchPlan`` the way ``Planner._build`` does, from public pieces only."""
     group_plans = tuple(
-        GroupPlan(s, tuple(sorted(required_ordinals(s, token_end, reuse_end, tpb)))) for s in groups
+        GroupPlan(s, tuple(sorted(required_ordinals(s, token_end, reuse_end_blocks, tpb))))
+        for s in groups
     )
     return FetchPlan(
         token_end=token_end,
@@ -104,7 +105,7 @@ def make_plan(
         no_local_fallback=no_local_fallback,
         group_plans=group_plans,
         block_keys=tuple(keys),
-        reuse_end=reuse_end,
+        reuse_end_blocks=reuse_end_blocks,
         tokens_per_block=tpb,
     )
 
@@ -139,8 +140,8 @@ class FakeRequest:
 
     py_request_id: int
     prompt_len: int
-    is_gen_init: bool = False
-    is_gen_first_context: bool = False
+    is_disagg_generation_init: bool = False
+    is_generation_first_context: bool = False
     route_hints: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
     seed: str | None = None
 
@@ -347,7 +348,7 @@ class FakePublishes:
         self.quiesce_answers: deque[bool] = deque()
         self.reject_next = 0
         self.reject_methods: set[str] = set()
-        """Methods (``"publish"``, ``"place"``) that always raise ``SubmissionRejected``."""
+        """Methods (``"publish"``, ``"place_piece"``) that always raise ``SubmissionRejected``."""
 
     def _submit(self, method: str, payload: object) -> FakeAttempt:
         self.calls.append((method, (payload,)))
@@ -384,8 +385,8 @@ class FakePublishes:
 class FakePlacingPublishes(FakePublishes):
     """A publisher that also satisfies ``PlacesPieces``."""
 
-    def place(self, chunk) -> FakeAttempt:
-        return self._submit("place", chunk)
+    def place_piece(self, chunk) -> FakeAttempt:
+        return self._submit("place_piece", chunk)
 
 
 @dataclass(frozen=True)
@@ -398,20 +399,17 @@ class FakeChunk:
 
 class FakeLanding:
     """A ``Landing`` whose outcome tests set with ``finish`` (or ``deliver_all``); ``place``
-    hands out a ``FakeAttempt`` scripted on the owning ``FakeLandsOnHost``; ``releases`` counts
-    ``release`` calls. A ``place`` after ``release`` fails the test: the coordinator forgets a
-    landing when it releases it, so such a call is a harness invariant broken, not back-pressure
+    hands out a ``FakeAttempt`` scripted on the owning ``FakeLandsOnHost``; ``closes`` counts
+    ``close`` calls. A ``place`` after ``close`` fails the test: the coordinator forgets a
+    landing when it closes it, so such a call is a harness invariant broken, not back-pressure
     (which the real backend would answer with ``SubmissionRejected``)."""
 
-    def __init__(
-        self, backend: FakeLandsOnHost, name: bytes, units: Sequence[bytes], outcome=None
-    ) -> None:
+    def __init__(self, backend: FakeLandsOnHost, units: Sequence[bytes], outcome=None) -> None:
         self.backend = backend
-        self.name = name
         self.units = tuple(units)
         self._outcome = outcome
         self.polls = 0
-        self.releases = 0
+        self.closes = 0
         self.placements: list[FakeAttempt] = []
 
     def poll(self) -> Outcome | None:
@@ -428,14 +426,14 @@ class FakeLanding:
         self.finish(Delivered(frozenset(self.units) - frozenset(missing)))
 
     def place(self, extent: CacheExtent) -> FakeAttempt:
-        assert self.releases == 0, (
-            f"{self.backend.name}: place on landing {self.name!r} after release"
+        assert self.closes == 0, (
+            f"{self.backend.name}: place on a landing of {len(self.units)} units after close"
         )
         return self.backend._place(self, extent)
 
-    def release(self) -> None:
-        self.releases += 1
-        self.backend.calls.append(("release", (self,)))
+    def close(self) -> None:
+        self.closes += 1
+        self.backend.calls.append(("close", (self,)))
 
 
 class FakeLandsOnHost:
@@ -485,13 +483,13 @@ class FakeLandsOnHost:
 
     # -- LandsOnHost --
 
-    def fetch_to_host(self, name: bytes, units: Sequence[bytes]) -> FakeLanding:
-        self.calls.append(("fetch_to_host", (name, tuple(units))))
+    def fetch_to_host(self, units: Sequence[bytes]) -> FakeLanding:
+        self.calls.append(("fetch_to_host", (tuple(units),)))
         if self.reject_next > 0:
             self.reject_next -= 1
             raise SubmissionRejected(f"{self.name} refused a landing")
         outcome = self._landing_outcomes.popleft() if self._landing_outcomes else None
-        landing = FakeLanding(self, name, units, outcome)
+        landing = FakeLanding(self, units, outcome)
         self.landings.append(landing)
         return landing
 
@@ -534,9 +532,9 @@ class FakeLandsOnHost:
     def count(self, method: str) -> int:
         return sum(1 for m, _ in self.calls if m == method)
 
-    def releases(self) -> int:
-        """``release`` calls over every landing this backend handed out."""
-        return sum(landing.releases for landing in self.landings)
+    def closes(self) -> int:
+        """``close`` calls over every landing this backend handed out."""
+        return sum(landing.closes for landing in self.landings)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -635,13 +633,13 @@ class LockstepWorld:
     returns. Each rank then applies the same gathered list. ``fn`` must call ``advance`` exactly
     once per rank. Between ``run`` calls the test scripts each rank's fakes freely.
 
-    ``authority_of(rank)`` names each rank's ``PlanAuthority`` (default: every rank ``VOTED``);
+    ``authority_of(rank)`` names each rank's ``PlanAuthority`` (default: every rank ``ALL_RANKS``);
     ``Rig`` construction reads it through ``rig_kwargs``.
     """
 
     def __init__(self, n: int, authority_of: Callable[[int], PlanAuthority] | None = None) -> None:
         self.n = n
-        self.authority_of = authority_of or (lambda rank: PlanAuthority.VOTED)
+        self.authority_of = authority_of or (lambda rank: PlanAuthority.ALL_RANKS)
         self.gathers = [LockstepGather(self, r) for r in range(n)]
         self._fn: Callable[[int], object] | None = None
         self._payloads: dict[int, object] = {}
@@ -705,12 +703,12 @@ class PeerGather:
 
 
 class FakeReader:
-    """Table-backed ``ResourceReader`` for a synthetic model.
+    """Table-backed ``ResourceView`` for a synthetic model.
 
     * ``groups``: the layer groups this rank holds.
     * ``reuse_tokens[rid]``: tokens the local radix tree already serves (default 0).
-    * ``gen_first_ready``: answer for gen-first context requests (per rid, default ``ready_default``).
-    * ``fetch_extent`` names ``tag + key`` for every ordinal in every group plan, ``is_last=True``,
+    * ``generation_first_ready``: answer for gen-first context requests (per rid, default ``ready_default``).
+    * ``fetch_extent_and_committed`` names ``tag + key`` for every ordinal in every group plan, ``is_last=True``,
       minus what the reservation looks like at launch: ordinals below ``committed_blocks[rid]``
       are returned as committed names instead, ordinals at or above ``reserved_blocks[rid]`` are
       dropped (the reservation fell short).
@@ -751,11 +749,11 @@ class FakeReader:
     def group_specs(self) -> Sequence[GroupSpec]:
         return self.groups
 
-    def gen_first_ready(self, request) -> bool:
+    def generation_first_ready(self, request) -> bool:
         return self.ready.get(request.py_request_id, self.ready_default)
 
-    def fetch_extent(self, request, plan) -> tuple[CacheExtent, frozenset[bytes]]:
-        self.calls.append(("fetch_extent", (request, plan)))
+    def fetch_extent_and_committed(self, request, plan) -> tuple[CacheExtent, frozenset[bytes]]:
+        self.calls.append(("fetch_extent_and_committed", (request, plan)))
         rid = request.py_request_id
         committed = self.committed_blocks.get(rid, 0)
         reserved = self.reserved_blocks.get(rid, len(plan.block_keys))
@@ -912,7 +910,7 @@ class Rig:
         """``advance`` with ``req`` as the only candidate, read its plan into ``plans``, then
         ``launch_reserved_fetches``; returns the attempt the worker created."""
         self.coord.advance([req], now)
-        plan = self.coord.plan_fetch(req)
+        plan = self.coord.fetch_answer(req)
         assert isinstance(plan, FetchPlan), f"expected a plan before launch, got {plan!r}"
         self.plans[req.py_request_id] = plan
         before = len(self.worker.attempts)
@@ -929,9 +927,9 @@ class Rig:
         return self.host.landings[-1]
 
     def reserve_and_place(self, req: FakeRequest, now: float) -> FakeAttempt:
-        """The scheduler's part for a ``STAGED`` record: read the plan (reserving is implied),
+        """The scheduler's part for a ``LANDED`` record: read the plan (reserving is implied),
         then ``launch_reserved_fetches``; returns the placement attempt."""
-        plan = self.coord.plan_fetch(req)
+        plan = self.coord.fetch_answer(req)
         assert isinstance(plan, FetchPlan), f"expected a plan to reserve for, got {plan!r}"
         self.plans[req.py_request_id] = plan
         before = len(self.host.attempts)

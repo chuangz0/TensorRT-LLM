@@ -148,7 +148,7 @@ class Rig:
 
     def plan(self, req) -> FetchPlan:
         self.advance(req)
-        plan = self.hooks.plan_fetch(req)
+        plan = self.hooks.fetch_answer(req)
         assert isinstance(plan, FetchPlan), f"expected a plan, got {plan!r}"
         return plan
 
@@ -260,7 +260,7 @@ def test_alias_states_are_the_disagg_transfer_states_and_outside_the_schedulable
 def test_request_view_has_constant_plan_inputs_and_passes_everything_else_through():
     req = make_request(5, 100)
     view = EngineRequestView(req)
-    assert view.is_gen_init is False and view.is_gen_first_context is False
+    assert view.is_disagg_generation_init is False and view.is_generation_first_context is False
     assert view.route_hints == {}
     assert view.py_request_id == 5 and view.prompt_len == 100
     assert view.is_first_context_chunk and view.context_remaining_length == 100
@@ -305,7 +305,7 @@ class TestParkForFetch:
     def test_a_parked_request_is_not_planned_again(self, rig):
         req = make_request(1, 100)
         rig.plan_reserve_launch(req)
-        assert rig.hooks.plan_fetch(req) is None
+        assert rig.hooks.fetch_answer(req) is None
         rig.advance(req)  # still in flight, still not a candidate
         assert rig.store.count("fetch") == 1
 
@@ -325,9 +325,9 @@ class TestUnpark:
         assert rig.kv.kv_cache_map[1].num_committed_tokens == 96
         assert not rig.hooks.owns(req)
         assert not rig.coord.has_pending_work()
-        assert rig.hooks.plan_fetch(req) is None  # decided: compute the rest locally
+        assert rig.hooks.fetch_answer(req) is None  # decided: compute the rest locally
         # A landed fetch record reaches its release point when the request ends (design §4.3).
-        assert [r["state"] for r in rig.records()] == ["LANDED"]
+        assert [r["state"] for r in rig.records()] == ["DELIVERED"]
         rig.executor._terminate_request(req)
         rig.executor._do_terminate_request.assert_called_once_with(req)
         assert rig.records() == []
@@ -400,7 +400,7 @@ class TestGiveBackFetchPages:
         assert not rig.hooks.owns(req)
         assert rig.store.count("quiesce") == 1  # quiesced before the pages were given back
         # One retry: the request is undecided again and the record is kept for the budget.
-        assert rig.hooks.plan_fetch(req) is DEFER
+        assert rig.hooks.fetch_answer(req) is DEFER
         assert rig.records()[0]["state"] == "PLANNED" and rig.records()[0]["try_index"] == 0
         plan2 = rig.plan(req)
         assert plan2.token_end == 96
@@ -432,7 +432,7 @@ class TestGiveBackFetchPages:
         assert rig.store.count("quiesce") == 0
         assert req.state == CONTEXT_INIT and not rig.hooks.owns(req)
         # The plan stands: the scheduler reserves for the same fetch next round, no retry spent.
-        assert rig.hooks.plan_fetch(req) is plan
+        assert rig.hooks.fetch_answer(req) is plan
 
     def test_second_failure_lands_the_request_on_the_local_path(self, rig):
         req = make_request(1, 100)
@@ -440,7 +440,7 @@ class TestGiveBackFetchPages:
             plan, attempt = rig.plan_reserve_launch(req)
             attempt.finish(Failed("boom"))
             rig.advance(req)
-        assert rig.hooks.plan_fetch(req) is None
+        assert rig.hooks.fetch_answer(req) is None
         assert rig.records() == []
         assert req.state == CONTEXT_INIT
 
@@ -751,7 +751,7 @@ class TestReleaseGate:
         attempt.deliver_all()
         rig.advance()
         assert rig.records() == []
-        assert rig.terminations() == 0  # _finish_publish did nothing for an unfinished request
+        assert rig.terminations() == 0  # _conclude_publish did nothing for an unfinished request
         req.state = KV_PUBLISH_IN_PROGRESS  # the disagg send still holds it
 
         rig.executor._terminate_request(req)  # release_transfer, send complete
@@ -942,7 +942,7 @@ class TestCancelAndIdle:
         assert sleeps == []
         req = make_request(1, 100)
         rig.advance(req)
-        assert rig.hooks.plan_fetch(req) is DEFER
+        assert rig.hooks.fetch_answer(req) is DEFER
         rig.hooks.pace_idle()
         assert sleeps == [0.001]
         # An in-flight transfer paces too.
@@ -998,13 +998,13 @@ class TestCancelAndIdle:
 
         rig.advance(first, dummy, continuation, gen_init, short)
 
-        assert isinstance(rig.hooks.plan_fetch(first), FetchPlan)
-        assert rig.hooks.plan_fetch(short) is None
-        assert rig.hooks.plan_fetch(gen_init) is None  # gen-init receives are the transceiver's
+        assert isinstance(rig.hooks.fetch_answer(first), FetchPlan)
+        assert rig.hooks.fetch_answer(short) is None
+        assert rig.hooks.fetch_answer(gen_init) is None  # gen-init receives are the transceiver's
         probed = {name for _, (name, _) in ((m, a) for m, a in rig.store.calls if m == "probe")}
         assert len(probed) == 1  # only ``first`` reached the store
         for other in (dummy, continuation):
-            assert rig.coord.plan_fetch(EngineRequestView(other)) is DEFER  # never planned
+            assert rig.coord.fetch_answer(EngineRequestView(other)) is DEFER  # never planned
 
 
 # =============================================================================================
@@ -1184,7 +1184,7 @@ class TestClose:
             "decided_plans",
             "finished_pending",
         }
-        assert coordinator["plan_authority"] == "VOTED"
+        assert coordinator["plan_authority"] == "ALL_RANKS"
         assert coordinator["any_rank_pending"] is True  # the last advance saw the planned fetch
         assert coordinator["finished_pending"] == [1]
         assert isinstance(coordinator["decided_plans"], int)
@@ -1201,13 +1201,13 @@ class TestClose:
                 "deadline",
                 "expired",
                 "token_end",
-                "launch_gave_up",
-                "peer_launched_at",
+                "gave_up_launching",
+                "peer_launch_seen_at",
                 "has_landing",
-                "waiting_since",
+                "resource_wait_since",
                 "retries_left",
                 "consecutive_launch_failures",
-                "retry_hint",
+                "retry_cap",
                 "committed_names",
             }
         assert records[(1, "publish")]["state"] == "IN_FLIGHT"
@@ -1232,7 +1232,7 @@ class TestClose:
     def test_status_dump_is_readable_before_close(self, rig):
         dump = rig.hooks.status_dump()
         assert dump["coordinator"] == {
-            "plan_authority": "VOTED",
+            "plan_authority": "ALL_RANKS",
             "any_rank_pending": False,
             "any_rank_drained": False,
             "records": [],
@@ -1365,7 +1365,7 @@ class TestRejectedSubmissions:
         req = make_request(1, 100)
         for _ in range(12):
             rig.advance(req)
-            plan = rig.hooks.plan_fetch(req)
+            plan = rig.hooks.fetch_answer(req)
             if plan is None:
                 break
             if plan is DEFER:
@@ -1373,7 +1373,7 @@ class TestRejectedSubmissions:
             assert isinstance(plan, FetchPlan)
             rig.reserve(req, plan.token_end)
             rig.hooks.launch_reserved_fetches([req])
-        assert rig.hooks.plan_fetch(req) is None, "rejections were never capped"
+        assert rig.hooks.fetch_answer(req) is None, "rejections were never capped"
         assert rig.store.count("fetch") == 6  # 3 per plan, two plans
         assert rig.store.attempts == []  # nothing escaped
         assert rig.executor._revert_ctx_alloc.call_count == rig.store.count("fetch")
@@ -1653,7 +1653,7 @@ class TestResponsePass:
 class TestCandidatesAndPublishers:
     def test_plan_fetch_answers_none_for_every_non_candidate(self, rig):
         """Scenario: a planner is attached, yet dummies, chunk continuations, gen-init and
-        DISAGG_CONTEXT_INIT_AND_TRANS requests take the ordinary path: ``plan_fetch`` is None."""
+        DISAGG_CONTEXT_INIT_AND_TRANS requests take the ordinary path: ``fetch_answer`` is None."""
         dummy = make_request(1, 100)
         dummy.is_dummy_request = True
         continuation = make_request(2, 100)
@@ -1664,9 +1664,9 @@ class TestCandidatesAndPublishers:
         ctx_and_trans = make_request(4, 100)
         ctx_and_trans.state = LlmRequestState.DISAGG_CONTEXT_INIT_AND_TRANS
         for request in (dummy, continuation, gen_init, ctx_and_trans):
-            assert rig.hooks.plan_fetch(request) is None
+            assert rig.hooks.fetch_answer(request) is None
             rig.advance(request)
-            assert rig.hooks.plan_fetch(request) is None
+            assert rig.hooks.fetch_answer(request) is None
         assert rig.store.count("probe") == 0
         assert rig.coord.status_dump()["decided_plans"] == 0
 
@@ -1720,7 +1720,7 @@ class TestHostFirstSchedulerSeam:
     def scheduler_round(self, rig: Rig, req) -> bool:
         """The scheduler's fetch path for one request in one round: ask for the plan, reserve
         pages for it, queue the request for launch when the reservation went through."""
-        plan = rig.hooks.plan_fetch(req)
+        plan = rig.hooks.fetch_answer(req)
         if not isinstance(plan, FetchPlan):
             return False
         if not rig.kv.reserve_transfer_pages(req, plan.token_end):
@@ -1734,12 +1734,12 @@ class TestHostFirstSchedulerSeam:
         rig = Rig(host_first=True)
         req = make_request(1, 100)
         rig.advance(req)
-        assert rig.store.count("fetch_to_host") == 1 and rig.hooks.plan_fetch(req) is DEFER
+        assert rig.store.count("fetch_to_host") == 1 and rig.hooks.fetch_answer(req) is DEFER
         assert rig.kv.count("reserve_transfer_pages") == 0
         assert req.state == CONTEXT_INIT and not rig.hooks.owns(req)
         assert rig.hooks.has_pending_work()  # a landing paces the idle loop ...
         assert rig.hooks.inflight_request_ids() == frozenset()  # ... but protects no page
-        assert [r["state"] for r in rig.records()] == ["STAGING"]
+        assert [r["state"] for r in rig.records()] == ["LANDING"]
         assert rig.executor._try_cancel_request(req) is True  # not parked: cancellable
 
     def test_staged_request_is_asked_for_pages_every_round_and_placed_once_they_come(self):
@@ -1749,16 +1749,16 @@ class TestHostFirstSchedulerSeam:
         landing = rig.store.landings[0]
         landing.deliver_all()
         rig.advance(req)
-        assert [r["state"] for r in rig.records()] == ["STAGED"]
+        assert [r["state"] for r in rig.records()] == ["LANDED"]
 
         rig.kv.reserve_answer = False
         for _ in range(3):
             assert self.scheduler_round(rig, req) is False
             rig.advance(req)
         assert rig.kv.count("reserve_transfer_pages") == 3
-        assert [r["state"] for r in rig.records()] == ["STAGED"]
+        assert [r["state"] for r in rig.records()] == ["LANDED"]
         assert rig.store.count("place") == 0 and req.state == CONTEXT_INIT
-        assert landing.releases == 0
+        assert landing.closes == 0
 
         rig.kv.reserve_answer = True
         assert self.scheduler_round(rig, req) is True
@@ -1771,8 +1771,8 @@ class TestHostFirstSchedulerSeam:
         placed.deliver_all()
         rig.advance(req)
         assert req.state == CONTEXT_INIT and req.context_current_position == 96
-        assert landing.releases == 1 and not rig.hooks.owns(req)
-        assert [r["state"] for r in rig.records()] == ["LANDED"]
+        assert landing.closes == 1 and not rig.hooks.owns(req)
+        assert [r["state"] for r in rig.records()] == ["DELIVERED"]
 
     def test_request_finished_while_staging_releases_the_landing_at_once_then_terminates(self):
         """The landing names no page and goes now; the record stays one round to vote so every
@@ -1783,7 +1783,7 @@ class TestHostFirstSchedulerSeam:
         landing = rig.store.landings[0]
         rig.executor._terminate_request(req)
         assert rig.terminations() == 0 and rig.coord.held_request_ids() == {1}
-        assert landing.releases == 1 and not rig.coord.has_backend_work()
+        assert landing.closes == 1 and not rig.coord.has_backend_work()
         assert rig.hooks.has_pending_work()  # held: the loop must not sleep on its queue
         rig.advance()
         rig.executor._do_terminate_request.assert_called_once_with(req)

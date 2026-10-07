@@ -57,7 +57,7 @@ class MemoryBlobStore:
             if self.registered.pop(address, None) is None:
                 raise BlobStoreError(f"[{address:#x}, {address + size:#x}) is not registered")
 
-    def holds(self, keys: Sequence[str]) -> list[bool]:
+    def contains(self, keys: Sequence[str]) -> list[bool]:
         with self._lock:
             return [key in self.objects for key in keys]
 

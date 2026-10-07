@@ -41,9 +41,9 @@ from ...disaggregation.backends.registry import (
 )
 from ...disaggregation.base.backend import CacheKind
 from ...disaggregation.orchestration.kv_transfer.build import build_coordinator
-from ...disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority
+from ...disaggregation.orchestration.kv_transfer.engine_protocols import PlanAuthority
 from ...disaggregation.resource.kv_extractor import build_page_table_from_manager
-from ...disaggregation.resource.kv_v2_reader import KVv2ResourceReader
+from ...disaggregation.resource.kv_v2_view import KVv2ResourceView
 from ...disaggregation.resource.naming import GROUP_TAG_BYTES
 from ...disaggregation.resource.region import (
     KVv2RegionResolver,
@@ -167,7 +167,7 @@ def plan_authority_for(mapping) -> PlanAuthority:
     to refuse such a model would trade an occasional local compute for a refused engine.
     """
     if mapping.pp_size == 1:
-        return PlanAuthority.VOTED
+        return PlanAuthority.ALL_RANKS
     schedules_for_its_replica = mapping.enable_attention_dp and mapping.tp_size > 1
     if mapping.rank == 0 or (mapping.pp_rank == 0 and schedules_for_its_replica):
         return PlanAuthority.OWNER
@@ -226,7 +226,7 @@ def model_identity_for(executor: PyExecutor) -> str:
     return f"{architecture}#{_digest_of_config(config)}"
 
 
-def _check_layer_groups_are_paged(reader: KVv2ResourceReader) -> None:
+def _check_layer_groups_are_paged(reader: KVv2ResourceView) -> None:
     """Every layer group must be paged: full attention or sliding window (with or without sink
     blocks), whose blocks the store path names and fetches per group. A recurrent group is
     refused because nothing publishes its state snapshots.
@@ -276,7 +276,7 @@ def _closing_backends_on_failure(backends: Sequence[BackendHandle], assemble: Ca
 
 
 def _unit_bytes_by_name(
-    reader: KVv2ResourceReader, resolver: KVv2RegionResolver
+    reader: KVv2ResourceView, resolver: KVv2RegionResolver
 ) -> Callable[[bytes], int]:
     """Size of a unit from its name: the name starts with its layer group's tag, and every unit
     of a group is one page of that group's pools. For a backend that lands units in its own
@@ -306,7 +306,7 @@ class _ResourceViews(NamedTuple):
     """This rank's KV cache as the transfer layer sees it: read by the coordinator through
     ``reader``, addressed by the backends through ``resolver`` and ``build_context``."""
 
-    reader: KVv2ResourceReader
+    reader: KVv2ResourceView
     resolver: KVv2RegionResolver
     model_identity: str
     build_context: BackendBuildContext
@@ -317,7 +317,7 @@ def _build_resource_views(executor: PyExecutor, config, mapping) -> _ResourceVie
     model with a recurrent layer group, and gather what every backend factory needs from them."""
     kv_cache_manager = executor.kv_cache_manager
     page_table = build_page_table_from_manager(kv_cache_manager)
-    reader = KVv2ResourceReader(kv_cache_manager, page_table)
+    reader = KVv2ResourceView(kv_cache_manager, page_table)
     _check_layer_groups_are_paged(reader)
     resolver = KVv2RegionResolver(page_table)
     model_identity = model_identity_for(executor)

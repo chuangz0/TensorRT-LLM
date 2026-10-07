@@ -19,7 +19,9 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
 from tensorrt_llm._torch.disaggregation.base.backend import CacheKind
 from tensorrt_llm._torch.disaggregation.base.views import GroupSpec
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority
+from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.engine_protocols import (
+    PlanAuthority,
+)
 from tensorrt_llm._torch.disaggregation.resource.region import layout_fingerprint
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_transfer import assembly
@@ -81,8 +83,8 @@ def test_in_scope_engine_passes(mapping):
 @pytest.mark.parametrize(
     "mapping, authority",
     [
-        (in_scope_mapping(), PlanAuthority.VOTED),
-        (in_scope_mapping(rank=1, tp_size=2), PlanAuthority.VOTED),
+        (in_scope_mapping(), PlanAuthority.ALL_RANKS),
+        (in_scope_mapping(rank=1, tp_size=2), PlanAuthority.ALL_RANKS),
         (in_scope_mapping(pp_size=2), PlanAuthority.OWNER),
         (in_scope_mapping(rank=1, pp_size=2, pp_rank=1), PlanAuthority.FOLLOWER),
         # The owner's TP peer receives the schedule by tp_broadcast: a follower.
@@ -319,7 +321,7 @@ def test_the_failure_guard_closes_the_built_backends_and_nothing_on_success():
 
 
 class _FakeReader:
-    """The slice of ``KVv2ResourceReader`` the assembly reads before and after ``build_backends``."""
+    """The slice of ``KVv2ResourceView`` the assembly reads before and after ``build_backends``."""
 
     tokens_per_block = 32
 
@@ -357,7 +359,7 @@ def attach_over_fakes(monkeypatch, tmp_path, executor, *, build_backends, build_
     """Run ``attach_kv_transfer`` with every KV v2 prerequisite faked, so that what happens
     around ``build_backends`` is the real assembly code."""
     monkeypatch.setattr(assembly, "build_page_table_from_manager", lambda manager: object())
-    monkeypatch.setattr(assembly, "KVv2ResourceReader", _FakeReader)
+    monkeypatch.setattr(assembly, "KVv2ResourceView", _FakeReader)
     monkeypatch.setattr(assembly, "KVv2RegionResolver", _FakeResolver)
     monkeypatch.setattr(assembly, "layout_fingerprint", lambda *args, **kwargs: b"\xfe" * 16)
     monkeypatch.setattr(assembly, "parallel_shard_tag", lambda mapping: "heads=all")

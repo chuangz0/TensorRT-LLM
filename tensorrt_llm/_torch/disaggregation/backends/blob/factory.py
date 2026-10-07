@@ -34,7 +34,7 @@ from ..config import BackendEntry
 from ..registry import BackendBuildContext, BackendHandle
 from .backend import BlobStoreBackend, BlobStoreConfig
 from .host_landing import HostLandingBlobBackend
-from .staging import HostStagingPool, open_pinned_staging_pool, plan_slot_geometry
+from .slot_pool import HostSlotPool, open_pinned_slot_pool, plan_slot_geometry
 from .store import BlobStore
 
 __all__ = ["build_blob_backend"]
@@ -96,12 +96,12 @@ def _host_landing_handle(
     """Two pools, then the inner backend over the publish pool and the landing backend over both.
     The store is registered with pinned host memory only, so the KV pools stay unregistered."""
     publish_pool = _open_pool(
-        store, context, config.transfer_batch_size, config.staging_buffer_bytes
+        store, context, config.transfer_batch_size, config.publish_buffer_bytes
     )
     landing_pool = _open_pool(store, context, config.max_landed_units, config.landing_buffer_bytes)
     _log_pool_geometry(entry, publish_pool, landing_pool, context.max_request_blocks)
     inner = BlobStoreBackend(
-        store, config, context.resolver, context.layout_fingerprint, staging=publish_pool
+        store, config, context.resolver, context.layout_fingerprint, publish_pool=publish_pool
     )
     assert context.unit_bytes_of is not None  # checked by the caller before the store was opened
     backend = HostLandingBlobBackend(
@@ -127,17 +127,17 @@ def _host_landing_handle(
 
 def _open_pool(
     store: BlobStore, context: BackendBuildContext, max_slots: int | None, budget_bytes: int
-) -> HostStagingPool:
+) -> HostSlotPool:
     slot_bytes, num_slots = plan_slot_geometry(context.max_unit_bytes, max_slots, budget_bytes)
-    return open_pinned_staging_pool(
+    return open_pinned_slot_pool(
         store, slot_bytes=slot_bytes, num_slots=num_slots, device_index=context.device_index
     )
 
 
 def _log_pool_geometry(
     entry: BackendEntry,
-    publish_pool: HostStagingPool,
-    landing_pool: HostStagingPool,
+    publish_pool: HostSlotPool,
+    landing_pool: HostSlotPool,
     max_request_blocks: int | None,
 ) -> None:
     """The two pools' sizes, and a warning when the landing pool cannot hold two fetches of the

@@ -29,8 +29,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Mapping, Optional, Sequence
 
 from ..base.cache_backend import Fetches, Publishes, RegistersPools
+from ..base.capabilities import LandsOnHost
 from ..base.region import RegionResolver
-from ..orchestration.kv_transfer.interfaces import LandsOnHost
 from .config import DEFAULT_LANDING_WAIT_TIMEOUT_S, BackendEntry, KVTransferConfig
 
 __all__ = [
@@ -53,7 +53,7 @@ class BackendBuildContext:
     Attributes:
         resolver: Maps a unit's local coordinates to memory segments.
         layout_fingerprint: Digest of the local memory layout, for content-addressed names.
-        max_unit_bytes: The largest unit any layer group produces; sizes staging buffers.
+        max_unit_bytes: The largest unit any layer group produces; sizes the host slot pools.
         device_index: CUDA device of the KV pools, for backends that copy through host memory.
         unit_bytes_of: Callable giving the byte size of the unit called ``name``, for a backend
             that lands units in its own memory before it knows their pages (``LandsOnHost``).

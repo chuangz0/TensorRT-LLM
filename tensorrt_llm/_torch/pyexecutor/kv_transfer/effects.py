@@ -70,8 +70,8 @@ class EngineRequestView:
 
     __slots__ = ("request",)
 
-    is_gen_init = False
-    is_gen_first_context = False
+    is_disagg_generation_init = False
+    is_generation_first_context = False
     route_hints: Mapping[str, Mapping[str, object]] = MappingProxyType({})
 
     def __init__(self, request: LlmRequest) -> None:

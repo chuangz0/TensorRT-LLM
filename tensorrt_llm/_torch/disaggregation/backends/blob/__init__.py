@@ -6,7 +6,7 @@ Two layers. The adaptation layer is store-agnostic: ``store.py`` is the ``BlobSt
 a store must offer, ``backend.py`` is ``BlobStoreBackend`` (``Fetches`` / ``Publishes`` /
 ``RegistersPools`` over one ``BlobStore``), ``host_landing.py`` is ``HostLandingBlobBackend`` (its
 ``LandsOnHost`` shape, chosen by ``BlobStoreConfig.landing: host``), ``factory.py`` builds either
-from a config entry for every store alike, and ``keys.py`` / ``staging.py`` / ``worker_pool.py``
+from a config entry for every store alike, and ``keys.py`` / ``slot_pool.py`` / ``worker_pool.py``
 are their parts. The drivers under ``drivers/`` each wrap one real store as a ``BlobStore``; a new
 store is a new module there and one line in the registry, nothing here.
 """

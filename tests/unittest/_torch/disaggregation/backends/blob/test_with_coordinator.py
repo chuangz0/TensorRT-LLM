@@ -117,7 +117,7 @@ def _publish(ctx: Side, req: FakeRequest) -> None:
     assert ctx.records()[0]["state"] == "IN_FLIGHT" and ctx.records()[0]["direction"] == "publish"
     wait_until(lambda: len(ctx.rank.store.objects) == BLOCKS, what="publish to land in the store")
     ctx.coord.advance([], 1.0)
-    assert ctx.records() == []  # LANDED, quiesced, released
+    assert ctx.records() == []  # DELIVERED, quiesced, released
     assert ctx.effects.calls == []  # a publish of a running request owes the engine nothing
     assert ctx.backend.counters.publish_stored == BLOCKS
 
@@ -126,11 +126,11 @@ def _probe_and_plan(gen: Side, req: FakeRequest) -> FetchPlan:
     """Generation side: the first ``advance`` queues the probe and defers; once the backend has
     answered, the next one plans from the store."""
     gen.coord.advance([req], 0.0)
-    assert gen.coord.plan_fetch(req) is DEFER
+    assert gen.coord.fetch_answer(req) is DEFER
     counters = gen.backend.counters
     wait_until(lambda: counters.probe_hits + counters.probe_misses == BLOCKS, what="probe answer")
     gen.coord.advance([req], 1.0)
-    plan = gen.coord.plan_fetch(req)
+    plan = gen.coord.fetch_answer(req)
     assert isinstance(plan, FetchPlan), plan
     return plan
 
@@ -152,7 +152,7 @@ def test_publish_on_one_rank_then_probe_plan_launch_and_land_on_another():
 
         gen.advance_until("unpark")
         assert gen.effects.only("unpark") == [(req, END, False, None)]
-        assert gen.records()[0]["state"] == "LANDED"
+        assert gen.records()[0]["state"] == "DELIVERED"
         for o in range(BLOCKS):
             assert gen.block_bytes(o) == pattern(o + 1, UNIT_BYTES) == ctx.block_bytes(o)
         assert gen.block_bytes(BLOCKS) == bytes([0xEE]) * UNIT_BYTES  # not asked for, not touched
@@ -163,7 +163,7 @@ def test_publish_on_one_rank_then_probe_plan_launch_and_land_on_another():
         gen.coord.notify_request_finished(req)
         assert gen.records() == [] and gen.effects.count("hold_for_transfer") == 0
         assert gen.coord.status_dump() == {
-            "plan_authority": "VOTED",
+            "plan_authority": "ALL_RANKS",
             "any_rank_pending": True,
             "any_rank_drained": False,
             "records": [],
@@ -203,7 +203,7 @@ def test_content_gone_between_probe_and_fetch_is_a_short_serve_retried_once_then
 
         # The retry is bounded by the short serve (hint 0), so the request computes locally.
         gen.coord.advance([req], 5.0)
-        assert gen.coord.plan_fetch(req) is None
+        assert gen.coord.fetch_answer(req) is None
         assert gen.records() == []
         assert gen.effects.count("fail_requests") == 0 and gen.effects.count("unpark") == 0
     finally:
@@ -218,7 +218,7 @@ def test_store_outage_during_fetch_is_failed_gives_pages_back_and_the_retry_land
         req = FakeRequest(3, prompt_len=PROMPT)
         _publish(ctx, req)
         _probe_and_plan(gen, req)
-        store.fail_next("holds")  # the fetch's own lookup, not the probe's
+        store.fail_next("contains")  # the fetch's own lookup, not the probe's
         gen.coord.launch_reserved_fetches([req], 1.0)
 
         gen.advance_until("give_back_fetch_pages")
@@ -229,7 +229,7 @@ def test_store_outage_during_fetch_is_failed_gives_pages_back_and_the_retry_land
 
         # Re-planned from the cached probe answer, launched again (try 1), and this time lands.
         gen.coord.advance([req], 20.0)
-        plan = gen.coord.plan_fetch(req)
+        plan = gen.coord.fetch_answer(req)
         assert isinstance(plan, FetchPlan) and plan.token_end == END
         gen.coord.launch_reserved_fetches([req], 20.0)
         assert gen.records()[0]["try_index"] == 1 and gen.records()[0]["attempts"] == 2
@@ -256,17 +256,17 @@ def test_probe_outage_defers_within_budget_then_plans_local_without_a_fetch():
             asked.append(tuple(keys))
             raise BlobStoreError("down")
 
-        store.holds = unreachable
+        store.contains = unreachable
         gen.coord.advance([req], 0.0)
-        assert gen.coord.plan_fetch(req) is DEFER
+        assert gen.coord.fetch_answer(req) is DEFER
         wait_until(lambda: len(asked) >= 1, what="the probe's lookup")
         # The lookup failed on the backend's thread. Whether the second probe finds the error
         # (and raises, which the coordinator logs and keeps pending) or is still waiting, the
         # answer is never an empty set, so the planner defers rather than reading a miss.
         gen.coord.advance([req], 1.0)
-        assert gen.coord.plan_fetch(req) is DEFER
+        assert gen.coord.fetch_answer(req) is DEFER
         gen.coord.advance([req], 2.0)  # probe budget spent: compute locally
-        assert gen.coord.plan_fetch(req) is None
+        assert gen.coord.fetch_answer(req) is None
         assert gen.records() == [] and gen.effects.calls == []
         assert gen.backend.counters.probe_misses == 0 and gen.backend.counters.fetch_misses == 0
         assert gen.backend.counters.probe_hits == 0
@@ -290,17 +290,17 @@ def test_probe_answer_expiring_before_the_planner_reads_it_is_asked_again_not_re
         req = FakeRequest(5, prompt_len=PROMPT)
         _publish(ctx, req)
         gen.coord.advance([req], 0.0)
-        assert gen.coord.plan_fetch(req) is DEFER
+        assert gen.coord.fetch_answer(req) is DEFER
         counters = gen.backend.counters
         wait_until(lambda: counters.probe_hits == BLOCKS, what="the first lookup")
-        lookups_before = store.count("holds")
+        lookups_before = store.count("contains")
         time.sleep(PROBE_TTL_S + 0.1)  # past the TTL: the answer nobody read is dropped
         gen.coord.advance([req], 1.0)
-        assert gen.coord.plan_fetch(req) is DEFER  # asked again, not read as a miss
+        assert gen.coord.fetch_answer(req) is DEFER  # asked again, not read as a miss
         wait_until(lambda: counters.probe_hits == 2 * BLOCKS, what="the second lookup")
-        assert store.count("holds") == lookups_before + 1  # one fresh lookup, nothing else
+        assert store.count("contains") == lookups_before + 1  # one fresh lookup, nothing else
         gen.coord.advance([req], 1.5)
-        plan = gen.coord.plan_fetch(req)
+        plan = gen.coord.fetch_answer(req)
         assert isinstance(plan, FetchPlan) and plan.token_end == END
         assert counters.probe_misses == 0 and gen.records()[0]["state"] == "PLANNED"
     finally:
@@ -346,7 +346,7 @@ class HostSide(Side):
 
 def test_host_landing_rank_lands_first_then_places_after_the_scheduler_reserves():
     """The host-first flow end to end over a real backend: the plan starts the landing at once
-    (``STAGING``, no pages), ``plan_fetch`` defers until the content is on the host, then answers
+    (``LANDING``, no pages), ``fetch_answer`` defers until the content is on the host, then answers
     the plan so the scheduler reserves pages, and ``launch_reserved_fetches`` places instead of fetching.
     The landing is released in the same round the request is unparked."""
     store = FakeBlobStore()
@@ -357,21 +357,21 @@ def test_host_landing_rank_lands_first_then_places_after_the_scheduler_reserves(
 
         # Probe, then plan: the plan is decided and the landing started in the same advance.
         gen.coord.advance([req], 0.0)
-        assert gen.coord.plan_fetch(req) is DEFER
+        assert gen.coord.fetch_answer(req) is DEFER
         counters = gen.backend.counters
         wait_until(lambda: counters.probe_hits + counters.probe_misses == BLOCKS, what="probe")
         gen.coord.advance([req], 1.0)
-        assert gen.coord.plan_fetch(req) is DEFER  # STAGING: no pages yet
-        assert gen.records()[0]["state"] == "STAGING" and gen.records()[0]["has_landing"]
+        assert gen.coord.fetch_answer(req) is DEFER  # LANDING: no pages yet
+        assert gen.records()[0]["state"] == "LANDING" and gen.records()[0]["has_landing"]
         assert gen.effects.names() == []  # nothing parked, nothing prepared
         gen.fill_all(0xEE)
 
-        # Landed on the host: the record is STAGED and the plan is offered to the scheduler.
+        # Landed on the host: the record is LANDED and the plan is offered to the scheduler.
         wait_until(lambda: counters.fetch_hits == BLOCKS, what="landing")
         gen.coord.advance([req], 2.0)
-        plan = gen.coord.plan_fetch(req)
+        plan = gen.coord.fetch_answer(req)
         assert isinstance(plan, FetchPlan) and plan.token_end == END
-        assert gen.records()[0]["state"] == "STAGED"
+        assert gen.records()[0]["state"] == "LANDED"
         assert gen.block_bytes(0) == bytes([0xEE]) * UNIT_BYTES  # pages untouched so far
         assert gen.rank.backend.landings_held() == 1
 
@@ -381,7 +381,7 @@ def test_host_landing_rank_lands_first_then_places_after_the_scheduler_reserves(
         assert gen.records()[0]["state"] == "IN_FLIGHT"
         gen.advance_until("unpark")
         assert gen.effects.only("unpark") == [(req, END, False, None)]
-        assert gen.records()[0]["state"] == "LANDED"
+        assert gen.records()[0]["state"] == "DELIVERED"
         assert not gen.records()[0]["has_landing"]
         assert gen.rank.backend.landings_held() == 0
         for o in range(BLOCKS):

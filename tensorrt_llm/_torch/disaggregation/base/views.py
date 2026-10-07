@@ -14,7 +14,7 @@
 # limitations under the License.
 """The two read-only views the KV transfer coordination layer consumes (design §6.2, §7.1).
 
-``RequestView`` is what the layer reads of a request; ``GroupSpec`` and ``ResourceReader`` are what
+``RequestView`` is what the layer reads of a request; ``GroupSpec`` and ``ResourceView`` are what
 it reads of this rank's cache. The engine side (``pyexecutor``) provides the request view as
 ``EngineRequestView``, a wrapper over an ``LlmRequest`` that adds the three attributes a request
 does not carry; ``resource/`` provides the reader; tests pass a plain dataclass and a table.
@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Mapping, Protocol, Sequence
 
+# ``backend``: Chunk/CacheKind only; ``cache_backend``: the contract.
 from .backend import CacheKind
 from .cache_backend import CacheExtent
 
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
     from ..remote_cache import FetchPlan
     from .backend import Chunk
 
-__all__ = ["GroupSpec", "RequestView", "ResourceReader"]
+__all__ = ["GroupSpec", "RequestView", "ResourceView"]
 
 
 class RequestView(Protocol):
@@ -41,9 +42,9 @@ class RequestView(Protocol):
     does not carry.
 
     Duck-typed: the engine passes ``EngineRequestView``, which wraps an ``LlmRequest`` and adds
-    ``is_gen_init``, ``is_gen_first_context`` and ``route_hints`` as constants; tests pass a plain
-    dataclass. The coordination layer never writes to a request; every write goes through
-    ``KVTransferEffects``.
+    ``is_disagg_generation_init``, ``is_generation_first_context`` and ``route_hints`` as
+    constants; tests pass a plain dataclass. The coordination layer never writes to a request;
+    every write goes through ``KVTransferEffects``.
     """
 
     @property
@@ -53,13 +54,13 @@ class RequestView(Protocol):
     def prompt_len(self) -> int: ...
 
     @property
-    def is_gen_init(self) -> bool:
+    def is_disagg_generation_init(self) -> bool:
         """A generation-side disagg request that must fetch its whole prompt KV from a context
         worker before it can run. Its plan is a short-circuit (§7.2 step 1)."""
         ...
 
     @property
-    def is_gen_first_context(self) -> bool:
+    def is_generation_first_context(self) -> bool:
         """A context-side request whose generation side arrived first and must be ready before
         this side may be scheduled (§7.2 step 2)."""
         ...
@@ -95,7 +96,7 @@ class GroupSpec:
     sink_blocks: int = 0
 
 
-class ResourceReader(Protocol):
+class ResourceView(Protocol):
     """Read-only view of this rank's cache resources, for planning and for building extents.
 
     Provided by ``resource/``; it is the only thing between the coordination layer and KV v2.
@@ -116,11 +117,11 @@ class ResourceReader(Protocol):
         """Every layer group this rank holds."""
         ...
 
-    def gen_first_ready(self, request: RequestView) -> bool:
+    def generation_first_ready(self, request: RequestView) -> bool:
         """For a gen-first context request: whether the generation side is ready."""
         ...
 
-    def fetch_extent(
+    def fetch_extent_and_committed(
         self, request: RequestView, plan: FetchPlan
     ) -> tuple[CacheExtent, frozenset[bytes]]:
         """The extent for a fetch the scheduler has already allocated pages for, and the names

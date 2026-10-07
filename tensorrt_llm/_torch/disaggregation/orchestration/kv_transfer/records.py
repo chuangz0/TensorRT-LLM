@@ -28,8 +28,8 @@ from typing import TYPE_CHECKING, Literal
 from ...base.cache_backend import Attempt, CacheExtent, Cancelled, Delivered, Failed, Outcome, Route
 
 if TYPE_CHECKING:
+    from ...base.capabilities import Landing
     from ...remote_cache import FetchPlan
-    from .interfaces import Landing
 
 __all__ = [
     "AttemptRecord",
@@ -57,17 +57,18 @@ class RecordState(Enum):
     """The observable states of a record. Release is an event, not a state: a released record
     leaves the table.
 
-    ``STAGING`` and ``STAGED`` belong to a fetch from a ``LandsOnHost`` source only: the units
-    are on their way to the backend's host memory, then landed there and waiting for the
-    scheduler to reserve pages. Neither holds a page; the request stays schedulable. The copy
-    into the pages that follows is an ordinary ``IN_FLIGHT``.
+    ``LANDING`` and ``LANDED`` belong to a fetch from a ``LandsOnHost`` source only: the units
+    are on their way to the host-first backend's own host memory (``LANDING``), then landed
+    there (``LANDED``) and waiting for the scheduler to reserve pages. Neither holds a page; the
+    request stays schedulable. The copy into the pages that follows is an ordinary
+    ``IN_FLIGHT``. ``DELIVERED`` is a delivery the ranks agreed is complete in the pages.
     """
 
     PLANNED = "PLANNED"
-    STAGING = "STAGING"
-    STAGED = "STAGED"
-    IN_FLIGHT = "IN_FLIGHT"
+    LANDING = "LANDING"
     LANDED = "LANDED"
+    IN_FLIGHT = "IN_FLIGHT"
+    DELIVERED = "DELIVERED"
     FAILED = "FAILED"
 
 
@@ -78,17 +79,18 @@ class AttemptRecord:
     Attributes:
         attempt: The backend's handle.
         outcome: What ``poll`` last returned; ``None`` while in flight.
-        try_index: Which retry this attempt belongs to (fetch only; publish is always 0).
-        source: ``FetchSource.name`` for a fetch, the publisher's assembly name for a publish.
-            The coordinator maps it back to the backend for ``quiesce``.
-        route: Worker backend only: opened for this attempt, closed at ``LANDED`` or after
+        try_index: Which try this attempt belongs to (fetch only; publish is always 0).
+        backend_name: ``FetchSource.name`` for a fetch, the publisher's assembly name
+            (``publish:<index>``) for a publish. The coordinator maps it back to the backend for
+            ``quiesce``.
+        route: Worker backend only: opened for this attempt, closed at ``DELIVERED`` or after
             ``quiesce``.
     """
 
     attempt: Attempt
     outcome: Outcome | None = None
     try_index: int = 0
-    source: str | None = None
+    backend_name: str | None = None
     route: Route | None = None
 
 
@@ -114,22 +116,23 @@ class TransferRecord:
             when a fetch is launched or starts landing on the host (cleared again once the
             landing is complete; the placement sets its own), when a publish's first submission
             is accepted, and at the request's end for a record kept to vote without one.
-        expired: The deadline passed. The record no longer waits for the ranks' agreement: it is
-            settled on this rank as soon as its own attempts are over.
+        expired: The deadline passed. The record no longer waits for the ranks' agreement: it
+            ends on this rank's own outcome as soon as its own attempts are over.
         quiesce_refused: The backend could not vouch for the pages at the release point. The
             engine is fatal; the record stays so the pages are never handed out again.
-        retry_hint: Fetch only; the block boundary the next try may aim for at most: the ranks'
-            agreed MIN of the merged B (``remote_cache.merge``) of the try that came up short.
+        retry_cap: Fetch only; the block boundary the next try may aim for at most: the ranks'
+            agreed MIN of the merged B (``remote_cache.served_token_end``) of the try that came
+            up short.
         rejected: Publish only; some submission of this record raised ``SubmissionRejected``.
             The units it carried were never offered, so the publish as a whole has failed even if
             the other pieces land.
         consecutive_launch_failures: Fetch only; launches in a row that never started, whether
             the backend refused the submission or the route could not be opened, since the last
             launch that went through. At ``MAX_CONSECUTIVE_LAUNCH_FAILURES`` the record gives up.
-        launch_gave_up: Fetch only; this rank will not launch the current plan. The record votes
-            ``FAILED`` every round until the ranks agree, and the scheduler is answered ``DEFER``
-            meanwhile. Cleared when the plan is dropped for a retry.
-        peer_launched_at: Fetch only; when this rank, voting ``UNLAUNCHED`` for the record (no
+        gave_up_launching: Fetch only; this rank will not launch the current plan. The record
+            votes ``FAILED`` every round until the ranks agree, and the scheduler is answered
+            ``DEFER`` meanwhile. Cleared when the plan is dropped for a retry.
+        peer_launch_seen_at: Fetch only; when this rank, voting ``UNLAUNCHED`` for the record (no
             attempt of its own in the pages: pages not reserved, launch not started, or landed
             on the host and waiting for pages), first saw another rank's vote that was not
             ``UNLAUNCHED``. Bounds how long this rank may hold the others up
@@ -137,13 +140,13 @@ class TransferRecord:
             landing is accepted or marked complete, and when the plan is dropped; it starts
             again if the peers move on while this rank still waits.
         landing: Host-first fetch only; the current try's ``Landing``, from ``fetch_to_host``
-            until the coordinator releases it. Never among ``attempts``.
-        committed_names: Fetch only; units the plan asked for that ``fetch_extent`` left out of
-            the launched extent because the local cache had committed them meanwhile. They count
-            as served when the delivery is merged.
-        waiting_since: Fetch only; when this rank started waiting for something the scheduler
-            or the backend has yet to give: the pages (from the plan's decision for a
-            device-direct fetch, from ``STAGED`` for a host-first one) or the landing memory
+            until the coordinator closes it. Never among ``attempts``.
+        committed_names: Fetch only; units the plan asked for that ``fetch_extent_and_committed``
+            left out of the launched extent because the local cache had committed them meanwhile.
+            They count as served when the delivery is merged.
+        resource_wait_since: Fetch only; when this rank started waiting for something the
+            scheduler or the backend has yet to give: the pages (from the plan's decision for a
+            device-direct fetch, from ``LANDED`` for a host-first one) or the landing memory
             (``fetch_to_host`` refused). Bounded by ``landing_wait_timeout_s``; cleared when
             the wait ends.
     """
@@ -158,14 +161,14 @@ class TransferRecord:
     deadline: float | None = None
     expired: bool = False
     quiesce_refused: bool = False
-    retry_hint: int | None = None
+    retry_cap: int | None = None
     rejected: bool = False
     consecutive_launch_failures: int = 0
-    launch_gave_up: bool = False
-    peer_launched_at: float | None = None
+    gave_up_launching: bool = False
+    peer_launch_seen_at: float | None = None
     landing: Landing | None = None
     committed_names: frozenset[bytes] = frozenset()
-    waiting_since: float | None = None
+    resource_wait_since: float | None = None
 
     @property
     def key(self) -> RecordKey:
@@ -174,27 +177,27 @@ class TransferRecord:
     @property
     def try_index(self) -> int:
         """The current try: the highest ``try_index`` among attempts, or 0 before any."""
-        return max((a.try_index for a in self.attempts), default=0)
+        return max((attempt.try_index for attempt in self.attempts), default=0)
 
     def current_try_attempts(self) -> list[AttemptRecord]:
         """Attempts of the current try only; earlier tries were quiesced when they failed."""
         current = self.try_index
-        return [a for a in self.attempts if a.try_index == current]
+        return [attempt for attempt in self.attempts if attempt.try_index == current]
 
-    def is_terminal(self) -> bool:
+    def has_all_outcomes(self) -> bool:
         """Every attempt of the current try has an outcome. False with no attempts at all."""
         current = self.current_try_attempts()
-        return bool(current) and all(a.outcome is not None for a in current)
+        return bool(current) and all(attempt.outcome is not None for attempt in current)
 
     def any_failed(self) -> bool:
         """Some attempt of the current try ended ``Failed`` or ``Cancelled(by_peer=True)``."""
-        return any(is_failure(a.outcome) for a in self.current_try_attempts())
+        return any(is_failure(attempt.outcome) for attempt in self.current_try_attempts())
 
-    def merged_served(self) -> frozenset[bytes]:
+    def served_names(self) -> frozenset[bytes]:
         """Union of ``Delivered.served`` over the current try; a local cancel contributes
         nothing."""
         served: set[bytes] = set()
-        for a in self.current_try_attempts():
-            if isinstance(a.outcome, Delivered):
-                served |= a.outcome.served
+        for attempt in self.current_try_attempts():
+            if isinstance(attempt.outcome, Delivered):
+                served |= attempt.outcome.served
         return frozenset(served)

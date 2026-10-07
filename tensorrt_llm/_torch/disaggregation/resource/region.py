@@ -65,7 +65,7 @@ class KVv2RegionResolver:
         return sorted(size_by_address.items())
 
     def max_unit_bytes(self) -> int:
-        """The largest unit any layer group produces; sizes one host staging slot."""
+        """The largest unit any layer group produces; sizes one slot of the host slot pools."""
         return max(
             sum(int(pool.slot_bytes) for pool in pool_group.pools)
             for pool_group in self._page_table.pool_groups

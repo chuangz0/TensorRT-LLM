@@ -33,12 +33,9 @@ from tensorrt_llm.logger import logger
 
 from ...disaggregation.backends.config import BackendEntry
 from ...disaggregation.backends.registry import BackendHandle, close_backends
-from ...disaggregation.orchestration.kv_transfer.coordinator import (
-    DEFER,
-    KVTransferCoordinator,
-    PlanAnswers,
-)
-from ...disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority
+from ...disaggregation.orchestration.kv_transfer.consensus import PlanAnswers
+from ...disaggregation.orchestration.kv_transfer.coordinator import DEFER, KVTransferCoordinator
+from ...disaggregation.orchestration.kv_transfer.engine_protocols import PlanAuthority
 from ..llm_request import LlmRequest, LlmRequestState
 from .effects import EngineRequestView, PyExecutorKVTransferEffects
 
@@ -73,7 +70,7 @@ class KVTransferHooks:
     """
 
     DEFER = DEFER
-    """``plan_fetch`` answer meaning "skip this round"; the scheduler compares against it."""
+    """``fetch_answer`` answer meaning "skip this round"; the scheduler compares against it."""
 
     def __init__(
         self,
@@ -136,7 +133,7 @@ class KVTransferHooks:
         candidates = self._undecided_candidates(active_requests)
         self._num_deferred_requests = self.coordinator.adopt_plan_answers(candidates, answers)
 
-    def plan_fetch(self, request: LlmRequest):
+    def fetch_answer(self, request: LlmRequest):
         """Scheduler hook: ``FetchPlan``, ``None`` or ``DEFER`` for ``request``.
 
         A request that is not a fetch candidate (``_is_fetch_candidate``) computes locally:
@@ -144,7 +141,7 @@ class KVTransferHooks:
         """
         if not _is_fetch_candidate(request):
             return None
-        return self.coordinator.plan_fetch(EngineRequestView(request))
+        return self.coordinator.fetch_answer(EngineRequestView(request))
 
     def launch_reserved_fetches(self, fetch_launch_queue: Sequence[LlmRequest]) -> None:
         """After scheduling: start the fetches the scheduler reserved pages for."""
@@ -325,7 +322,7 @@ class KVTransferHooks:
             if not _is_fetch_candidate(request):
                 continue
             view = EngineRequestView(request)
-            if self.coordinator.plan_fetch(view) is DEFER:
+            if self.coordinator.fetch_answer(view) is DEFER:
                 candidates.append(view)
         return candidates
 

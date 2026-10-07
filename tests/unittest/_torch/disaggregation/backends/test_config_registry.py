@@ -40,7 +40,7 @@ from store_fakes import (  # noqa: E402
     ArenaResolver,
     FakeBlobStore,
     MemoryArena,
-    fake_open_staging,
+    fake_open_slot_pool,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -423,7 +423,7 @@ def test_importing_the_registry_does_not_import_the_mooncake_driver():
 @pytest.fixture
 def mooncake_module(monkeypatch):
     """The driver module with ``MooncakeBlobStore.open`` replaced by a fake; yields
-    ``(factory_module, opened)``: the shared factory module, whose ``open_pinned_staging_pool`` the
+    ``(factory_module, opened)``: the shared factory module, whose ``open_pinned_slot_pool`` the
     host-landing tests replace, and the fake stores opened so far."""
     driver = importlib.import_module("disaggregation.backends.blob.drivers.mooncake")
     factory = importlib.import_module("disaggregation.backends.blob.factory")
@@ -472,9 +472,9 @@ def fake_pools(mooncake_module, monkeypatch):
 
     def open_pool(store, *, slot_bytes, num_slots, device_index=None):
         geometry.append((slot_bytes, num_slots, device_index))
-        return fake_open_staging(store, slot_bytes=slot_bytes, num_slots=num_slots)
+        return fake_open_slot_pool(store, slot_bytes=slot_bytes, num_slots=num_slots)
 
-    monkeypatch.setattr(factory, "open_pinned_staging_pool", open_pool)
+    monkeypatch.setattr(factory, "open_pinned_slot_pool", open_pool)
     return geometry
 
 
@@ -586,7 +586,7 @@ def test_mooncake_host_landing_opens_two_pools_with_their_own_geometry(
                 "store",
                 "mooncake",
                 transfer_batch_size=4,
-                staging_buffer_bytes=4096,
+                publish_buffer_bytes=4096,
                 landing_buffer_bytes=8192,
                 **TCP_OPTIONS,
             ),
@@ -782,7 +782,7 @@ def test_mooncake_pool_failure_closes_the_store(mooncake_module, monkeypatch):
     def fail_pool(*args, **kwargs):
         raise RuntimeError("no pinned memory")
 
-    monkeypatch.setattr(module, "open_pinned_staging_pool", fail_pool)
+    monkeypatch.setattr(module, "open_pinned_slot_pool", fail_pool)
     config = KVTransferConfig(backends=(entry("store", "mooncake", **TCP_OPTIONS),))
     with pytest.raises(RuntimeError, match="no pinned memory"):
         build_backends(config, make_context())

@@ -29,7 +29,7 @@ def test_backend_fields_are_the_documented_nine():
         "namespace",
         "transfer_batch_size",
         "landing",
-        "staging_buffer_bytes",
+        "publish_buffer_bytes",
         "landing_buffer_bytes",
         "max_landed_units",
         "max_inflight_ops",
@@ -46,7 +46,7 @@ def test_backend_config_defaults_are_the_documented_ones():
     assert cfg.namespace == "trtllm" and cfg.landing == "device" and not cfg.lands_on_host
     assert cfg.transfer_batch_size > 0 and cfg.max_inflight_ops > 0 and cfg.num_workers > 0
     assert cfg.probe_ttl_s > 0
-    assert cfg.staging_buffer_bytes == 512 << 20 and cfg.landing_buffer_bytes == 2 << 30
+    assert cfg.publish_buffer_bytes == 512 << 20 and cfg.landing_buffer_bytes == 2 << 30
     assert cfg.max_landed_units is None  # every slot the landing budget affords
 
 
@@ -67,7 +67,7 @@ def test_configs_are_frozen():
         ({"probe_ttl_s": 0.0}, "probe_ttl_s"),
         ({"landing": "gpu"}, "landing"),
         ({"landing": True}, "landing"),
-        ({"landing": "host", "staging_buffer_bytes": 0}, "staging_buffer_bytes"),
+        ({"landing": "host", "publish_buffer_bytes": 0}, "publish_buffer_bytes"),
         ({"landing": "host", "landing_buffer_bytes": 0}, "landing_buffer_bytes"),
         ({"max_landed_units": 0}, "max_landed_units"),
         # The wrong type is a bad value too, not a TypeError from the first comparison.
@@ -75,7 +75,7 @@ def test_configs_are_frozen():
         ({"transfer_batch_size": "4"}, "transfer_batch_size must be an integer"),
         ({"num_workers": 2.0}, "num_workers must be an integer"),
         ({"num_workers": True}, "num_workers must be an integer"),
-        ({"staging_buffer_bytes": "512M"}, "staging_buffer_bytes must be an integer"),
+        ({"publish_buffer_bytes": "512M"}, "publish_buffer_bytes must be an integer"),
         ({"max_landed_units": "3"}, "max_landed_units must be an integer"),
         ({"probe_ttl_s": "1"}, "probe_ttl_s must be a number"),
     ],
@@ -91,8 +91,8 @@ def test_backend_from_dict_reports_a_wrongly_typed_value_as_a_value_error():
 
 
 def test_backend_config_leaves_pool_budgets_unchecked_when_landing_on_device():
-    cfg = BlobStoreConfig(staging_buffer_bytes=0, landing_buffer_bytes=0)
-    assert cfg.staging_buffer_bytes == 0 and cfg.landing_buffer_bytes == 0
+    cfg = BlobStoreConfig(publish_buffer_bytes=0, landing_buffer_bytes=0)
+    assert cfg.publish_buffer_bytes == 0 and cfg.landing_buffer_bytes == 0
     assert cfg.landing == "device"
 
 
@@ -101,7 +101,7 @@ def test_backend_from_dict_round_trips_known_keys():
         "namespace": "ns",
         "num_workers": 3,
         "landing": "host",
-        "staging_buffer_bytes": 4096,
+        "publish_buffer_bytes": 4096,
         "landing_buffer_bytes": 8192,
         "max_landed_units": 16,
     }
@@ -110,9 +110,10 @@ def test_backend_from_dict_round_trips_known_keys():
     assert cfg.num_workers == 3 and cfg.lands_on_host and cfg.max_landed_units == 16
 
 
-def test_backend_from_dict_refuses_the_old_staging_key():
-    with pytest.raises(ValueError, match="stage_through_host"):
-        BlobStoreConfig.from_dict({"stage_through_host": True})
+@pytest.mark.parametrize("old_key", ["stage_through_host", "staging_buffer_bytes"])
+def test_backend_from_dict_refuses_a_retired_key_by_name(old_key):
+    with pytest.raises(ValueError, match=old_key):
+        BlobStoreConfig.from_dict({old_key: 4096})
 
 
 # ---- MooncakeStoreConfig ----

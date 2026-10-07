@@ -660,7 +660,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         hooks = self.kv_transfer_hooks
         if hooks is None:
             return FetchPathAction.NOT_A_FETCH
-        plan = hooks.plan_fetch(req)
+        plan = hooks.fetch_answer(req)
         if plan is hooks.DEFER:
             logger.debug(
                 "Deferring context request %s: its KV transfer plan is not decided yet",

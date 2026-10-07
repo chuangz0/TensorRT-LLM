@@ -30,7 +30,9 @@ from tensorrt_llm._torch.disaggregation.backends.registry import BackendHandle
 from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.coordinator import (
     KVTransferCoordinator,
 )
-from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority
+from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.engine_protocols import (
+    PlanAuthority,
+)
 from tensorrt_llm._torch.disaggregation.remote_cache import FetchPlan, FetchSource, Planner
 from tensorrt_llm._torch.disaggregation.resource.region import parallel_shard_tag
 from tensorrt_llm._torch.pyexecutor.kv_transfer.effects import (
@@ -105,7 +107,7 @@ class RankRig:
         enable_attention_dp: bool = False,
         unlaunched_timeout_s: float | None = 10.0,
         fetch_timeout_s: float | None = None,
-        plan_authority: PlanAuthority = PlanAuthority.VOTED,
+        plan_authority: PlanAuthority = PlanAuthority.ALL_RANKS,
         close_timeout_s: float = CLOSE_TIMEOUT_S,
     ) -> None:
         self.rank = rank
@@ -178,7 +180,7 @@ class RankRig:
             self.hooks.adopt_plan_answers(list(active), adopt(list(active)))
         launch_queue = []
         for request in active:
-            plan = self.hooks.plan_fetch(request)
+            plan = self.hooks.fetch_answer(request)
             if isinstance(plan, FetchPlan) and self.reserve(request, plan.token_end):
                 launch_queue.append(request)
         self.hooks.launch_reserved_fetches(launch_queue)

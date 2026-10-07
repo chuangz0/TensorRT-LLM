@@ -46,7 +46,7 @@ from .backend import (
     _StoreAttempt,
     _Task,
 )
-from .staging import HostStagingPool
+from .slot_pool import HostSlotPool
 from .worker_pool import DaemonWorkerPool
 
 __all__ = ["HostLandingBlobBackend"]
@@ -73,23 +73,19 @@ class _Landing:
     """One host-first landing: the ``Landing`` a ``HostLandingBlobBackend`` hands out.
 
     Its life is four states, moved under ``_lock``. ``QUEUED``: waiting in the landing pool for
-    one slot per unit. ``LANDING``: slots granted, a worker runs ``holds`` then ``get`` into them.
-    ``LANDED``: ``poll`` has an outcome; on ``Delivered`` the slots hold the served units until
-    ``release``. ``RELEASED``: holds nothing, does nothing. ``release`` is non-blocking and runs
-    on the caller's thread: it dequeues a queued landing, asks a landing one to give its slots
-    back when its get returns, gives a landed one's slots back at once unless a placement is
-    still copying out of them (then the last placement to finish gives them back), and does
-    nothing after the backend has closed (the pool is being torn down and the workers are
-    stopping).
+    one slot per unit. ``LANDING``: slots granted, a worker runs ``contains`` then ``get`` into
+    them. ``LANDED``: ``poll`` has an outcome; on ``Delivered`` the slots hold the served units until
+    ``close``. ``RELEASED``: holds nothing, does nothing. ``close`` is non-blocking and runs on
+    the caller's thread: it dequeues a queued landing, asks a landing one to give its slots back
+    when its get returns, gives a landed one's slots back at once unless a placement is still
+    copying out of them (then the last placement to finish gives them back), and does nothing
+    after the backend has closed (the pool is being torn down and the workers are stopping).
     """
 
     QUEUED, LANDING, LANDED, RELEASED = "queued", "landing", "landed", "released"
 
-    def __init__(
-        self, backend: HostLandingBlobBackend, name: bytes, units: Sequence[_LandingUnit]
-    ) -> None:
+    def __init__(self, backend: HostLandingBlobBackend, units: Sequence[_LandingUnit]) -> None:
         self._backend = backend
-        self.name = name
         self.units = tuple(units)
         self.enqueued_at = time.monotonic()
         self._lock = threading.Lock()
@@ -101,7 +97,7 @@ class _Landing:
         self._placing = 0
         """Placements that may still read the slots; counted up in ``place``, down when the copy
         has landed or the placement was refused at submission."""
-        self._release_requested = False
+        self._close_requested = False
 
     # -- Landing --
 
@@ -125,13 +121,13 @@ class _Landing:
         """Copy the units of ``extent`` out of their slots into the units' own segments, on a
         worker and its copy stream; ``Delivered`` after the copies have landed. Only units this
         landing delivered may be asked for, each at the size it landed with; nothing is touched
-        otherwise. The slots stay held until the copy is done, whatever ``release`` says
+        otherwise. The slots stay held until the copy is done, whatever ``close`` says
         meanwhile."""
         with self._lock:
             placeable = (
                 self._state is self.LANDED
                 and isinstance(self._outcome, Delivered)
-                and not self._release_requested
+                and not self._close_requested
             )
             if not placeable:
                 raise SubmissionRejected("the landing has no content to place")
@@ -143,35 +139,35 @@ class _Landing:
             self._placement_done()
             raise
 
-    def release(self) -> None:
+    def close(self) -> None:
         with self._lock:
             if self._state is self.RELEASED or self._backend.is_closed:
                 self._state = self.RELEASED
                 return
             if self._state is self.QUEUED:
                 if self._backend.landing_pool.dequeue(self):
-                    self._set_outcome_locked(Failed("released before landing"))
+                    self._set_outcome_locked(Failed("closed before landing"))
                     self._leave_locked()
                 else:
                     # Popped by a granting thread that has yet to call ``slots_granted``.
-                    self._release_requested = True
+                    self._close_requested = True
                 return
             if self._state is self.LANDING or self._placing:
-                self._release_requested = True
+                self._close_requested = True
                 return
             slots = self._give_up_slots_locked()
         self._give_back(slots)
 
-    def release_for_close(self) -> None:
-        """``release`` as the closing backend calls it, after the pool refused every queued
+    def close_at_shutdown(self) -> None:
+        """``close`` as the closing backend calls it, after the pool refused every queued
         landing: a get or a placement still in flight returns the slots when it ends, held slots
         go back now."""
         with self._lock:
             if self._state is self.LANDING or self._placing:
-                self._release_requested = True
+                self._close_requested = True
                 return
             if self._state is self.QUEUED:
-                self._set_outcome_locked(Failed("released before landing"))
+                self._set_outcome_locked(Failed("closed before landing"))
                 self._leave_locked()
                 return
             slots = self._give_up_slots_locked()
@@ -187,8 +183,8 @@ class _Landing:
 
     def slots_granted(self, slots: list[int]) -> None:
         with self._lock:
-            if self._release_requested or self._state is not self.QUEUED:
-                self._set_outcome_locked(Failed("released before landing"))
+            if self._close_requested or self._state is not self.QUEUED:
+                self._set_outcome_locked(Failed("closed before landing"))
                 self._leave_locked()
                 give_back = slots
             else:
@@ -211,7 +207,7 @@ class _Landing:
     # -- the work --
 
     def _run_on_worker(self) -> None:
-        """Worker: ``holds`` then ``get`` into the slots, batch by batch, back to back."""
+        """Worker: ``contains`` then ``get`` into the slots, batch by batch, back to back."""
         _report_outcome_of(
             lambda: self._backend._fetch_into_slots(self.units, self._slots, self._served),
             self._end,
@@ -219,11 +215,11 @@ class _Landing:
 
     def _end(self, outcome: Outcome) -> None:
         """Record the outcome. The slots go back at once when nothing landed to place, or when
-        a release was asked for while the get was in flight."""
+        a close was asked for while the get was in flight."""
         with self._lock:
             self._set_outcome_locked(outcome)
             self._state = self.LANDED
-            done_with_slots = self._release_requested or isinstance(outcome, Failed)
+            done_with_slots = self._close_requested or isinstance(outcome, Failed)
             slots = self._give_up_slots_locked() if done_with_slots else []
         if isinstance(outcome, Failed):
             self._backend._count_failed(outcome.reason)
@@ -231,10 +227,10 @@ class _Landing:
 
     def _placement_done(self) -> None:
         """One placement no longer reads the slots (its copy landed, or it was refused before a
-        worker took it). The last one out honours a release asked for while it ran."""
+        worker took it). The last one out honours a close asked for while it ran."""
         with self._lock:
             self._placing -= 1
-            give_back = self._placing == 0 and self._release_requested
+            give_back = self._placing == 0 and self._close_requested
             slots = self._give_up_slots_locked() if give_back else []
         self._give_back(slots)
 
@@ -265,7 +261,7 @@ class _Landing:
         return slots
 
     @property
-    def holds_slots(self) -> bool:
+    def has_slots(self) -> bool:
         with self._lock:
             return bool(self._slots)
 
@@ -281,11 +277,11 @@ class HostLandingBlobBackend:
     Two host pools, because their slots live differently. The inner backend's publish pool hands
     slots to a worker for the length of one task, so a worker may block for them. The landing pool
     here hands slots to a ``_Landing`` that keeps them across scheduler rounds, until the
-    coordinator has placed the content and released the landing; a worker blocked for one of
+    coordinator has placed the content and closed the landing; a worker blocked for one of
     those could be blocked for as long as the scheduler takes to find pages, and with every
     worker so blocked nothing would ever return a slot. So landings never block a worker: they
     wait in the pool's queue, and the thread that returns slots hands the head of the queue to a
-    worker (``HostStagingPool.enqueue``). Landings are bounded by their slots and do not take the
+    worker (``HostSlotPool.enqueue``). Landings are bounded by their slots and do not take the
     inner backend's in-flight semaphore; placements, which write pages, do.
 
     Args:
@@ -301,7 +297,7 @@ class HostLandingBlobBackend:
     def __init__(
         self,
         inner: BlobStoreBackend,
-        landing_pool: HostStagingPool,
+        landing_pool: HostSlotPool,
         unit_bytes: UnitBytes,
         *,
         landing_wait_timeout_s: float | None,
@@ -353,16 +349,16 @@ class HostLandingBlobBackend:
         """Landings currently holding slots, for the status dump."""
         with self._lock:
             landings = list(self._landings)
-        return sum(1 for landing in landings if landing.holds_slots)
+        return sum(1 for landing in landings if landing.has_slots)
 
     # ---- LandsOnHost ----
 
-    def fetch_to_host(self, name: bytes, units: Sequence[bytes]) -> _Landing:
-        """Queue a landing of ``units``: one slot each, then ``holds`` and ``get`` on a worker.
+    def fetch_to_host(self, units: Sequence[bytes]) -> _Landing:
+        """Queue a landing of ``units``: one slot each, then ``contains`` and ``get`` on a worker.
         Non-blocking. A unit no slot can hold, or more units than the pool has slots, fails the
         landing at once (a wiring or sizing error, not back-pressure)."""
         landing_units, problem = self._size_units(units)
-        landing = _Landing(self, name, landing_units)
+        landing = _Landing(self, landing_units)
         with self._lock:
             if self._closed:
                 raise SubmissionRejected("store backend is closed")
@@ -405,7 +401,7 @@ class HostLandingBlobBackend:
         with self._lock:
             landings = list(self._landings)
         for landing in landings:
-            landing.release_for_close()
+            landing.close_at_shutdown()
         self._inner.close()
 
     # ---- for _Landing ----

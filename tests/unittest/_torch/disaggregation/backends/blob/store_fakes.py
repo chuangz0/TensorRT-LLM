@@ -25,7 +25,7 @@ __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.backends.blob.backend import BlobStoreBackend, BlobStoreConfig  # noqa: E402
 from disaggregation.backends.blob.drivers.memory import MemoryBlobStore  # noqa: E402
 from disaggregation.backends.blob.host_landing import HostLandingBlobBackend  # noqa: E402
-from disaggregation.backends.blob.staging import HostStagingPool  # noqa: E402
+from disaggregation.backends.blob.slot_pool import HostSlotPool  # noqa: E402
 from disaggregation.backends.blob.store import GetStatus, PutStatus  # noqa: E402
 from disaggregation.backends.config import DEFAULT_LANDING_WAIT_TIMEOUT_S  # noqa: E402
 from disaggregation.base.cache_backend import CacheExtent, Unit  # noqa: E402
@@ -220,9 +220,9 @@ class FakeBlobStore(_Knobs):
         self._enter("unregister_span", address, size)
         self.inner.unregister_span(address, size)
 
-    def holds(self, keys: Sequence[str]) -> list[bool]:
-        self._enter("holds", tuple(keys))
-        return self.inner.holds(keys)
+    def contains(self, keys: Sequence[str]) -> list[bool]:
+        self._enter("contains", tuple(keys))
+        return self.inner.contains(keys)
 
     def put(self, keys: Sequence[str], buffers: Sequence[Sequence[Segment]]) -> list[PutStatus]:
         self._enter("put", tuple(keys))
@@ -280,7 +280,7 @@ class FakeCopier(_Knobs):
 
 
 class Trace:
-    """A thread-stamped event log shared by a copier and a staging pool: ``(event, thread, args)``
+    """A thread-stamped event log shared by a copier and a slot pool: ``(event, thread, args)``
     in real-time order, so tests can check that a ``sync`` precedes a ``release`` on the same
     thread and that no slot is copied into or out of by a thread that does not hold it."""
 
@@ -296,7 +296,7 @@ class Trace:
         with self._lock:
             return [(e, a) for e, t, a in self.events if t == ident]
 
-    def check_slot_exclusivity(self, pool: HostStagingPool) -> None:
+    def check_slot_exclusivity(self, pool: HostSlotPool) -> None:
         """Replay: every copy touching a slot must be issued by the thread holding that slot, and
         a slot must never be held by two threads at once."""
         owner: dict[int, int] = {}
@@ -316,15 +316,15 @@ class Trace:
                 kind, dst, src, size = args
                 host = dst if kind == "d2h" else src
                 slot = (host - pool.slot_address(0)) // pool.slot_bytes
-                assert 0 <= slot < pool.num_slots, f"copy outside the staging buffer: {args}"
+                assert 0 <= slot < pool.num_slots, f"copy outside the slot pool buffer: {args}"
                 assert owner.get(slot) == thread, (
                     f"thread {thread} copied through slot {slot} it does not hold"
                 )
         assert not owner, f"slots still held at the end of the trace: {owner}"
 
 
-class TracingStagingPool(HostStagingPool):
-    """A ``HostStagingPool`` that logs ``acquire``/``release`` to the same ``Trace`` as its copier."""
+class TracingSlotPool(HostSlotPool):
+    """A ``HostSlotPool`` that logs ``acquire``/``release`` to the same ``Trace`` as its copier."""
 
     def __init__(self, *args, trace: Trace, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -340,28 +340,28 @@ class TracingStagingPool(HostStagingPool):
         super().release(slots)
 
 
-def make_staging(
+def make_publish_pool(
     store: FakeBlobStore, *, slots: int, slot_bytes: int
-) -> tuple[TracingStagingPool, FakeCopier, MemoryArena, Trace]:
+) -> tuple[TracingSlotPool, FakeCopier, MemoryArena, Trace]:
     """A registered host arena cut into ``slots`` traced slots over a traced ``FakeCopier``."""
     host = MemoryArena(slot_bytes * slots)
     store.register_span(host.address, host.size)
     trace = Trace()
     copier = FakeCopier()
     copier.trace = trace
-    pool = TracingStagingPool(host.address, slot_bytes, slots, copier, keepalive=host, trace=trace)
+    pool = TracingSlotPool(host.address, slot_bytes, slots, copier, keepalive=host, trace=trace)
     return pool, copier, host, trace
 
 
-def fake_open_staging(
+def fake_open_slot_pool(
     store, *, slot_bytes: int, num_slots: int, device_index=None
-) -> HostStagingPool:
-    """Stand-in for ``factory.open_pinned_staging_pool``: a registered host arena over a
+) -> HostSlotPool:
+    """Stand-in for ``factory.open_pinned_slot_pool``: a registered host arena over a
     ``FakeCopier`` instead of a pinned torch buffer over CUDA. Same signature, so a test patches
     the factory's name with it."""
     host = MemoryArena(slot_bytes * num_slots)
     store.register_span(host.address, host.size)
-    return HostStagingPool(host.address, slot_bytes, num_slots, FakeCopier(), keepalive=host)
+    return HostSlotPool(host.address, slot_bytes, num_slots, FakeCopier(), keepalive=host)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -400,10 +400,10 @@ class Rank:
     inner: BlobStoreBackend | None = None
     registration: object | None = None
     units: dict[tuple[int, int], Unit] = field(default_factory=dict)
-    publish_pool: TracingStagingPool | None = None
+    publish_pool: TracingSlotPool | None = None
     publish_copier: FakeCopier | None = None
     trace: Trace | None = None
-    landing_pool: HostStagingPool | None = None
+    landing_pool: HostSlotPool | None = None
     landing_copier: FakeCopier | None = None
 
     def unit(self, local_group: int, local: int, *sizes: int, seed: str = "u") -> Unit:
@@ -422,9 +422,9 @@ class Rank:
     def segments(self, unit: Unit) -> tuple[Segment, ...]:
         return self.resolver.segments(unit.local_group, unit.local)
 
-    def land(self, units: Iterable[Unit], name: bytes = b"ext", timeout: float = 5.0):
+    def land(self, units: Iterable[Unit], timeout: float = 5.0):
         """Host shape: ``fetch_to_host`` the units and wait for the landing's outcome."""
-        landing = self.backend.fetch_to_host(name, [u.name for u in units])
+        landing = self.backend.fetch_to_host([u.name for u in units])
         wait_until(lambda: landing.poll() is not None, timeout, what="landing outcome")
         return landing
 
@@ -475,18 +475,18 @@ def make_rank(
     *,
     arena_bytes: int = 1 << 16,
     register: bool = True,
-    staging=None,
+    publish_pool=None,
     fingerprint: bytes = FINGERPRINT,
     **config_overrides,
 ) -> Rank:
     """A ``landing: device`` backend over ``store`` (a fresh one when ``None``) with its pool
-    registered. ``staging`` builds the inner backend of a host shape; ``make_host_rank`` is the
+    registered. ``publish_pool`` builds the inner backend of a host shape; ``make_host_rank`` is the
     usual way there."""
     store = store if store is not None else FakeBlobStore()
     arena = MemoryArena(arena_bytes)
     resolver = ArenaResolver(arena)
     cfg = config(**config_overrides)
-    backend = BlobStoreBackend(store, cfg, resolver, fingerprint, staging=staging)
+    backend = BlobStoreBackend(store, cfg, resolver, fingerprint, publish_pool=publish_pool)
     rank = Rank(store, backend, arena, resolver, inner=backend)
     if register and not cfg.lands_on_host:
         rank.registration = backend.register_pool(arena.address, arena.size)
@@ -509,12 +509,16 @@ def make_host_rank(
     deliberately not registered, as it would not be on a machine without GPUDirect. Units are
     sized by ``unit_bytes``, by default from the rank's own table (``Rank.unit``)."""
     store = store if store is not None else FakeBlobStore()
-    publish_pool, publish_copier, _, trace = make_staging(
+    publish_pool, publish_copier, _, trace = make_publish_pool(
         store, slots=publish_slots, slot_bytes=slot_bytes
     )
-    landing_pool = fake_open_staging(store, slot_bytes=slot_bytes, num_slots=landing_slots)
+    landing_pool = fake_open_slot_pool(store, slot_bytes=slot_bytes, num_slots=landing_slots)
     rank = make_rank(
-        store, arena_bytes=arena_bytes, staging=publish_pool, landing="host", **config_overrides
+        store,
+        arena_bytes=arena_bytes,
+        publish_pool=publish_pool,
+        landing="host",
+        **config_overrides,
     )
     rank.backend = HostLandingBlobBackend(
         rank.inner,

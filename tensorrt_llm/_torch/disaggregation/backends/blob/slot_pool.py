@@ -15,8 +15,8 @@
 """Pinned host slots a unit passes through when the store cannot reach the caller's memory.
 
 The direct path registers the caller's pools with the store, which needs GPUDirect RDMA for device
-memory. Staging instead registers one pinned host buffer: a unit is gathered into a slot before a
-put, or lands in a slot from a get and is scattered out later. A slot holds the unit's segments
+memory. A slot pool instead registers one pinned host buffer: a unit is gathered into a slot before
+a put, or lands in a slot from a get and is scattered out later. A slot holds the unit's segments
 concatenated in resolver order, which is the same byte string the direct path produces from the
 same segments, so a pool written by either path is readable by the other.
 
@@ -29,7 +29,7 @@ parked for one would be a worker lost. One pool serves one of the two styles; th
 pool per style.
 
 Nothing here imports torch or CUDA at module load. Copies go through a ``Copier``
-(``backends/host_copy.py``); the default one is created lazily by ``open_pinned_staging_pool``.
+(``backends/host_copy.py``); the default one is created lazily by ``open_pinned_slot_pool``.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ from ...base.region import Segment
 from ..host_copy import Copier, CudaCopier
 from .store import BlobStore, BlobStoreError
 
-__all__ = ["HostStagingPool", "SlotWaiter", "open_pinned_staging_pool", "plan_slot_geometry"]
+__all__ = ["HostSlotPool", "SlotWaiter", "open_pinned_slot_pool", "plan_slot_geometry"]
 
 
 def plan_slot_geometry(
@@ -65,7 +65,7 @@ def plan_slot_geometry(
 
 
 class SlotWaiter(Protocol):
-    """What ``HostStagingPool.enqueue`` takes: told once how its wait ended.
+    """What ``HostSlotPool.enqueue`` takes: told once how its wait ended.
 
     Either call may come on the enqueuing thread (slots were free) or on whichever thread later
     returned slots or shut the pool down; neither may block.
@@ -80,13 +80,13 @@ class SlotWaiter(Protocol):
         ...
 
 
-class HostStagingPool:
+class HostSlotPool:
     """A registered host buffer cut into equal slots, shared by the backend's worker threads.
 
     Args:
         base: Address of the buffer. It must already be registered with the store.
-        slot_bytes: Width of one slot; a unit larger than this cannot be staged.
-        num_slots: How many units may be staged at once.
+        slot_bytes: Width of one slot; a unit larger than this cannot pass through the pool.
+        num_slots: How many units may sit in slots at once.
         copier: Issues and waits for the copies.
         keepalive: Whatever owns the buffer's memory; held so it outlives the pool.
     """
@@ -140,10 +140,10 @@ class HostStagingPool:
         with self._cond:
             while len(self._free) < count:
                 if self._shutdown:
-                    raise RuntimeError("staging pool is shut down")
+                    raise RuntimeError("slot pool is shut down")
                 self._cond.wait()  # ``release`` and ``shutdown`` both notify
             if self._shutdown:
-                raise RuntimeError("staging pool is shut down")
+                raise RuntimeError("slot pool is shut down")
             return self._take(count)
 
     # ---- queued hand-out ----
@@ -161,7 +161,7 @@ class HostStagingPool:
                 self._waiting.append((waiter, count))
                 return
         if refused:
-            waiter.slots_refused("staging pool is shut down")
+            waiter.slots_refused("slot pool is shut down")
         else:
             waiter.slots_granted(slots)
 
@@ -194,7 +194,7 @@ class HostStagingPool:
             self._cond.notify_all()
             refused, self._waiting = list(self._waiting), deque()
         for waiter, _ in refused:
-            waiter.slots_refused("staging pool is shut down")
+            waiter.slots_refused("slot pool is shut down")
 
     def _check_count(self, count: int) -> None:
         if not 0 < count <= self._num_slots:
@@ -245,13 +245,13 @@ class HostStagingPool:
         self._copier.sync()
 
 
-def open_pinned_staging_pool(
+def open_pinned_slot_pool(
     store: BlobStore,
     *,
     slot_bytes: int,
     num_slots: int,
     device_index: int | None = None,
-) -> HostStagingPool:
+) -> HostSlotPool:
     """Allocate a pinned buffer with torch, register it with ``store`` and wrap it in a pool.
 
     Imports torch here and nowhere else in the package.
@@ -265,6 +265,6 @@ def open_pinned_staging_pool(
         store.register_span(base, buffer.numel())
     except BlobStoreError as exc:
         raise BlobStoreError(
-            f"{exc} for the staging buffer at [{base:#x}, {base + buffer.numel():#x})"
+            f"{exc} for the slot pool buffer at [{base:#x}, {base + buffer.numel():#x})"
         ) from exc
-    return HostStagingPool(base, slot_bytes, num_slots, CudaCopier(device_index), keepalive=buffer)
+    return HostSlotPool(base, slot_bytes, num_slots, CudaCopier(device_index), keepalive=buffer)

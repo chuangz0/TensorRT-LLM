@@ -14,7 +14,7 @@
 # limitations under the License.
 """KV Cache Manager V2 as the KV transfer coordination layer reads it (design §8.2, appendix B).
 
-``KVv2ResourceReader`` is the ``ResourceReader``: which blocks a prompt names, which layer groups
+``KVv2ResourceView`` is the ``ResourceView``: which blocks a prompt names, which layer groups
 this rank holds, which pages a fetch lands in, which committed pages a publish offers. It is the
 only thing between the coordination layer and the KV v2 wrapper, and it reaches the wrapper through
 its methods alone; nothing outside ``resource/`` reads a page object or an address.
@@ -37,14 +37,14 @@ from .page import KVCachePageTable, MambaLayerGroup
 if TYPE_CHECKING:
     from ..remote_cache import FetchPlan, GroupPlan
 
-__all__ = ["KVv2ResourceReader"]
+__all__ = ["KVv2ResourceView"]
 
 _BLOCK_KEY_CACHE_SIZE = 4096
 """Requests whose block keys the reader remembers; the planner asks for them several times."""
 
 
-class KVv2ResourceReader:
-    """``ResourceReader`` over a ``KVCacheManagerV2`` wrapper.
+class KVv2ResourceView:
+    """``ResourceView`` over a ``KVCacheManagerV2`` wrapper.
 
     Args:
         kv_cache_manager: The engine's primary ``KVCacheManagerV2``.
@@ -92,11 +92,13 @@ class KVv2ResourceReader:
     def group_specs(self) -> Sequence[GroupSpec]:
         return self._group_specs
 
-    def gen_first_ready(self, request) -> bool:
+    def generation_first_ready(self, request) -> bool:
         """Always ready: the store path has no context request waiting on a generation side."""
         return True
 
-    def fetch_extent(self, request, plan: FetchPlan) -> tuple[CacheExtent, frozenset[bytes]]:
+    def fetch_extent_and_committed(
+        self, request, plan: FetchPlan
+    ) -> tuple[CacheExtent, frozenset[bytes]]:
         """Units for the pages the scheduler reserved with ``reserve_transfer_pages``, and the
         names of the plan's blocks that reservation found committed locally.
 
@@ -147,7 +149,7 @@ class KVv2ResourceReader:
         fetcher's largest target ``B = (prompt_len - 1) // tpb * tpb``. With ``window % tpb == 0``
         the two stale ends differ exactly when ``prompt_len % tpb`` is ``0`` or ``tpb - 1``; the
         window's first block at ``B`` is then already dropped here, and since the stale end grows
-        with the target no larger target does without it either. A fetcher's ``servable_blocks``
+        with the target no larger target does without it either. A fetcher's ``servable_block_end``
         falls to what the sink blocks alone serve (nothing, without sinks) and the request
         computes locally.
 

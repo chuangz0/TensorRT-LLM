@@ -9,7 +9,7 @@ __extra_import_path__ = ["~/tensorrt_llm/_torch"]
 from disaggregation.backends.config import BackendEntry, KVTransferConfig  # noqa: E402
 from disaggregation.backends.registry import BackendHandle  # noqa: E402
 from disaggregation.orchestration.kv_transfer.build import build_coordinator  # noqa: E402
-from disaggregation.orchestration.kv_transfer.interfaces import PlanAuthority  # noqa: E402
+from disaggregation.orchestration.kv_transfer.engine_protocols import PlanAuthority  # noqa: E402
 from disaggregation.remote_cache import FetchPlan  # noqa: E402
 from fakes import (  # noqa: E402
     TPB,
@@ -27,7 +27,7 @@ from fakes import (  # noqa: E402
 pytestmark = pytest.mark.cpu_only
 
 
-def build(*, store: FakeFetches, plan_authority: PlanAuthority = PlanAuthority.VOTED):
+def build(*, store: FakeFetches, plan_authority: PlanAuthority = PlanAuthority.ALL_RANKS):
     reader = FakeReader(groups=[full_attention(0)], tokens_per_block=TPB)
     handle = BackendHandle(
         name="store",
@@ -70,7 +70,7 @@ def test_answered_probe_plans_from_the_store():
     req = FakeRequest(1, prompt_len=29)
     store.probe_default = reader.unit_names(req, range(7))
     coordinator.advance([req], 0.0)
-    plan = coordinator.plan_fetch(req)
+    plan = coordinator.fetch_answer(req)
     assert isinstance(plan, FetchPlan)
     assert plan.token_end == 28 and plan.source == "store"
 

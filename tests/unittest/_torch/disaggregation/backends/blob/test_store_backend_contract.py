@@ -54,7 +54,7 @@ def test_backend_satisfies_the_three_protocols():
 
 
 def test_host_landing_requires_a_publish_pool_when_configured():
-    with pytest.raises(ValueError, match="HostStagingPool"):
+    with pytest.raises(ValueError, match="HostSlotPool"):
         BlobStoreBackend(FakeBlobStore(), config(landing="host"), lambda group, local: (), b"\x01")
 
 
@@ -238,7 +238,7 @@ def test_delivery_into_unregistered_memory_fails_and_is_not_a_miss(direction):
         attempt = getattr(rank.backend, direction)(extent([u]))
         outcome = attempt.poll()  # decided at submission: nothing was queued
         assert isinstance(outcome, Failed) and "not registered" in outcome.reason
-        assert rank.store.count("holds") == 0
+        assert rank.store.count("contains") == 0
         assert rank.backend.counters.failed_attempts == 1
         assert rank.backend.counters.fetch_misses == 0
         assert rank.backend.quiesce([attempt]) is True
@@ -271,7 +271,7 @@ def test_one_bad_unit_fails_the_whole_delivery_and_nothing_is_moved():
         unknown = Unit(name=b"?", local_group=7, local=7)
         outcome = rank.backend.publish(extent([good, unknown])).poll()
         assert isinstance(outcome, Failed) and "does not resolve" in outcome.reason
-        assert rank.store.count("holds") == 0
+        assert rank.store.count("contains") == 0
         assert rank.key(good) not in rank.store.objects
 
 
@@ -305,7 +305,7 @@ def test_fetch_with_any_route_is_rejected():
     with make_rank() as rank:
         with pytest.raises(SubmissionRejected):
             rank.backend.fetch(extent([rank.unit(0, 0, 8)]), route=SomeRoute())
-        assert rank.store.count("holds") == 0
+        assert rank.store.count("contains") == 0
 
 
 def test_open_route_is_not_implemented():
@@ -353,7 +353,7 @@ def test_close_finishes_work_in_flight_before_closing_the_store():
 def test_poll_is_non_blocking_while_workers_are_blocked():
     with make_rank() as rank:
         u = rank.unit(0, 0, 8)
-        rank.store.block("holds")
+        rank.store.block("contains")
         attempt = rank.backend.publish(extent([u]))
         rank.store.wait_entered(2)
         start = time.monotonic()
@@ -367,7 +367,7 @@ def test_poll_is_non_blocking_while_workers_are_blocked():
 def test_settle_blocks_until_an_outcome_then_poll_is_set():
     with make_rank() as rank:
         u = rank.unit(0, 0, 8)
-        rank.store.block("holds")
+        rank.store.block("contains")
         attempt = rank.backend.fetch(extent([u]))
         rank.store.wait_entered(2)
         settled = threading.Event()
@@ -422,12 +422,12 @@ def test_max_inflight_ops_rejects_the_excess_and_nothing_escapes():
     with make_rank(max_inflight_ops=1, num_workers=2) as rank:
         a, b = rank.unit(0, 0, 8), rank.unit(0, 1, 8)
         rank.write(b, pattern(2, 8))
-        rank.store.block("holds")
+        rank.store.block("contains")
         first = rank.backend.publish(extent([a], name=b"a"))
         rank.store.wait_entered(2)
         with pytest.raises(SubmissionRejected, match="1 deliveries already in flight"):
             rank.backend.publish(extent([b], name=b"b"))
-        assert rank.store.count("holds") == 1  # only the first delivery reached it
+        assert rank.store.count("contains") == 1  # only the first delivery reached it
         rank.store.unblock()
         assert isinstance(rank.finish(first), Delivered)
         assert rank.key(b) not in rank.store.objects  # nothing of the rejected one escaped
@@ -442,7 +442,7 @@ def test_rejected_submission_succeeds_once_an_in_flight_delivery_finishes():
     # The semaphore is restored by the finishing delivery, whatever its outcome.
     with make_rank(max_inflight_ops=2, num_workers=2) as rank:
         units = [rank.unit(0, i, 8) for i in range(3)]
-        rank.store.block("holds")
+        rank.store.block("contains")
         first = rank.backend.publish(extent([units[0]]))
         second = rank.backend.publish(extent([units[1]]))
         rank.store.wait_entered(3)  # register, then both lookups parked at the gate
@@ -460,7 +460,7 @@ def test_rejected_submission_succeeds_once_an_in_flight_delivery_finishes():
 def test_failed_delivery_releases_its_inflight_slot():
     with make_rank(max_inflight_ops=1) as rank:
         u = rank.unit(0, 0, 8)
-        rank.store.fail_next("holds")
+        rank.store.fail_next("contains")
         assert isinstance(rank.finish(rank.backend.fetch(extent([u]))), Failed)
         assert isinstance(rank.finish(rank.backend.fetch(extent([u]))), Delivered)
 
@@ -503,11 +503,11 @@ def test_transfer_batch_size_bounds_one_store_call_not_one_delivery():
         assert outcome == Delivered(frozenset(u.name for u in units))
         puts = [args[0] for m, args in rank.store.calls if m == "put"]
         assert [len(keys) for keys in puts] == [2, 2, 1]
-        exists = [args[0] for m, args in rank.store.calls if m == "holds"]
+        exists = [args[0] for m, args in rank.store.calls if m == "contains"]
         assert [len(keys) for keys in exists] == [2, 2, 1]
 
 
-def test_staged_put_batch_is_bounded_by_the_publish_pool_slot_count():
+def test_pooled_put_batch_is_bounded_by_the_publish_pool_slot_count():
     """A staged put holds a publish-pool slot per unit for the length of the call, so with
     fewer slots than ``transfer_batch_size`` the store is asked in rounds of the slot count."""
     with make_host_rank(publish_slots=3, transfer_batch_size=64) as rank:
@@ -516,5 +516,5 @@ def test_staged_put_batch_is_bounded_by_the_publish_pool_slot_count():
         assert outcome == Delivered(frozenset(u.name for u in units))
         puts = [args[0] for m, args in rank.store.calls if m == "put"]
         assert [len(keys) for keys in puts] == [3, 2]
-        lookups = [args[0] for m, args in rank.store.calls if m == "holds"]
+        lookups = [args[0] for m, args in rank.store.calls if m == "contains"]
         assert [len(keys) for keys in lookups] == [5]  # lookups hold no slot

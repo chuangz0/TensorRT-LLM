@@ -57,14 +57,14 @@ def _store(**answers) -> MooncakeBlobStore:
 
 def test_holds_translates_one_and_zero_to_booleans():
     store = _store(batch_is_exist=[1, 0, 1])
-    assert store.holds(KEYS) == [True, False, True]
+    assert store.contains(KEYS) == [True, False, True]
     assert store.raw.calls == [("batch_is_exist", (KEYS,))]
 
 
 def test_holds_raises_on_a_negative_status_or_the_wrong_count():
     for answer in ([1, -1, 0], [1, 0], []):
         with pytest.raises(BlobStoreError, match="batch_is_exist"):
-            _store(batch_is_exist=answer).holds(KEYS)
+            _store(batch_is_exist=answer).contains(KEYS)
 
 
 def test_get_full_read_is_hit_and_not_found_is_miss():

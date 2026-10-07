@@ -36,7 +36,7 @@ from disaggregation.base.cache_backend import (  # noqa: E402
     SubmissionRejected,
     Unit,
 )
-from disaggregation.orchestration.kv_transfer.interfaces import Landing, LandsOnHost  # noqa: E402
+from disaggregation.base.capabilities import Landing, LandsOnHost  # noqa: E402
 from store_fakes import (  # noqa: E402
     FakeBlobStore,
     extent,
@@ -79,12 +79,12 @@ def test_host_shape_is_lands_on_host_and_not_fetches():
         assert isinstance(rank.backend, LandsOnHost)
         assert not isinstance(rank.backend, Fetches)
         assert isinstance(rank.inner, BlobStoreBackend) and isinstance(rank.inner, Publishes)
-        landing = rank.backend.fetch_to_host(b"n", [])
+        landing = rank.backend.fetch_to_host([])
         assert isinstance(landing, Landing)
         assert landing.poll() == Delivered(frozenset())
         assert isinstance(landing.place(extent([])), Attempt)
-        landing.release()
-        landing.release()  # idempotent
+        landing.close()
+        landing.close()  # idempotent
         # The inner backend has a publish pool and no fetch path of its own: a wiring error.
         with pytest.raises(RuntimeError, match="fetch_to_host"):
             rank.inner.fetch(extent([rank.unit(0, 0, 8)]))
@@ -129,7 +129,7 @@ def test_landing_then_place_round_trips_bytes_and_writes_only_the_extent():
         assert rank.place(landing, [b]) == Delivered(frozenset({b.name}))
         assert rank.read(b) == pattern(2, UNIT)
         assert rank.backend.landings_held() == 1
-        landing.release()
+        landing.close()
         assert rank.backend.landings_held() == 0 and rank.free_landing_slots() == 4
         assert rank.backend.counters.failed_attempts == 0
 
@@ -148,7 +148,7 @@ def test_place_of_a_unit_the_landing_did_not_serve_fails_without_touching_memory
         assert rank.landing_copier.copies == [] and rank.read(never) == bytes([0xEE]) * UNIT
         assert rank.backend.quiesce([attempt]) is True
         assert rank.backend.counters.failed_attempts == 1
-        landing.release()
+        landing.close()
 
 
 def test_place_of_a_unit_whose_pages_differ_in_size_from_the_landed_bytes_fails():
@@ -170,15 +170,15 @@ def test_place_of_a_unit_whose_pages_differ_in_size_from_the_landed_bytes_fails(
         assert rank.backend.counters.failed_attempts == 1
         assert rank.backend.landings_held() == 1  # still placeable, at the size it landed with
         assert rank.place(landing, [a]) == Delivered(frozenset({a.name}))
-        landing.release()
+        landing.close()
         assert rank.free_landing_slots() == 4
 
 
 def test_place_before_the_landing_has_content_is_rejected():
     with make_host_rank() as rank:
         a = rank.unit(0, 0, UNIT)
-        rank.store.block("holds")
-        landing = rank.backend.fetch_to_host(b"n", [a.name])
+        rank.store.block("contains")
+        landing = rank.backend.fetch_to_host([a.name])
         rank.store.wait_entered(3)  # two registrations, then the lookup parked
         with pytest.raises(SubmissionRejected, match="no content"):
             landing.place(extent([a]))
@@ -189,7 +189,7 @@ def test_place_before_the_landing_has_content_is_rejected():
         # unit the landing did not serve is a wiring error, not back-pressure.
         outcome = landing.place(extent([a])).poll()
         assert isinstance(outcome, Failed) and "not landed" in outcome.reason
-        landing.release()
+        landing.close()
 
 
 def test_place_copier_failure_is_failed_quiet_and_keeps_the_landing_placeable():
@@ -207,7 +207,7 @@ def test_place_copier_failure_is_failed_quiet_and_keeps_the_landing_placeable():
         assert rank.backend.landings_held() == 1  # the failed placement released nothing
         assert rank.place(landing, [a]) == Delivered(frozenset({a.name}))
         assert rank.read(a) == pattern(1, UNIT)
-        landing.release()
+        landing.close()
 
 
 # ---- the queue: slots without threads ----
@@ -219,18 +219,18 @@ def test_slot_shortage_queues_the_landing_and_release_hands_it_to_a_worker():
     with direct, make_host_rank(store, landing_slots=1) as rank:
         a, b = _mirror(rank, theirs)
         first = rank.land([a])
-        lookups = rank.store.count("holds")
-        second = rank.backend.fetch_to_host(b"second", [b.name])
+        lookups = rank.store.count("contains")
+        second = rank.backend.fetch_to_host([b.name])
         time.sleep(0.05)
         for _ in range(20):
             assert second.poll() is None  # queued, non-blocking
-        assert rank.store.count("holds") == lookups  # the worker was not asked yet
-        first.release()  # the engine thread returns the slot and dispatches the queue head
+        assert rank.store.count("contains") == lookups  # the worker was not asked yet
+        first.close()  # the engine thread returns the slot and dispatches the queue head
         wait_until(lambda: second.poll() is not None)
         assert second.poll() == Delivered(frozenset({b.name}))
         assert rank.place(second, [b]) == Delivered(frozenset({b.name}))
         assert rank.read(b) == pattern(2, UNIT)
-        second.release()
+        second.close()
 
 
 def test_one_worker_one_slot_three_landings_all_complete_in_order():
@@ -238,16 +238,14 @@ def test_one_worker_one_slot_three_landings_all_complete_in_order():
     direct, theirs = _published(store, 3)
     with direct, make_host_rank(store, landing_slots=1, num_workers=1) as rank:
         mine = _mirror(rank, theirs)
-        landings = [
-            rank.backend.fetch_to_host(f"l{i}".encode(), [u.name]) for i, u in enumerate(mine)
-        ]
+        landings = [rank.backend.fetch_to_host([u.name]) for i, u in enumerate(mine)]
         for i, landing in enumerate(landings):
             wait_until(lambda: landing.poll() is not None, what=f"landing {i}")
             assert landing.poll() == Delivered(frozenset({mine[i].name}))
             assert rank.place(landing, [mine[i]]) == Delivered(frozenset({mine[i].name}))
             later = [other.poll() for other in landings[i + 1 :]]
             assert later == [None] * len(later)  # the rest still wait for the one slot
-            landing.release()
+            landing.close()
         for i, u in enumerate(mine):
             assert rank.read(u) == pattern(1 + i, UNIT)
 
@@ -268,7 +266,7 @@ def test_publish_completes_while_a_landing_holds_every_landing_slot_on_the_only_
         for i, u in enumerate(out):
             assert store.objects[rank.key(u)] == pattern(10 + i, UNIT)
         assert held.poll() == Delivered(frozenset({a.name}))  # still landed, still held
-        held.release()
+        held.close()
 
 
 def test_landings_take_no_inflight_slot_but_placements_do():
@@ -280,8 +278,8 @@ def test_landings_take_no_inflight_slot_but_placements_do():
     with direct, make_host_rank(store, max_inflight_ops=1) as rank:
         a, b = _mirror(rank, theirs)
         rank.store.block("get")
-        first = rank.backend.fetch_to_host(b"a", [a.name])
-        second = rank.backend.fetch_to_host(b"b", [b.name])
+        first = rank.backend.fetch_to_host([a.name])
+        second = rank.backend.fetch_to_host([b.name])
         rank.store.wait_entered(6)  # 2 registrations, 2 lookups, 2 gets parked
         out = rank.unit(1, 0, UNIT)
         rank.write(out, pattern(9, UNIT))
@@ -297,8 +295,8 @@ def test_landings_take_no_inflight_slot_but_placements_do():
         rank.landing_copier.unblock()
         assert isinstance(rank.finish(placing), Delivered)
         assert rank.place(second, [b]) == Delivered(frozenset({b.name}))  # the slot is back
-        first.release()
-        second.release()
+        first.close()
+        second.close()
 
 
 def test_holds_and_get_run_back_to_back_once_the_slots_are_granted():
@@ -308,13 +306,13 @@ def test_holds_and_get_run_back_to_back_once_the_slots_are_granted():
         a, b = _mirror(rank, theirs)
         first = rank.land([a])
         calls_before = len(rank.store.calls)
-        second = rank.backend.fetch_to_host(b"b", [b.name])
+        second = rank.backend.fetch_to_host([b.name])
         time.sleep(0.05)
         assert rank.store.calls[calls_before:] == []  # nothing asked while queued
-        first.release()
+        first.close()
         wait_until(lambda: second.poll() is not None)
-        assert [m for m, _ in rank.store.calls[calls_before:]] == ["holds", "get"]
-        second.release()
+        assert [m for m, _ in rank.store.calls[calls_before:]] == ["contains", "get"]
+        second.close()
 
 
 # ---- release in every state ----
@@ -326,13 +324,13 @@ def test_release_while_queued_dequeues_and_takes_no_slot():
     with direct, make_host_rank(store, landing_slots=1) as rank:
         a, b = _mirror(rank, theirs)
         first = rank.land([a])
-        lookups = rank.store.count("holds")
-        second = rank.backend.fetch_to_host(b"b", [b.name])
-        second.release()  # gives up its place in the queue
+        lookups = rank.store.count("contains")
+        second = rank.backend.fetch_to_host([b.name])
+        second.close()  # gives up its place in the queue
         assert rank.backend.landings_held() == 1
-        first.release()  # the slot comes back and nobody is dispatched
+        first.close()  # the slot comes back and nobody is dispatched
         time.sleep(0.05)
-        assert rank.store.count("holds") == lookups
+        assert rank.store.count("contains") == lookups
         assert rank.free_landing_slots() == 1 and rank.backend.landings_held() == 0
         assert rank.backend.counters.failed_attempts == 0  # a release is not a failure
 
@@ -343,10 +341,10 @@ def test_release_while_the_get_is_in_flight_returns_the_slots_after_it():
     with direct, make_host_rank(store, landing_slots=1) as rank:
         (a,) = _mirror(rank, theirs)
         rank.store.block("get")
-        landing = rank.backend.fetch_to_host(b"a", [a.name])
+        landing = rank.backend.fetch_to_host([a.name])
         rank.store.wait_entered(4)  # 2 registrations, lookup, get parked
         start = time.monotonic()
-        landing.release()
+        landing.close()
         assert time.monotonic() - start < 0.5  # did not wait for the get
         assert rank.free_landing_slots() == 0  # the store may still write the slot
         rank.store.unblock()
@@ -368,12 +366,12 @@ def test_release_during_an_in_flight_placement_returns_slots_after_the_copy():
         placing = landing.place(extent([a]))
         rank.landing_copier.wait_entered(1)  # the worker is inside the copy
         start = time.monotonic()
-        landing.release()
+        landing.close()
         assert time.monotonic() - start < 0.5  # did not wait for the copy
         assert rank.free_landing_slots() == 0  # the copy still reads the slot
         with pytest.raises(SubmissionRejected, match="no content"):
             landing.place(extent([a]))  # released: nothing more may be placed
-        waiting = rank.backend.fetch_to_host(b"next", [a.name])  # wants the one slot
+        waiting = rank.backend.fetch_to_host([a.name])  # wants the one slot
         assert waiting.poll() is None
         rank.landing_copier.unblock()
         assert rank.finish(placing) == Delivered(frozenset({a.name}))
@@ -382,7 +380,7 @@ def test_release_during_an_in_flight_placement_returns_slots_after_the_copy():
         wait_until(lambda: waiting.poll() is not None, what="the next landing")
         assert waiting.poll() == Delivered(frozenset({a.name}))
         assert rank.backend.landings_held() == 1  # ``waiting``; the released one is gone
-        waiting.release()
+        waiting.close()
         assert rank.free_landing_slots() == 1
 
 
@@ -392,16 +390,16 @@ def test_queue_wait_past_the_bound_fails_the_landing_and_dequeues_it():
     with direct, make_host_rank(store, landing_slots=1, landing_wait_timeout_s=30.0) as rank:
         a, b = _mirror(rank, theirs)
         first = rank.land([a])
-        second = rank.backend.fetch_to_host(b"b", [b.name])
+        second = rank.backend.fetch_to_host([b.name])
         assert second.poll() is None
         second.enqueued_at -= 31.0  # queued "half a minute ago": past the bound
         outcome = second.poll()  # the bound is checked here, on the caller's clock
         assert isinstance(outcome, Failed) and "waited 30 s" in outcome.reason
         assert rank.backend.counters.failed_attempts == 0  # a wait, not a store failure
-        lookups = rank.store.count("holds")
-        first.release()  # the slot comes back; a dispatch would take it at once, on this thread
-        assert rank.free_landing_slots() == 1 and rank.store.count("holds") == lookups
-        second.release()  # nothing to give back; no error
+        lookups = rank.store.count("contains")
+        first.close()  # the slot comes back; a dispatch would take it at once, on this thread
+        assert rank.free_landing_slots() == 1 and rank.store.count("contains") == lookups
+        second.close()  # nothing to give back; no error
 
 
 def test_landing_failure_gives_the_slots_back_at_once():
@@ -415,9 +413,9 @@ def test_landing_failure_gives_the_slots_back_at_once():
         assert isinstance(outcome, Failed) and "store unreachable" in outcome.reason
         assert rank.free_landing_slots() == 4 and rank.backend.landings_held() == 0
         assert rank.backend.counters.failed_attempts == 1
-        landing.release()
+        landing.close()
         # A lookup failure is a failure too, not a miss.
-        rank.store.fail_next("holds", BlobStoreError("master unreachable"))
+        rank.store.fail_next("contains", BlobStoreError("master unreachable"))
         outcome = rank.land([a]).poll()
         assert isinstance(outcome, Failed) and "lookup failed" in outcome.reason
         assert rank.backend.counters.fetch_misses == 0
@@ -427,9 +425,9 @@ def test_more_units_than_slots_or_an_unknown_unit_fails_before_the_store_is_aske
     with make_host_rank(landing_slots=2) as rank:
         units = [rank.unit(0, i, UNIT) for i in range(3)]
         calls = len(rank.store.calls)
-        outcome = rank.backend.fetch_to_host(b"big", [u.name for u in units]).poll()
+        outcome = rank.backend.fetch_to_host([u.name for u in units]).poll()
         assert isinstance(outcome, Failed) and "exceed the 2 landing slots" in outcome.reason
-        outcome = rank.backend.fetch_to_host(b"?", [b"nobody"]).poll()
+        outcome = rank.backend.fetch_to_host([b"nobody"]).poll()
         assert isinstance(outcome, Failed) and "no known size" in outcome.reason
         assert len(rank.store.calls) == calls and rank.backend.counters.failed_attempts == 2
         assert rank.free_landing_slots() == 2
@@ -438,7 +436,7 @@ def test_more_units_than_slots_or_an_unknown_unit_fails_before_the_store_is_aske
 def test_unit_larger_than_a_slot_fails_the_landing_at_once():
     with make_host_rank(slot_bytes=32) as rank:
         big = rank.unit(0, 0, 33)
-        outcome = rank.backend.fetch_to_host(b"n", [big.name]).poll()
+        outcome = rank.backend.fetch_to_host([big.name]).poll()
         assert isinstance(outcome, Failed) and "exceeds the landing slot" in outcome.reason
 
 
@@ -452,17 +450,17 @@ def test_close_refuses_queued_landings_frees_held_slots_and_release_afterwards_i
         rank = make_host_rank(store, landing_slots=1)
         a, b = _mirror(rank, theirs)
         landed = rank.land([a])
-        queued = rank.backend.fetch_to_host(b"b", [b.name])
+        queued = rank.backend.fetch_to_host([b.name])
         rank.backend.close()
         outcome = queued.poll()
         assert isinstance(outcome, Failed) and "shut down" in outcome.reason
         assert rank.backend.landings_held() == 0 and rank.free_landing_slots() == 1
         assert store.closed == 1
         # Late releases from the coordinator: nothing to do, nothing to submit, no error.
-        landed.release()
-        queued.release()
+        landed.close()
+        queued.close()
         with pytest.raises(SubmissionRejected):
-            rank.backend.fetch_to_host(b"c", [a.name])
+            rank.backend.fetch_to_host([a.name])
         with pytest.raises(SubmissionRejected):
             landed.place(extent([a]))
         rank.backend.close()  # idempotent
@@ -487,13 +485,13 @@ def test_fetch_to_host_racing_close_is_refused_or_released():
             enqueue(waiter, count)
 
         pool.enqueue = close_then_enqueue
-        racing = rank.backend.fetch_to_host(b"racing", [a.name])
+        racing = rank.backend.fetch_to_host([a.name])
         outcome = racing.poll()
-        assert isinstance(outcome, Failed) and "released before landing" in outcome.reason
+        assert isinstance(outcome, Failed) and "closed before landing" in outcome.reason
         assert rank.backend.landings_held() == 0 and rank.free_landing_slots() == 4
-        racing.release()  # inert
+        racing.close()  # inert
         with pytest.raises(SubmissionRejected):
-            rank.backend.fetch_to_host(b"late", [a.name])
+            rank.backend.fetch_to_host([a.name])
         assert store.closed == 1
 
 
@@ -504,7 +502,7 @@ def test_close_waits_for_a_get_in_flight_then_returns_its_slots():
         rank = make_host_rank(store, landing_slots=1)
         (a,) = _mirror(rank, theirs)
         store.block("get")
-        landing = rank.backend.fetch_to_host(b"a", [a.name])
+        landing = rank.backend.fetch_to_host([a.name])
         store.wait_entered(4)
         closer = threading.Thread(target=rank.backend.close)
         closer.start()
@@ -515,7 +513,7 @@ def test_close_waits_for_a_get_in_flight_then_returns_its_slots():
         assert not closer.is_alive()
         assert landing.poll() == Delivered(frozenset({a.name}))
         assert rank.free_landing_slots() == 1  # close asked for the slots back
-        landing.release()
+        landing.close()
 
 
 # ---- misc contract points ----
@@ -524,13 +522,13 @@ def test_close_waits_for_a_get_in_flight_then_returns_its_slots():
 def test_empty_landing_and_empty_placement_complete_at_once_without_the_store():
     with make_host_rank() as rank:
         calls = len(rank.store.calls)
-        landing = rank.backend.fetch_to_host(b"n", [])
+        landing = rank.backend.fetch_to_host([])
         assert landing.poll() == Delivered(frozenset())
         attempt = landing.place(extent([]))
         assert attempt.poll() == Delivered(frozenset())
         assert rank.backend.quiesce([attempt]) is True
         rank.backend.settle([attempt])
-        landing.release()
+        landing.close()
         assert len(rank.store.calls) == calls
         assert rank.free_landing_slots() == 4
 
@@ -541,7 +539,7 @@ def test_quiesce_and_settle_only_know_placements():
             rank.backend.quiesce([object()])
         u = Unit(name=b"x", local_group=0, local=0)
         rank.resolver._table[(0, 0)] = ((rank.arena.address, 8),)
-        attempt = rank.backend.fetch_to_host(b"n", []).place(extent([u]))
+        attempt = rank.backend.fetch_to_host([]).place(extent([u]))
         outcome = attempt.poll()
         assert isinstance(outcome, Failed) and "not landed" in outcome.reason
         assert rank.backend.quiesce([attempt]) is True
@@ -553,13 +551,13 @@ def test_no_wait_bound_keeps_a_queued_landing_waiting():
     with direct, make_host_rank(store, landing_slots=1, landing_wait_timeout_s=None) as rank:
         a, b = _mirror(rank, theirs)
         first = rank.land([a])
-        second = rank.backend.fetch_to_host(b"b", [b.name])
+        second = rank.backend.fetch_to_host([b.name])
         second.enqueued_at -= 3600.0  # queued "an hour ago": still no bound to hit
         assert second.poll() is None
-        first.release()
+        first.close()
         wait_until(lambda: second.poll() is not None)
         assert second.poll() == Delivered(frozenset({b.name}))
-        second.release()
+        second.close()
 
 
 def test_close_fails_a_landing_still_queued_so_poll_is_never_none_forever():
@@ -569,7 +567,7 @@ def test_close_fails_a_landing_still_queued_so_poll_is_never_none_forever():
         rank = make_host_rank(store, landing_slots=1)
         a, b = _mirror(rank, theirs)
         held = rank.land([a])
-        queued = rank.backend.fetch_to_host(b"b", [b.name])
+        queued = rank.backend.fetch_to_host([b.name])
         rank.backend.close()
         assert isinstance(queued.poll(), Failed) and isinstance(held.poll(), Delivered)
         with pytest.raises(SubmissionRejected):  # its slots went back at close

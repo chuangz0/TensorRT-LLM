@@ -15,7 +15,11 @@
 """The cache-transfer contract.
 
 What this package exports is the contract; what it does not is backend-internal and has to be
-imported by file path.
+imported by file path. Two contracts live here side by side: ``backend.py`` is the paired path's
+(the disagg transceiver and ``native/``), re-exported below; ``cache_backend.py`` is the store
+path's (``orchestration/kv_transfer/``, ``backends/``, ``resource/``), imported by file path, with
+``capabilities.py`` for its optional backend capabilities. The store path takes only ``Chunk`` and
+``CacheKind`` from ``backend.py``.
 """
 
 from .backend import (

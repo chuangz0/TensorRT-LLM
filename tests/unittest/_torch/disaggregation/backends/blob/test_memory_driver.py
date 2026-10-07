@@ -25,7 +25,7 @@ from store_fakes import (  # noqa: E402
     ArenaResolver,
     MemoryArena,
     extent,
-    fake_open_staging,
+    fake_open_slot_pool,
     pattern,
     read,
     wait_until,
@@ -103,7 +103,7 @@ def test_get_of_an_unknown_key_is_a_miss_that_leaves_the_destination_alone():
     store.register_span(arena.address, arena.size)
     dst = arena.carve(64)
     write([dst], bytes([0xEE]) * 64)
-    assert store.holds(["nope"]) == [False]
+    assert store.contains(["nope"]) == [False]
     assert store.get(["nope"], [[dst]]) == [GetStatus.MISS]
     assert read([dst]) == bytes([0xEE]) * 64
 
@@ -114,7 +114,7 @@ def test_memory_type_with_host_landing_builds_the_lands_on_host_shape(monkeypatc
     the inner backend, no pool is registered, and a unit round-trips publish -> land -> place."""
     importlib.import_module("disaggregation.backends.blob.drivers.memory")
     factory = importlib.import_module("disaggregation.backends.blob.factory")
-    monkeypatch.setattr(factory, "open_pinned_staging_pool", fake_open_staging)
+    monkeypatch.setattr(factory, "open_pinned_slot_pool", fake_open_slot_pool)
     arena = MemoryArena(1 << 10)
     resolver = ArenaResolver(arena)
     src = resolver.add(0, 0, 64)
@@ -125,7 +125,7 @@ def test_memory_type_with_host_landing_builds_the_lands_on_host_shape(monkeypatc
             "type": "memory",
             "namespace": "t",
             "landing": "host",
-            "staging_buffer_bytes": 256,
+            "publish_buffer_bytes": 256,
             "landing_buffer_bytes": 512,
         }
     )
@@ -146,7 +146,7 @@ def test_memory_type_with_host_landing_builds_the_lands_on_host_shape(monkeypatc
         attempt = handle.publisher.publish(extent([Unit(name=b"u", local_group=0, local=0)]))
         handle.publisher.settle([attempt])
         assert attempt.poll() == Delivered(frozenset({b"u"}))
-        landing = handle.fetcher.fetch_to_host(b"n", [b"u"])
+        landing = handle.fetcher.fetch_to_host([b"u"])
         wait_until(lambda: landing.poll() is not None)
         assert landing.poll() == Delivered(frozenset({b"u"}))
         assert handle.counters()["landings_held"] == 1
@@ -155,7 +155,7 @@ def test_memory_type_with_host_landing_builds_the_lands_on_host_shape(monkeypatc
         handle.fetcher.settle([placed])
         assert placed.poll() == Delivered(frozenset({b"u"}))
         assert read(dst) == pattern(3, 64)
-        landing.release()
+        landing.close()
         assert handle.counters()["landings_held"] == 0
     finally:
         close_backends(handles)

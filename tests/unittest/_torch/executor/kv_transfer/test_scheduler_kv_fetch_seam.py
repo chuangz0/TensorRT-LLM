@@ -188,7 +188,7 @@ class FakePlanner:
         self.answers = dict(answers or {})
         self.asked: list[int] = []
 
-    def plan_fetch(self, req):
+    def fetch_answer(self, req):
         self.asked.append(req.py_request_id)
         return self.answers.get(req.py_request_id)
 
@@ -409,7 +409,7 @@ def test_pool_exhaustion_is_detected_once_the_request_is_back_on_the_local_path(
 class FilteringPlanner(FakePlanner):
     """A planner that applies the hooks' real candidate filter before answering a plan."""
 
-    def plan_fetch(self, req):
+    def fetch_answer(self, req):
         from tensorrt_llm._torch.pyexecutor.kv_transfer.hooks import _is_fetch_candidate
 
         self.asked.append(req.py_request_id)
@@ -615,18 +615,18 @@ def test_planner_is_asked_after_the_prefix_probe_but_before_any_cache_work():
     sched = make_scheduler(mgr)
 
     class OrderedPlanner(FakePlanner):
-        def plan_fetch(self, req):
-            order.append(("plan_fetch", req.py_request_id))
-            return super().plan_fetch(req)
+        def fetch_answer(self, req):
+            order.append(("fetch_answer", req.py_request_id))
+            return super().fetch_answer(req)
 
     sched.kv_transfer_hooks = OrderedPlanner({1: FakePlanner.DEFER, 2: None})
     reqs = [make_ctx_request(1, 100), make_ctx_request(2, 100)]
     sched.schedule_request(reqs, set())
     assert order == [
         ("probe", 1),
-        ("plan_fetch", 1),
+        ("fetch_answer", 1),
         ("probe", 2),
-        ("plan_fetch", 2),
+        ("fetch_answer", 2),
         ("prepare_context", 2),
     ]
 
