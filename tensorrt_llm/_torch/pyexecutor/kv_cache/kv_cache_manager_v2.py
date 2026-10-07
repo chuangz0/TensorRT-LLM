@@ -5181,12 +5181,14 @@ class KVCacheManagerV2(BaseResourceManager):
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:
-                # Dummy/warmup request. ``stop_committing()`` below blocks all
-                # writes to the radix tree, so the choice of branch does not
-                # affect committed state. ``cache_salt`` is left defaulted
-                # to None to avoid coupling synthetic data to any salted branch.
+                # Dummy/warmup request: its cache starts empty and stays out of
+                # the radix tree. No lookup (``None`` tokens): the synthetic
+                # prompt ``[1] * token_num`` would match the blocks of any real
+                # prompt that starts with token 1 (the BOS of Llama-family
+                # tokenizers), e.g. when the attention-DP pad runs on a rank that
+                # served such a request. No writes: ``stop_committing()`` below.
                 kv_cache = self._create_kv_cache(
-                    req.py_request_id, req.lora_task_id, input_tokens, is_dummy=req.is_dummy
+                    req.py_request_id, req.lora_task_id, None, is_dummy=req.is_dummy
                 )
                 # Saturated IndexMapper (e.g. disagg gen trans in progress)
                 # returns None; retry next iter.
@@ -5211,9 +5213,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 draft_kv_cache = None
                 if draft_kv_cache_manager is not None:
                     draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
-                        req.py_request_id, req.lora_task_id, input_tokens, is_dummy=req.is_dummy
+                        req.py_request_id, req.lora_task_id, None, is_dummy=req.is_dummy
                     )
-                    # Dummy path: see comment above, no salt.
+                    # Dummy path: see comment above, no lookup.
                     if draft_kv_cache is None:
                         release_resources(req)
                         return None
