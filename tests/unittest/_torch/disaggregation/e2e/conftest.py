@@ -14,4 +14,4 @@ working tree, not an installed wheel. ``mooncake_cluster.py`` is found through p
 import mode, so ``--noconftest`` only loses the fixture registration below.
 """
 
-from mooncake_cluster import mooncake_cluster, tinyllama_path  # noqa: F401
+from mooncake_cluster import mooncake_cluster, tinyllama_path, transport_store  # noqa: F401
