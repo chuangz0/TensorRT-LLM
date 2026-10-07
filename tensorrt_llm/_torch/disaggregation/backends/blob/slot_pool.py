@@ -240,9 +240,9 @@ class HostSlotPool:
             self._copier.copy(address, source + offset, size, "h2d")
             offset += size
 
-    def sync(self) -> None:
+    def wait_for_copies(self) -> None:
         """Wait for this thread's copies to land."""
-        self._copier.sync()
+        self._copier.wait_for_copies()
 
 
 def open_pinned_slot_pool(

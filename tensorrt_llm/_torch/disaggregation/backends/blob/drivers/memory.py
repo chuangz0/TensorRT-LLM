@@ -16,7 +16,7 @@
 
 It reaches no other process, so it shares nothing between engines; it exists so that the blob
 path can be run and tested end to end without a store service, and as the store behind the test
-fakes. An entry of this type takes the ``BlobStoreConfig`` keys and no others.
+fakes. An entry of this type takes the ``BlobBackendConfig`` keys and no others.
 """
 
 from __future__ import annotations

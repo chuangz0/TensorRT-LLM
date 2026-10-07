@@ -15,7 +15,7 @@ import time
 import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.backends.blob.backend import BlobStoreBackend, StoreCounters  # noqa: E402
+from disaggregation.backends.blob.backend import BackendCounters, BlobStoreBackend  # noqa: E402
 from disaggregation.backends.blob.store import BlobStoreError  # noqa: E402
 from disaggregation.base.cache_backend import (  # noqa: E402
     Attempt,
@@ -49,7 +49,7 @@ def test_backend_satisfies_the_three_protocols():
         assert isinstance(rank.backend, Fetches)
         assert isinstance(rank.backend, Publishes)
         assert isinstance(rank.backend, RegistersPools)
-        assert isinstance(rank.backend.counters, StoreCounters)
+        assert isinstance(rank.backend.counters, BackendCounters)
         assert isinstance(rank.backend.publish(extent([])), Attempt)
 
 

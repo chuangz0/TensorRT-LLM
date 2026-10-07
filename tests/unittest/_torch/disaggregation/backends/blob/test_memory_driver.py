@@ -8,7 +8,7 @@ import importlib
 import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.backends.blob.backend import BlobStoreBackend, BlobStoreConfig  # noqa: E402
+from disaggregation.backends.blob.backend import BlobBackendConfig, BlobStoreBackend  # noqa: E402
 from disaggregation.backends.blob.drivers.memory import MemoryBlobStore  # noqa: E402
 from disaggregation.backends.blob.host_landing import HostLandingBlobBackend  # noqa: E402
 from disaggregation.backends.blob.store import GetStatus, PutStatus  # noqa: E402
@@ -49,7 +49,7 @@ def test_memory_type_builds_a_blob_store_backend_that_registers_pools():
         assert isinstance(handle, BackendHandle) and handle.name == "local"
         assert isinstance(handle.fetcher, BlobStoreBackend)
         assert handle.publisher is handle.fetcher and handle.pool_registrar is handle.fetcher
-        assert set(handle.counters()) >= {"fetch_hits", "publish_stored"}
+        assert set(handle.read_counters()) >= {"fetch_hits", "publish_stored"}
     finally:
         close_backends(handles)
 
@@ -58,7 +58,7 @@ def test_backend_over_the_memory_store_round_trips_and_probes():
     store = MemoryBlobStore()
     arena = MemoryArena(1 << 12)
     resolver = ArenaResolver(arena)
-    backend = BlobStoreBackend(store, BlobStoreConfig(namespace="t"), resolver, FINGERPRINT)
+    backend = BlobStoreBackend(store, BlobBackendConfig(namespace="t"), resolver, FINGERPRINT)
     try:
         backend.register_pool(arena.address, arena.size)
         assert store.registered == {arena.address: arena.size}
@@ -141,7 +141,7 @@ def test_memory_type_with_host_landing_builds_the_lands_on_host_shape(monkeypatc
         assert handle.landing == "host" and handle.pool_registrar is None
         assert isinstance(handle.fetcher, HostLandingBlobBackend)
         assert isinstance(handle.publisher, BlobStoreBackend)
-        assert handle.counters()["landings_held"] == 0
+        assert handle.read_counters()["landings_held"] == 0
         write(src, pattern(3, 64))
         attempt = handle.publisher.publish(extent([Unit(name=b"u", local_group=0, local=0)]))
         handle.publisher.settle([attempt])
@@ -149,14 +149,14 @@ def test_memory_type_with_host_landing_builds_the_lands_on_host_shape(monkeypatc
         landing = handle.fetcher.fetch_to_host([b"u"])
         wait_until(lambda: landing.poll() is not None)
         assert landing.poll() == Delivered(frozenset({b"u"}))
-        assert handle.counters()["landings_held"] == 1
+        assert handle.read_counters()["landings_held"] == 1
         write(dst, bytes([0xEE]) * 64)
         placed = landing.place(extent([Unit(name=b"u", local_group=0, local=1)]))
         handle.fetcher.settle([placed])
         assert placed.poll() == Delivered(frozenset({b"u"}))
         assert read(dst) == pattern(3, 64)
         landing.close()
-        assert handle.counters()["landings_held"] == 0
+        assert handle.read_counters()["landings_held"] == 0
     finally:
         close_backends(handles)
 

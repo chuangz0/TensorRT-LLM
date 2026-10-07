@@ -254,7 +254,7 @@ class KVTransferHooks:
                     "type": entry.type,
                     "roles": sorted(entry.roles),
                     "landing": handle.landing,
-                    "counters": dict(handle.counters()),
+                    "counters": dict(handle.read_counters()),
                 }
                 for handle, entry in zip(self.backends, self._backend_entries)
             ],

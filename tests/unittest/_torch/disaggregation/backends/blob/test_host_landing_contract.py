@@ -124,7 +124,7 @@ def test_landing_then_place_round_trips_bytes_and_writes_only_the_extent():
         assert rank.read(a) == pattern(1, UNIT) == direct.read(theirs[0])
         assert rank.read(c) == pattern(3, UNIT) == direct.read(theirs[2])
         assert rank.read(b) == bytes([0xEE]) * UNIT
-        assert rank.landing_copier.kinds() == ["h2d", "h2d"] and rank.landing_copier.syncs == 1
+        assert rank.landing_copier.kinds() == ["h2d", "h2d"] and rank.landing_copier.copy_waits == 1
         # The rest can still be placed: the slots are held until release.
         assert rank.place(landing, [b]) == Delivered(frozenset({b.name}))
         assert rank.read(b) == pattern(2, UNIT)
@@ -203,7 +203,7 @@ def test_place_copier_failure_is_failed_quiet_and_keeps_the_landing_placeable():
         outcome = rank.finish(attempt)
         assert isinstance(outcome, Failed) and "cudaMemcpyAsync" in outcome.reason
         assert rank.backend.quiesce([attempt]) is True
-        assert rank.landing_copier.syncs == 1  # drained before the outcome
+        assert rank.landing_copier.copy_waits == 1  # waited for before the outcome
         assert rank.backend.landings_held() == 1  # the failed placement released nothing
         assert rank.place(landing, [a]) == Delivered(frozenset({a.name}))
         assert rank.read(a) == pattern(1, UNIT)

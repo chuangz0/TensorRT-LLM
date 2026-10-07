@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""``BlobStoreConfig`` (the backend's options) and ``MooncakeStoreConfig`` (the driver's) as
+"""``BlobBackendConfig`` (the backend's options) and ``MooncakeStoreConfig`` (the driver's) as
 two disjoint halves of one flat entry, and the ``KeyScheme`` re-encoding. No backend, no
 threads."""
 
@@ -9,7 +9,7 @@ import dataclasses
 import pytest
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.backends.blob.backend import BlobStoreConfig  # noqa: E402
+from disaggregation.backends.blob.backend import BlobBackendConfig  # noqa: E402
 from disaggregation.backends.blob.drivers.mooncake import (  # noqa: E402
     DEFAULT_METADATA_SERVER,
     MooncakeStoreConfig,
@@ -21,11 +21,11 @@ from disaggregation.backends.blob.keys import KeyScheme  # noqa: E402
 
 def test_backend_and_driver_fields_do_not_overlap():
     # One flat entry is split by key name, so a key must belong to exactly one side.
-    assert not BlobStoreConfig.fields() & MooncakeStoreConfig.fields()
+    assert not BlobBackendConfig.fields() & MooncakeStoreConfig.fields()
 
 
 def test_backend_fields_are_the_documented_nine():
-    assert BlobStoreConfig.fields() == {
+    assert BlobBackendConfig.fields() == {
         "namespace",
         "transfer_batch_size",
         "landing",
@@ -38,11 +38,11 @@ def test_backend_fields_are_the_documented_nine():
     }
 
 
-# ---- BlobStoreConfig ----
+# ---- BlobBackendConfig ----
 
 
 def test_backend_config_defaults_are_the_documented_ones():
-    cfg = BlobStoreConfig()
+    cfg = BlobBackendConfig()
     assert cfg.namespace == "trtllm" and cfg.landing == "device" and not cfg.lands_on_host
     assert cfg.transfer_batch_size > 0 and cfg.max_inflight_deliveries > 0 and cfg.num_workers > 0
     assert cfg.probe_ttl_s > 0
@@ -52,7 +52,7 @@ def test_backend_config_defaults_are_the_documented_ones():
 
 def test_configs_are_frozen():
     with pytest.raises(dataclasses.FrozenInstanceError):
-        BlobStoreConfig().namespace = "other"
+        BlobBackendConfig().namespace = "other"
     with pytest.raises(dataclasses.FrozenInstanceError):
         MooncakeStoreConfig("master:50051").protocol = "tcp"
 
@@ -82,16 +82,16 @@ def test_configs_are_frozen():
 )
 def test_backend_config_rejects_bad_values_naming_the_field(overrides, needle):
     with pytest.raises(ValueError, match=needle):
-        BlobStoreConfig(**overrides)
+        BlobBackendConfig(**overrides)
 
 
 def test_backend_from_dict_reports_a_wrongly_typed_value_as_a_value_error():
     with pytest.raises(ValueError, match="num_workers must be an integer, got '2'"):
-        BlobStoreConfig.from_dict({"num_workers": "2"})
+        BlobBackendConfig.from_dict({"num_workers": "2"})
 
 
 def test_backend_config_leaves_pool_budgets_unchecked_when_landing_on_device():
-    cfg = BlobStoreConfig(publish_buffer_bytes=0, landing_buffer_bytes=0)
+    cfg = BlobBackendConfig(publish_buffer_bytes=0, landing_buffer_bytes=0)
     assert cfg.publish_buffer_bytes == 0 and cfg.landing_buffer_bytes == 0
     assert cfg.landing == "device"
 
@@ -105,8 +105,8 @@ def test_backend_from_dict_round_trips_known_keys():
         "landing_buffer_bytes": 8192,
         "max_landed_units": 16,
     }
-    cfg = BlobStoreConfig.from_dict(raw)
-    assert cfg == BlobStoreConfig(**raw)
+    cfg = BlobBackendConfig.from_dict(raw)
+    assert cfg == BlobBackendConfig(**raw)
     assert cfg.num_workers == 3 and cfg.lands_on_host and cfg.max_landed_units == 16
 
 
@@ -115,7 +115,7 @@ def test_backend_from_dict_round_trips_known_keys():
 )
 def test_backend_from_dict_refuses_a_retired_key_by_name(old_key):
     with pytest.raises(ValueError, match=old_key):
-        BlobStoreConfig.from_dict({old_key: 4096})
+        BlobBackendConfig.from_dict({old_key: 4096})
 
 
 # ---- MooncakeStoreConfig ----

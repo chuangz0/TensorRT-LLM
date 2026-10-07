@@ -29,7 +29,7 @@ README §4 把 `native/`、`blob/`、`kvcr/`、`nixl/` 直接放在 `disaggregat
 
 **A3. `blob/fetch.py` + `blob/publish.py` → `blob/{store,backend,host_landing,factory,keys,slot_pool,worker_pool}.py` + `drivers/`。**
 README §4 把 blob 后端拆成 `fetch.py` 与 `publish.py`。本分支的 `BlobStoreBackend` 是一个类同时实现 `Fetches` / `Publishes` / `RegistersPools`:三者共用同一个 `BlobStore`、同一张 registration 表(登记的 pool 跨度既被 fetch 的目的地检查用,也被 publish 的来源检查用),拆成两个文件只会让共享状态变成第三个模块。`landing: host` 形态 `HostLandingBlobBackend`(`LandsOnHost`)组合一个 `BlobStoreBackend`,自成一个模块 `host_landing.py`。
-提议:README §4 的 `blob/` 条目改为 `store.py`(`BlobStore` 协议 + `PutStatus` / `GetStatus` / `BlobStoreError`:驱动实现的面)+ `backend.py`(三个契约面 + `BlobStoreConfig`)+ `host_landing.py`(host-first 形态)+ `factory.py`(所有驱动共用的工厂骨架)+ `keys.py` / `slot_pool.py` / `worker_pool.py`(实现细节)+ `drivers/`(每个存储一个模块:`mooncake.py`、`memory.py`;新存储只加一个模块与注册表一行)。README "一个存储驱动;其他字节存储产品与之并列"仍成立,只多 `drivers/` 一层。若作者坚持拆分,`fetch.py` / `publish.py` 可以是对 `backend.py` 的纯搬家,不改行为。
+提议:README §4 的 `blob/` 条目改为 `store.py`(`BlobStore` 协议 + `PutStatus` / `GetStatus` / `BlobStoreError`:驱动实现的面)+ `backend.py`(三个契约面 + `BlobBackendConfig`)+ `host_landing.py`(host-first 形态)+ `factory.py`(所有驱动共用的工厂骨架)+ `keys.py` / `slot_pool.py` / `worker_pool.py`(实现细节)+ `drivers/`(每个存储一个模块:`mooncake.py`、`memory.py`;新存储只加一个模块与注册表一行)。README "一个存储驱动;其他字节存储产品与之并列"仍成立,只多 `drivers/` 一层。若作者坚持拆分,`fetch.py` / `publish.py` 可以是对 `backend.py` 的纯搬家,不改行为。
 
 ## B 类:现状注记
 
@@ -37,7 +37,7 @@ README §4 把 blob 后端拆成 `fetch.py` 与 `publish.py`。本分支的 `Blo
 
 **B2. 路由提示。** README §7 的"由路由提示确定对端"在本分支只有 `FetchSource.hint_key`(装配表里每个后端认哪个提示键)+ `KVTransferCoordinator.launch_reserved_fetches` 里的一次 `open_route(hint)`;blob 后端 `hint_key = None`。有 worker 后端接入协调层时再具体化。
 
-**B3. `resource/kv_v2_view.py` 与 `resource/region.py`。** README §4 说 `resource/` 是过渡期 helper,"职责迁入 KVManager 侧导出模块(`export.py`)后退役"。本分支的 `KVv2ResourceView`(请求 → 块键、层组、fetch extent、publish extent)与 `KVv2RegionResolver` + `layout_fingerprint`(页 → 内存段、pool 跨度、布局指纹)就是那个导出面今天的落点,放在 `resource/`,只经 KV v2 wrapper 的公开方法触达。
+**B3. `resource/kv_v2_view.py` 与 `resource/region.py`。** README §4 说 `resource/` 是过渡期 helper,"职责迁入 KVManager 侧导出模块(`export.py`)后退役"。本分支的 `KVv2ResourceView`(请求 → 块键、层组、fetch extent、publish extent)与 `KVv2RegionResolver` + `compute_layout_fingerprint`(页 → 内存段、pool 跨度、布局指纹)就是那个导出面今天的落点,放在 `resource/`,只经 KV v2 wrapper 的公开方法触达。
 
 **B4. 装配层。** `backends/config.py`(`TRTLLM_KV_TRANSFER_CONFIG` 指向的 YAML → `KVTransferConfig` / `BackendEntry`)与 `backends/registry.py`(`type` → 工厂 → `BackendHandle`)。README §6 只写"装配层负责安排这些步骤",没写装配表长什么样;目录归属见 A2。
 

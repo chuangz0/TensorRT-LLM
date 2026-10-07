@@ -51,9 +51,9 @@ SPDX-License-Identifier: Apache-2.0
       ▼                                                  ▼
  disaggregation/backends/            disaggregation/resource/
    config.py              (YAML → KVTransferConfig)        kv_v2_view.py  (KVv2ResourceView)
-   registry.py            (type → factory → BackendHandle) region.py        (KVv2RegionResolver · layout_fingerprint)
+   registry.py            (type → factory → BackendHandle) region.py        (KVv2RegionResolver · compute_layout_fingerprint)
    blob/store.py          (BlobStore 协议:驱动实现的面)                  │ 只经 wrapper 公开方法
-   blob/backend.py …      (BlobStoreBackend + BlobStoreConfig;RegionResolver 在 base/region.py)  ▼
+   blob/backend.py …      (BlobStoreBackend + BlobBackendConfig;RegionResolver 在 base/region.py)  ▼
    blob/factory.py        (build_blob_backend:所有驱动共用的工厂骨架)
    blob/drivers/mooncake.py (type: mooncake 的驱动:连接配置、码翻译、工厂)
                                                     pyexecutor/kv_cache/kv_cache_manager_v2.py (3 处小改)
@@ -72,7 +72,7 @@ SPDX-License-Identifier: Apache-2.0
 | `TRTLLM_KV_TRANSFER_CONFIG` | 环境变量 | 读于 `py_executor_creator` | 指向 YAML;未设 = 不装配,零行为差异 |
 | `TRTLLM_KV_TRANSFER_STATUS_DUMP` | 环境变量(测试用) | 读于 `kv_transfer/assembly.py` | 设了则 `close()` 时把协调层 `status_dump()` + 各后端 counters 写成 JSON;路径中的 `{pid}` 替换为 worker 进程号 |
 | `KVTransferConfig` | dataclass | `backends/config.py` | 整份 YAML:`backends` 装配表 + 协调层限值 |
-| `BackendEntry` | dataclass | 同上 | 装配表一行:`name, type, hint_key, roles, options`;`serves_fetch` / `serves_publish` 是 roles 的布尔视图 |
+| `BackendEntry` | dataclass | 同上 | 装配表一行:`name, type, hint_key, roles, options`;`has_fetch_role` / `has_publish_role` 是 roles 的布尔视图 |
 | `load_kv_transfer_config(path)` | 函数 | 同上 | 读 YAML,校验,返回 `KVTransferConfig` |
 | `fetch_timeout_s` / `publish_timeout_s` | 配置键 | YAML 顶层 | 记录 deadline,秒;缺省 30 / 60,显式 `null` 才不超时 |
 | `unlaunched_timeout_s` / `fetch_wait_timeout_s` | 配置键 | YAML 顶层 | 同伴已发起而本 rank 未发起的上界 / 计划好的 fetch 等调度器给页或等后端落地内存的上界,秒;缺省各 30,到了投 FAILED;显式 `null` 才不超时 |
@@ -85,11 +85,11 @@ SPDX-License-Identifier: Apache-2.0
 | `build_backends(config, ctx)` / `close_backends(handles)` | 函数 | 同上 | 按装配表逐行构造;失败关掉已建的 |
 | `register_backend_type(name, factory)` | 函数 | 同上 | 外部后端登记入口(设计§10.3) |
 | `build_mooncake_backend` | 函数 | `backends/blob/drivers/mooncake.py` | `type: mooncake` 的工厂,调 `factory.build_blob_backend`(拒绝 `hint_key`、报未知键)。同文件:`MooncakeStoreConfig`(连接 7 项)、`MooncakeBlobStore`(`BlobStore` 实现,翻译 Mooncake 状态码) |
-| `BlobStoreBackend` | 类 | `backends/blob/backend.py` | `Fetches` / `Publishes` / `RegistersPools` 三面合一,只依赖 `blob/store.py::BlobStore` 协议;同文件 `BlobStoreConfig`(后端读的 7 个字段) |
+| `BlobStoreBackend` | 类 | `backends/blob/backend.py` | `Fetches` / `Publishes` / `RegistersPools` 三面合一,只依赖 `blob/store.py::BlobStore` 协议;同文件 `BlobBackendConfig`(后端读的 7 个字段) |
 | `RegionResolver` / `Segment` | Protocol / 类型别名 | `base/region.py` | `(local_group, local) → Sequence[(address, size)]`;多后端共用 |
 | `KVv2ResourceView` | 类 | `resource/kv_v2_view.py` | `ResourceView` 实现:块 key、层组、fetch extent、publish extent |
 | `KVv2RegionResolver` | 类 | `resource/region.py` | `(local_group, page) → [(address, size)]`;也给出 pool 跨度与最大 unit 字节数 |
-| `layout_fingerprint(manager, page_table)` | 函数 | 同上 | 布局摘要,进 store key;两侧字节含义不同则必不同 |
+| `compute_layout_fingerprint(manager, page_table)` | 函数 | 同上 | 布局摘要,进 store key;两侧字节含义不同则必不同 |
 | `KV_FETCH_IN_PROGRESS` | 常量 | `pyexecutor/kv_transfer/effects.py` | 别名 `DISAGG_GENERATION_TRANS_IN_PROGRESS`:前缀在取回中,调度器不碰 |
 | `KV_HELD_FOR_TRANSFER` | 常量 | 同上 | 别名 `DISAGG_CONTEXT_TRANS_IN_PROGRESS`:请求已结束,页被传输(fetch 或 publish)占着 |
 | `EngineRequestView` | 类 | 同上 | `RequestView` 实现,包一个 `LlmRequest` |
@@ -156,7 +156,7 @@ SPDX-License-Identifier: Apache-2.0
 | `disaggregation/backends/blob/drivers/memory.py` | `type: memory` 驱动:进程内字典存储;证明可插拔,也是测试假件背后的存储 | `MemoryBlobStore`、`build_memory_backend` | 116 |
 | `disaggregation/base/region.py`(追加) | 多后端共用的 `(local_group, local) → 段` 抽象 | `RegionResolver`、`Segment` | 137(整文件) |
 | `disaggregation/resource/kv_v2_view.py` | `ResourceView` 实现;块 key 缓存(按 request_id,prompt_len 变则失效) | `KVv2ResourceView`(含 `forget_request`) | 235 |
-| `disaggregation/resource/region.py` | 页 → 内存段;pool 跨度;布局指纹 | `KVv2RegionResolver`(`__call__`、`pool_memory_spans`、`max_unit_bytes`)、`layout_fingerprint` | 135 |
+| `disaggregation/resource/region.py` | 页 → 内存段;pool 跨度;布局指纹 | `KVv2RegionResolver`(`__call__`、`pool_memory_spans`、`max_unit_bytes`)、`compute_layout_fingerprint` | 135 |
 | `pyexecutor/kv_transfer/effects.py` | 引擎侧四个 Protocol 的实现 + 两个别名常量 | 见命名表 | 320 |
 | `pyexecutor/kv_transfer/hooks.py` | 循环视角的 API;候选/发布请求筛选;关闭顺序 | `KVTransferHooks` | 304 |
 | `pyexecutor/kv_transfer/assembly.py` | 范围守卫、装配、pool 登记、模型身份、status dump、日志转发 | `attach_kv_transfer`、`check_engine_supports_kv_transfer`、`model_identity_for`、`plan_authority_for`、`install_log_forwarding` | 421 |
@@ -205,7 +205,7 @@ backends:                    # 顺序即 fetch 优先级(设计§7.4)
 
 注册表:`BackendRegistry.factory_for(type)` 先查显式登记,再查内置表 `{"mooncake": ".blob.drivers.mooncake:build_mooncake_backend", "memory": ".blob.drivers.memory:build_memory_backend"}`(相对本包的字符串,import 延后到首次使用);未知类型报错并列出已知类型。加后端 = 新目录 + 内置表一行(或运行期 `register_backend_type`),协调层、hooks、调度器不改(设计§10.3)。
 
-`BackendHandle.pool_registrar`:`landing: device` 时为后端自身(`RegistersPools`),装配把 `KVv2RegionResolver.pool_memory_spans()` 逐个 `register_pool`;`landing: host` 时 `None`。`BackendHandle.landing` 记录解析后的形态,状态导出的每个 backend 条目带 `"landing"`。装配还给 `BackendBuildContext` 两项:`unit_bytes(name)`(按 unit 名前缀的 group tag 查该组一页的字节数,host 落地的 get 需要精确大小)与 `max_request_blocks`(`max_seq_len / tokens_per_block`,落地池偏小时告警)。
+`BackendHandle.pool_registrar`:`landing: device` 时为后端自身(`RegistersPools`),装配把 `KVv2RegionResolver.pool_memory_spans()` 逐个 `register_pool`;`landing: host` 时 `None`。`BackendHandle.landing` 记录解析后的形态,状态导出的每个 backend 条目带 `"landing"`。装配还给 `BackendBuildContext` 两项:`unit_bytes_of(name)`(按 unit 名前缀的 group tag 查该组一页的字节数,host 落地的 get 需要精确大小)与 `max_request_blocks`(`max_seq_len / tokens_per_block`,落地池偏小时告警)。
 
 **测试用状态导出** `TRTLLM_KV_TRANSFER_STATUS_DUMP=/tmp/kvt-{pid}.json`:设了则 `KVTransferHooks.close()` 末尾写一份 JSON:`{"started_at": <attach 时的 time.time()>, "pid": …, "coordinator": status_dump(), "backends": [{"name", "type", "roles", "counters": {...}}]}`。`{pid}` 由 worker 进程号替换,同一测试里的多个 `LLM()` 各写一份;测试按 `started_at` 排序即得创建顺序。不设则不写;非测试代码不读它。
 
@@ -285,7 +285,7 @@ backends:                    # 顺序即 fetch 优先级(设计§7.4)
 | ID | 文件 | 覆盖 |
 |---|---|---|
 | U0 | `tests/unittest/_torch/disaggregation/backends/test_config_registry.py` | YAML 解析/校验;注册表:未知 type、重复登记、假工厂、失败回滚 `close`;`mooncake` 内置项按名懒加载(用 monkeypatched `MooncakeBlobStore.open`,断言模块名 `disaggregation.backends.blob.drivers.mooncake`);后端键拼错报 `type mooncake` 而非驱动配置类 |
-| U1 | `tests/unittest/_torch/executor/kv_transfer/test_kv_v2_reader_layout.py`(GPU) | 对真 `KVCacheManagerV2`(小配置,如 4 层 / tpb 32 / 256 页):`context_block_keys` 数量与一致性;`layout_fingerprint` 同配置稳定、改 tpb/dtype/头数即变;`KVv2RegionResolver` 段数 = pool 数、跨度不重叠;`reserve_transfer_pages(token_end)` 后 `fetch_extent_and_committed` 的 unit 数 = `(token_end/tpb - reuse_end)`;两请求经 `try_commit_blocks` 后 `publish_extent_and_chunk` 命名相同 |
+| U1 | `tests/unittest/_torch/executor/kv_transfer/test_kv_v2_reader_layout.py`(GPU) | 对真 `KVCacheManagerV2`(小配置,如 4 层 / tpb 32 / 256 页):`context_block_keys` 数量与一致性;`compute_layout_fingerprint` 同配置稳定、改 tpb/dtype/头数即变;`KVv2RegionResolver` 段数 = pool 数、跨度不重叠;`reserve_transfer_pages(token_end)` 后 `fetch_extent_and_committed` 的 unit 数 = `(token_end/tpb - reuse_end)`;两请求经 `try_commit_blocks` 后 `publish_extent_and_chunk` 命名相同 |
 | U2 | `tests/unittest/_torch/executor/kv_transfer/test_hooks.py`(另有 `test_assembly_guard.py` 守卫、`test_hook_points.py` 按源码文本核对全部接线点) | `object.__new__(PyExecutor)` + 假 `resource_manager`/`kv_cache_manager`(不需要假 `async_transfer_manager`:本层不读它),真 `KVTransferCoordinator` + `orchestration/kv_transfer/fakes.py` 的 `FakeFetches/FakePublishes`:park/unpark 状态与游标(含 §10 #14 的 WARNING 路径);`revert_fetch_pages` 调 `_revert_ctx_alloc`,cache 残留时 `free_resources` + rewind(§10 #13);释放门五种情形 A–E(§9)各 `_do_terminate_request` 恰好一次,E 下 `release_transfer` 不再来也不泄漏;`owns` 对 parked 为 True;dummy 请求绕过门;`has_pending_work` 影响 idle;`close()` 释放 held 请求并写 dump,后端 `close` 挂住时超时后仍释放。overlap 发布只取 `previous_batch` 这一点不在此单测(需要整条循环),由 E1 的 `disable_overlap_scheduler=False` 参数化覆盖 |
 | U3 | `tests/unittest/_torch/executor/kv_transfer/test_scheduler_kv_fetch_seam.py`(`test_kv_cache_v2_scheduler.py` 不改) | planner 答 DEFER → 不建 cache;答 plan → 进 `fetch_launch_queue`、不计 `num_requests`;`reserve_transfer_pages` 失败 → 请求留在 CONTEXT_INIT;gen-init 仍走 `prepare_disagg_gen_init(req)` 原调用形状;导入卫生(monkeypatch 字串含 `disaggregation.remote_cache`) |
 | U4 | `orchestration/kv_transfer/test_planner_time_budget.py` | `probe_timeout_s` 按 `decide(now=)` 计:超时后无 store 答案 → None |

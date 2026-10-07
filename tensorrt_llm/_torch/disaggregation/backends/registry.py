@@ -87,9 +87,13 @@ class BackendHandle:
         pool_registrar: The backend as a ``RegistersPools`` when it needs the KV pools registered
             with its transport; ``None`` when it reaches memory another way.
         close: Stops the backend and releases what it holds. Idempotent.
-        counters: The backend's operational counters, for the status dump; empty if it has none.
-        landing: Where a fetch lands first: ``device`` (the caller's pages; a ``Fetches``) or
-            ``host`` (the backend's own memory; a ``LandsOnHost``). Shown in the status dump.
+        read_counters: Reads the backend's operational counters, for the status dump; empty if
+            it has none.
+        landing: The landing the factory resolved for this entry, ``device`` or ``host``,
+            whether or not the YAML named one (a driver may pick it from its transport). It is
+            the shape of the whole backend, publish path included; a ``LandsOnHost`` fetcher
+            follows from ``host``, not the reverse (a publish-only ``host`` entry has no
+            fetcher). Shown in the status dump.
     """
 
     name: str
@@ -98,7 +102,7 @@ class BackendHandle:
     publisher: Optional[Publishes]
     pool_registrar: Optional[RegistersPools]
     close: Callable[[], None]
-    counters: Callable[[], Mapping[str, int]] = field(default=dict)
+    read_counters: Callable[[], Mapping[str, int]] = field(default=dict)
     landing: str = "device"
 
 

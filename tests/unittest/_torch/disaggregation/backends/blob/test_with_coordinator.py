@@ -53,7 +53,7 @@ UNIT_BYTES = 64
 
 class Side:
     """One rank: a store backend over the shared store, with a coordinator on top of it;
-    ``config_overrides`` go to the backend's ``BlobStoreConfig``."""
+    ``config_overrides`` go to the backend's ``BlobBackendConfig``."""
 
     def __init__(self, store: FakeBlobStore, *, publishes: bool, **config_overrides) -> None:
         self.rank = make_rank(store, arena_bytes=1 << 16, **config_overrides)
@@ -322,7 +322,7 @@ class HostSide(Side):
             store,
             arena_bytes=1 << 16,
             landing_slots=BLOCKS + 2,
-            unit_bytes=lambda name: UNIT_BYTES,  # every unit is one block of one group
+            unit_bytes_of=lambda name: UNIT_BYTES,  # every unit is one block of one group
         )
         for o in range(BLOCKS + 2):
             self.rank.resolver.add(0, o, UNIT_BYTES // 2, UNIT_BYTES // 2)

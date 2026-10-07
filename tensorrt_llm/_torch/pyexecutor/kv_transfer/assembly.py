@@ -51,7 +51,7 @@ from ...disaggregation.resource.naming import GROUP_TAG_BYTES
 from ...disaggregation.resource.page import KVCachePageTable
 from ...disaggregation.resource.region import (
     KVv2RegionResolver,
-    layout_fingerprint,
+    compute_layout_fingerprint,
     parallel_shard_tag,
 )
 from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -189,7 +189,7 @@ def _build_backend_context(
     fingerprint naming the model and its shard, the unit sizes, and the fetch wait bound."""
     return BackendBuildContext(
         resolver=views.resolver,
-        layout_fingerprint=layout_fingerprint(
+        layout_fingerprint=compute_layout_fingerprint(
             executor.kv_cache_manager,
             views.page_table,
             parallel_shard=parallel_shard_tag(mapping),

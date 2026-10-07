@@ -35,7 +35,7 @@ class Copier(Protocol):
 
     def copy(self, dst: int, src: int, size: int, kind: CopyKind) -> None: ...
 
-    def sync(self) -> None:
+    def wait_for_copies(self) -> None:
         """Block until every copy this thread issued has completed."""
         ...
 
@@ -85,5 +85,5 @@ class CudaCopier:
                 f"src={int(src):#x} size={size} device={self._device_index}"
             )
 
-    def sync(self) -> None:
+    def wait_for_copies(self) -> None:
         self._check(self._cudart.cudaStreamSynchronize(self._stream()))

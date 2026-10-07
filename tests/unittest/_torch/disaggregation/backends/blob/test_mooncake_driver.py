@@ -160,22 +160,22 @@ def test_register_and_unregister_raise_on_a_nonzero_status_and_close_does_not():
 
 
 def test_a_span_over_several_cuda_allocations_registers_and_unregisters_each(monkeypatch):
-    pieces = [(0x1000, 0x100), (0x1100, 0x100), (0x1200, 0x80)]
-    monkeypatch.setattr(driver_module, "_allocation_spans", lambda address, size: pieces)
+    allocations = [(0x1000, 0x100), (0x1100, 0x100), (0x1200, 0x80)]
+    monkeypatch.setattr(driver_module, "_allocations_within", lambda address, size: allocations)
     store = _store(register_buffer=0, unregister_buffer=0)
     store.register_span(0x1000, 0x280)
     store.unregister_span(0x1000, 0x280)
-    assert store.raw.calls == [("register_buffer", piece) for piece in pieces] + [
-        ("unregister_buffer", (start,)) for start, _ in pieces
+    assert store.raw.calls == [("register_buffer", allocation) for allocation in allocations] + [
+        ("unregister_buffer", (start,)) for start, _ in allocations
     ]
 
 
-def test_a_piece_that_fails_to_register_unregisters_the_pieces_before_it(monkeypatch):
-    pieces = [(0x1000, 0x100), (0x1100, 0x100), (0x1200, 0x80)]
-    monkeypatch.setattr(driver_module, "_allocation_spans", lambda address, size: pieces)
+def test_an_allocation_that_fails_to_register_unregisters_the_allocations_before_it(monkeypatch):
+    allocations = [(0x1000, 0x100), (0x1100, 0x100), (0x1200, 0x80)]
+    monkeypatch.setattr(driver_module, "_allocations_within", lambda address, size: allocations)
     store = _store(register_buffer=deque([0, 0, -600]), unregister_buffer=0)
     with pytest.raises(
-        BlobStoreError, match=r"status -600 for \[0x1200, 0x1280\) \(piece 3 of 3\)"
+        BlobStoreError, match=r"status -600 for \[0x1200, 0x1280\) \(allocation 3 of 3\)"
     ):
         store.register_span(0x1000, 0x280)
     assert store.raw.calls[3:] == [
@@ -184,19 +184,21 @@ def test_a_piece_that_fails_to_register_unregisters_the_pieces_before_it(monkeyp
     ]
 
 
-def test_a_piece_that_fails_to_unregister_is_kept_for_a_retry_and_the_rest_are_released(
+def test_an_allocation_that_fails_to_unregister_is_kept_for_a_retry_and_the_rest_are_released(
     monkeypatch,
 ):
-    """A failed piece does not stop the pieces after it from being released, and only it stays on
-    the books: the backend keeps the handle live after the error, and the retry it allows asks
-    the bindings for that piece alone."""
-    pieces = [(0x1000, 0x100), (0x1100, 0x100), (0x1200, 0x80)]
-    monkeypatch.setattr(driver_module, "_allocation_spans", lambda address, size: pieces)
+    """A failed allocation does not stop the allocations after it from being released, and only
+    it stays on the books: the backend keeps the handle live after the error, and the retry it
+    allows asks the bindings for that allocation alone."""
+    allocations = [(0x1000, 0x100), (0x1100, 0x100), (0x1200, 0x80)]
+    monkeypatch.setattr(driver_module, "_allocations_within", lambda address, size: allocations)
     store = _store(register_buffer=0, unregister_buffer=deque([0, -6, 0, 0]))
     store.register_span(0x1000, 0x280)
-    with pytest.raises(BlobStoreError, match=r"status -6 for \[0x1100, 0x1200\) \(1 of 3 pieces\)"):
+    with pytest.raises(
+        BlobStoreError, match=r"status -6 for \[0x1100, 0x1200\) \(1 of 3 allocations\)"
+    ):
         store.unregister_span(0x1000, 0x280)
-    assert store.raw.calls[3:] == [("unregister_buffer", (start,)) for start, _ in pieces]
+    assert store.raw.calls[3:] == [("unregister_buffer", (start,)) for start, _ in allocations]
     store.unregister_span(0x1000, 0x280)
     assert store.raw.calls[6:] == [("unregister_buffer", (0x1100,))]
 
@@ -277,20 +279,20 @@ def _reported_allocations(cuda, base: int, chunk: int, count: int) -> list[tuple
 
 def _cut(start: int, size: int, ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """``[start, start + size)`` cut at the boundaries of ``ranges``: the part inside each."""
-    pieces = []
+    parts = []
     for base, length in ranges:
         lo, hi = max(start, base), min(start + size, base + length)
         if lo < hi:
-            pieces.append((lo, hi - lo))
-    return pieces
+            parts.append((lo, hi - lo))
+    return parts
 
 
-def test_allocation_spans_cut_a_vmm_range_at_the_allocations_the_driver_reports():
+def test_allocations_within_cut_a_vmm_range_at_the_allocations_the_driver_reports():
     """Over a range of ``cuMemCreate`` chunks mapped back to back, as KV cache manager V2 lays out
-    a pool, the pieces are exactly the span cut at the boundaries ``cuMemGetAddressRange`` reports
-    for the chunks, whether the driver reports every chunk as its own allocation or merges some.
-    A driver that reports the whole range as one allocation leaves nothing to cut, so the test
-    skips. Pinned host memory, as the staging pool uses, comes back whole."""
+    a pool, the allocations are exactly the span cut at the boundaries ``cuMemGetAddressRange``
+    reports for the chunks, whether the driver reports every chunk as its own allocation or merges
+    some. A driver that reports the whole range as one allocation leaves nothing to cut, so the
+    test skips. Pinned host memory, as the slot pools use, comes back whole."""
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
@@ -305,9 +307,9 @@ def test_allocation_spans_cut_a_vmm_range_at_the_allocations_the_driver_reports(
         if len(ranges) == 1:
             pytest.skip("the CUDA driver reports the mapped chunks as one allocation")
         for start, size in ((base, chunk * count), (base + chunk // 2, chunk * 2)):
-            assert driver_module._allocation_spans(start, size) == _cut(start, size, ranges)
+            assert driver_module._allocations_within(start, size) == _cut(start, size, ranges)
         host = torch.empty(4096, dtype=torch.uint8, pin_memory=True)
-        assert driver_module._allocation_spans(host.data_ptr(), 4096) == [(host.data_ptr(), 4096)]
+        assert driver_module._allocations_within(host.data_ptr(), 4096) == [(host.data_ptr(), 4096)]
 
 
 # ---- open ----

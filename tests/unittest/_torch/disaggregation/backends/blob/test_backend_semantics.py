@@ -463,18 +463,18 @@ def _probe_until_decided(rank, name, units, timeout: float = 5.0):
 
 def test_probe_lookup_the_store_reports_failed_is_an_outage_not_an_empty_answer():
     """A store that keeps failing its lookup is asked a bounded number of times (``1 +
-    LOOKUP_RETRIES``), then the probe raises once, naming the store's error, and counts one
+    PROBE_RETRIES``), then the probe raises once, naming the store's error, and counts one
     ``probe_failed``; nothing is read as a miss."""
-    from disaggregation.backends.blob.backend import LOOKUP_RETRIES
+    from disaggregation.backends.blob.backend import PROBE_RETRIES
 
     with make_rank() as rank:
         u = rank.unit(0, 0, 8)
-        for _ in range(LOOKUP_RETRIES + 5):  # more failures armed than tries allowed
+        for _ in range(PROBE_RETRIES + 5):  # more failures armed than tries allowed
             rank.store.fail_next("contains", BlobStoreError("down"))
         assert rank.backend.probe(b"n", [u.name]) is None
         answer, exc = _probe_until_decided(rank, b"n", [u.name])
         assert answer is None and "lookup failed: down" in str(exc)
-        assert rank.store.count("contains") == 1 + LOOKUP_RETRIES
+        assert rank.store.count("contains") == 1 + PROBE_RETRIES
         assert rank.backend.counters.probe_failed == 1
         assert rank.backend.counters.probe_misses == 0
 

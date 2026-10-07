@@ -87,7 +87,7 @@ _DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024
 
 @dataclass(frozen=True)
 class MooncakeStoreConfig:
-    """How to reach a Mooncake store; the backend's own options are ``BlobStoreConfig``.
+    """How to reach a Mooncake store; the backend's own options are ``BlobBackendConfig``.
 
     Attributes:
         master_server_address: ``host:port`` of the Mooncake master.
@@ -139,7 +139,7 @@ def _default_hostname() -> str:
     return socket.gethostbyname(socket.gethostname())
 
 
-def _allocation_spans(address: int, size: int) -> list[Segment]:
+def _allocations_within(address: int, size: int) -> list[Segment]:
     """The span cut at the boundaries of the CUDA allocations it covers.
 
     KV cache manager V2 maps one ``cuMemCreate`` chunk after another into a reserved address
@@ -156,7 +156,7 @@ def _allocation_spans(address: int, size: int) -> list[Segment]:
             _span_text(address, size),
         )
         return [(address, size)]
-    spans = []
+    allocations = []
     cursor, end = address, address + size
     while cursor < end:
         err, base, length = cuda.cuMemGetAddressRange(cursor)
@@ -165,9 +165,9 @@ def _allocation_spans(address: int, size: int) -> list[Segment]:
         stop = min(int(base) + int(length), end)
         if stop <= cursor:  # an allocation that does not reach past the cursor cannot be walked
             return [(address, size)]
-        spans.append((cursor, stop - cursor))
+        allocations.append((cursor, stop - cursor))
         cursor = stop
-    return spans
+    return allocations
 
 
 def _span_text(address: int, size: int) -> str:
@@ -175,7 +175,9 @@ def _span_text(address: int, size: int) -> str:
     return f"[{address:#x}, {address + size:#x})"
 
 
-def _split(buffers: Sequence[Sequence[Segment]]) -> tuple[list[list[int]], list[list[int]]]:
+def _addresses_and_sizes(
+    buffers: Sequence[Sequence[Segment]],
+) -> tuple[list[list[int]], list[list[int]]]:
     """The bindings take addresses and sizes as two parallel lists per key."""
     ptrs = [[address for address, _ in segments] for segments in buffers]
     sizes = [[size for _, size in segments] for segments in buffers]
@@ -204,14 +206,15 @@ class MooncakeBlobStore:
     minus 16 bytes) and answers ``INVALID_PARAMS`` for a unit whose segments add up to more,
     however they are cut, where the default ``offset`` allocator has no such cap. An answer of
     the wrong length from any batch call raises ``BlobStoreError``. A span is registered one
-    CUDA allocation at a time (``_allocation_spans``) and unregistered the same way.
+    CUDA allocation at a time (``_allocations_within``) and unregistered the same way.
     """
 
     def __init__(self, client: Any, config: MooncakeStoreConfig) -> None:
         self._client = client
         self._config = config
-        self._pieces: dict[int, list[Segment]] = {}
-        """The pieces each registered span was cut into and still holds, by the span's address."""
+        self._registered_allocations: dict[int, list[Segment]] = {}
+        """The allocations each registered span was cut into and still holds, by the span's
+        address."""
 
     @classmethod
     def open(cls, config: MooncakeStoreConfig) -> MooncakeBlobStore:
@@ -258,44 +261,51 @@ class MooncakeBlobStore:
         )
 
     def register_span(self, address: int, size: int) -> None:
-        pieces = _allocation_spans(address, size)
+        allocations = _allocations_within(address, size)
         registered = []
-        for start, length in pieces:
+        for start, length in allocations:
             status = self._client.register_buffer(start, length)
             if status != 0:
                 for done, _ in registered:
                     self._client.unregister_buffer(done)
                 where = (
-                    f" (piece {len(registered) + 1} of {len(pieces)})" if len(pieces) > 1 else ""
+                    f" (allocation {len(registered) + 1} of {len(allocations)})"
+                    if len(allocations) > 1
+                    else ""
                 )
                 raise BlobStoreError(
                     f"register_buffer failed with status {status} for "
                     f"{_span_text(start, length)}{where}"
                 )
             registered.append((start, length))
-        self._pieces[address] = registered
-        if len(pieces) > 1:
+        self._registered_allocations[address] = registered
+        if len(allocations) > 1:
             logger.info(
-                "%s: registered %d bytes as %d CUDA allocations", self.describe(), size, len(pieces)
+                "%s: registered %d bytes as %d CUDA allocations",
+                self.describe(),
+                size,
+                len(allocations),
             )
 
     def unregister_span(self, address: int, size: int) -> None:
-        """Every piece is asked to unregister even after one fails. The pieces that failed stay
-        on the books, so a retry asks for those alone; one error names them all."""
-        pieces = self._pieces.get(address, [(address, size)])
+        """Every allocation is asked to unregister even after one fails. The allocations that
+        failed stay on the books, so a retry asks for those alone; one error names them all."""
+        allocations = self._registered_allocations.get(address, [(address, size)])
         failed = []
-        for start, length in pieces:
+        for start, length in allocations:
             status = self._client.unregister_buffer(start)
             if status != 0:
                 failed.append((start, length, status))
         if not failed:
-            self._pieces.pop(address, None)
+            self._registered_allocations.pop(address, None)
             return
-        self._pieces[address] = [(start, length) for start, length, _ in failed]
+        self._registered_allocations[address] = [(start, length) for start, length, _ in failed]
         failures = ", ".join(
             f"status {status} for {_span_text(start, length)}" for start, length, status in failed
         )
-        where = f" ({len(failed)} of {len(pieces)} pieces)" if len(pieces) > 1 else ""
+        where = (
+            f" ({len(failed)} of {len(allocations)} allocations)" if len(allocations) > 1 else ""
+        )
         raise BlobStoreError(f"unregister_buffer failed with {failures}{where}")
 
     @staticmethod
@@ -312,7 +322,7 @@ class MooncakeBlobStore:
         return [status == 1 for status in statuses]
 
     def put(self, keys: Sequence[str], buffers: Sequence[Sequence[Segment]]) -> Sequence[PutStatus]:
-        ptrs, sizes = _split(buffers)
+        ptrs, sizes = _addresses_and_sizes(buffers)
         statuses = self._client.batch_put_from_multi_buffers(list(keys), ptrs, sizes)
         self._check_count("batch_put_from_multi_buffers", statuses, keys)
         return [self._put_status(key, status) for key, status in zip(keys, statuses)]
@@ -340,19 +350,19 @@ class MooncakeBlobStore:
             for i, status in zip(expired, again):
                 statuses[i] = status
         return [
-            self._read_status(key, status, sum(size for _, size in segments))
+            self._get_status(key, status, sum(size for _, size in segments))
             for key, status, segments in zip(keys, statuses, buffers)
         ]
 
     def _batch_get(
         self, keys: Sequence[str], buffers: Sequence[Sequence[Segment]]
     ) -> Sequence[int]:
-        ptrs, sizes = _split(buffers)
+        ptrs, sizes = _addresses_and_sizes(buffers)
         statuses = self._client.batch_get_into_multi_buffers(list(keys), ptrs, sizes)
         self._check_count("batch_get_into_multi_buffers", statuses, keys)
         return statuses
 
-    def _read_status(self, key: str, status: int, expected: int) -> GetStatus:
+    def _get_status(self, key: str, status: int, expected: int) -> GetStatus:
         if status == expected:
             return GetStatus.HIT
         if status == OBJECT_NOT_FOUND:
@@ -395,15 +405,13 @@ def _resolve_landing(entry: BackendEntry) -> BackendEntry:
 
 
 def _keep_memcpy_bypass_off_over_device_memory(entry: BackendEntry) -> None:
-    """With ``landing: device`` the backend registers the KV pools, which live on the GPU. Older
-    Mooncake clients served the memcpy bypass with a plain ``memcpy`` even for such spans; this
-    backend keeps the bypass off for the device landing whatever the client, and refuses an
-    explicit on. Left unset, the variable is decided by the client from the transports it
-    actually loaded (on when only TCP came up, which an RDMA entry without a reachable HCA does
-    too), not from the entry's ``protocol``; so an unset variable is set to off here, before
-    ``setup`` reads it. The variable is process-wide and is set only when unset. ``landing:
-    host`` registers pinned host memory only, where the bypass is a harmless fast path, and is
-    left to the client. Reads the resolved ``landing``."""
+    """Three rules for ``MC_STORE_MEMCPY``, read against the resolved ``landing``. With
+    ``landing: device`` the backend registers the KV pools, which live on the GPU: the bypass is
+    kept off, and an explicit on is refused. Unset, the variable is set to off here, before
+    ``setup`` reads it (the client would otherwise decide it from the transports it loaded, not
+    from the entry's ``protocol``); it is process-wide and set only when unset. With ``landing:
+    host`` the store registers pinned host memory only, where the bypass is a harmless fast
+    path, and the variable is left to the client."""
     if entry.options.get("landing", "device") != "device":
         return
     value = os.environ.get(MEMCPY_BYPASS_ENV)

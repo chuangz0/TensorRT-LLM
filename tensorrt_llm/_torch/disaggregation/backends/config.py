@@ -61,11 +61,6 @@ _COORDINATOR_KEYS = (
 )
 _DEFAULT_FETCH_TIMEOUT_S = 30.0
 _DEFAULT_PUBLISH_TIMEOUT_S = 60.0
-# Wall-clock, measured on the loop clock from a request's first deferral. A store's existence
-# lookup is one RPC per request and runs on the master under the load of every rank's probes, and
-# the ranks' clocks are not aligned to the round; 50 ms made loaded stores look empty. A budget
-# counted in rounds instead of seconds would be independent of the clock skew; that is a design
-# change left for a follow-up.
 _DEFAULT_PROBE_TIMEOUT_S = 1.0
 _DEFAULT_CLOSE_TIMEOUT_S = 30.0
 DEFAULT_UNLAUNCHED_TIMEOUT_S = 30.0
@@ -129,11 +124,11 @@ class BackendEntry:
         )
 
     @property
-    def serves_fetch(self) -> bool:
+    def has_fetch_role(self) -> bool:
         return "fetch" in self.roles
 
     @property
-    def serves_publish(self) -> bool:
+    def has_publish_role(self) -> bool:
         return "publish" in self.roles
 
 

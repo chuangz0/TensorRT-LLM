@@ -114,7 +114,7 @@ class Rig:
             publisher=self.publisher if publish else None,
             pool_registrar=None,
             close=self.backend_close,
-            counters=lambda: {
+            read_counters=lambda: {
                 "fetch_hits": self.store.count("fetch"),
                 "publish_stored": self.publisher.count("publish"),
             },

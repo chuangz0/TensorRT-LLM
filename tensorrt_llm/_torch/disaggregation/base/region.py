@@ -119,7 +119,7 @@ class RegionMapperBase(ABC):
 
 
 Segment = tuple[int, int]
-"""``(address, size)`` of one contiguous piece of a unit."""
+"""``(address, size)`` of one contiguous memory range: a part of a unit, or of a registered span."""
 
 
 class RegionResolver(Protocol):

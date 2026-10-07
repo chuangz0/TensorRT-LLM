@@ -96,7 +96,7 @@ def test_plan_section_8_example_loads(tmp_path):
     assert entry.type == "mooncake"
     assert entry.hint_key is None
     assert entry.roles == frozenset({"fetch", "publish"})
-    assert entry.serves_fetch and entry.serves_publish
+    assert entry.has_fetch_role and entry.has_publish_role
     # Type-specific keys pass through unread; entry keys do not.
     assert entry.options == {
         "master_server_address": "127.0.0.1:50051",
@@ -138,7 +138,7 @@ def test_publish_only_role(tmp_path):
         """,
     )
     entry = config.backends[0]
-    assert entry.serves_publish and not entry.serves_fetch
+    assert entry.has_publish_role and not entry.has_fetch_role
 
 
 def test_backend_order_is_kept(tmp_path):
@@ -311,11 +311,11 @@ def fake_factory(entry: BackendEntry, context: BackendBuildContext) -> BackendHa
     return BackendHandle(
         name=entry.name,
         hint_key=entry.hint_key,
-        fetcher=built if entry.serves_fetch else None,
-        publisher=built if entry.serves_publish else None,
+        fetcher=built if entry.has_fetch_role else None,
+        publisher=built if entry.has_publish_role else None,
         pool_registrar=None,
         close=built.close,
-        counters=lambda: {"built": 1},
+        read_counters=lambda: {"built": 1},
     )
 
 
@@ -347,7 +347,7 @@ def test_build_backends_returns_one_handle_per_entry_in_order():
 
 def test_handle_counters_default_to_an_empty_mapping():
     handle = BackendHandle("x", None, None, None, None, lambda: None)
-    assert dict(handle.counters()) == {}
+    assert dict(handle.read_counters()) == {}
 
 
 def test_duplicate_registration_is_refused():
@@ -506,8 +506,8 @@ def test_mooncake_factory_builds_a_blob_store_backend_over_the_opened_store(moon
         assert handle.publisher is handle.fetcher
         # No host pools: the KV pools must be registered with the transport, by the backend itself.
         assert handle.pool_registrar is handle.fetcher
-        assert set(handle.counters()) >= {"fetch_hits", "fetch_misses", "publish_stored"}
-        assert "landings_held" not in handle.counters()
+        assert set(handle.read_counters()) >= {"fetch_hits", "fetch_misses", "publish_stored"}
+        assert "landings_held" not in handle.read_counters()
     finally:
         close_backends(handles)
     assert opened[0].closed == 1
@@ -544,7 +544,7 @@ def test_mooncake_over_tcp_lands_on_host_by_default(mooncake_module, fake_pools,
         assert isinstance(handle.fetcher, HostLandingBlobBackend)
         assert isinstance(handle.publisher, BlobStoreBackend)
         assert handle.pool_registrar is None
-        assert handle.counters()["landings_held"] == 0
+        assert handle.read_counters()["landings_held"] == 0
         assert len(fake_pools) == 2  # publish pool, landing pool
         assert opened[0].count("register_span") == 2
         messages = [r.getMessage() for r in caplog.records]
@@ -667,8 +667,8 @@ def test_mooncake_refuses_the_memcpy_bypass_when_it_would_register_gpu_memory(
     mooncake_module, monkeypatch, value
 ):
     """A ``landing: device`` backend registers GPU pools and keeps the client's memcpy bypass off
-    for them (older clients memcpy'd such spans). The client reads any value but the spellings
-    of "off" as on, and so does the guard. Refused before a store is opened."""
+    for them. The client reads any value but the spellings of "off" as on, and so does the
+    guard. Refused before a store is opened."""
     _, opened = mooncake_module
     monkeypatch.setenv("MC_STORE_MEMCPY", value)
     config = KVTransferConfig(backends=(entry("store", "mooncake", **MOONCAKE_OPTIONS),))

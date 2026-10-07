@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Sequence
 
 __extra_import_path__ = ["~/tensorrt_llm/_torch"]
-from disaggregation.backends.blob.backend import BlobStoreBackend, BlobStoreConfig  # noqa: E402
+from disaggregation.backends.blob.backend import BlobBackendConfig, BlobStoreBackend  # noqa: E402
 from disaggregation.backends.blob.drivers.memory import MemoryBlobStore  # noqa: E402
 from disaggregation.backends.blob.host_landing import HostLandingBlobBackend  # noqa: E402
 from disaggregation.backends.blob.slot_pool import HostSlotPool  # noqa: E402
@@ -261,7 +261,7 @@ class FakeCopier(_Knobs):
     def __init__(self) -> None:
         super().__init__()
         self.copies: list[tuple[str, int, int, int]] = []
-        self.syncs = 0
+        self.copy_waits = 0
 
     def copy(self, dst: int, src: int, size: int, kind: str) -> None:
         self._enter("copy", kind, dst, src, size)
@@ -269,10 +269,10 @@ class FakeCopier(_Knobs):
         with self._lock:
             self.copies.append((kind, dst, src, size))
 
-    def sync(self) -> None:
-        self._enter("sync")
+    def wait_for_copies(self) -> None:
+        self._enter("wait_for_copies")
         with self._lock:
-            self.syncs += 1
+            self.copy_waits += 1
 
     def kinds(self) -> list[str]:
         with self._lock:
@@ -281,8 +281,9 @@ class FakeCopier(_Knobs):
 
 class Trace:
     """A thread-stamped event log shared by a copier and a slot pool: ``(event, thread, args)``
-    in real-time order, so tests can check that a ``sync`` precedes a ``release`` on the same
-    thread and that no slot is copied into or out of by a thread that does not hold it."""
+    in real-time order, so tests can check that a ``wait_for_copies`` precedes a ``release`` on
+    the same thread and that no slot is copied into or out of by a thread that does not hold
+    it."""
 
     def __init__(self) -> None:
         self.events: list[tuple[str, int, tuple]] = []
@@ -377,10 +378,10 @@ def extent(units: Iterable[Unit], name: bytes = b"ext", is_last: bool = True) ->
     return CacheExtent(name=name, units=tuple(units), is_last=is_last)
 
 
-def config(**overrides) -> BlobStoreConfig:
+def config(**overrides) -> BlobBackendConfig:
     base = dict(num_workers=2, probe_ttl_s=30.0)
     base.update(overrides)
-    return BlobStoreConfig(**base)
+    return BlobBackendConfig(**base)
 
 
 @dataclass
@@ -412,7 +413,7 @@ class Rank:
         self.units[(local_group, local)] = unit
         return unit
 
-    def unit_bytes(self, name: bytes) -> int:
+    def unit_bytes_of(self, name: bytes) -> int:
         """Size of the unit called ``name`` on this rank; what the host shape is built with."""
         for unit in self.units.values():
             if unit.name == name:
@@ -501,13 +502,13 @@ def make_host_rank(
     slot_bytes: int = SLOT,
     fetch_wait_timeout_s: float | None = DEFAULT_FETCH_WAIT_TIMEOUT_S,
     arena_bytes: int = 1 << 16,
-    unit_bytes: Callable[[bytes], int] | None = None,
+    unit_bytes_of: Callable[[bytes], int] | None = None,
     **config_overrides,
 ) -> Rank:
     """A ``landing: host`` backend: a traced publish pool, a landing pool over its own
     ``FakeCopier``, and a ``HostLandingBlobBackend`` over the inner backend. The caller's pool is
     deliberately not registered, as it would not be on a machine without GPUDirect. Units are
-    sized by ``unit_bytes``, by default from the rank's own table (``Rank.unit``)."""
+    sized by ``unit_bytes_of``, by default from the rank's own table (``Rank.unit``)."""
     store = store if store is not None else FakeBlobStore()
     publish_pool, publish_copier, _, trace = make_publish_pool(
         store, slots=publish_slots, slot_bytes=slot_bytes
@@ -523,7 +524,7 @@ def make_host_rank(
     rank.backend = HostLandingBlobBackend(
         rank.inner,
         landing_pool,
-        unit_bytes or rank.unit_bytes,
+        unit_bytes_of or rank.unit_bytes_of,
         fetch_wait_timeout_s=fetch_wait_timeout_s,
     )
     rank.publish_pool, rank.publish_copier, rank.trace = publish_pool, publish_copier, trace

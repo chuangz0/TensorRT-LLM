@@ -16,8 +16,9 @@
 
 ``KVv2RegionResolver`` turns a unit's local coordinates ``(layer group, page index)`` into the
 memory segments a backend moves, lists the pool spans a backend registers, and sizes the largest
-unit. ``layout_fingerprint`` digests everything those bytes assume, so two processes whose bytes
-would not mean the same thing miss each other in a store instead of reading each other's pages.
+unit. ``compute_layout_fingerprint`` digests everything those bytes assume, so two processes
+whose bytes would not mean the same thing miss each other in a store instead of reading each
+other's pages.
 """
 
 from __future__ import annotations
@@ -30,14 +31,14 @@ import numpy as np
 from .kv_extractor import build_page_table_from_manager
 from .page import KVCachePageTable
 
-__all__ = ["KVv2RegionResolver", "layout_fingerprint", "parallel_shard_tag"]
+__all__ = ["KVv2RegionResolver", "compute_layout_fingerprint", "parallel_shard_tag"]
 
 
 class KVv2RegionResolver:
     """``RegionResolver`` over a V2 page table: ``(local_group, page index)`` -> memory segments.
 
     A page is one slot in each pool of the layer group's pool group, in pool order. That order is
-    fixed by the page table and is part of what ``layout_fingerprint`` covers.
+    fixed by the page table and is part of what ``compute_layout_fingerprint`` covers.
     """
 
     def __init__(self, page_table: KVCachePageTable) -> None:
@@ -73,7 +74,7 @@ class KVv2RegionResolver:
 
 
 def parallel_shard_tag(mapping) -> str:
-    """Which slice of the model's KV state this rank's units hold, for ``layout_fingerprint``.
+    """Which slice of the model's KV state this rank's units hold, for the layout fingerprint.
 
     A rank that holds every head, whether it runs alone (TP=1) or as an attention-DP replica,
     gets the one shared tag, so such workers share store entries. Under tensor parallelism each
@@ -93,7 +94,7 @@ def parallel_shard_tag(mapping) -> str:
     return heads
 
 
-def layout_fingerprint(
+def compute_layout_fingerprint(
     kv_cache_manager,
     page_table: KVCachePageTable | None = None,
     *,

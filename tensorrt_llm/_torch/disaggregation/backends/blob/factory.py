@@ -16,7 +16,7 @@
 
 A driver's registry factory calls ``build_blob_backend`` with a function that opens its store
 from the driver's share of the entry's options. The entry's options are one flat mapping: the
-keys ``BlobStoreConfig`` reads go to the backend, the driver's keys go to ``open_store``, and a
+keys ``BlobBackendConfig`` reads go to the backend, the driver's keys go to ``open_store``, and a
 key neither knows is refused here, naming the entry and its type.
 
 ``landing`` picks the shape. ``device`` is a ``BlobStoreBackend`` that registers the caller's
@@ -32,7 +32,7 @@ from typing import Any, Callable, Collection, Mapping
 
 from ..config import BackendEntry
 from ..registry import BackendBuildContext, BackendHandle
-from .backend import BlobStoreBackend, BlobStoreConfig
+from .backend import BlobBackendConfig, BlobStoreBackend
 from .host_landing import HostLandingBlobBackend
 from .slot_pool import HostSlotPool, open_pinned_slot_pool, plan_slot_geometry
 from .store import BlobStore
@@ -59,7 +59,7 @@ def build_blob_backend(
     if entry.hint_key is not None:
         raise ValueError(f"backend {entry.name!r}: a blob store takes no hint_key")
     backend_options, driver_options = _split_options(entry, driver_fields)
-    config = BlobStoreConfig.from_dict(backend_options)
+    config = BlobBackendConfig.from_dict(backend_options)
     if config.lands_on_host and context.unit_bytes_of is None:
         raise ValueError(
             f"backend {entry.name!r}: landing 'host' needs the assembly to size units by name"
@@ -75,23 +75,23 @@ def build_blob_backend(
 
 
 def _device_handle(
-    entry: BackendEntry, config: BlobStoreConfig, context: BackendBuildContext, store: BlobStore
+    entry: BackendEntry, config: BlobBackendConfig, context: BackendBuildContext, store: BlobStore
 ) -> BackendHandle:
     backend = BlobStoreBackend(store, config, context.resolver, context.layout_fingerprint)
     return BackendHandle(
         name=entry.name,
         hint_key=None,
-        fetcher=backend if entry.serves_fetch else None,
-        publisher=backend if entry.serves_publish else None,
+        fetcher=backend if entry.has_fetch_role else None,
+        publisher=backend if entry.has_publish_role else None,
         pool_registrar=backend,
         close=backend.close,
-        counters=lambda: dataclasses.asdict(backend.counters),
+        read_counters=lambda: dataclasses.asdict(backend.counters),
         landing=config.landing,
     )
 
 
 def _host_landing_handle(
-    entry: BackendEntry, config: BlobStoreConfig, context: BackendBuildContext, store: BlobStore
+    entry: BackendEntry, config: BlobBackendConfig, context: BackendBuildContext, store: BlobStore
 ) -> BackendHandle:
     """Two pools, then the inner backend over the publish pool and the landing backend over both.
     The store is registered with pinned host memory only, so the KV pools stay unregistered."""
@@ -113,11 +113,11 @@ def _host_landing_handle(
     return BackendHandle(
         name=entry.name,
         hint_key=None,
-        fetcher=backend if entry.serves_fetch else None,
-        publisher=inner if entry.serves_publish else None,
+        fetcher=backend if entry.has_fetch_role else None,
+        publisher=inner if entry.has_publish_role else None,
         pool_registrar=None,
         close=backend.close,
-        counters=lambda: {
+        read_counters=lambda: {
             **dataclasses.asdict(backend.counters),
             "landings_held": backend.landings_held(),
         },
@@ -128,9 +128,9 @@ def _host_landing_handle(
 def _open_pool(
     store: BlobStore, context: BackendBuildContext, max_slots: int | None, budget_bytes: int
 ) -> HostSlotPool:
-    slot_bytes, num_slots = plan_slot_geometry(context.max_unit_bytes, max_slots, budget_bytes)
+    host_slot_bytes, num_slots = plan_slot_geometry(context.max_unit_bytes, max_slots, budget_bytes)
     return open_pinned_slot_pool(
-        store, slot_bytes=slot_bytes, num_slots=num_slots, device_index=context.device_index
+        store, slot_bytes=host_slot_bytes, num_slots=num_slots, device_index=context.device_index
     )
 
 
@@ -165,7 +165,7 @@ def _log_pool_geometry(
 def _split_options(
     entry: BackendEntry, driver_fields: Collection[str]
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    backend_fields = BlobStoreConfig.fields()
+    backend_fields = BlobBackendConfig.fields()
     known = backend_fields | frozenset(driver_fields)
     unknown = sorted(set(entry.options) - known)
     if unknown:

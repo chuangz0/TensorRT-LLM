@@ -13,8 +13,9 @@ host-landing backend uses). ``config.py`` maps the assembly-table YAML to ``KVTr
 line there.
 
 ``blob/``: the peer is a store of byte objects (``blob/store.py::BlobStore``); ``blob/backend.py``
-is the ``landing: device`` shape, ``blob/host_landing.py`` the ``landing: host`` shape, and the
-drivers live under ``blob/drivers/``. ``worker/`` (future): the peer is an engine worker, after
+is the store-facing backend (the publish path of both shapes and the fetch path of
+``landing: device``), ``blob/host_landing.py`` adds the ``landing: host`` fetch path over it, and
+the drivers live under ``blob/drivers/``. ``worker/`` (future): the peer is an engine worker, after
 the paired path migrates. ``kvcr/`` (future): the peer is the KVCR runtime.
 
 Tests: ``tests/unittest/_torch/disaggregation/backends/`` (config and registry; ``blob/`` for the

@@ -22,7 +22,7 @@ from tensorrt_llm._torch.disaggregation.base.views import GroupSpec
 from tensorrt_llm._torch.disaggregation.orchestration.kv_transfer.engine_protocols import (
     PlanAuthority,
 )
-from tensorrt_llm._torch.disaggregation.resource.region import layout_fingerprint
+from tensorrt_llm._torch.disaggregation.resource.region import compute_layout_fingerprint
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_transfer import assembly
 from tensorrt_llm._torch.pyexecutor.kv_transfer.assembly import (
@@ -273,7 +273,7 @@ def test_model_identity_is_unknown_on_an_engine_without_a_model_config():
 
 
 def test_two_model_identities_give_two_layout_fingerprints_through_the_assembly_path():
-    """What the assembly feeds ``layout_fingerprint`` keeps two models of one KV geometry apart
+    """What the assembly feeds ``compute_layout_fingerprint`` keeps two models of one KV geometry apart
     in the store; the page table and manager here are the minimum the digest reads."""
     page_table = SimpleNamespace(
         tokens_per_block=32,
@@ -298,7 +298,7 @@ def test_two_model_identities_give_two_layout_fingerprints_through_the_assembly_
         config = PretrainedConfig(architectures=["LlamaForCausalLM"])
         config._name_or_path = name
         identity = model_identity_for(executor_with_model(config))
-        return layout_fingerprint(manager, page_table, model_identity=identity)
+        return compute_layout_fingerprint(manager, page_table, model_identity=identity)
 
     assert fingerprint_for("meta-llama/Llama-3.1-8B") != fingerprint_for("mistralai/Mistral-7B")
     assert fingerprint_for("meta-llama/Llama-3.1-8B") == fingerprint_for("meta-llama/Llama-3.1-8B")
@@ -363,7 +363,9 @@ def attach_over_fakes(monkeypatch, tmp_path, executor, *, build_backends, build_
     monkeypatch.setattr(assembly, "build_page_table_from_manager", lambda manager: object())
     monkeypatch.setattr(assembly, "KVv2ResourceView", _FakeReader)
     monkeypatch.setattr(assembly, "KVv2RegionResolver", _FakeResolver)
-    monkeypatch.setattr(assembly, "layout_fingerprint", lambda *args, **kwargs: b"\xfe" * 16)
+    monkeypatch.setattr(
+        assembly, "compute_layout_fingerprint", lambda *args, **kwargs: b"\xfe" * 16
+    )
     monkeypatch.setattr(assembly, "parallel_shard_tag", lambda mapping: "heads=all")
     monkeypatch.setattr(assembly, "build_backends", build_backends)
     monkeypatch.setattr(assembly, "build_coordinator", build_coordinator)

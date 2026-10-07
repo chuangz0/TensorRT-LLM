@@ -60,7 +60,7 @@ class KVv2ResourceView:
             else build_page_table_from_manager(kv_cache_manager)
         )
         self._tokens_per_block = int(kv_cache_manager.tokens_per_block)
-        self._group_specs = self._describe_layer_groups()
+        self._group_specs = self._group_specs_from_page_table()
         self._block_keys_by_request: OrderedDict[int, tuple[int, list[bytes]]] = OrderedDict()
         """``request_id -> (prompt_len, keys)``; a prompt is hashed once per request, not per ask."""
 
@@ -113,7 +113,7 @@ class KVv2ResourceView:
         committed_names: set[bytes] = set()
         for group_plan in plan.group_plans:
             page_indices = self._page_indices_by_ordinal(kv_cache, group_plan.spec.local_group)
-            committed, fetchable = self._split_committed_and_fetchable(
+            committed, fetchable = self._committed_names_and_fetchable_ordinals(
                 group_plan, plan.block_keys, committed_blocks, len(page_indices)
             )
             committed_names.update(committed)
@@ -126,7 +126,7 @@ class KVv2ResourceView:
         return extent, frozenset(committed_names)
 
     @staticmethod
-    def _split_committed_and_fetchable(
+    def _committed_names_and_fetchable_ordinals(
         group_plan: GroupPlan, block_keys: Sequence[bytes], committed_blocks: int, num_pages: int
     ) -> tuple[list[bytes], list[int]]:
         """Of one group's asked ordinals: the names of those committed locally already, and the
@@ -145,13 +145,9 @@ class KVv2ResourceView:
         """Every committed full block the request still holds, in the pages it holds right now.
 
         A windowed group holds ``[0, sink) | [stale_end(history), committed)``, with ``history``
-        read at publish time: after an unchunked prefill that is ``prompt_len``, one block past a
-        fetcher's largest target ``B = (prompt_len - 1) // tpb * tpb``. With ``window % tpb == 0``
-        the two stale ends differ exactly when ``prompt_len % tpb`` is ``0`` or ``tpb - 1``; the
-        window's first block at ``B`` is then already dropped here, and since the stale end grows
-        with the target no larger target does without it either. A fetcher's ``servable_block_end``
-        falls to what the sink blocks alone serve (nothing, without sinks) and the request
-        computes locally.
+        read at publish time; why a fetcher's largest target may then lack the window's first
+        block, and computes locally, is derived in the design document's extent table
+        (``KV_TRANSFER_COORDINATOR_DESIGN.zh.md``, the windowed publish row).
 
         Read after the step was committed: committing may swap a block's pages for a concurrent
         committer's (``allow_seq_rebasing``). The positional chunk is ``None``: the store path
@@ -209,7 +205,7 @@ class KVv2ResourceView:
             local_group=group_spec.local_group,
         )
 
-    def _describe_layer_groups(self) -> tuple[GroupSpec, ...]:
+    def _group_specs_from_page_table(self) -> tuple[GroupSpec, ...]:
         """One ``GroupSpec`` per layer group: kind, shared tag, window and sink blocks."""
         group_specs = []
         for local_group, layer_group in enumerate(self._page_table.layer_groups):

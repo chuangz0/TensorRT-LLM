@@ -174,8 +174,8 @@ def test_gather_and_scatter_concatenate_in_resolver_order():
     pool.scatter(1, [d1, d2])
     assert read([d1]) == pattern(1, 12) and read([d2]) == pattern(2, 20)
     assert copier.kinds() == ["d2h", "d2h", "h2d", "h2d"]
-    pool.sync()
-    assert copier.syncs == 1
+    pool.wait_for_copies()
+    assert copier.copy_waits == 1
     with pytest.raises(ValueError, match="exceeds"):
         pool.gather(0, [s1, s2, (s1[0], 1)])
 
@@ -195,7 +195,7 @@ def test_staged_publish_is_quiet_before_the_store_takes_it_then_delivered():
         assert rank.backend.quiesce([attempt]) is True
         assert attempt.poll() is None
         assert rank.publish_copier.kinds() == ["d2h", "d2h", "d2h"]
-        assert rank.publish_copier.syncs == 1
+        assert rank.publish_copier.copy_waits == 1
         # Overwriting the source now must not change what the store receives.
         rank.fill(a, 0x00)
         rank.fill(b, 0x00)
@@ -307,17 +307,18 @@ def test_staging_does_not_require_the_callers_pool_to_be_registered():
 # ---- copier failure part-way through a unit ----
 
 
-def _sync_precedes_release(rank, thread: int) -> None:
-    """On ``thread``, the last ``sync`` happened before the last ``release`` (copies drained
-    before the slots go back, so nobody reuses a slot a copy may still be landing in)."""
+def _copy_wait_precedes_release(rank, thread: int) -> None:
+    """On ``thread``, the last ``wait_for_copies`` happened before the last ``release`` (copies
+    waited for before the slots go back, so nobody reuses a slot a copy may still be landing
+    in)."""
     events = [e for e, _ in rank.trace.by_thread(thread)]
-    assert "sync" in events and "release" in events, events
-    last_sync = max(i for i, e in enumerate(events) if e == "sync")
+    assert "wait_for_copies" in events and "release" in events, events
+    last_wait = max(i for i, e in enumerate(events) if e == "wait_for_copies")
     last_release = max(i for i, e in enumerate(events) if e == "release")
-    assert last_sync < last_release, events
+    assert last_wait < last_release, events
 
 
-def test_copier_failing_on_the_second_segment_of_a_publish_syncs_before_releasing_the_slot():
+def test_copier_failing_on_the_second_segment_of_a_publish_waits_before_releasing_the_slot():
     with _staged(slots=2) as rank:
         two_seg = rank.unit(0, 0, 32, 32)
         rank.write(two_seg, pattern(1, 64))
@@ -335,8 +336,8 @@ def test_copier_failing_on_the_second_segment_of_a_publish_syncs_before_releasin
         copies = [(e, a) for e, _, a in rank.trace.events if e == "copy"]
         assert len(copies) == 2  # the second call is recorded before it raises
         worker = next(t_ for e, t_, _ in rank.trace.events if e == "copy")
-        _sync_precedes_release(rank, worker)
-        assert rank.publish_copier.syncs >= 1
+        _copy_wait_precedes_release(rank, worker)
+        assert rank.publish_copier.copy_waits >= 1
         assert rank.store.count("put") == 0
         # Another delivery through the same slots afterwards sees nothing of the failed one.
         fresh = rank.unit(0, 1, 64)
@@ -364,7 +365,7 @@ def test_copier_failing_on_the_second_segment_of_a_placement_drains_and_leaves_m
         t.join(5)
         assert isinstance(outcome, Failed) and "segment 2" in outcome.reason
         assert quiet == [True]
-        assert rank.landing_copier.syncs == 1  # drained before the outcome
+        assert rank.landing_copier.copy_waits == 1  # waited for before the outcome
         # SPEC §5.2 inv. 3: after Failed the destination is undefined. Here the first segment
         # landed and the second never did, which is exactly what the caller must not trust.
         assert rank.read(two_seg) == pattern(1, 64)[:32] + bytes([0xEE]) * 32

@@ -6,7 +6,7 @@
 ``context_block_keys`` count, determinism and divergence; ``reserve_transfer_pages(token_end)``
 declaring history to the fetch target; the fetch extent naming exactly the nameable blocks the
 local radix tree does not serve; two identical committed requests publishing under identical
-names; ``layout_fingerprint`` stable per layout and different across layouts; the region
+names; ``compute_layout_fingerprint`` stable per layout and different across layouts; the region
 resolver's spans; and the idempotent ``release_index_slot``. Allocates device pools.
 
 ``TestVariableSlidingWindow`` repeats the fetch and publish walk on a two-group manager (window
@@ -37,7 +37,7 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_
 from tensorrt_llm._torch.disaggregation.resource.kv_v2_view import KVv2ResourceView
 from tensorrt_llm._torch.disaggregation.resource.region import (
     KVv2RegionResolver,
-    layout_fingerprint,
+    compute_layout_fingerprint,
     parallel_shard_tag,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -437,17 +437,17 @@ class TestPublishDescription:
 
 
 # ---------------------------------------------------------------------------------------------
-# layout_fingerprint and KVv2RegionResolver
+# compute_layout_fingerprint and KVv2RegionResolver
 # ---------------------------------------------------------------------------------------------
 
 
 class TestLayout:
     def test_fingerprint_is_stable_for_one_layout(self, manager):
         page_table = build_page_table_from_manager(manager)
-        first = layout_fingerprint(manager, page_table)
+        first = compute_layout_fingerprint(manager, page_table)
         assert isinstance(first, bytes) and len(first) == 16
-        assert layout_fingerprint(manager, page_table) == first
-        assert layout_fingerprint(manager) == first  # page table rebuilt from the manager
+        assert compute_layout_fingerprint(manager, page_table) == first
+        assert compute_layout_fingerprint(manager) == first  # page table rebuilt from the manager
         # A second manager with the same configuration (different pool addresses) agrees.
         other = make_manager()
         try:
@@ -455,7 +455,7 @@ class TestLayout:
             assert KVv2RegionResolver(other_table).pool_memory_spans() != (
                 KVv2RegionResolver(page_table).pool_memory_spans()
             )
-            assert layout_fingerprint(other, other_table) == first
+            assert compute_layout_fingerprint(other, other_table) == first
         finally:
             other.shutdown()
 
@@ -472,7 +472,7 @@ class TestLayout:
     def test_fingerprint_changes_with_the_layout(self, manager, override):
         other = make_manager(**override)
         try:
-            assert layout_fingerprint(other) != layout_fingerprint(manager)
+            assert compute_layout_fingerprint(other) != compute_layout_fingerprint(manager)
         finally:
             other.shutdown()
 
@@ -497,14 +497,18 @@ class TestLayout:
         (no shard tag) is stable."""
         page_table = build_page_table_from_manager(manager)
         by_tag = {
-            tag: layout_fingerprint(manager, page_table, parallel_shard=tag)
+            tag: compute_layout_fingerprint(manager, page_table, parallel_shard=tag)
             for tag in ("heads=0/2", "heads=1/2", "heads=all", "")
         }
         assert by_tag["heads=0/2"] != by_tag["heads=1/2"]
-        assert by_tag["heads=all"] == layout_fingerprint(
+        assert by_tag["heads=all"] == compute_layout_fingerprint(
             manager, page_table, parallel_shard="heads=all"
         )
-        assert by_tag[""] == layout_fingerprint(manager, page_table) == layout_fingerprint(manager)
+        assert (
+            by_tag[""]
+            == compute_layout_fingerprint(manager, page_table)
+            == compute_layout_fingerprint(manager)
+        )
         assert len(set(by_tag.values())) == 4
 
     def test_fingerprint_separates_models_of_one_geometry_by_identity(self, manager):
@@ -512,22 +516,22 @@ class TestLayout:
         identity the assembly passes is part of the digest. Unknown (empty) is the default and
         is what every call without the argument gets."""
         page_table = build_page_table_from_manager(manager)
-        unknown = layout_fingerprint(manager, page_table)
-        assert unknown == layout_fingerprint(manager, page_table, model_identity="")
+        unknown = compute_layout_fingerprint(manager, page_table)
+        assert unknown == compute_layout_fingerprint(manager, page_table, model_identity="")
         by_model = {
-            name: layout_fingerprint(manager, page_table, model_identity=name)
+            name: compute_layout_fingerprint(manager, page_table, model_identity=name)
             for name in ("meta-llama/Llama-3.1-8B@main", "mistralai/Mistral-7B-v0.3@main")
         }
         assert len({unknown, *by_model.values()}) == 3
-        assert by_model["meta-llama/Llama-3.1-8B@main"] == layout_fingerprint(
+        assert by_model["meta-llama/Llama-3.1-8B@main"] == compute_layout_fingerprint(
             manager, page_table, model_identity="meta-llama/Llama-3.1-8B@main"
         )
         # Identity and shard tag are independent dimensions of the key.
-        assert layout_fingerprint(
+        assert compute_layout_fingerprint(
             manager, page_table, parallel_shard="heads=0/2", model_identity="m"
         ) not in {
             by_model["meta-llama/Llama-3.1-8B@main"],
-            layout_fingerprint(manager, page_table, parallel_shard="heads=0/2"),
+            compute_layout_fingerprint(manager, page_table, parallel_shard="heads=0/2"),
         }
 
     def test_resolver_spans_and_segments(self, manager):
