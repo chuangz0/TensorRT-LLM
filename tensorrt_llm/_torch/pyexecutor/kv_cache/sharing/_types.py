@@ -12,8 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The public types and protocols of the lender. Numpy and the standard library only, so any
-side can import them without a live KV cache manager."""
+"""The lender's public types and protocols.
+
+Numpy and the standard library only, so any side can import them without a live KV cache manager.
+"""
 
 from __future__ import annotations
 
@@ -50,17 +52,17 @@ def _integer(name: str, value: object, least: int = 1) -> int:
 class StagingOptions:
     """The staging size, in whole fetches.
 
-    The lender computes the bytes of one fetch from the layer groups and their windows, and a range
-    of at most ``fetch_tokens`` tokens always fits. A capacity budget, not concurrency: a lease
-    takes one contiguous run of slots per pool group and leases that need slots are granted strictly
-    in order, so holes that released leases leave can make a lease wait although enough slots are
-    free in total; a lease with no rows is ready at its first poll, with no place in line.
+    The lender sizes one fetch from the layer groups and windows; any range of at most
+    ``fetch_tokens`` tokens fits. A capacity budget, not concurrency: a lease takes one contiguous
+    run of slots per pool group, granted strictly first come, first served, so holes released leases
+    leave can make it wait although enough slots are free. A lease with no rows is ready at its
+    first poll, with no place in line.
 
     Attributes:
         fetch_tokens: The tokens of one fetch.
         max_fetches: How many fetches staging holds.
-        max_bytes: A cap on the staging bytes, or ``None``; ``attach_staging`` raises
-            ``ValueError`` if it is below one fetch.
+        max_bytes: A cap on the staging bytes, or ``None``; ``attach_staging`` raises ``ValueError``
+            if it is below one fetch.
 
     Raises:
         TypeError: A field is not an integer (``bool`` included).
@@ -82,8 +84,8 @@ class StagingOptions:
 class Part:
     """One device pool group's staging host region, to register as ``(address, nbytes)``.
 
-    ``StagingLender.parts`` states what a backend may rely on about the regions and when it
-    registers and deregisters them.
+    ``StagingLender.parts`` states what a backend may rely on and when it may register;
+    ``PartsHold`` states when it deregisters.
 
     Attributes:
         name: Equal on instances laid out alike.
@@ -104,22 +106,20 @@ class Part:
 class GroupRun:
     """One layer group's rows, with read-only arrays: row ``i`` is block ``ordinals[i]``.
 
-    Equal names mean interchangeable bytes within the limits ``attach_staging`` states, so a name is
-    usable as a store key. Their format is not API, but their width, 54 bytes, is. Consumers store
-    names and compare them for equality, and nothing else. A change to the format or to the layout
-    behind it makes objects stored under the old one miss; they never hit wrongly.
+    Staging rows carry names, slot addresses and a part; in-place rows carry none, as the caller
+    addresses them with its own page-table code. Equal names mean interchangeable bytes within the
+    limits ``attach_staging`` states, so a name is usable as a store key. Their format is not API,
+    but their width, 54 bytes, is: consumers store names and compare them for equality, and nothing
+    else. A change of format or layout makes objects stored under the old one miss, never hit
+    wrongly.
 
     Attributes:
         layer_group: The manager's local index of the layer group.
-        ordinals: ``int64 (n,)``, each row's block index; block ``b`` covers tokens
-            ``[b * tokens_per_block, (b + 1) * tokens_per_block)``.
+        ordinals: ``int64 (n,)``, each row's block index.
         names: Staging only: ``uint8 (n, 54)``, each row's opaque name (``names[i].tobytes()``).
-        addresses: Staging only: ``int64 (n,)``; row ``i``'s slot is the part's ``slot_bytes``
-            bytes at ``addresses[i]``.
-        part: Staging only: the index of the row's part in ``StagingLender.parts``.
-
-    In-place rows carry none of the three staging fields: the caller addresses them with its own
-    page-table code.
+        addresses: Staging only: ``int64 (n,)``; row ``i``'s slot is the part's ``slot_bytes`` bytes
+            at ``addresses[i]``.
+        part: Staging only: the index of the rows' part in ``StagingLender.parts``.
     """
 
     layer_group: int
@@ -234,64 +234,72 @@ class RegionView:
 class Readiness(NamedTuple):
     """Where a request may resume after a fetch.
 
-    The request may resume at a ``p`` with ``restart_floor <= p <= usable_until``, with ``p`` no
-    lower than its context position. The interval is this rank's own and covers only this manager's
-    blocks. With several ranks the waiter takes the largest floor and the smallest end, and likewise
-    over a request's target manager and its joint-reuse draft pool, which shares the request's
-    cursor: the caller fetches through the draft pool's own lender too and resumes where both
-    intervals allow (the smaller ``usable_until``, the larger ``restart_floor``), so never below the
-    draft pool's history. An empty interval means drop the request's cache in every manager it
-    fetched into, a target and its joint-reuse draft pool alike, compute from 0 and do not fetch
-    again. Below the floor a resume may read blocks a sliding window has released, so it cannot
-    continue there. Under a block reuse policy other than all-reusable the floor is also at least
-    the request's history, since the manager's context update never moves a history back. The same
-    holds in a joint-reuse draft pool, whose context resize sets the capacity from the chunk it runs
-    and raises where that capacity is below the request's history. Where the request's multimodal
-    data sets ``mm_bidirectional_blocks``, no position in the interval lies strictly inside a run of
-    multimodal tokens, which the scheduler keeps within one context chunk: ``usable_until`` stops at
-    the start of a run it would fall inside and ``restart_floor`` rises to the end of the last run
-    below it, so the interval can be empty, and where the context position lies strictly inside a
-    run it can end below that position, which the caller treats as empty too.
+    It may resume at a ``p`` with ``restart_floor <= p <= usable_until``, no lower than its context
+    position; below the floor it may read blocks a sliding window released. ``readiness`` does not
+    read the context position, so the interval is empty if
+    ``max(restart_floor, context position) > usable_until``. The interval is this rank's own and
+    covers only this manager's blocks.
 
-    ``usable_until`` need not be a multiple of ``tokens_per_block``. It reaches the request's
-    prompt length only where the request computed its whole prompt itself: a fetch ends before the
-    last prompt token, which the request computes for its logits.
+    Bounds:
+        - ``usable_until`` need not be a multiple of ``tokens_per_block``. It reaches the request's
+          prompt length only where the request computed its whole prompt itself, as a fetch ends
+          before the last prompt token.
+        - Under a block reuse policy other than all-reusable the floor is also at least the
+          request's history, since the manager's context update never moves a history back.
+        - The same holds in a joint-reuse draft pool, whose context resize sets the capacity from
+          the chunk it runs and raises where that capacity is below the request's history.
+        - With ``mm_bidirectional_blocks``, no position in the interval lies strictly inside a run
+          of multimodal tokens (the scheduler keeps a run within one context chunk).
+          ``usable_until`` stops at the start of a run it would fall inside and ``restart_floor``
+          rises to the end of the last run below it, possibly emptying the interval. A context
+          position strictly inside a run can leave it ending below that position, which the caller
+          treats as empty too.
+        - Across ranks the waiter takes the largest floor and the smallest end. With a joint-reuse
+          draft pool sharing the request's cursor (``StagingLender``), the request resumes where
+          both intervals allow: the smaller ``usable_until``, the larger ``restart_floor``, so never
+          below the draft pool's history.
 
-    From ``lend_write`` until the request resumes, the caller keeps it among the executor's active
-    requests, as the disaggregated transfer-in-progress state does, keeps it from being scheduled,
-    and it resumes at ``p`` with ``py_connector_served_position`` set to ``p``, the cache's history
-    raised to ``p`` where below it and, once it is back in its context state, its prepopulated
-    length and context position moved to ``p`` together by ``set_prepopulated_prompt_len(p,
-    tokens_per_block)`` with the manager's ``tokens_per_block``, its context chunk first set to span
-    to the prompt's end: the steps a KV cache connector takes to skip a request past the prefix it
-    served, here on any context chunk. The request resumes only at a ``p`` in the interval no lower
-    than its context position: like a connector's skip, the step moves it only forward, and below
-    that position it can leave a chunk that the next scheduling pass makes negative, which raises
-    out of the scheduler. Its next chunk is then a first context chunk, which the manager settles at
-    ``p``, and a scheduling pass that tries and fails to admit it drops the request's caches in
-    every manager and rewinds it to 0, as for any first context chunk.
-    ``set_prepopulated_prompt_len(0, tokens_per_block)`` leaves the context position where it is: a
-    resume at 0 takes no step where the context position is 0, and elsewhere means dropping the
-    request's cache in every manager it fetched into and computing from 0. Without
-    ``set_prepopulated_prompt_len`` a request past its first context chunk stays at its own context
-    position, and a context position moved by itself leaves the prepopulated length behind, which
-    the executor reads for context logits and a pipelined cache transfer's first chunk. With
-    ``enable_return_routed_experts``, the caller fetches into a request that asks for routed experts
-    only before its first context step runs, so never after a recompute pause: route capture stops
-    reading a request's prepopulated length once it holds the routes below it, at the first context
-    step already when that length is 0, and keeps that state until the request finishes, also across
-    a recompute pause, so a later resume can leave the skipped positions without routes, and the
-    request's completion then raises out of the executor loop. The executor's pool rebalance
-    suspends the active requests' caches and its own CUDA-graph padding dummies, no others, so a
-    request taken out of the active requests while its cache is active stops the executor loop. Each
-    response reports as ``cached_tokens`` where the request's first context step started, a count
-    kept until a recompute pause, so a fetch the request resumes from after that step adds nothing
-    to it.
+    Caller must:
+        - Park the request from ``lend_write`` until it resumes: keep it among the executor's active
+          requests, as the disaggregated transfer-in-progress state does, but unscheduled. Pool
+          rebalance suspends only active requests' caches (and its CUDA-graph padding dummies), so a
+          request taken out of them with an active cache stops the executor loop.
+        - Resume only at a ``p`` in the interval no lower than its context position; lower, the next
+          scheduling pass can make a chunk negative and raise.
+        - Resume as a KV cache connector skips a served prefix, on any context chunk. These steps
+          form a set; only the last two keep their order:
+
+          - Set ``py_connector_served_position`` to ``p``.
+          - Raise the cache's history to ``p`` where below.
+          - Once the request is back in its context state, set its context chunk to span to the
+            prompt's end.
+          - Then move the prepopulated length and context position to ``p`` together by
+            ``set_prepopulated_prompt_len(p, tokens_per_block)``, with the manager's
+            ``tokens_per_block``.
+
+          ``set_prepopulated_prompt_len(0, tokens_per_block)`` leaves the context position as is: a
+          resume at 0 needs no step from position 0, and elsewhere means dropping the cache in every
+          manager and computing from 0. Without the call, a request past its first chunk stays at
+          its context position; a position moved alone leaves the prepopulated length behind, which
+          context logits and a pipelined cache transfer's first chunk read.
+        - On an empty interval, drop the request's cache in every manager it fetched into (a target
+          and its joint-reuse draft pool alike), compute from 0 and do not fetch again.
+        - With a sliding window, a non-empty interval does not by itself permit another lease: see
+          the split rule in ``StagingLender.lend_write``.
+
+    Notes:
+        - The next chunk is a first context chunk, which the manager places at ``p``. A pass
+          failing to admit it drops its caches in every manager and rewinds it to 0, as for any
+          first chunk.
+        - ``cached_tokens`` reports where the first context step started, until a recompute pause,
+          so a fetch resumed from later adds nothing.
+        - With ``enable_return_routed_experts``, a resume can leave skipped positions without routes
+          (``StagingLender``).
 
     Attributes:
         usable_until: The last position the request may resume at.
-        restart_floor: The first position the request may resume at, unless its context
-            position is higher.
+        restart_floor: The first position the request may resume at, unless its context position is
+            higher.
     """
 
     usable_until: int
@@ -302,41 +310,36 @@ class Readiness(NamedTuple):
 class Lease(Protocol):
     """One lent range: poll until the view or ``failure``, mark a write once, release.
 
-    Its methods run only on the manager's thread; a backend's own threads read the view, access the
-    memory it points to, call no lease or lender method and tell the holder through their own
-    channel when they are done. Without that signal the lease stays open. After the manager's
-    shutdown ``poll``, ``mark_arrived`` and ``release`` only end records.
+    Its methods run only on the manager's thread (see the package docstring). Backend threads tell
+    the holder through their own channel when done; without that signal the lease stays open. After
+    the manager's shutdown, ``poll``, ``mark_arrived`` and ``release`` only end records. Outcomes
+    are this rank's own (slots, copies, free pages and a pipeline stage's windows are per rank), so
+    ranks lending alike can end differently; the lender runs no collective. Failure is final.
 
-    Caller obligations:
+    Caller must:
         - Poll every open lease each iteration of the executor loop, also when no new request
           arrives: all progress happens inside lender calls. Once no request is live or waiting, the
-          executor waits for a new request, with no timeout under MPI and for up to 1200 s under
-          Ray, so the caller keeps that wait from blocking while a lease is open or a backend has
-          work for the holder, as the executor does itself while a KV cache connector's transfers
-          pend.
-        - Release every lease, failed ones too, once the backend has let go of the memory. An
-          unreleased staging lease keeps the staging memory past the manager's shutdown until the
-          process exits.
-        - A lease's outcome is this rank's own: slots, copies, free pages and a pipeline stage's
-          windows are per rank, so ranks lending alike can end differently. The caller combines
-          every rank's outcome and decides for all ranks; the lender runs no collective.
-        - Failure is final. A lease already failed when ``lend_read`` or ``lend_write`` returns
-          changed nothing in the request's cache, so the caller computes locally or tries later.
-        - An exception a lender, lease or hold call raises for a reason its docstring does not
-          list, a ``MemoryError`` say, is not recovered from: it can leave the lender's records,
-          and a staging lender's of other requests too, disagreeing with the caches and the
-          staging slots. The caller then lends, polls, marks and asks ``readiness`` through that
-          lender no more, only releases its leases and holds, and treats each request parked for
-          a fetch through it as it does an empty interval. The lender may keep caches, and with
-          them the manager's device pools, and the staging memory until the process exits.
+          executor waits for one, with no timeout under MPI and up to 1200 s under Ray. Keep that
+          wait from blocking while a lease is open or a backend has work for the holder, as the
+          executor does while a KV cache connector's transfers pend.
+        - Combine every rank's outcome and decide for all ranks. A lease already failed when
+          ``lend_read`` or ``lend_write`` returns changed nothing in the request's cache: compute
+          locally or try later. A write lease that fails after the call has grown the cache: then
+          ``readiness`` decides, and on an empty interval the request does not fetch again.
+        - Release every lease, failed ones too, once the backend let go of the memory; an unreleased
+          staging lease keeps the staging memory past shutdown until the process exits.
+        - A lender, lease or hold call that raises for a reason its docstring does not list (a
+          ``MemoryError``, say) is not recovered from. Then only release that lender's leases and
+          holds, and treat requests parked through it as on an empty interval. Its records may
+          disagree with caches and slots, a staging lender's for other requests too, and may keep
+          caches, device pools and staging memory until exit.
     """
 
     def poll(self) -> Optional[RegionView]:
         """Does pending work and returns the view once the lease is ready.
 
-        A staging read is ready once its copy into the slots completed, a staging write at the
-        first poll after its slots were granted, and an in-place lease at its first poll, with no
-        stream wait.
+        Ready: a staging read once its copy into the slots completed, a staging write at the first
+        poll after its slots were granted, an in-place lease at its first poll, with no stream wait.
 
         Returns:
             The view once ready, the same object every time; ``None`` while pending, and for good
@@ -356,16 +359,18 @@ class Lease(Protocol):
         """Marks the rows of a write lease that arrived whole.
 
         Write leases only, once, after ``poll()`` returned the view, before or after release.
-        Required for staging writes: only marked rows reach the request's pages, copied in one
-        batch that every forward pass queued after it waits for, about the fetch's bytes over the
-        host-to-device bandwidth, so callers split long fetches into several leases, within the
-        limit ``StagingLender`` states for a sliding window with speculative decoding's extra KV
-        tokens. Marked rows are copied only where the request's active cache still locks the lent
-        GPU page inside its window; after the request exits, the holder still marks and releases,
-        and nothing is copied into freed pages. A staging write's slots return only after release,
-        ``mark_arrived`` and the copy's completion. A write released before its view was returned
-        abandons its fetch and needs no mark. Optional in place: it checks only the masks and feeds
-        no readiness.
+        Required for staging writes: only marked rows reach the request's pages, in one copy batch
+        that every later-queued forward waits for, about the fetch's bytes over the host-to-device
+        bandwidth. So callers split long fetches, but only by the split rule in
+        ``StagingLender.lend_write`` and its extra-KV-token bound: the next lease once ``readiness``
+        is not None on every rank and, with a sliding window, its ``usable_until`` reaches this
+        lease's end.
+
+        Rows are copied only where the active cache still locks the lent GPU page inside its window:
+        after the request exits the holder still marks and releases, and freed pages get nothing. A
+        staging write's slots return only after release, ``mark_arrived`` and the copy's completion.
+        A write released before its view needs no mark. Optional in place: it checks only the masks
+        and feeds no readiness.
 
         Args:
             masks: One boolean array per run of the view, ``True`` where the row arrived whole;
@@ -381,9 +386,8 @@ class Lease(Protocol):
     def release(self) -> None:
         """The backend has stopped touching the lent memory.
 
-        Required for every lease, failed ones too; legal in every state, and later calls do
-        nothing. The release that ends the last in-place loan on a freed request's cache closes
-        that cache.
+        Required for every lease, failed ones too; legal in every state, and later calls do nothing.
+        The release that ends the last in-place loan on a freed request's cache closes that cache.
         """
         ...
 
@@ -392,19 +396,18 @@ class Lease(Protocol):
 class PartsHold(Protocol):
     """A staging backend's hold on the staging memory.
 
-    A hold still open at the manager's shutdown keeps the staging memory until the process exits.
-    Take one with ``StagingLender.hold_parts()`` on the manager's thread before registering
+    Take it with ``StagingLender.hold_parts()`` on the manager's thread before registering
     ``StagingLender.parts``; deregister the parts before the manager shuts down, and release it on
-    the manager's thread once deregistration is confirmed. A backend that fails after registering
-    and cannot confirm its deregistration keeps its hold, so the memory stays until exit. The lender
-    holds it, so dropping it unreleased keeps the memory.
+    the manager's thread once deregistration is confirmed. A hold still open at the manager's
+    shutdown keeps the staging memory until the process exits, so a backend that cannot confirm its
+    deregistration keeps its hold. The lender holds it, so dropping it unreleased keeps the memory.
     """
 
     def release(self) -> None:
         """The backend has deregistered the parts and cannot reach them.
 
-        Runs only on the manager's thread, like every lender and lease method; legal in every
-        state, and later calls do nothing.
+        Runs only on the manager's thread, like every lender and lease method; legal in every state,
+        and later calls do nothing.
         """
         ...
 
@@ -415,164 +418,121 @@ class PartsHold(Protocol):
 class StagingLender(Protocol):
     """Relays whole blocks between a request's device pages and host staging slots.
 
-    Leases that need slots are granted first come, first served; a lease with no rows is ready at
-    its first poll, with no place in line. Lender and lease methods run only on the manager's
-    thread; a backend's own threads read a view, access the memory it points to, call no lease or
-    lender method, and tell the holder through their own channel. Backends never lend and never call
-    a lease.
+    ``lend_read`` publishes, ``lend_write`` fetches, ``readiness`` says where to resume. Its methods
+    run only on the manager's thread (see the package docstring); backends never lend and never call
+    a lease. Leases needing slots wait in line (``StagingOptions``).
 
-    Copies queue on the manager's execution stream: on the GPU they run serially with the forward
-    passes, so a step that queues copies takes about their time longer. With page-locked staging and
-    the fresh-page fill off, no lend, poll, mark or readiness call waits for them on the CPU; only
-    the manager's shutdown does. Under confidential computing staging is pageable, and a copy can
-    hold the call that queues it until the stream reaches it. A call asks each copy's event at most
-    once, but every call asks again the pending copy of each released lease, so N calls while P such
-    copies pend cost about N * P queries. Every call also checks each lease holding slots, even with
-    no copy pending, so polling H such leases once each costs about H * H checks.
+    Copies queue on the manager's stream, serially with the forward passes on the GPU, so a step
+    queuing copies takes about their time longer. With page-locked staging and the fresh-page fill
+    off, no lend, poll, mark or readiness call waits for them on the CPU; only the manager's
+    shutdown does. Under confidential computing staging is pageable, and a copy can hold its call
+    until the stream reaches it. The executor's pool rebalance suspends active caches, parked ones
+    too, and moves their pages, lent ones too. Queued copies finish first, and a read waiting for
+    slots fails at its grant where pages moved. A write marked afterwards copies only the rows whose
+    pages stayed, and ``readiness`` counts only those.
 
-    A pool rebalance by the executor suspends its active requests' caches, which a parked request
-    stays among, and moves their pages, lent ones included: copies already queued complete first, a
-    read still waiting for slots fails at its grant where its pages moved, and a write marked after
-    the rebalance copies only the rows whose pages stayed, which are all ``readiness`` counts.
-
-    Caller obligations:
-        - A staging backend, on the manager's thread, takes a hold with ``hold_parts()`` and
-          registers ``parts`` after the attach and before it touches a lease; it deregisters before
-          the manager shuts down, and releases the hold once deregistration is confirmed.
-        - Each iteration of the executor loop the holder polls every open lease and the waiter asks
-          ``readiness`` for every waiting request, also when no new request arrives.
-        - At shutdown the executor loop stops; the staging backends stop, deregister and release
+    Caller must:
+        - Hold and register the parts before a backend touches a lease, and deregister them before
+          shutdown (see ``PartsHold``).
+        - Each executor iteration, also with no new request, the holder polls every open lease and
+          the waiter asks ``readiness`` for every parked request.
+        - Split a fetch only by the rule in ``lend_write``: the next lease once ``readiness`` is not
+          None on every rank and, with a sliding window, its ``usable_until`` reaches the previous
+          lease's end. The lender does not check this yet.
+        - For a one-model draft with its own joint-reuse pool, which shares the request's context
+          cursor, fetch the same range into both managers through their own lenders, resume within
+          both intervals and publish both. A fetch into one alone leaves the other without the
+          prefix as the cursor moves past it.
+        - Shut down in order: the executor loop stops; staging backends stop, deregister and release
           their holds; the holder marks and releases what they give back; the manager shuts down
           last.
-        - A request whose one-model draft has a joint-reuse pool of its own shares its context
-          cursor with that pool: the caller fetches the same range into both managers, each
-          through its own lender, resumes within both intervals and publishes both. A fetch into
-          one alone leaves the other without the prefix while the shared cursor moves past it.
 
     First-version limits:
-        - Staging needs block reuse, one lender per manager, no context or pipeline parallelism,
-          recurrent state, sparse buffers or KV cache connector, and no one-model draft that reads
-          prompt tokens past a position, since a block's name covers only the tokens up to the
-          block's end; one-model DraftTarget, whose read-ahead upstream has not established,
-          counts as reading none (``attach_staging``).
-        - A publish leaves out the window blocks the request's own window has passed, although the
-          manager's prefix tree may still hold their committed pages, so a fetch whose window still
-          keeps such a block finds its row missing (``lend_read``).
+        - ``attach_staging`` lists the refused managers. Lending stops for good once the manager
+          resets its reuse state.
+        - Window gap: a publish leaves out window blocks its request's window has passed, though the
+          prefix tree may still hold their committed pages, so a fetch whose window still keeps such
+          a block finds its row missing.
         - DeepSeek-V4 keeps every window the draft length wider under any speculative decoding, and
-          a fetch asks for the rows of that margin too: at 128 tokens per block and a draft length
-          of 2 or more, a publish from a request whose history stands at least the draft length less
-          one token past the fetch's end leaves out the margin's row, so the fetch finds it missing.
-        - DeepSeek-V4's model defaults turn SWA scratch reuse on, with which a fetch fails at the
-          call (``lend_write``), so a fetch there needs
+          a fetch asks for the rows of that margin too. At 128 tokens per block and a draft length
+          of 2 or more, a publisher whose history stands at least the draft length less one token
+          past the fetch's end leaves out that row, and the fetch misses it. Its default SWA scratch
+          reuse fails fetches (``lend_write``): set
           ``kv_cache_config.enable_swa_scratch_reuse=False``.
-        - Under the all-reusable block reuse policy a fetch fails at the call where a window leaves
-          behind, at the fetch's end, a block whose page holds tokens past the cache's history: the
-          block keeps its page until the commit stores it whole, the request never wrote those
-          tokens (the rest of a block its local match copied from another request's page, or a page
-          grown before the fetch), and the manager has no way to drop one block's page in one layer
-          group. With partial reuse on, local matches often end inside a block, so on a model with a
-          sliding window such a request computes from its local match rather than fetch past the
-          window (``lend_write``).
-        - With speculative decoding's extra KV tokens (``num_extra_kv_tokens``, the draft length
-          less one under one-model speculative decoding), each lease's grow gives the block holding
-          them a page past the history the lease leaves, and nothing writes it. So under the
-          all-reusable policy, where the manager keeps a sliding window of ``W`` tokens, a later
-          consecutive lease spanning at least ``W + tokens_per_block - 1`` tokens leaves that block
-          behind and fails at the call: a caller splitting such a fetch keeps later leases shorter,
-          or the request computes the rest (``lend_write``).
+        - Under the all-reusable policy, a fetch fails at the call where a window leaves behind a
+          block whose page holds tokens past the cache's history (``lend_write``). Rows an earlier
+          lease missed are not checked: the split rule covers those.
+        - Names exist only in ready views: a caller cannot ask a source how far it holds a prefix
+          before a fetch grows the cache.
+        - A publish lends a sliding-window layer group's rows only for the window at its ``end``,
+          and a windowed fetch needs the window at the history it leaves. So two cases find rows
+          missing and compute from 0. A fork from a published prompt at an earlier block does so
+          once the window at the publisher's history has released blocks. A fetch past the published
+          end (a longer next turn) does so once the window at the fetch's end has released blocks.
+          The exception is a prefix whose publishes together lend the window at the fetch's end, as
+          one ending there does if its publisher's window had passed none of that window's blocks.
+          With no block released at the publisher's history, a fork finds every row. A fetch past
+          the published end, with none released at its own end either, misses only the rows past
+          the published end. It resumes at the first of them where the request may resume below its
+          history (all-reusable policy, outside a joint-reuse draft pool), else computes from 0.
         - The pages a fetch grows are outside the V2 scheduler's reach: it neither evicts, pauses
           nor preempts a parked request. Its deadlock check counts no pass while any request is in
-          a disaggregated transfer state, as one parked in the transfer-in-progress state is, and
-          otherwise raises "V2 scheduler deadlock" after 1000 passes in a row that schedule and
-          reclaim nothing while a context or generation request waits. So while requests are
-          parked in another state, a request that cannot be admitted, resume or grow can end in
-          that deadlock, unless the caller keeps room for the running requests in each pool group:
-          the pages parked requests' caches lock, the other pages the scheduler cannot reclaim,
-          and, for the generation request that needs the most, the pages of its cache within its
-          windows, which a resume locks all at once, and the pages its next step adds stay within
-          ``max_util_for_resume`` of the group's GPU pages. A share of each pool group for the
-          parked fetches alone does not ensure it, with or without a cache tier below the GPU. The
-          manager's ``get_page_indices_by_layer_group`` lists a request's pages per layer group, one
-          beam's (under beam search each further beam also locks a page of its own for every block
-          not wholly inside the prompt), and the runtime's ``impl.pool_group_descs`` give each pool
-          group's number of GPU pages and its layer groups.
-        - Under attention data parallelism without a cache transceiver, the executor counts parked
-          requests as schedulable, so a rank whose active requests are all parked, at its cap of
-          active requests or without pages for a padding dummy, schedules nothing, and its empty
-          batch holds every rank's forward until a fetch settles. The caller keeps a rank from
-          parking all its active requests, or accepts the stall.
+          a disaggregated transfer state, such as transfer-in-progress. With requests parked in
+          another state, keep room in each pool group (package docstring), or a request that cannot
+          be admitted, resume or grow can deadlock. A share of each pool group for the parked
+          fetches alone does not ensure it, with or without a cache tier below the GPU.
+        - Under attention data parallelism without a cache transceiver, parked requests count as
+          schedulable: a rank with all its active requests parked, at its cap or without pages for a
+          padding dummy, schedules nothing, and its empty batch holds every rank's forward until a
+          fetch settles. Keep a rank from parking all its active requests, or accept the stall.
         - With ``enable_return_routed_experts``, the caller fetches into a request that asks for
           routed experts only before its first context step runs, so never after a recompute pause.
-          Route capture stops reading a request's prepopulated length once it holds the routes below
-          it, at the first context step already when that length is 0, and keeps that state until
-          the request finishes, also across a recompute pause. So a later resume can leave the
-          skipped positions without routes, and the request's completion then raises out of the
-          executor loop.
-        - Names exist only in ready views: nothing names blocks without lending them, so a caller
-          cannot ask a source how far it holds a prefix before a fetch grows the cache. A publish
-          lends a sliding-window layer group's rows only for the window at its ``end``
-          (``lend_read``), and a fetch into a cache with a sliding window needs the rows of the
-          window at the history it leaves (``lend_write``). So a request forking from a published
-          prompt at an earlier block, once the window at the publisher's history has released
-          blocks, or one whose fetch ends past the published end, as a longer next turn's does, once
-          the window at the fetch's end has released blocks, finds rows missing and computes from 0,
-          unless the publishes of its prefix together lend the window at the fetch's end: a publish
-          ending there does if its publisher's own window had passed none of that window's blocks
-          (the window-gap limit above). While no window has released a block at a publisher's
-          history, its publish lends its whole range, so a fork finds every row; a fetch past the
-          published end, where no window has released a block at its own end either, then misses
-          only the rows past the published end and resumes at the first of them where the request
-          may resume below its history, which is under the all-reusable policy outside a joint-reuse
-          draft pool, and elsewhere computes from 0.
-        - Lending stops for good once the manager resets its reuse state, after which its names no
-          longer say which bytes it computes (``attach_staging``).
-        - Copies issue at most one copy call per row and pool. Only in a pool group of one pool do
-          rows whose device pages and staging slots both continue merge into one call, so small rows
-          on scattered pages and rows spread over several pools run below the host-to-device
-          bandwidth.
+          Route capture stops reading the prepopulated length once it holds the routes below it
+          (from the first context step when that length is 0), also across a recompute pause, so a
+          later resume can leave skipped positions without routes and the request's completion
+          raises out of the executor loop.
+        - Copies issue at most one copy call per row and pool, merging rows contiguous in both pages
+          and slots only in a single-pool pool group, so small scattered rows and rows over several
+          pools run below the host-to-device bandwidth.
+        - A call asks each copy's event at most once, but every call asks again the pending copy of
+          each released lease (N calls over P such copies: about N * P queries). Every call also
+          checks each lease holding slots, even with no copy pending (polling H such leases: about H
+          * H checks).
         - A writer of recycled pages off the manager's stream is not ordered after staging copies,
-          which come only before later work on that stream, the work a page's new owner waits for:
-          such a writer orders itself after them. An integrator adding one makes it wait on the
-          manager's stream first, as the disaggregated receive does. With a KV cache connector
-          refused, the manager's only such writer is the fresh-page fill
-          (``TRTLLM_KV_FRESH_PAGE_FILL``, a diagnostic off by default), which synchronizes the
-          device before it fills pages and again after: it overwrites no page a queued copy still
-          reads, and a ``lend_write`` that grows the cache then waits on the CPU for the queued
-          staging copies.
+          which precede only later work on that stream; an integrator adding one makes it wait on
+          that stream first, as the disaggregated receive does. With connectors refused, the only
+          such writer is the fresh-page fill (``TRTLLM_KV_FRESH_PAGE_FILL``, a diagnostic off by
+          default): it synchronizes the device before it fills pages and after, so it overwrites no
+          page a queued copy reads, and a growing ``lend_write`` then waits on the CPU for queued
+          copies.
         - Every lease hashes the request's whole prefix again from block 0, so a lease late in a
           long prompt costs time in proportion to the prompt.
-        - A slot lost to a failed copy is never reused: a slot is lost when a copy into or out of it
-          may have been queued without its completion recorded, because that completion could not be
-          recorded or a read's grant failed while queuing the copy. Such failures erode staging
-          capacity: a lease that needs, in some pool group, a longer run of slots than the longest
-          one without a lost slot there waits in line for good without failing, and holds up every
-          lease behind it until it is released or its request is freed. They also keep the staging
-          memory until the process exits.
+        - A slot lost to a failed copy is never reused and keeps the staging memory until the
+          process exits. A slot is lost when a copy into or out of it may have been queued without
+          its completion recorded: the completion could not be recorded, or a read's grant failed
+          while queuing. A lease needing, in some pool group, a longer run of slots than the longest
+          without a lost slot waits in line for good without failing, holding up every lease behind
+          it until released or its request is freed.
     """
 
     @property
     def parts(self) -> Tuple[Part, ...]:
         """The staging host regions, one per device pool group.
 
-        Each part stays at a fixed address for the lender's life and can be registered once,
-        after the attach and before the first lease is used; part names are equal on instances
-        laid out alike. Nothing more is promised: not one allocation, not an order in memory, not
-        that parts are back to back. A backend that can register only one region sorts the parts by
-        address, checks that each part ends where the next begins and registers their span; if they
-        are not back to back, it raises at construction and does not start.
-
-        A backend deregisters them before the manager shuts down and releases its hold once
-        deregistration is confirmed (``PartsHold``). The manager's shutdown frees them, once, unless
-        an unreleased lease (failed ones included), an unreleased hold (dropped ones included) or a
-        slot lost to a failed copy keeps them until the process exits.
+        Each stays at a fixed address for the lender's life and can be registered once, after the
+        attach and before the first lease is used. Nothing more is promised: not one allocation, not
+        an order in memory, not that parts are back to back. A backend able to register only one
+        region sorts them by address, checks each ends where the next begins and registers their
+        span, or raises at construction and does not start. The manager's shutdown frees them, once,
+        unless an unreleased lease (failed ones included), an unreleased hold (dropped ones
+        included) or a slot lost to a failed copy keeps them until the process exits.
         """
         ...
 
     def hold_parts(self) -> PartsHold:
-        """Returns a new hold on the staging memory.
+        """Returns a new hold on the staging memory, as ``PartsHold`` describes.
 
-        Take it on the manager's thread before registering ``parts``. After the manager's
-        shutdown the hold is inert: the memory was freed or kept then.
+        After the manager's shutdown the hold is inert: the memory was freed or kept then.
 
         Returns:
             The hold, open until its ``release``.
@@ -582,22 +542,17 @@ class StagingLender(Protocol):
     def lend_read(self, request: LlmRequest, start: int, end: int) -> Lease:
         """Publishes the committed blocks ``[start, end)``: a copy of them into staging slots.
 
-        Committed tokens are the request's prompt tokens in the manager's prefix-reuse tree: the
-        ones it reused, then the ones the forward computed, committed after each context chunk
-        (only after the last one under a reuse policy other than all-reusable) and never past the
-        end of the context. Generated tokens never commit.
+        Once its slots are granted, at once or after waiting in line, the lease queues the copy;
+        then the request may exit, and a queued copy completes. After ``poll()`` returns the view,
+        the backend reads those slots and no others, until release. A sliding-window layer group
+        lends only the blocks a history of ``end`` reads that its window still keeps (window gap:
+        ``StagingLender``); blocks without a page are left out.
 
-        When its slots are granted, at once or after waiting in line, the lease queues a copy of
-        the request's pages into them; from then on the request may exit, and a copy already
-        queued completes. A sliding-window layer group lends only the blocks a history of ``end``
-        reads that its window still keeps, and a block without a page is left out. Once ``poll()``
-        returns the view, the backend reads those slots and no others, until release.
-
-        Its outcome is this rank's own. It fails at the call on no cache, a suspended cache, a
-        request with multimodal data without digests or with encoder input, which its names do not
-        cover, a manager shut down or one that reset its reuse state, or a copy that could not be
-        queued; a read that waited for slots fails if its cache was freed, suspended or changed
-        meanwhile. The caller combines every rank's outcome.
+        Its outcome is this rank's own; the caller combines every rank's outcome. It fails at the
+        call on no or a suspended cache, multimodal data without digests or with encoder input
+        (which names do not cover), a manager shut down or one that reset its reuse state, or a copy
+        that could not be queued. A read that waited for slots also fails if its cache was freed,
+        suspended or changed meanwhile.
 
         Args:
             request: The request whose blocks are read.
@@ -608,129 +563,128 @@ class StagingLender(Protocol):
             The lease, possibly failed already.
 
         Raises:
-            ValueError: Bounds that are negative, reversed or not whole blocks, an end past the
-                committed tokens, or a range needing more slots than a part has.
+            ValueError: Bounds negative, reversed or not whole blocks, an end past the committed
+                tokens, or a range needing more slots than a part has.
         """
         ...
 
     def lend_write(self, request: LlmRequest, start: int, end: int) -> Lease:
-        """Fetches into blocks ``[start, end)``: the cache grown to ``end``, and empty slots.
+        """Fetches into blocks ``[start, end)``: grows the cache to ``end`` and lends empty slots.
 
-        The lease takes slots as ``lend_read`` does; the backend fills them, and the holder marks
-        the rows that arrived whole and releases. A sliding-window layer group lends only the blocks
-        a history of ``end`` reads. Fetches into one cache add up until the request commits past
-        them: consecutive leases count as one fetch of their whole range, and an abandoned lease
-        drops only its own rows, unless its failed copy covered the block the committed tokens end
-        inside, which empties the interval (``readiness``). Whether a fetch settled is this rank's
-        own, so a caller splitting a fetch lends the next segment only once ``readiness`` is not
-        None on every rank, after combining their outcomes. With a sliding window each lease moves
-        the history to its end at the call: where no window has released blocks at that end, the
-        block reuse policy is all-reusable and the manager is no joint-reuse draft pool, the request
-        may still resume below it, up to where the rows delivered reach, and otherwise
-        ``restart_floor`` rises to that end, where the request resumes if the rows delivered reach
-        it; else, as after a later lease that is abandoned or misses rows, the interval is empty and
-        the request computes from 0. Without a sliding window the history stays where it was:
-        ``restart_floor`` is that history under a block reuse policy other than all-reusable and in
-        a joint-reuse draft pool, and otherwise the lower of that history and the lowest start of a
-        fetch into the cache that was not abandoned. The committed tokens still count, and so do the
-        other tokens the request had computed below ``start``; past ``start`` the fetch may
-        overwrite them. Where a copy ``mark_arrived`` queued fails over the block the committed
-        tokens end inside, the interval is empty from then on (``readiness``). The lender takes the
-        tokens below the cache's history as computed: the caller fetches only into a request whose
-        pages hold what its history covers, not one whose history runs ahead of its data, such as a
-        disaggregated generation request before its transfer lands. A block a window leaves behind
-        at ``end`` is neither fetched nor computed, and under the all-reusable policy it keeps any
-        page it had until the commit stores that page whole; so where such a block has a page
-        holding tokens past the cache's history, which the request never wrote, the lease fails at
-        the call. That covers the block the committed tokens end inside, whose page past them holds
-        what the local match copied from another request's page, pages grown before the fetch and,
-        with speculative decoding's extra KV tokens, the block holding them, which an earlier
-        consecutive lease's grow gave a page past the history it left: a later lease spanning at
-        least ``W + tokens_per_block - 1`` tokens leaves it behind where the manager keeps a window
-        of ``W`` tokens. With partial reuse on, local matches often end inside a block, and such a
-        request then computes from its local match. With a sliding window, once ``readiness`` after
-        a lease ends short of that lease's end, the caller drops the cache or computes from
-        ``usable_until`` through that lease's end before it lends into the cache again: a later
-        lease would move the history past the rows the earlier one missed, which nothing computes
-        and, under the all-reusable policy, the commit stores. Where the interval is empty or the
-        caller drops the cache, it drops the request's cache in every manager it fetched into, a
-        target and its joint-reuse draft pool alike. Pages a fetch grew are freed with the request.
-
-        Fails as ``lend_read``, also at the call on no free pages, while an earlier fetch into the
-        request has not settled on this rank, on a target cache with SWA scratch reuse on
-        (``enable_swa_scratch_reuse``), which must be off since each capacity change then keeps the
-        history within the scratch rewind of the old capacity, which a fetch's grow breaks, and a
-        window's next chunk overwrites scratch slots, where the request's history already stands
-        past the positions ``readiness`` would count, as after the request computed past ``end``
-        under a block reuse policy other than all-reusable, and under the all-reusable policy where
-        a window leaves behind at ``end`` a block whose page holds tokens past the cache's history.
-        It also fails at the call where the request's multimodal data sets
-        ``mm_bidirectional_blocks`` and ``end`` falls strictly inside a run of multimodal tokens,
-        whatever the run's length: the scheduler keeps such a run within one context chunk, and a
-        chunk resumed inside it sees the run's earlier tokens only within the model's sliding
-        window, which the lender cannot see. The caller ends such a fetch at a whole block at or
-        below the run's start or at or past its end, as the scheduler ends a chunk, and
-        ``readiness`` keeps resumes out of the runs, raising ``restart_floor`` and lowering
-        ``usable_until`` where a run requires it. It also fails at the call on a request that
-        returns context logits, as one asking for prompt logprobs does, or asks for additional model
-        outputs, which a model may give per context token, whether or not it holds any yet: the
-        executor gives these only for the positions the request computes, prompt logprobs pair the
-        context logits' rows with the prompt's tokens from the second on, wherever the rows start,
-        and neither a rewind nor a recompute pause clears the rows held. So after a fetch, per-token
-        outputs would miss the fetched positions and prompt logprobs would pair rows with the wrong
-        tokens; after a context step a fetch could also leave a gap or repeated rows, and context
-        logits could overflow their storage, sized to the prompt, which fails every active request.
-        A block left without a page fails it at its first poll, as does an error in the grant of its
-        slots within the call. A write that fails after the call leaves the cache grown, and
-        ``readiness`` accounts for it.
+        Slots are granted as for ``lend_read``; the backend fills them, the holder marks the rows
+        that arrived whole and releases. A sliding-window layer group lends only the blocks a
+        history of ``end`` reads. Grown pages stay until the request is freed.
 
         Args:
             request: The request fetched into.
-            start: The first token, a multiple of ``tokens_per_block`` and at least the committed
-                tokens rounded down to whole blocks.
-            end: The end token, a multiple of ``tokens_per_block``, at most the whole blocks
-                before the request's last prompt token, which the request computes itself for its
-                logits, and not below the history a windowed cache keeps.
+            start: A multiple of ``tokens_per_block``, at least the committed tokens rounded down.
+            end: A multiple of ``tokens_per_block``, at most the whole blocks before the request's
+                last prompt token (which it computes for its logits), not below a windowed cache's
+                history.
 
         Returns:
-            The lease, possibly failed already.
+            The lease, possibly failed already. One failing after the call leaves the cache grown;
+            ``readiness`` accounts for it.
 
         Raises:
-            ValueError: Bounds that are negative, reversed or not whole blocks, a start inside the
-                committed whole blocks, an end past the whole blocks before the request's last
-                prompt token or below the history a windowed cache keeps, or a range needing more
-                slots than a part has; raised before the cache changes.
+            ValueError: Before the cache changes: bounds negative, reversed, not whole blocks or
+                outside the limits above, or a range needing more slots than a part has.
+
+        Caller must:
+            - Split a fetch only this way: lend the next segment only once ``readiness`` is not None
+              on every rank (settling is this rank's own).
+            - With a sliding window, also wait until ``usable_until`` reaches the previous lease's
+              end. If it falls short, first drop the request's cache in every manager it fetched
+              into, or compute from ``usable_until`` through that end. Not checked yet: a later
+              lease would move the history past rows nothing computed, which under the all-reusable
+              policy the commit stores.
+            - Fetch only into a request whose pages hold what its history covers, since the lender
+              takes the tokens below the cache's history as computed: not one whose history runs
+              ahead of its data, such as a disaggregated generation request before its transfer
+              lands.
+            - With ``mm_bidirectional_blocks``, end a fetch on a whole block outside every
+              multimodal run, as the scheduler ends a chunk.
+
+        Readiness accounting:
+            - Consecutive leases count as one fetch until the request commits past them; an
+              abandoned lease drops only its own rows. If all were abandoned, the request may resume
+              only at its history, and only if what was kept reaches it.
+            - The committed tokens still count, and so do the other tokens the request had computed
+              below ``start``; past ``start`` the fetch may overwrite them. Delivered rows add to
+              what is kept.
+            - With a sliding window, each lease moves the history to its end at the call. The
+              request may still resume below it, up to the delivered rows, if three things hold: no
+              window has released blocks at that end, the policy is all-reusable, and the manager is
+              no joint-reuse draft pool. Otherwise ``restart_floor`` rises to that end, usable if
+              the delivered rows reach it; else, as after a later lease that is abandoned or misses
+              rows, the interval is empty and the request computes from 0.
+            - Without a sliding window the history stays where it was. ``restart_floor`` is that
+              history under a policy other than all-reusable or in a joint-reuse draft pool.
+              Otherwise it is the lower of that history and the lowest start of a fetch whose marked
+              rows were copied without error; with no such fetch it is that history.
+            - A failed copy over the block the committed tokens end inside empties the interval for
+              good (``readiness``).
+
+        Fails as ``lend_read``, and also at the call:
+            - on no free pages, or while an earlier fetch into the request has not settled on this
+              rank;
+            - with SWA scratch reuse on (``enable_swa_scratch_reuse``) in a target cache: a grow
+              breaks the old capacity's scratch rewind, and a window's next chunk overwrites scratch
+              slots;
+            - where the history already stands past the positions ``readiness`` would count, as
+              after computing past ``end`` under another policy;
+            - under the all-reusable policy, where a window leaves behind at ``end`` a block whose
+              page holds tokens past the cache's history (see Unwritten pages below);
+            - where the request's multimodal data sets ``mm_bidirectional_blocks`` and ``end`` falls
+              strictly inside a run of multimodal tokens, whatever the run's length: a chunk resumed
+              there sees the run only within the model's sliding window, which the lender cannot
+              see;
+            - on a request that returns context logits (prompt logprobs do) or additional model
+              outputs, whether or not it holds any yet. The executor gives these only for the
+              positions the request computes, and neither a rewind nor a recompute pause clears the
+              rows held, so they would miss the fetched positions. Prompt logprobs pair the rows
+              with the prompt's tokens from the second on, wherever the rows start, so they would
+              pair rows with the wrong tokens. After a context step a fetch could also leave gaps
+              or repeated rows and overflow the prompt-sized context logits, failing every active
+              request.
+
+            It fails at its first poll on a block left without a page, or on an error granting its
+            slots within the call.
+
+        Unwritten pages:
+            Under the all-reusable policy a block a window leaves behind at ``end`` is neither
+            fetched nor computed, yet keeps any page it had until the commit stores it whole; the
+            manager cannot drop one block's page in one layer group. Pages holding tokens the
+            request never wrote:
+
+            - the block the committed tokens end inside, holding past them what the local match
+              copied from another request's page (common with partial reuse: on a sliding-window
+              model such a request computes from its local match);
+            - pages grown before the fetch;
+            - with speculative decoding's extra KV tokens (``num_extra_kv_tokens``, the draft length
+              less one under one-model speculative decoding), their block, which each lease's grow
+              pages past the history it leaves. Under a ``W``-token window, a later consecutive
+              lease spanning at least ``W + tokens_per_block - 1`` tokens leaves it behind and
+              fails: keep later leases shorter, or compute the rest.
         """
         ...
 
     def readiness(self, request: LlmRequest) -> Optional[Readiness]:
-        """Where the request may resume once a fetch into it settled.
+        """Where the request may resume once every fetch into it has settled.
 
-        No fetched token counts as computed until this returns a ``Readiness``. That happens when
-        the copy ``mark_arrived`` queued is done or the fetch is abandoned. A fetch keeps the
-        committed tokens and the other tokens the request had computed below its start: from its
-        start on it may overwrite them. The rows it delivers add to what it keeps. If every fetch
-        into the cache was abandoned, the request may resume only at its history, and only if what
-        was kept reaches it; a fetch into a cache with a sliding window moves the history to the
-        fetch's end. A copy ``mark_arrived`` queued that fails counts none of the rows it was to
-        copy, and where it covered the block the committed tokens end inside, the interval is empty
-        from then on: that block may hold the fetch's bytes in some pools and the bytes it held
-        before in others. Under a block reuse policy other than all-reusable the request never
-        resumes below its history, which the manager's context update cannot move back. Neither does
-        a request in a joint-reuse draft pool, whose context resize sets the capacity from the chunk
-        it runs and raises where that capacity is below the request's history. Like ``lend_write``,
-        it takes the tokens below the cache's history as computed, apart from those a fetch into a
-        cache with a sliding window moved the history over: the caller asks only while the request's
-        pages hold the rest, so not while its history runs ahead of its data. The caller combines
-        every rank's interval as ``Readiness`` states. A shrink of the cache in place, such as the
-        manager's context rollback of the growth a fetch made, voids every delivered row past the
-        new capacity for good: growing again brings pages, not their contents. Fetched rows end
-        before the request's last prompt token, so the usable end reaches the prompt length only
-        where the request computed its whole prompt itself. Copies queue on the manager's stream,
-        serial with the forward on the GPU; with page-locked staging and the fresh-page fill off, no
-        lender call waits for them on the CPU. ``Readiness`` states how a request with a joint-reuse
-        draft pool combines both pools' intervals, and that an empty one drops the request's cache
-        in every manager it fetched into.
+        No fetched token counts as computed until this returns a ``Readiness``: when the copy
+        ``mark_arrived`` queued is done or the fetch is abandoned. How each fetch counts: see
+        ``lend_write``. The interval's bounds, such as the floor at the history, and how to combine
+        ranks and pools: see ``Readiness``.
+
+        A failed copy from ``mark_arrived`` counts none of its rows; where it covered the block the
+        committed tokens end inside, the interval is empty from then on, as that block may mix
+        fetched and older bytes across pools. Like ``lend_write``, it takes the tokens below the
+        cache's history as computed, apart from those a windowed fetch moved the history over; the
+        caller asks only while the request's pages hold the rest, so not while its history runs
+        ahead of its data. A shrink in place, such as a context rollback of a fetch's growth, voids
+        delivered rows past the new capacity for good: regrowth brings pages, not contents. Copies
+        run serial with the forward on the GPU (``StagingLender``).
 
         Args:
             request: The request a fetch went into.
@@ -748,84 +702,70 @@ class StagingLender(Protocol):
 class InPlaceLender(Protocol):
     """Lends a request's own device pages in place.
 
-    The caller addresses the lent blocks with its own page-table code: rows carry only layer groups
-    and ordinals, no names, addresses or part. Lender and lease methods run only on the manager's
-    thread; a backend's own threads access the lent memory, call no lease or lender method, and tell
-    the holder through their own channel. The lender never grows the cache, and a sliding-window
-    layer group lends only its sinks and the blocks a history of ``end`` reads. Pages lent in place
-    stay until the last release, also after the request is freed. The caller copies the lent blocks'
-    page indices while the request still has its cache: once the manager frees the request's
-    page-index slot, at the free or, for a context-only request, once its forward is done, an array
-    viewing that slot can show another request's pages. Neither lender protocol derives from the
-    other, but ``isinstance`` checks only that their members exist: a staging lender passes
-    ``isinstance(lender, InPlaceLender)`` too, so the attach that made a lender tells its mode.
+    The caller addresses lent blocks with its own page-table code (rows carry only layer groups and
+    ordinals); ``lend_read`` states which blocks a lease covers. The lender never grows the cache.
+    Its methods run only on the manager's thread (see the package docstring); backend threads access
+    the lent memory. Lent pages stay until the last release, even after the request's free. Copy the
+    lent blocks' page indices while the request still has its cache: once its page-index slot is
+    freed (at the free, or after a context-only request's forward), an array viewing that slot can
+    show another request's pages. Neither lender protocol derives from the other, but ``isinstance``
+    checks only members: a staging lender passes ``isinstance(lender, InPlaceLender)`` too, so the
+    attach that made a lender tells its mode.
 
     In-place lending is a transitional capability with explicit preconditions, not a general
     address-stable loan: a lent page keeps its address only while the caller keeps them.
 
-    First-version limits: the lender guards lent pages only against the request's free and the
-    manager's shutdown. While any loan is open, also after the request is freed, the caller keeps
-    these preconditions, none of them checked:
+    Caller must, while any loan is open, also after the request is freed:
+        - Keep the request unscheduled, unsuspended, unshrunk and its window still: its sliding
+          windows do not advance.
+        - Commit none of the request's blocks (``try_commit_blocks``): commit before the first loan
+          or after the last release. A commit can rebase the request onto blocks another request
+          committed and return the request's own pages, lent ones included, to the pool.
+        - Neither rebalance the pools nor reset the prefix cache:
+          ``kv_cache_config.enable_kv_pool_rebalance`` stays off, since the executor's pool
+          rebalance moves lent pages and, while a cache stays on loan after its request's free,
+          raises out of the executor loop.
+        - Synchronize as ``lend_read`` and ``lend_write`` say, for instance after
+          ``prepare_resources`` queued the work: the lender waits on no stream. A KV cache
+          connector's asynchronous loads and saves run off the manager's stream; wait for those
+          touching lent pages too.
+        - Own completion and the validity of what the backend reads and writes.
+        - With several tensor- or pipeline-parallel ranks, release the last loan on a freed
+          request's cache in the same executor iteration on every rank (say after combining
+          completions): ranks schedule on their own, so a cache still open on one rank leaves its
+          pools fewer free pages.
+        - Where generation requests run on the manager, keep room for them in each pool group
+          (package docstring). A cache on loan keeps every page it locks, not only the lent blocks',
+          until its last release, even after its request's free, and the V2 scheduler cannot reclaim
+          those pages. Without that room a generation request that cannot resume or grow can
+          deadlock: a share of each pool group for the loans alone does not prevent it, with or
+          without a cache tier below the GPU.
+        - Where requests wait to be admitted on the manager, keep enough free pages to admit them
+          beside the pages on loan, or keep each request whose cache is on loan among the
+          executor's requests, in a disaggregated transfer state, until its last release. A cache
+          on loan after its request's free belongs to no request the scheduler sees, so with
+          nothing else running its deadlock check raises.
 
-    - The request stays unscheduled, unsuspended, unshrunk and its window still: it is not
-      scheduled or suspended, its cache does not shrink and its sliding windows do not advance.
-    - No commit of the request's blocks (``try_commit_blocks``): the caller commits before the
-      first loan or after the last release. A commit can rebase the request onto blocks another
-      request committed and return the request's own pages, lent ones included, to the pool.
-    - The caller does not rebalance the pools and does not reset the prefix cache:
-      ``kv_cache_config.enable_kv_pool_rebalance`` stays off, since the executor's pool rebalance
-      moves lent pages and, while a cache stays on loan after its request's free, raises out of the
-      executor loop.
-    - Before a read, the work the manager's stream queued that still writes those pages has
-      completed, and before a write, all work it queued for those pages. The lender waits on no
-      stream, so the caller synchronizes, for instance after ``prepare_resources`` queued that work.
-      A KV cache connector's asynchronous loads and saves run off the manager's stream, so with one
-      the caller also waits for those that touch the lent pages.
-    - The caller owns completion and the validity of what it reads and writes.
-    - With several tensor- or pipeline-parallel ranks, the caller releases the last loan on a freed
-      request's cache in the same executor iteration on every rank, for instance after combining
-      every rank's completion: each rank schedules on its own, and a cache still open on one rank
-      leaves its pools with fewer free pages.
-    - Where generation requests run on the manager, the caller keeps room for them in each pool
-      group: the pages caches on loan lock, the other pages the V2 scheduler cannot reclaim, and,
-      for the generation request that needs the most, the pages of its cache within its windows,
-      which a resume locks all at once, and the pages its next step adds stay within
-      ``max_util_for_resume`` of the group's GPU pages. A cache on loan keeps every page it locks,
-      not only the lent blocks', until its last release, also after the request's free, and the V2
-      scheduler cannot reclaim those pages. Its deadlock check counts no pass while any request is
-      in a disaggregated transfer state or a KV cache connector's load is pending, and otherwise
-      raises "V2 scheduler deadlock" out of the executor loop after 1000 passes in a row that
-      schedule and reclaim nothing while a context or generation request waits. So without that
-      room a generation request that cannot resume or grow can end in that deadlock: a share of
-      each pool group for the loans alone does not prevent it, with or without a cache tier below
-      the GPU. The manager's ``get_page_indices_by_layer_group`` lists a request's pages per layer
-      group, one beam's (under beam search each further beam also locks a page of its own for
-      every block not wholly inside the prompt), while the request still has its cache, and the
-      runtime's ``impl.pool_group_descs`` give each pool group's number of GPU pages and its layer
-      groups.
-    - Where requests wait to be admitted on the manager, the caller keeps room to admit them
-      beside the pages caches on loan lock, or keeps each request whose cache is on loan among
-      the executor's requests in a disaggregated transfer state until its last release: a cache
-      on loan after its request's free belongs to no request the V2 scheduler sees, so where no
-      other request runs, its deadlock check raises out of the executor loop after those 1000
-      passes.
+    First-version limits:
+        - The lender guards lent pages only against the request's free and the manager's shutdown;
+          nothing checks the preconditions above.
     """
 
     def lend_read(self, request: LlmRequest, start: int, end: int) -> Lease:
         """Lends for reading the pages of the blocks ``[start, end)`` touches, ready at once.
 
         Any token range, a partial last block included. A sliding-window layer group lends only its
-        sinks and the blocks a history of ``end`` reads. Of those, only pages the request's active
-        cache locks are lent: blocks without one, such as window blocks behind the cache's history,
-        which keep at most a held page, are left out. Its outcome is this rank's own: it fails at
-        the call on no cache, a suspended cache or a manager shut down, and the caller combines
-        every rank's outcome. Before the backend reads, the caller ensures work the manager's stream
-        queued that still writes those pages completed, and keeps the preconditions
-        ``InPlaceLender`` lists. Among them, no commit of the request's blocks while any loan on it
-        is open: commit before lending or after the last release, since a commit can rebase the
-        request onto another request's committed blocks and return the lent pages to the pool. With
-        several ranks, the caller releases the last loan on a freed request's cache in the same
-        executor iteration on every rank.
+        sinks and the blocks a history of ``end`` reads. In every layer group, only pages the
+        request's active cache locks are lent, and every block without one is left out. Window
+        blocks behind the history, which keep at most a held page, are one such case. Its outcome
+        is this rank's own; the caller combines every rank's outcome. It fails at the call on no
+        cache, a suspended cache or a manager shut down.
+
+        Caller must:
+            - Before the backend reads, ensure the work the manager's stream queued that still
+              writes those pages completed.
+            - Keep every precondition ``InPlaceLender`` lists while any loan is open; in particular,
+              commit before lending or after the last release.
 
         Args:
             request: The request whose pages are lent.
@@ -843,16 +783,14 @@ class InPlaceLender(Protocol):
     def lend_write(self, request: LlmRequest, start: int, end: int) -> Lease:
         """As ``lend_read``, for writing.
 
-        A sliding-window layer group lends only its sinks and the blocks a history of ``end`` reads,
-        so the lease covers no block behind that window. A block the lease would lend that has no
-        page its cache locks fails the lease at the call. Before the backend writes, all work the
-        manager's stream queued for those pages has completed. While either kind is lent the caller
-        keeps the request unscheduled, unsuspended, unshrunk and its window still, commits none of
-        its blocks (commit before lending or after the last release: a commit can rebase the request
-        onto another request's committed blocks and return the lent pages to the pool), does not
-        rebalance the pools or reset the prefix cache (``kv_cache_config.enable_kv_pool_rebalance``
-        stays off), owns validity and, with several ranks, releases the last loan on a freed
-        request's cache in the same executor iteration on every rank.
+        The lease covers no block behind the window; a block it would lend that has no page its
+        cache locks fails it at the call.
+
+        Caller must:
+            - Before the backend writes, ensure all work the manager's stream queued for those pages
+              has completed.
+            - Keep every precondition ``InPlaceLender`` lists while any loan is open; in particular,
+              commit before lending or after the last release.
 
         Args:
             request: The request whose pages are lent.

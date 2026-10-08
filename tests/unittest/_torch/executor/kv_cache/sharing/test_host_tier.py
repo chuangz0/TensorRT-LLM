@@ -158,14 +158,14 @@ def test_a_fetch_stays_usable_across_its_request_s_trip_to_host(
 def test_the_check_catches_a_lender_tying_a_fetch_to_where_its_pages_were(kit, host_tier_manager):
     def deliver(self, request_id, fetch, rows, copied):  # also remembers the slots the rows had
         real("_deliver")(self, request_id, fetch, rows, copied)
-        self.lent_rows = rows
+        self.lent_rows, self.lent_kv = rows, self._records[request_id].kv
 
     def where_they_were(self, manager, delivered, committed):
         from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _manager
 
         rows = self.lent_rows
-        for lg, ordinals, slots in zip(rows.layer_groups, rows.ordinals, rows.device_slots):
-            moved = ordinals[_manager.pages(delivered.kv, lg)[ordinals] != slots]
+        for lg, ordinals, slots in zip(rows.layer_groups, rows.ordinals, rows.device_pages):
+            moved = ordinals[_manager.pages(self.lent_kv, lg)[ordinals] != slots]
             delivered.blocks[lg][moved[moved < len(delivered.blocks[lg])]] = False
         return real("_usable_until")(self, manager, delivered, committed)
 
@@ -282,7 +282,7 @@ def test_the_check_catches_a_lender_settling_a_fetch_before_its_copy_ran(kit, ho
             kit,
             host_tier_manager,
             "copy_queued",
-            attach_breaking({"_report_settled": at_the_marks}),
+            attach_breaking({"_fetch_settled": at_the_marks}),
         )
 
 
@@ -295,7 +295,10 @@ def test_the_check_catches_a_lender_trusting_the_cache_but_not_its_pages(kit, ho
 
     with pytest.raises(CAUGHT, match="the marks' copy reached another request's page"):
         test_other_requests_pushing_blocks_to_host_leave_a_fetch_where_its_readiness_says(
-            kit, host_tier_manager, "before_marks", attach_breaking({"_still_lent": same_cache})
+            kit,
+            host_tier_manager,
+            "before_marks",
+            attach_breaking({"_rows_on_lent_pages": same_cache}),
         )
 
 
@@ -456,7 +459,7 @@ def test_the_check_catches_a_lender_naming_a_block_by_its_slot(kit, host_tier_ma
     def by_slot(self, rows, keys):
         slot_keys = [
             np.repeat(slots.astype("<i8").view(np.uint8).reshape(-1, 8), 4, axis=1)
-            for slots in rows.device_slots
+            for slots in rows.device_pages
         ]
         return real("_view")(self, rows, slot_keys)
 
@@ -678,7 +681,10 @@ def test_the_check_catches_a_lender_copying_into_pages_a_rebalance_moved(
 
     with pytest.raises(CAUGHT, match="the marks' copy wrote outside the pages the target locks"):
         test_a_rebalance_under_a_fetch_moves_no_copy_off_the_pages_still_lent(
-            kit, host_tier_manager, monkeypatch, attach_breaking({"_still_lent": same_cache})
+            kit,
+            host_tier_manager,
+            monkeypatch,
+            attach_breaking({"_rows_on_lent_pages": same_cache}),
         )
 
 
@@ -1072,7 +1078,7 @@ def test_the_check_catches_a_lender_reading_where_rebalanced_pages_were(
 def test_the_check_catches_a_lender_writing_where_rebalanced_pages_were(
     kit, host_tier_manager, monkeypatch, mechanism
 ):
-    liar = attach_breaking({"_still_lent": every_row_of_a_live_cache})
+    liar = attach_breaking({"_rows_on_lent_pages": every_row_of_a_live_cache})
     with pytest.raises(CAUGHT, match=f"{STRAY}|never landed"):
         rebalance_with_leases_in_flight(
             kit, host_tier_manager, monkeypatch, mechanism, attach=liar, block=True
@@ -1210,7 +1216,7 @@ def test_the_check_catches_a_lender_matching_pages_by_slot_number_alone(kit, hos
         rows = lease._rows
         alive = kv is not None and kv is lease._kv and _manager.cache_state(kv).active
         masks = []
-        for lg, ordinals, slots in zip(rows.layer_groups, rows.ordinals, rows.device_slots):
+        for lg, ordinals, slots in zip(rows.layer_groups, rows.ordinals, rows.device_pages):
             same = np.zeros(len(ordinals), dtype=bool)
             if alive:
                 pages = _manager.pages(kv, lg)
@@ -1221,5 +1227,5 @@ def test_the_check_catches_a_lender_matching_pages_by_slot_number_alone(kit, hos
 
     with pytest.raises(CAUGHT, match="the marks' copy wrote slots other requests lock"):
         test_a_late_mark_writes_no_slot_its_window_left(
-            kit, host_tier_manager, attach_breaking({"_still_lent": same_number})
+            kit, host_tier_manager, attach_breaking({"_rows_on_lent_pages": same_number})
         )

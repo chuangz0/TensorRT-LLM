@@ -28,6 +28,7 @@ from typing import (
     List,
     NamedTuple,
     Optional,
+    Protocol,
     Sequence,
     Tuple,
     Union,
@@ -1184,6 +1185,29 @@ def _settle_context_cursor(req: LlmRequest, reuse: int, tokens_per_block: int) -
     req.context_chunk_size = req.context_remaining_length
 
 
+class _LenderHooks(Protocol):
+    """What the manager calls on the lender ``sharing.attach_*`` installs as ``_sharing``."""
+
+    def _on_free(
+        self, request_id: int, kv_cache: _KVCache, after_close: Callable[[], None]
+    ) -> bool:
+        """After the request's cache left the map: ``True`` if the lender closes it later, running
+        ``after_close`` then."""
+
+    def _on_shrink(self, request_id: int, kv_cache: _KVCache) -> None:
+        """Right after the request's cache may have shrunk in place."""
+
+    def _on_reset(self) -> None:
+        """After a reuse reset."""
+
+    def _on_shutdown(self, impl: KVCacheManagerPy) -> frozenset[object]:
+        """First in the shutdown: the caches to leave open, with ``impl``, until the process
+        exits."""
+
+    def _on_caches_closed(self) -> None:
+        """Once the shutdown has closed every cache."""
+
+
 class KVCacheManagerV2(BaseResourceManager):
     # Filled lazily by _cold_pool_group_membership(); the grouping is fixed after construction.
     # Declared on the class so it is present even when an instance is built without running __init__.
@@ -1193,7 +1217,7 @@ class KVCacheManagerV2(BaseResourceManager):
     _supports_reuse_match_backoff = True
     # The lender sharing.attach_* installs, one per manager for its life; None without one.
     # On the class so it exists without running __init__.
-    _sharing = None
+    _sharing: Optional[_LenderHooks] = None
 
     def __init__(
         self,

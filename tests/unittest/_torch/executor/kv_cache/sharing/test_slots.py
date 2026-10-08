@@ -434,7 +434,7 @@ def test_usable_until_is_the_largest_start_every_layer_group_reads():
         ends = range(first + 1, last + 1)
         starts = [e for e in ends if reads_all(manager, windows, blocks, first, e, tpb)]
         want = starts[-1] * tpb if starts else known
-        delivered = _lender._Delivered(None, origin, [b.copy() for b in blocks])
+        delivered = _lender._Delivered(origin, [b.copy() for b in blocks])
         got = lender._usable_until(manager, delivered, known)
         assert got == want, (
             f"windows {windows}, sinks {sinks}, tpb {tpb}, origin {origin}, known {known}, "
@@ -456,7 +456,7 @@ def test_usable_until_after_a_whole_fetch_checks_its_end_alone(monkeypatch):
         return real_stale(*args)
 
     monkeypatch.setattr(_lender, "_stale", counted)
-    got = lender._usable_until(manager, _lender._Delivered(None, 0, blocks), 0)
+    got = lender._usable_until(manager, _lender._Delivered(0, blocks), 0)
     assert got == 4096 * 32, f"usable until {got}"
     assert len(calls) == 2, f"{len(calls)} stale-range lookups for one usable end"
 
@@ -477,7 +477,7 @@ def test_usable_until_checks_no_start_past_a_missing_full_attention_block(monkey
         blocks = np.ones(8192, dtype=bool)
         blocks[hole] = False
         calls.clear()
-        got = lender._usable_until(manager, _lender._Delivered(None, 0, [blocks]), 0)
+        got = lender._usable_until(manager, _lender._Delivered(0, [blocks]), 0)
         assert got == usable, f"usable until {got} with block {hole} missing"
         assert len(calls) == checked, f"{len(calls)} starts checked with block {hole} missing"
 
@@ -515,7 +515,7 @@ def test_readiness_and_fetch_ends_keep_out_of_bidirectional_runs():
             pos = stop + rng.randint(1, 40)
         request = multimodal(runs, length)
         usable = rng.randint(0, length)
-        got, floor = lender._outside_runs(request, usable)
+        got, floor = lender._outside_bidirectional_spans(request, usable)
         want = max(p for p in range(usable + 1) if not strictly_inside(runs, p))
         case = f"runs {runs}, usable {usable}"
         assert got == want, f"{case}: the end lowered to {got}, not {want}"
@@ -527,7 +527,7 @@ def test_readiness_and_fetch_ends_keep_out_of_bidirectional_runs():
         )
         end = rng.randint(0, length)
         for each in (lender, windowed):
-            refused = each._splits_bidirectional_run(request, end) is not None
+            refused = each._splits_bidirectional_span(request, end) is not None
             assert refused == strictly_inside(runs, end), (
                 f"{case}: an end at {end} refused: {refused}"
             )
@@ -541,8 +541,8 @@ def test_a_request_without_bidirectional_runs_keeps_its_interval_and_ends():
         SimpleNamespace(py_multimodal_data=None),
         SimpleNamespace(py_multimodal_data={"mm_bidirectional_blocks": True}),
     ):
-        assert lender._outside_runs(request, 200) == (200, 0)
-        assert lender._splits_bidirectional_run(request, 200) is None
+        assert lender._outside_bidirectional_spans(request, 200) == (200, 0)
+        assert lender._splits_bidirectional_span(request, 200) is None
 
 
 # -- the bytes the test kit stages ------------------------------------------------------------

@@ -925,7 +925,7 @@ def test_a_publish_is_ready_only_once_its_copy_ran(kit, real_manager, attach=att
 
 
 def test_the_check_catches_a_lender_ready_before_its_copy(kit, real_manager):
-    liar = attach_breaking({"_copy_landed": lambda self, lease: True})
+    liar = attach_breaking({"_read_copy_done": lambda self, lease: True})
     with pytest.raises(CAUGHT, match="ready before its copy into staging ran"):
         test_a_publish_is_ready_only_once_its_copy_ran(kit, real_manager, liar)
 
@@ -954,11 +954,11 @@ def test_a_slot_returns_only_after_the_copy_into_it_ran(kit, real_manager, attac
 def test_the_check_catches_a_lender_recycling_before_the_copy_lands(kit, real_manager):
     def recycle_early(self, lease):
         with kit.events_report_done():
-            return real("_recyclable")(self, lease)
+            return real("_slots_returnable")(self, lease)
 
     with pytest.raises(CAUGHT, match="slots handed out while a copy into them was queued"):
         test_a_slot_returns_only_after_the_copy_into_it_ran(
-            kit, real_manager, attach_breaking({"_recyclable": recycle_early})
+            kit, real_manager, attach_breaking({"_slots_returnable": recycle_early})
         )
 
 
@@ -1072,11 +1072,11 @@ def test_a_fetch_is_usable_once_its_copy_lands(kit, real_manager, local_blocks, 
 def test_the_check_catches_readiness_before_the_copy(kit, real_manager):
     def settled_early(self, fetch):
         with kit.events_report_done():
-            return real("_report_settled")(self, fetch)
+            return real("_fetch_settled")(self, fetch)
 
     with pytest.raises(CAUGHT, match="settled before the copy into pages ran"):
         test_a_fetch_is_usable_once_its_copy_lands(
-            kit, real_manager, 0, attach_breaking({"_report_settled": settled_early})
+            kit, real_manager, 0, attach_breaking({"_fetch_settled": settled_early})
         )
 
 
@@ -1245,12 +1245,12 @@ def test_arrivals_for_a_freed_request_copy_nothing(kit, real_manager, attach=att
 
 def test_the_check_catches_a_lender_copying_into_pages_no_longer_lent(kit, real_manager):
     def always_lent(self, kv, lease):
-        return [np.ones_like(m, dtype=bool) for m in real("_still_lent")(self, kv, lease)]
+        return [np.ones_like(m, dtype=bool) for m in real("_rows_on_lent_pages")(self, kv, lease)]
 
     def tail_of_a_live_cache(self, kv, rows, copied):  # the freed request has no cache to read
         return kv is not None and real("_covers_committed_tail")(self, kv, rows, copied)
 
-    rules = {"_still_lent": always_lent, "_covers_committed_tail": tail_of_a_live_cache}
+    rules = {"_rows_on_lent_pages": always_lent, "_covers_committed_tail": tail_of_a_live_cache}
     with pytest.raises(CAUGHT, match="an arrival overwrote another request's page"):
         test_arrivals_for_a_freed_request_copy_nothing(kit, real_manager, attach_breaking(rules))
 
@@ -1303,11 +1303,11 @@ def test_a_commit_during_a_fetch_copies_nothing_into_pages_it_returned(
 
 def test_the_check_catches_a_lender_copying_into_pages_a_commit_returned(kit, real_manager):
     def always_lent(self, kv, lease):
-        return [np.ones_like(m, dtype=bool) for m in real("_still_lent")(self, kv, lease)]
+        return [np.ones_like(m, dtype=bool) for m in real("_rows_on_lent_pages")(self, kv, lease)]
 
     with pytest.raises(CAUGHT, match="an arrival overwrote another request's page"):
         test_a_commit_during_a_fetch_copies_nothing_into_pages_it_returned(
-            kit, real_manager, attach_breaking({"_still_lent": always_lent})
+            kit, real_manager, attach_breaking({"_rows_on_lent_pages": always_lent})
         )
 
 
@@ -1527,7 +1527,7 @@ def test_consecutive_leases_add_up_to_one_fetch(kit, real_manager, case, attach=
 
 def test_the_check_catches_a_lender_keeping_only_the_latest_segment(kit, real_manager):
     def latest_only(self, request_id, fetch, rows, copied):
-        self._delivered.pop(request_id, None)
+        self._records[request_id].delivered = None
         real("_deliver")(self, request_id, fetch, rows, copied)
 
     with pytest.raises(CAUGHT, match="an earlier segment's delivered prefix was dropped"):
@@ -1626,7 +1626,9 @@ def test_an_abandoned_segment_keeps_what_earlier_ones_delivered(kit, real_manage
 def test_the_check_catches_a_lender_dropping_every_delivery_on_abandon(kit, real_manager):
     def abandon_all(self, lease):
         real("_abandon")(self, lease)
-        self._delivered.pop(lease._request_id, None)
+        record = self._records.get(lease._request_id)
+        if record is not None:
+            record.delivered = None
 
     with pytest.raises(CAUGHT, match="the first segment's delivered prefix was dropped"):
         test_an_abandoned_segment_keeps_what_earlier_ones_delivered(
@@ -1683,7 +1685,7 @@ def test_a_lost_later_segment_empties_the_interval_only_where_a_window_released_
 
 
 def floor_at_any_windowed_end(self, manager, history, origin):  # wherever a window is
-    return history if self._any_window else real("_floor")(self, manager, history, origin)
+    return history if self._any_window else real("_restart_floor")(self, manager, history, origin)
 
 
 def floor_ignoring_the_windows(self, manager, history, origin):  # the reuse policy alone
@@ -1705,7 +1707,7 @@ def test_the_check_catches_a_lender_misplacing_the_floor_after_a_lost_segment(
 ):
     with pytest.raises(CAUGHT, match=why):
         test_a_lost_later_segment_empties_the_interval_only_where_a_window_released_blocks(
-            kit, real_manager, case, "abandoned", attach_breaking({"_floor": rule})
+            kit, real_manager, case, "abandoned", attach_breaking({"_restart_floor": rule})
         )
 
 
@@ -2115,7 +2117,7 @@ def test_the_check_catches_a_lender_ignoring_the_manager_s_shrink(kit, real_mana
 
 
 def test_the_check_catches_a_lender_never_voiding_delivered_rows(kit, real_manager):
-    liar = attach_breaking({"_void_past": lambda self, delivered, kv: None})
+    liar = attach_breaking({"_forget_rows_past_capacity": lambda self, delivered, kv: None})
     with pytest.raises(CAUGHT, match="counts freed blocks"):
         test_a_rollback_voids_what_the_fetch_delivered(
             kit, real_manager, ask_between=True, attach=liar
@@ -2162,7 +2164,7 @@ def test_the_check_catches_a_lender_counting_rows_past_the_shrunk_cache(kit, rea
     liar = attach_breaking(
         {
             "_on_shrink": lambda self, request_id, kv_cache: None,
-            "_void_past": lambda self, delivered, kv: None,
+            "_forget_rows_past_capacity": lambda self, delivered, kv: None,
         }
     )
     with pytest.raises(CAUGHT, match="counts block 2, which the rollback freed"):
@@ -2260,7 +2262,7 @@ def committed_only(self, request_id, kv, start):  # a fetch keeps the committed 
 
 @pytest.mark.parametrize("outcome", OUTCOMES)
 def test_the_check_catches_a_lender_keeping_only_the_committed_tokens(kit, real_manager, outcome):
-    liar = attach_breaking({"_kept_by": committed_only})
+    liar = attach_breaking({"_computed_below_start": committed_only})
     with pytest.raises(CAUGHT, match="the tokens computed before the fetch were dropped"):
         test_a_fetch_keeps_the_tokens_computed_before_it(
             kit, real_manager, "per_request", outcome, liar
@@ -2293,7 +2295,7 @@ def test_a_windowed_fetch_counts_what_its_window_still_holds(kit, real_manager, 
 
 
 def test_the_check_catches_a_windowed_lender_keeping_only_the_committed_tokens(kit, real_manager):
-    liar = attach_breaking({"_kept_by": committed_only})
+    liar = attach_breaking({"_computed_below_start": committed_only})
     with pytest.raises(CAUGHT, match="the tokens computed before the fetch were dropped"):
         test_a_windowed_fetch_counts_what_its_window_still_holds(kit, real_manager, liar)
 
@@ -2392,7 +2394,7 @@ def trusting_the_history(self, request_id, kv):  # the history counts, whoever m
 
 
 def test_the_check_catches_a_lender_trusting_the_history_its_fetch_moved(kit, real_manager):
-    liar = attach_breaking({"_computed_before": trusting_the_history})
+    liar = attach_breaking({"_computed_tokens": trusting_the_history})
     with pytest.raises(CAUGHT, match="claims a start whose blocks were released or never written"):
         test_an_abandoned_windowed_fetch_claims_nothing(kit, real_manager, liar)
 
@@ -2433,13 +2435,13 @@ def test_a_fetch_from_below_the_history_keeps_only_what_lies_below_it(
 
 
 def past_the_start(self, request_id, kv, start):  # keeps what was computed, past the start too
-    return self._computed_before(request_id, kv)
+    return self._computed_tokens(request_id, kv)
 
 
 def test_the_check_catches_a_lender_keeping_tokens_past_the_fetch_start(
     kit, real_manager, monkeypatch
 ):
-    liar = attach_breaking({"_kept_by": past_the_start})
+    liar = attach_breaking({"_computed_below_start": past_the_start})
     with pytest.raises(CAUGHT, match="counts block 1, which the abandoned fetch overwrote"):
         test_a_fetch_from_below_the_history_keeps_only_what_lies_below_it(
             kit, real_manager, monkeypatch, liar
@@ -2449,7 +2451,7 @@ def test_the_check_catches_a_lender_keeping_tokens_past_the_fetch_start(
 def test_the_check_catches_a_lender_dropping_the_chunk_below_the_fetch_start(
     kit, real_manager, monkeypatch
 ):
-    liar = attach_breaking({"_kept_by": committed_only})
+    liar = attach_breaking({"_computed_below_start": committed_only})
     with pytest.raises(CAUGHT, match="block 0, computed before the fetch, was dropped"):
         test_a_fetch_from_below_the_history_keeps_only_what_lies_below_it(
             kit, real_manager, monkeypatch, liar
@@ -2495,7 +2497,7 @@ def test_a_refetch_whose_copy_fails_partway_counts_none_of_the_rows_it_was_to_ov
 def test_the_check_catches_a_lender_keeping_the_rows_a_failed_copy_overwrote(
     kit, real_manager, monkeypatch
 ):
-    liar = attach_breaking({"_overwrite": lambda self, lease, copied: None})
+    liar = attach_breaking({"_forget_overwritten_rows": lambda self, lease, copied: None})
     with pytest.raises(CAUGHT, match="counts rows the failed copy was to overwrite"):
         test_a_refetch_whose_copy_fails_partway_counts_none_of_the_rows_it_was_to_overwrite(
             kit, real_manager, monkeypatch, liar
@@ -2503,13 +2505,15 @@ def test_the_check_catches_a_lender_keeping_the_rows_a_failed_copy_overwrote(
 
 
 def drops_every_delivery(self, lease, copied):  # forgets the rows the copy leaves alone too
-    self._delivered.pop(lease._request_id, None)
+    record = self._records.get(lease._request_id)
+    if record is not None:
+        record.delivered = None
 
 
 def test_the_check_catches_a_lender_dropping_the_rows_a_failed_copy_left_alone(
     kit, real_manager, monkeypatch
 ):
-    liar = attach_breaking({"_overwrite": drops_every_delivery})
+    liar = attach_breaking({"_forget_overwritten_rows": drops_every_delivery})
     with pytest.raises(CAUGHT, match="which the second fetch left alone, was dropped"):
         test_a_refetch_whose_copy_fails_partway_counts_none_of_the_rows_it_was_to_overwrite(
             kit, real_manager, monkeypatch, liar
@@ -2690,7 +2694,7 @@ def from_the_cache_alone(self, request_id, kv, start):  # ignores what earlier f
 
 
 def test_the_check_catches_a_lender_ignoring_what_an_earlier_fetch_kept(kit, real_manager):
-    liar = attach_breaking({"_kept_by": from_the_cache_alone})
+    liar = attach_breaking({"_computed_below_start": from_the_cache_alone})
     with pytest.raises(CAUGHT, match="counts block 3, which nothing computed or fetched"):
         test_a_second_fetch_keeps_what_the_first_kept(kit, real_manager, liar)
 
@@ -2732,7 +2736,7 @@ def with_the_deliveries(self, request_id, kv, start):  # keeps what readiness co
 
 
 def test_the_check_catches_a_lender_keeping_fetched_rows_with_the_chunk(kit, real_manager):
-    liar = attach_breaking({"_kept_by": with_the_deliveries})
+    liar = attach_breaking({"_computed_below_start": with_the_deliveries})
     with pytest.raises(CAUGHT, match="counts block 1, which the rollback freed"):
         test_a_rollback_keeps_the_computed_chunk_and_voids_the_fetches(kit, real_manager, liar)
 
@@ -2881,7 +2885,7 @@ def floor_of_the_windows_alone(self, manager, history, origin):  # whatever the 
 
 @pytest.mark.parametrize("case", ["windowed_nothing_delivered", "below_the_history_delivered"])
 def test_the_check_catches_a_lender_whose_floor_ignores_the_reuse_policy(kit, real_manager, case):
-    liar = attach_breaking({"_floor": floor_of_the_windows_alone})
+    liar = attach_breaking({"_restart_floor": floor_of_the_windows_alone})
     with pytest.raises(CAUGHT, match="where its next chunk fails"):
         test_readiness_claims_only_starts_the_context_update_takes(
             kit, real_manager, case, "per_request", liar
@@ -2919,16 +2923,17 @@ def kept_until_committed(self, request_id, kv):  # what a fetch kept stands unti
     from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _manager
 
     state = _manager.cache_state(kv)
-    advanced = self._advanced.get(request_id)
-    if advanced is None or advanced[0] is not kv:
+    record = self._record(request_id, kv)
+    mark = record.grow_mark if record is not None else None
+    if mark is None:
         return max(state.committed, state.history)
-    return max(state.committed, advanced[1])
+    return max(state.committed, mark.kept_tokens)
 
 
 def test_the_check_catches_a_lender_dropping_what_the_request_computed_after_resuming(
     kit, real_manager
 ):
-    liar = attach_breaking({"_computed_before": kept_until_committed})
+    liar = attach_breaking({"_computed_tokens": kept_until_committed})
     with pytest.raises(CAUGHT, match="the tokens computed after resuming were dropped"):
         test_a_later_fetch_keeps_what_the_request_computed_after_resuming(kit, real_manager, liar)
 
@@ -2937,14 +2942,15 @@ def trusting_the_history_its_fetch_left(self, request_id, kv):  # from the fetch
     from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _manager
 
     state = _manager.cache_state(kv)
-    advanced = self._advanced.get(request_id)
-    if advanced is None or advanced[0] is not kv or state.history >= advanced[2]:
+    record = self._record(request_id, kv)
+    mark = record.grow_mark if record is not None else None
+    if mark is None or state.history >= mark.history_after:
         return max(state.committed, state.history)
-    return max(state.committed, advanced[1])
+    return max(state.committed, mark.kept_tokens)
 
 
 def test_the_check_catches_a_lender_trusting_the_history_its_fetch_left(kit, real_manager):
-    liar = attach_breaking({"_computed_before": trusting_the_history_its_fetch_left})
+    liar = attach_breaking({"_computed_tokens": trusting_the_history_its_fetch_left})
     with pytest.raises(CAUGHT, match="claims a start whose blocks were released or never written"):
         test_an_abandoned_windowed_fetch_claims_nothing(kit, real_manager, liar)
 
@@ -3160,13 +3166,13 @@ def floor_ignoring_the_draft_resize(self, manager, history, origin):  # as a tar
     from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _manager
 
     with mock.patch.object(_manager, "resize_ends_at_chunk", lambda manager: False):
-        return real("_floor")(self, manager, history, origin)
+        return real("_restart_floor")(self, manager, history, origin)
 
 
 def test_the_check_catches_a_lender_letting_a_draft_pool_resume_below_its_history(
     kit, real_manager
 ):
-    liar = attach_breaking({"_floor": floor_ignoring_the_draft_resize})
+    liar = attach_breaking({"_restart_floor": floor_ignoring_the_draft_resize})
     with pytest.raises(CAUGHT, match="the draft pool's context resize at"):
         test_a_windowed_joint_draft_pool_resumes_only_where_its_context_resize_holds(
             kit, real_manager, "short_in_both", liar
@@ -3479,15 +3485,16 @@ def test_a_write_the_pool_cannot_grow_leaves_a_computed_prefix_as_it_was(
 
 
 def kept_and_recorded_before_the_grow(self, request_id, kv, start):  # whether or not it grows
-    from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _manager
+    from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _lender, _manager
 
-    kept = real("_kept_by")(self, request_id, kv, start)
-    self._advanced[request_id] = (kv, kept, _manager.cache_state(kv).history)
+    kept = real("_computed_below_start")(self, request_id, kv, start)
+    history = _manager.cache_state(kv).history
+    self._record_for(request_id, kv).grow_mark = _lender._GrowMark(kept, history)
     return kept
 
 
 def test_the_check_catches_a_lender_recording_a_fetch_before_its_grow(kit, real_manager):
-    liar = attach_breaking({"_kept_by": kept_and_recorded_before_the_grow})
+    liar = attach_breaking({"_computed_below_start": kept_and_recorded_before_the_grow})
     with pytest.raises(CAUGHT, match="the failed grow changed the cache or its readiness"):
         test_a_write_the_pool_cannot_grow_leaves_a_computed_prefix_as_it_was(
             kit, real_manager, liar
@@ -3568,8 +3575,8 @@ def test_a_write_whose_grant_raises_within_the_call_fails_at_its_first_poll(
 
 def failing_a_fresh_write_at_the_call(self, fresh=None):  # as before: failed when it returns
     real("_grant_waiting")(self, fresh=fresh)
-    if fresh is not None and fresh._kind == "write" and fresh._doomed is not None:
-        self._fail(fresh, fresh._doomed)
+    if fresh is not None and fresh._kind == "write" and fresh._first_poll_failure is not None:
+        self._fail(fresh, fresh._first_poll_failure)
 
 
 def test_the_check_catches_a_lender_failing_a_grown_write_at_the_call(
@@ -4802,11 +4809,11 @@ def test_the_check_catches_a_lender_asking_every_held_lease_on_every_call(
     def asks_first(self, lease):
         if lease._copy is not None:
             lease._copy._event.query()
-        return real("_recyclable")(self, lease)
+        return real("_slots_returnable")(self, lease)
 
     with pytest.raises(CAUGHT, match="asked twice in one lender call"):
         test_each_call_asks_each_copy_s_event_at_most_once(
-            kit, real_manager, monkeypatch, attach_breaking({"_recyclable": asks_first})
+            kit, real_manager, monkeypatch, attach_breaking({"_slots_returnable": asks_first})
         )
 
 
@@ -4814,13 +4821,13 @@ def test_the_check_catches_a_lender_asking_every_held_lease_s_copy_once_per_call
     kit, real_manager, monkeypatch
 ):
     def lent_first(self, lease):  # asks through the per-round cache, then applies the rule
-        if not self._landed(lease._copy):
+        if not self._copy_done(lease._copy):
             return False
-        return real("_recyclable")(self, lease)
+        return real("_slots_returnable")(self, lease)
 
     with pytest.raises(CAUGHT, match="a read's poll asked 5 copies"):
         test_each_call_asks_each_copy_s_event_at_most_once(
-            kit, real_manager, monkeypatch, attach_breaking({"_recyclable": lent_first})
+            kit, real_manager, monkeypatch, attach_breaking({"_slots_returnable": lent_first})
         )
 
 
@@ -4833,7 +4840,7 @@ def test_the_check_catches_a_lender_asking_a_completed_copy_again(kit, real_mana
 
     with pytest.raises(CAUGHT, match="a copy reported complete was asked again"):
         test_each_call_asks_each_copy_s_event_at_most_once(
-            kit, real_manager, monkeypatch, attach_breaking({"_landed": forgets_completion})
+            kit, real_manager, monkeypatch, attach_breaking({"_copy_done": forgets_completion})
         )
 
 
@@ -4963,7 +4970,7 @@ def test_an_event_query_that_raises_returns_no_slot_twice(
 def gives_as_it_judges(self):  # returns each lease's slots as soon as it is judged
     holding = []
     for lease in self._holding:
-        if self._recyclable(lease):
+        if self._slots_returnable(lease):
             self._slots.give(lease._runs)
         else:
             holding.append(lease)
@@ -4993,7 +5000,7 @@ def test_marks_that_raise_leave_the_fetch_abandoned_and_the_slots_returnable(
         view = lease.poll()
         kv = kit.kv(mgr, target)
         with monkeypatch.context() as patched:
-            patched.setattr(_lender.Staging, "_still_lent", planted)
+            patched.setattr(_lender.Staging, "_rows_on_lent_pages", planted)
             with pytest.raises(RuntimeError, match="planted"):
                 lease.mark_arrived(view.row_masks(True))
         assert lender.readiness(target) == (kv.num_committed_tokens, kv.history_length)
@@ -5358,7 +5365,7 @@ def test_a_fetch_ending_inside_a_bidirectional_run_fails_at_the_call(
 
 
 def test_the_check_catches_a_lender_lending_inside_a_bidirectional_run(kit, real_manager):
-    liar = attach_breaking({"_splits_bidirectional_run": lambda self, *args: None})
+    liar = attach_breaking({"_splits_bidirectional_span": lambda self, *args: None})
     with pytest.raises(CAUGHT, match="lent a fetch ending inside the run"):
         test_a_fetch_ending_inside_a_bidirectional_run_fails_at_the_call(
             kit, real_manager, "end_inside_a_run_longer_than_the_window", liar
@@ -5369,17 +5376,17 @@ def exempting_runs_within_the_window(self, request, end):  # splits runs the win
     from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _manager
 
     window = min(w for w in self._layout.windows if w is not None)
-    runs = [(b, e) for b, e in _manager.bidirectional_runs(request) if b < end < e]
+    runs = [(b, e) for b, e in _manager.bidirectional_spans(request) if b < end < e]
     if all(e - b <= window for b, e in runs):
         return None
-    return real("_splits_bidirectional_run")(self, request, end)
+    return real("_splits_bidirectional_span")(self, request, end)
 
 
 @pytest.mark.parametrize(
     "case", ["end_inside_a_run_within_the_window", "end_inside_a_run_within_a_wider_window"]
 )
 def test_the_check_catches_a_lender_trusting_the_manager_s_window(kit, real_manager, case):
-    liar = attach_breaking({"_splits_bidirectional_run": exempting_runs_within_the_window})
+    liar = attach_breaking({"_splits_bidirectional_span": exempting_runs_within_the_window})
     with pytest.raises(CAUGHT, match="lent a fetch ending inside the run"):
         test_a_fetch_ending_inside_a_bidirectional_run_fails_at_the_call(
             kit, real_manager, case, liar
@@ -5421,7 +5428,7 @@ def keeping_the_interval(self, request, usable):  # no end lowered, no floor rai
 
 
 def lowering_the_end_alone(self, request, usable):  # the end lowered, no floor raised
-    return real("_outside_runs")(self, request, usable)[0], 0
+    return real("_outside_bidirectional_spans")(self, request, usable)[0], 0
 
 
 @pytest.mark.parametrize(
@@ -5435,7 +5442,7 @@ def lowering_the_end_alone(self, request, usable):  # the end lowered, no floor 
 def test_the_check_catches_a_lender_resuming_inside_a_bidirectional_run(
     kit, real_manager, rule, case
 ):
-    liar = attach_breaking({"_outside_runs": rule})
+    liar = attach_breaking({"_outside_bidirectional_spans": rule})
     with pytest.raises(CAUGHT, match="lets the request resume inside a run"):
         test_readiness_keeps_resumes_out_of_bidirectional_runs(kit, real_manager, case, liar)
 
@@ -5507,7 +5514,7 @@ def test_the_index_buffer_is_kept_from_the_attach_until_the_shutdown(
 
 
 def test_the_check_catches_a_lender_keeping_the_index_buffer_past_the_shutdown(kit, real_manager):
-    liar = attach_breaking({"_let_go_index_buffer": lambda self: None})
+    liar = attach_breaking({"_release_index_buffer": lambda self: None})
     with pytest.raises(CAUGHT, match="kept past the shutdown"):
         test_the_index_buffer_is_kept_from_the_attach_until_the_shutdown(kit, real_manager, liar)
 

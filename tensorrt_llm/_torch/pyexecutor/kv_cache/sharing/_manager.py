@@ -209,8 +209,8 @@ def has_encoder_input(request: LlmRequest) -> bool:
     return request.try_get_encoder_output_len() is not None
 
 
-def bidirectional_runs(request: LlmRequest) -> list[tuple[int, int]]:
-    """The runs ``[b, e)`` of multimodal tokens the scheduler keeps within one context chunk: none
+def bidirectional_spans(request: LlmRequest) -> list[tuple[int, int]]:
+    """The spans ``[b, e)`` of multimodal tokens the scheduler keeps within one context chunk: none
     unless the request's multimodal data sets ``mm_bidirectional_blocks`` and holds a
     ``multimodal_embed_mask_cumsum``, the gate the scheduler uses."""
     data = request.py_multimodal_data
@@ -277,13 +277,13 @@ def block_keys(
 
 
 def grow(
-    manager: KVCacheManagerV2, request: LlmRequest, kv: _KVCache, position: int, end: int
+    manager: KVCacheManagerV2, request: LlmRequest, kv: _KVCache, new_history: int, end: int
 ) -> bool:
-    """Cover ``[0, end)`` and move the history to ``position`` with the manager's own resize, then
-    run its fresh-page fill (a diagnostic, off unless set) on the pages the resize added alone.
+    """Cover ``[0, end)`` and move the history to ``new_history`` with the manager's own resize,
+    then run its fresh-page fill (a diagnostic, off unless set) on the pages the resize added alone.
     ``False``, the cache unchanged, when pages run out."""
     before = _pages_by_pool(manager, kv)
-    if not manager._resize_for_connector_prefix(request, kv, position, end):
+    if not manager._resize_for_connector_prefix(request, kv, new_history, end):
         return False
     if before is not None:
         # The fill takes as fresh the pages its record lacks, and a joint draft pool's own resizes

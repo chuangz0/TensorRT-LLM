@@ -18,10 +18,11 @@ reuse reset and shutdown."""
 from __future__ import annotations
 
 import collections
+import enum
 import traceback
 import weakref
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Deque, Mapping, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, Deque, Literal, Mapping, NamedTuple, Sequence
 
 import numpy as np
 import torch
@@ -44,10 +45,10 @@ if TYPE_CHECKING:
     from ...llm_request import LlmRequest
     from ..kv_cache_manager_v2 import KVCacheManagerV2
 
-# Staging memory, caches and page-index buffers kept until the process exits, by identity, oldest
-# first; only a clean shutdown or a last loan's end removes an entry. Each change is one dict
-# operation, atomic under the GIL, so lenders of managers on different threads need no lock.
-_kept: dict[int, object] = {}
+# Staging memory, caches and page-index buffers retained until the process exits, by identity,
+# oldest first; only a clean shutdown or a last loan's end releases an entry. Each change is one
+# dict operation, atomic under the GIL, so lenders of managers on different threads need no lock.
+_retained_until_exit: dict[int, object] = {}
 
 _SHUT_DOWN = "the KV cache manager shut down"
 _RESET = "the KV cache manager reset its reuse state, after which nothing is lent by name"
@@ -63,26 +64,28 @@ _CONTEXT_OUTPUTS = (
     "gives only for computed positions and keeps across a rewind and a recompute pause"
 )
 
+_LeaseKind = Literal["read", "write"]
+
 
 def _retained() -> tuple[object, ...]:
-    """What is kept until exit, oldest first; for tests."""
-    return tuple(_kept.values())
+    """What is retained until exit, oldest first; for tests."""
+    return tuple(_retained_until_exit.values())
 
 
-def _keep(owner: object) -> None:
-    """Keep ``owner`` until the process exits, or until ``_let_go``."""
-    _kept[id(owner)] = owner
+def _retain_until_exit(owner: object) -> None:
+    """Retain ``owner`` until the process exits, or until ``_release_retained``."""
+    _retained_until_exit[id(owner)] = owner
 
 
-def _let_go(owner: object) -> None:
-    """Drop ``owner`` from the keep list, compared by identity."""
-    _kept.pop(id(owner), None)
+def _release_retained(owner: object) -> None:
+    """Stop retaining ``owner``, compared by identity."""
+    _retained_until_exit.pop(id(owner), None)
 
 
 class _HostMemory:
     """Host memory of exactly ``nbytes``, page-locked where pinning pays off. Pinned memory goes
-    only through ``free``, once; pageable memory goes with the object, which the keep list holds
-    until exit, so memory kept until exit stays mapped either way."""
+    only through ``free``, once; pageable memory goes with the object, which the exit registry
+    holds, so memory retained until exit stays mapped either way."""
 
     def __init__(self, nbytes: int) -> None:
         self.nbytes = nbytes
@@ -109,12 +112,12 @@ class _HostMemory:
 
 
 def _allocate(nbytes: int) -> _HostMemory:
-    """One host allocation of ``nbytes`` for the staging parts, put on the keep list."""
+    """One host allocation of ``nbytes`` for the staging parts, retained until exit."""
     # TODO: staging duplicates the manager's host tier, whose host pools move when they resize
     # (mremap), so a backend cannot register them, and hold a pool group's row in one mapping per
     # pool rather than as one contiguous slot.
     memory = _HostMemory(max(int(nbytes), 1))
-    _keep(memory)
+    _retain_until_exit(memory)
     return memory
 
 
@@ -206,8 +209,7 @@ def _check_connector(manager: KVCacheManagerV2) -> None:
 def _attach_staging(
     manager: KVCacheManagerV2, *, scope: bytes, staging: StagingOptions, cls: type | None = None
 ) -> Staging:
-    """``attach_staging`` with the lender class as a parameter (``Staging`` when ``None``), so a
-    test can attach a subclass that breaks one rule."""
+    """``attach_staging`` with the lender class as a parameter, ``Staging`` when ``None``."""
     layout = _checked_layout(manager, pipeline=False)
     _check_commits(manager)
     _check_lookahead(manager)
@@ -221,7 +223,7 @@ def _attach_staging(
     slots = {g: int(counts.get(g, 0)) for g in layout.pool_groups}
     sizes = {g: slots[g] * int(layout.page_bytes[g]) for g in layout.pool_groups}
     # TODO: an exception after the allocation keeps the staging memory, and the page-index buffer
-    # once kept, until the process exits.
+    # once retained, until the process exits.
     memory = _allocate(sum(sizes.values()))
     base = memory.address
     parts = []
@@ -233,7 +235,7 @@ def _attach_staging(
     lender = (cls or Staging)(
         weakref.ref(manager), layout, identity, tuple(parts), Slots(slots), weakref.ref(memory)
     )
-    lender._keep_index_buffer(manager)
+    lender._retain_index_buffer(manager)
     logger.info(
         f"KV cache lender: namespace {identity.namespace.hex()}, staging {offset >> 20} MiB "
         f"in {len(parts)} parts"
@@ -274,6 +276,13 @@ class _Copy:
             self._done = True
 
 
+class _CopyResult(NamedTuple):
+    """What ``_memcpy`` queued: the copies (``None`` if no event covers them) and the first error."""
+
+    copy: _Copy | None
+    error: str | None
+
+
 def _no_cache(request_id: int) -> str:
     return f"request {request_id} has no KV cache"
 
@@ -287,7 +296,7 @@ def _stale(
     return _manager.stale_blocks(manager, lg, history)
 
 
-def _needed_runs(
+def _needed_block_ranges(
     manager: KVCacheManagerV2,
     layout: ManagerLayout,
     lg: int,
@@ -299,15 +308,15 @@ def _needed_runs(
     ``history`` tokens still reads, in order and none empty: the whole range for full attention;
     the sinks and the window otherwise. Arithmetic only, so a range of any length costs nothing."""
     stale_beg, stale_end = _stale(manager, layout, lg, history)
-    runs = ((start_block, min(end_block, stale_beg)), (max(start_block, stale_end), end_block))
-    return [(beg, end) for beg, end in runs if end > beg]
+    ranges = ((start_block, min(end_block, stale_beg)), (max(start_block, stale_end), end_block))
+    return [(beg, end) for beg, end in ranges if end > beg]
 
 
-def _ordinals(runs: Sequence[tuple[int, int]]) -> np.ndarray:
-    """``int64`` ordinals of ``runs``, in order."""
-    if not runs:
+def _ordinals(ranges: Sequence[tuple[int, int]]) -> np.ndarray:
+    """``int64`` ordinals of ``ranges``, in order."""
+    if not ranges:
         return np.zeros(0, dtype=np.int64)
-    return np.concatenate([np.arange(beg, end, dtype=np.int64) for beg, end in runs])
+    return np.concatenate([np.arange(beg, end, dtype=np.int64) for beg, end in ranges])
 
 
 def _needed_ordinals(
@@ -320,32 +329,78 @@ def _needed_ordinals(
 ) -> np.ndarray:
     """Ordinals of ``lg`` in ``[start_block, end_block)`` that a history of ``history`` tokens
     still reads: all of them for full attention; the sinks and the window otherwise."""
-    return _ordinals(_needed_runs(manager, layout, lg, start_block, end_block, history))
+    return _ordinals(_needed_block_ranges(manager, layout, lg, start_block, end_block, history))
+
+
+@dataclass(eq=False)
+class _GroupRows:
+    """One layer group's rows, aligned: block ordinals, their device pages (-1 where a block has
+    none) and, once the lease is granted, their staging slots."""
+
+    layer_group: int
+    ordinals: np.ndarray
+    device_pages: np.ndarray
+    staging_slots: np.ndarray | None = None
 
 
 @dataclass(eq=False)
 class _Rows:
-    """Per layer group, in order: ordinals, device slots and their staging slots, aligned."""
+    """A lease's rows: one ``_GroupRows`` per layer group, in order."""
 
-    layer_groups: list[int]
-    ordinals: list[np.ndarray]
-    device_slots: list[np.ndarray]
-    staging_slots: list[np.ndarray] = field(default_factory=list)
+    groups: list[_GroupRows]
 
     @property
     def num_rows(self) -> int:
-        return sum(len(o) for o in self.ordinals)
+        return sum(len(group.ordinals) for group in self.groups)
+
+    @property
+    def layer_groups(self) -> list[int]:
+        return [group.layer_group for group in self.groups]
+
+    @property
+    def ordinals(self) -> list[np.ndarray]:
+        return [group.ordinals for group in self.groups]
+
+    @property
+    def device_pages(self) -> list[np.ndarray]:
+        return [group.device_pages for group in self.groups]
+
+
+class _FetchState(enum.Enum):
+    """Where one write lease's fetch into a cache stands.
+
+    ``OPEN``: the cache grew for it and its marks have not come; readiness is ``None`` and no new
+    fetch into the cache starts. ``ABANDONED``: it delivered nothing (its lease failed, was released
+    before its view was returned, or the copy of its marks failed); readiness counts what earlier
+    fetches into the cache delivered. ``DELIVERED``: the copy of its marked rows was queued without
+    error; the fetch has settled once that copy has completed."""
+
+    OPEN = "open"
+    ABANDONED = "abandoned"
+    DELIVERED = "delivered"
 
 
 @dataclass(eq=False)
 class _Fetch:
-    """One write lease's fetch into one cache: delivered once its marked rows' copy is queued
-    without error, settled once that copy has completed."""
+    """One write lease's fetch into one cache, from ``start``; ``copy`` is the copy its marks
+    queued."""
 
     start: int
-    kv: object
-    delivered: bool = False
+    state: _FetchState = _FetchState.OPEN
     copy: _Copy | None = None
+
+    @property
+    def delivered(self) -> bool:
+        return self.state is _FetchState.DELIVERED
+
+
+class _Usable(NamedTuple):
+    """Readiness's answer for ``computed_tokens``: the usable end, and the floor that keeps resumes
+    out of bidirectional spans below it."""
+
+    computed_tokens: int
+    usable_until: int
+    span_floor: int
 
 
 @dataclass(eq=False)
@@ -354,11 +409,31 @@ class _Delivered:
     last copy from staging was queued without error and that no shrink freed since; ``origin`` is
     the lowest fetch start."""
 
-    kv: object
     origin: int
     blocks: list[np.ndarray]
-    # (tokens computed before, usable_until, the end of the last run below it), last computed
-    usable: tuple[int, int, int] | None = None
+    usable: _Usable | None = None  # the last answer, dropped whenever ``blocks`` change
+
+
+class _GrowMark(NamedTuple):
+    """Left by the latest fetch whose grow moved the history past the committed tokens: what it kept
+    of the tokens computed before it, and the history its grow left."""
+
+    kept_tokens: int
+    history_after: int
+
+
+@dataclass(eq=False)
+class _RequestRecord:
+    """What the lender remembers of one request's cache ``kv``. A record of a cache that another
+    replaced (a restart) is moot."""
+
+    kv: _KVCache
+    fetch: _Fetch | None = None  # the latest fetch into ``kv``
+    delivered: _Delivered | None = None
+    grow_mark: _GrowMark | None = None
+    # A failed copy may have left the committed tail block with the fetch's bytes in some pools and
+    # the bytes it held before in others; readiness is empty from then on.
+    torn_tail: bool = False
 
 
 # TODO: a draft pool also gives up a resume below its history whose chunk would reach it, as
@@ -377,31 +452,23 @@ class Staging:
 
     def __init__(
         self,
-        manager: weakref.ref,
+        manager: weakref.ref[KVCacheManagerV2],
         layout: ManagerLayout,
         identity: Identity,
         parts: tuple[Part, ...],
         slots: Slots,
-        memory: weakref.ref,
+        memory: weakref.ref[_HostMemory],
     ) -> None:
         self._manager_ref = manager
         self._layout = layout
         self._identity = identity
         self._parts = tuple(parts)
         self._slots = slots
-        # Only the keep list holds the staging memory strongly; this finds it there at shutdown.
+        # Only the exit registry holds the staging memory strongly; this finds it there at shutdown.
         self._memory = memory
         self._part_of_group = {g: i for i, g in enumerate(layout.pool_groups)}
         self._any_window = any(w is not None for w in layout.windows)
-        self._fetches: dict[int, _Fetch] = {}  # the latest fetch into each request
-        self._delivered: dict[int, _Delivered] = {}
-        # Requests whose history was past the committed tokens after a fetch's grow: the cache it
-        # grew, what the latest such fetch kept of the prefix computed before it, and the history
-        # its grow left.
-        self._advanced: dict[int, tuple[object, int, int]] = {}
-        # Requests whose committed tail block a failed copy may have left with the fetch's bytes in
-        # some pools and the bytes it held before in others: the cache. Readiness is empty for it.
-        self._tainted: dict[int, object] = {}
+        self._records: dict[int, _RequestRecord] = {}  # by request id
         self._line: Deque[_StagingLease] = collections.deque()  # waiting for slots, in order
         self._holding: list[_StagingLease] = []  # granted, slots not yet returned
         # Open leases, held strongly: an open lease keeps the staging memory at shutdown even
@@ -412,7 +479,7 @@ class Staging:
         self._quarantined: list[Runs] = []  # slots a failed copy may still touch; never reused
         self._closed = False
         self._reset = False  # the manager reset its reuse state: nothing is lent by name again
-        self._index_buffer: object | None = None  # kept until the shutdown closed every cache
+        self._index_buffer: object | None = None  # retained until the shutdown closed every cache
         self._round = 0  # rounds of progress, so each asks a copy's event at most once
 
     @property
@@ -437,14 +504,9 @@ class Staging:
         if manager is None:
             return _StagingLease._failed(self, "read", request_id, _SHUT_DOWN)
         self._progress()
-        if self._reset:
-            return _StagingLease._failed(self, "read", request_id, _RESET)
-        kv = _manager.kv_of(manager, request_id)
-        if kv is None:
-            return _StagingLease._failed(self, "read", request_id, _no_cache(request_id))
-        unnamed = self._unnamed(request)
-        if unnamed is not None:
-            return _StagingLease._failed(self, "read", request_id, unnamed)
+        kv, refusal = self._cache_to_lend(manager, request, request_id)
+        if refusal is not None:
+            return _StagingLease._failed(self, "read", request_id, refusal)
         state = _manager.cache_state(kv)
         if end > state.committed:
             raise ValueError(
@@ -455,7 +517,8 @@ class Staging:
         # TODO: a publish leaves out window blocks the request's own window has passed, although
         # the prefix tree may still hold their committed pages, so a fetch whose window still keeps
         # such a block finds it missing.
-        rows = self._lendable(manager, state.history, self._rows(manager, kv, start, end))
+        rows = self._rows(manager, kv, start, end)
+        rows = self._drop_unpaged_and_stale(manager, state.history, rows)
         counts = self._counts([len(ordinals) for ordinals in rows.ordinals])
         self._check_fits(counts)
         keys = self._keys_for(manager, request, kv, rows.ordinals)
@@ -464,80 +527,31 @@ class Staging:
         return lease
 
     def lend_write(self, request: LlmRequest, start: int, end: int) -> _StagingLease:
-        """See ``StagingLender.lend_write``."""
+        """See ``StagingLender.lend_write``. Its checks run in phases: ``ValueError`` from the call,
+        the request's prompt and the layout; what this rank holds for the request; ``ValueError``
+        against the cache; this rank's refusals. Only then does the cache grow."""
         start, end = self._whole_blocks(start, end)
         request_id = int(request.py_request_id)
         manager = self._live()
         if manager is None:
             return _StagingLease._failed(self, "write", request_id, _SHUT_DOWN)
         self._progress()
-        layout = self._layout
-        tpb = int(layout.tokens_per_block)
-        # The request computes its last prompt token itself, for its logits, so a fetch ends at
-        # the whole blocks before it.
-        prompt = _manager.prompt_length(request)
-        if end > (prompt - 1) // tpb * tpb:
-            raise ValueError(
-                f"the range ends at {end}, past the whole blocks before the request's last prompt "
-                f"token ({prompt} prompt tokens)"
-            )
-        # Rows and their names come from the layout for a history of ``end``, so every
-        # ValueError is raised before the cache changes. The rows are counted from their ranges
-        # and checked to fit before any array is built.
-        runs = [
-            _needed_runs(manager, layout, lg, start // tpb, end // tpb, end)
-            for lg in range(layout.num_layer_groups)
-        ]
-        counts = self._counts([sum(e - b for b, e in lg_runs) for lg_runs in runs])
-        self._check_fits(counts)
-        ordinals = [_ordinals(lg_runs) for lg_runs in runs]
+        counts, ordinals = self._check_write_range(manager, request, start, end)
         # The checks above read only the call, the request's prompt and the layout, so on a
         # manager not shut down a wrong call raises whatever this rank holds for the request.
-        if self._reset:
-            return _StagingLease._failed(self, "write", request_id, _RESET)
-        kv = _manager.kv_of(manager, request_id)
-        if kv is None:
-            return _StagingLease._failed(self, "write", request_id, _no_cache(request_id))
-        unnamed = self._unnamed(request)
-        if unnamed is not None:
-            return _StagingLease._failed(self, "write", request_id, unnamed)
+        kv, refusal = self._cache_to_lend(manager, request, request_id)
+        if refusal is not None:
+            return _StagingLease._failed(self, "write", request_id, refusal)
         state = _manager.cache_state(kv)
-        if start < (state.committed // tpb) * tpb:
-            raise ValueError(
-                f"the range starts at {start}, inside the committed whole blocks of "
-                f"{state.committed} tokens"
-            )
-        keys = self._keys_for(manager, request, kv, ordinals)
-        if self._any_window and end < state.history:
-            raise ValueError(
-                f"the range ends at {end}, below the history of {state.history} tokens its "
-                "windows keep"
-            )
-        split = self._splits_bidirectional_run(request, end)
-        if split is not None:
-            return _StagingLease._failed(self, "write", request_id, split)
-        if not state.active:
-            return _StagingLease._failed(self, "write", request_id, _SUSPENDED)
-        if self._scratch_reuse_on(kv):
-            return _StagingLease._failed(self, "write", request_id, _SCRATCH)
-        if self._returns_context_outputs(request):
-            return _StagingLease._failed(self, "write", request_id, _CONTEXT_OUTPUTS)
-        # After every ValueError: whether an earlier fetch settled is this rank's own timing.
-        unsettled = self._unsettled(request_id, kv)
-        if unsettled is not None:
-            return _StagingLease._failed(self, "write", request_id, unsettled)
+        keys = self._check_write_against_cache(manager, request, kv, state, start, end, ordinals)
         # With a window the history moves to ``end``, so windows need pages only for the blocks a
         # history of that length reads.
-        position = end if self._any_window else state.history
-        refusal = self._history_refusal(manager, state.history, position, end)
-        # TODO: a later lease can move the history past rows an earlier lease of the fetch missed,
-        # and the commit then stores their pages, which nothing wrote.
-        if refusal is None:
-            refusal = self._unwritten_pages_refusal(manager, kv, state.history, position)
+        new_history = end if self._any_window else state.history
+        refusal = self._write_refusal(manager, request, kv, state, end, new_history)
         if refusal is not None:
             return _StagingLease._failed(self, "write", request_id, refusal)
         # Read before the grow, which moves a windowed cache's history to ``end``.
-        kept = self._kept_by(request_id, kv, start)
+        kept_tokens = self._computed_below_start(request_id, kv, start)
         # TODO: the V2 scheduler cannot reclaim the pages a parked fetch grew.
         # TODO: route capture stops reading a request's prepopulated length once it holds the routes
         # below it, until the request finishes, so a later resume leaves positions without routes.
@@ -546,25 +560,22 @@ class Staging:
         # TODO: an exception once the grow resized the cache, in its fill or a step below, can leave
         # no record of a windowed cache's moved history, so readiness counts tokens never fetched as
         # computed, or a fetch record nothing settles, so readiness stays None.
-        if not _manager.grow(manager, request, kv, position, end):
+        if not _manager.grow(manager, request, kv, new_history, end):
             return _StagingLease._failed(
                 self, "write", request_id, f"no free pages to grow the cache to {end} tokens"
             )
         # The cache has grown, and readiness accounts for it whatever this lease's outcome.
-        if position > state.committed:
-            self._advanced[request_id] = (kv, kept, position)
-        fetch = _Fetch(start, kv)
-        self._fetches[request_id] = fetch
+        record = self._record_for(request_id, kv)
+        if new_history > state.committed:
+            record.grow_mark = _GrowMark(kept_tokens, new_history)
+        fetch = _Fetch(start)
+        record.fetch = fetch
         rows = self._rows(manager, kv, start, end)
-        doomed = None
-        for lg, lg_ordinals, lg_slots in zip(rows.layer_groups, rows.ordinals, rows.device_slots):
-            if doomed is None and np.any(lg_slots < 0):
-                missing = lg_ordinals[lg_slots < 0].tolist()
-                doomed = f"layer group {lg}: blocks {missing[:8]} have no page"
         lease = _StagingLease(self, "write", request_id, kv, rows, keys, fetch)
-        if doomed is not None:
+        missing = self._missing_pages(rows)
+        if missing is not None:
             # It fails at its first poll, which abandons the fetch.
-            lease._doomed = doomed
+            lease._fail_at_first_poll(missing)
             self._unreleased.add(lease)
             return lease
         self._open(lease, counts)
@@ -581,55 +592,45 @@ class Staging:
         if kv is None:
             raise ValueError(_no_cache(request_id))
         history = _manager.cache_state(kv).history
-        # A record of a replaced cache (a restart) is moot.
-        fetch = self._fetches.get(request_id)
-        if fetch is not None and fetch.kv is not kv:
-            del self._fetches[request_id]
-            fetch = None
-        delivered = self._delivered.get(request_id)
-        if delivered is not None and delivered.kv is not kv:
-            del self._delivered[request_id]
-            delivered = None
-        advanced = self._advanced.get(request_id)
-        if advanced is not None and advanced[0] is not kv:
-            del self._advanced[request_id]
-        tainted = self._tainted.get(request_id)
-        if tainted is not None and tainted is not kv:
-            del self._tainted[request_id]
-            tainted = None
-        if fetch is not None and not self._report_settled(fetch):
+        record = self._records.get(request_id)
+        if record is None or record.kv is not kv:
+            # None yet, or one of a replaced cache (a restart), which is moot.
+            self._records.pop(request_id, None)
+            record = _RequestRecord(kv)
+        if self._waits_for(record.fetch):
             return None
-        if tainted is not None:
+        if record.torn_tail:
             # Empty: the request drops its cache and computes from 0.
             return Readiness(0, max(history, 1))
-        known = self._computed_before(request_id, kv)
+        computed = self._computed_tokens(request_id, kv)
+        delivered = record.delivered
         if delivered is None:
             # Nothing delivered: what was computed and kept counts, resumed no lower than the
             # history, which a windowed fetch moved to its end.
-            usable, floor = self._outside_runs(request, known)
-            return Readiness(usable, max(floor, history))
+            usable_until, span_floor = self._outside_bidirectional_spans(request, computed)
+            return Readiness(usable_until, max(span_floor, history))
         # A shrink the manager did not report still shows as blocks past the capacity.
-        self._void_past(delivered, kv)
-        if delivered.usable is None or delivered.usable[0] != known:
-            usable = self._usable_until(manager, delivered, known)
-            delivered.usable = (known, *self._outside_runs(request, usable))
-        _, usable, floor = delivered.usable
-        return Readiness(usable, max(floor, int(self._floor(manager, history, delivered.origin))))
+        self._forget_rows_past_capacity(delivered, kv)
+        if delivered.usable is None or delivered.usable.computed_tokens != computed:
+            usable_until = self._usable_until(manager, delivered, computed)
+            spans = self._outside_bidirectional_spans(request, usable_until)
+            delivered.usable = _Usable(computed, *spans)
+        usable = delivered.usable
+        floor = int(self._restart_floor(manager, history, delivered.origin))
+        return Readiness(usable.usable_until, max(usable.span_floor, floor))
 
     def _on_free(
         self, request_id: int, kv_cache: _KVCache, after_close: Callable[[], None]
     ) -> bool:
         """Manager hook, after the request's cache left the map: its waiting leases fail and its
-        fetch records go. Returns ``False``: the manager closes the cache itself. Logs its own
-        errors."""
+        record goes. Returns ``False``: the manager closes the cache itself. Logs its own errors."""
         try:
             if self._live() is None:
                 return False
             # Granted leases go on: a read's copy is queued already, and a write's marks copy
             # nothing into pages other than the ones lent.
             self._fail_waiting(int(request_id), "the request was freed")
-            for records in (self._fetches, self._delivered, self._advanced, self._tainted):
-                records.pop(int(request_id), None)
+            self._records.pop(int(request_id), None)
             self._progress()
         except Exception:
             # Logged, not raised into the manager's free: the cache is then closed as usual, and
@@ -641,11 +642,11 @@ class Staging:
         """Manager hook, right after the request's cache may have shrunk in place: delivered rows
         past its blocks lost their pages for good. Logs its own errors."""
         try:
-            delivered = self._delivered.get(int(request_id))
-            if self._live() is not None and delivered is not None and delivered.kv is kv_cache:
-                self._void_past(delivered, kv_cache)
+            record = self._record(int(request_id), kv_cache)
+            if self._live() is not None and record is not None and record.delivered is not None:
+                self._forget_rows_past_capacity(record.delivered, kv_cache)
         except Exception:
-            # Logged, not raised into the manager's resize; readiness voids the rows it sees past
+            # Logged, not raised into the manager's resize; readiness forgets the rows it sees past
             # the capacity.
             logger.error(
                 f"KV cache lender: shrink of request {request_id}: {traceback.format_exc()}"
@@ -675,13 +676,14 @@ class Staging:
             self._recycle()
             for lease in list(self._line):
                 self._fail(lease, _SHUT_DOWN)
-            for lease in [lease for lease in self._unreleased if lease._doomed is not None]:
-                self._fail(lease, lease._doomed)
+            failing = [lease for lease in self._unreleased if lease._first_poll_failure is not None]
+            for lease in failing:
+                self._fail(lease, lease._first_poll_failure)
             self._closed = True
             if not self._memory_in_use():
                 # Every copy on it has completed above, and no lease or hold reaches it any more.
                 memory = self._memory()
-                _let_go(memory)
+                _release_retained(memory)
                 memory.free()
             else:
                 logger.warning(
@@ -691,23 +693,23 @@ class Staging:
                     f"{len(self._quarantined)} slot runs lost to failed copies"
                 )
         except Exception:
-            # Logged, not raised into the manager's shutdown; the staging memory then stays in
-            # the keep list until exit.
+            # Logged, not raised into the manager's shutdown; the staging memory then stays
+            # retained until exit.
             self._closed = True
             logger.error(f"KV cache lender: shutting down: {traceback.format_exc()}")
         return frozenset()
 
     def _on_caches_closed(self) -> None:
         """Manager hook, once its shutdown has closed every cache: none writes into the page-index
-        buffer any more, so the lender lets it go. A close that raises skips this call, and the
+        buffer any more, so the lender releases it. A close that raises skips this call, and the
         buffer stays until a retried shutdown closes every cache, or until exit."""
         # TODO: a cache whose close raised in a free stays open outside the manager's map, and a
-        # lease holding it can still close it into the buffer let go here.
+        # lease holding it can still close it into the buffer released here.
         if self._index_buffer is None:
             return
-        self._let_go_index_buffer()
+        self._release_index_buffer()
 
-    # One rule per method, so a test subclass that breaks exactly one rule overrides one method.
+    # Each rule is a separate method.
 
     def _progress(self) -> None:
         """Return the slots of settled leases, then grant waiting leases in order."""
@@ -717,40 +719,43 @@ class Staging:
         self._recycle()
         self._grant_waiting()
 
-    def _landed(self, copy: _Copy | None) -> bool:
+    def _copy_done(self, copy: _Copy | None) -> bool:
         """``copy`` has completed (or there is none), its event asked at most once this round."""
         return copy is None or copy.done(self._round)
 
-    def _copy_landed(self, lease: _StagingLease) -> bool:
+    def _read_copy_done(self, lease: _StagingLease) -> bool:
         """A read lease's copy into its slots has completed."""
-        return self._landed(lease._copy)
+        return self._copy_done(lease._copy)
 
-    def _recyclable(self, lease: _StagingLease) -> bool:
+    def _slots_returnable(self, lease: _StagingLease) -> bool:
         """The lease's slots may return: no backend access possible and no copy on them pending.
         The copy is asked last, so a lease still lent costs no event query."""
         # A failed lease was never ready, so no backend has seen its slots.
-        if lease.failure is None:
+        if lease._state is not _LeaseState.FAILED:
             if not lease._released:
                 return False
-            if not (lease._kind == "read" or lease._marked or not lease._seen_ready):
+            # A write whose view was returned keeps its slots until it is marked.
+            if lease._kind == "write" and lease._state is _LeaseState.VIEW_RETURNED:
                 return False
         # TODO: every lender call asks each released lease's pending copy again, so N calls while P
         # copies pend cost N*P event queries.
-        return self._landed(lease._copy)
+        return self._copy_done(lease._copy)
 
-    def _still_lent(self, kv: _KVCache | None, lease: _StagingLease) -> list[np.ndarray]:
-        """Per run, the rows whose block is still in the window of the same active cache and still
-        locks the GPU page lent; a page only held may sit on another tier under the same number."""
-        rows = lease._rows
+    def _rows_on_lent_pages(self, kv: _KVCache | None, lease: _StagingLease) -> list[np.ndarray]:
+        """Per layer group, the rows whose block is still in the window of the same active cache and
+        still locks the GPU page lent; a page only held may sit on another tier under the same
+        number."""
+        groups = lease._rows.groups
         manager = self._manager_ref()
         state = _manager.cache_state(kv) if kv is not None and kv is lease._kv else None
         masks = []
-        for lg, ordinals, slots in zip(rows.layer_groups, rows.ordinals, rows.device_slots):
+        for group in groups:
+            lg, ordinals = group.layer_group, group.ordinals
             same = np.zeros(len(ordinals), dtype=bool)
             if state is not None and state.active:
                 pages = _manager.locked_pages(kv, lg)
                 inside = ordinals < len(pages)
-                same[inside] = pages[ordinals[inside]] == slots[inside]
+                same[inside] = pages[ordinals[inside]] == group.device_pages[inside]
                 stale_beg, stale_end = _stale(manager, self._layout, lg, state.history)
                 same &= (ordinals < stale_beg) | (ordinals >= stale_end)
             masks.append(same)
@@ -766,11 +771,11 @@ class Staging:
         return None
 
     # TODO: the lender cannot see the model's sliding window, so it also keeps fetch ends and
-    # resumes out of runs that window would cover whole.
-    def _splits_bidirectional_run(self, request: LlmRequest, end: int) -> str | None:
-        """Why the fetch ends strictly inside a run of multimodal tokens the scheduler keeps within
-        one context chunk, if it does, whatever the run's length."""
-        for b, e in _manager.bidirectional_runs(request):
+    # resumes out of spans that window would cover whole.
+    def _splits_bidirectional_span(self, request: LlmRequest, end: int) -> str | None:
+        """Why the fetch ends strictly inside a span of multimodal tokens the scheduler keeps within
+        one context chunk, if it does, whatever the span's length."""
+        for b, e in _manager.bidirectional_spans(request):
             if b < end < e:
                 return (
                     f"the range ends at {end}, inside the multimodal tokens [{b}, {e}), a run the "
@@ -778,15 +783,15 @@ class Staging:
                 )
         return None
 
-    def _outside_runs(self, request: LlmRequest, usable: int) -> tuple[int, int]:
-        """The end lowered to the start of a run of multimodal tokens it falls strictly inside, and
-        the lowest floor that then leaves no position strictly inside a run below that end: the end
-        of the last run at or below it. Runs are those the scheduler keeps within one chunk."""
-        runs = _manager.bidirectional_runs(request)
-        for b, e in runs:
+    def _outside_bidirectional_spans(self, request: LlmRequest, usable: int) -> tuple[int, int]:
+        """The end lowered to the start of a span of multimodal tokens it falls strictly inside, and
+        the lowest floor that then leaves no position strictly inside a span below that end: the
+        end of the last span at or below it. Spans are those the scheduler keeps within one chunk."""
+        spans = _manager.bidirectional_spans(request)
+        for b, e in spans:
             if b < usable < e:
                 usable = b
-        return int(usable), max((e for _, e in runs if e <= usable), default=0)
+        return int(usable), max((e for _, e in spans if e <= usable), default=0)
 
     def _scratch_reuse_on(self, kv: _KVCache) -> bool:
         """A write target with SWA scratch reuse on, windowed or not: each capacity change keeps its
@@ -803,31 +808,31 @@ class Staging:
         return _manager.returns_context_outputs(request)
 
     def _history_refusal(
-        self, manager: KVCacheManagerV2, history: int, position: int, end: int
+        self, manager: KVCacheManagerV2, history: int, new_history: int, end: int
     ) -> str | None:
-        """Why the history the fetch leaves, ``position``, admits no resume at the positions
+        """Why the history the fetch leaves, ``new_history``, admits no resume at the positions
         readiness would count, or ``None``: in a cache without a window whose floor follows the
         history, the history stands past ``end``."""
         if self._any_window:
             return None  # the fetch moves the history to ``end``
         if not _floor_follows_history(manager):
             return None  # the floor is a delivered fetch's lowest start, or the history if lower
-        if position > end:
+        if new_history > end:
             return f"the cache's history of {history} tokens stands past the fetch's end, {end}"
         return None
 
     def _unwritten_pages_refusal(
-        self, manager: KVCacheManagerV2, kv: _KVCache, history: int, position: int
+        self, manager: KVCacheManagerV2, kv: _KVCache, history: int, new_history: int
     ) -> str | None:
-        """Why moving the history to ``position`` would have the commit store bytes the request
+        """Why moving the history to ``new_history`` would have the commit store bytes the request
         never wrote, or ``None``: a window leaving behind a block whose page holds tokens past the
         history keeps that page for the commit (a partial match's copy, a page grown early)."""
         if not _manager.keeps_passed_pages(manager):
             return None
-        first = history // int(self._layout.tokens_per_block)  # the first block past the history
+        first_past_history = history // int(self._layout.tokens_per_block)
         for lg in range(self._layout.num_layer_groups):
-            stale_beg, stale_end = _stale(manager, self._layout, lg, position)
-            beg = max(first, stale_beg)
+            stale_beg, stale_end = _stale(manager, self._layout, lg, new_history)
+            beg = max(first_past_history, stale_beg)
             if beg >= stale_end:
                 continue
             paged = _manager.locked_pages(kv, lg)[beg:stale_end] >= 0
@@ -836,23 +841,23 @@ class Staging:
                 # TODO: no runtime call drops one block's page in one layer group, so the fetch
                 # fails where the commit could store no page for those blocks instead.
                 return (
-                    f"layer group {lg} leaves blocks {blocks[:8]} behind its window at {position} "
-                    f"tokens; past the history of {history} tokens their pages hold bytes the "
-                    "request never wrote, which the commit would store"
+                    f"layer group {lg} leaves blocks {blocks[:8]} behind its window at "
+                    f"{new_history} tokens; past the history of {history} tokens their pages hold "
+                    "bytes the request never wrote, which the commit would store"
                 )
         return None
 
     def _unsettled(self, request_id: int, kv: _KVCache) -> str | None:
         """Why the request's earlier fetch into ``kv`` keeps a new one from starting, or ``None``:
         it has not settled on this rank, where the copy its marks queued may still be pending."""
-        previous = self._fetches.get(request_id)
-        if previous is not None and previous.kv is kv and not self._report_settled(previous):
+        record = self._record(request_id, kv)
+        if record is not None and self._waits_for(record.fetch):
             return f"request {request_id} already has an unsettled fetch"
         return None
 
-    def _report_settled(self, fetch: _Fetch) -> bool:
+    def _fetch_settled(self, fetch: _Fetch) -> bool:
         """The fetch's arrived rows are marked and their copy into the request's pages is done."""
-        return fetch.delivered and self._landed(fetch.copy)
+        return fetch.delivered and self._copy_done(fetch.copy)
 
     def _fail_waiting(self, request_id: int, reason: str) -> None:
         """Fail the request's leases still waiting for slots."""
@@ -860,27 +865,28 @@ class Staging:
             self._fail(lease, reason)
 
     def _abandon(self, lease: _StagingLease) -> None:
-        """Drop the write lease's fetch record: it delivered nothing, and readiness counts what
-        earlier fetches into the cache delivered."""
-        if lease._fetch is not None and self._fetches.get(lease._request_id) is lease._fetch:
-            del self._fetches[lease._request_id]
+        """Abandon the write lease's fetch if it is the request's latest: it delivered nothing, and
+        readiness counts what earlier fetches into the cache delivered."""
+        if self._is_latest_fetch(lease):
+            lease._fetch.state = _FetchState.ABANDONED
 
-    def _computed_before(self, request_id: int, kv: _KVCache) -> int:
+    def _computed_tokens(self, request_id: int, kv: _KVCache) -> int:
         """What readiness counts as computed besides delivered rows: the tokens up to the history,
         but only the committed ones and what the latest fetch kept while the history stays where
         that fetch's grow left it past them (a windowed fetch moves it to its end)."""
         state = _manager.cache_state(kv)
-        advanced = self._advanced.get(request_id)
+        record = self._record(request_id, kv)
+        mark = record.grow_mark if record is not None else None
         # Past where that fetch left it, the history moved as the request resumed and computed on.
-        if advanced is None or advanced[0] is not kv or state.history > advanced[2]:
+        if mark is None or state.history > mark.history_after:
             return max(state.committed, state.history)
-        return max(state.committed, advanced[1])
+        return max(state.committed, mark.kept_tokens)
 
-    def _kept_by(self, request_id: int, kv: _KVCache, start: int) -> int:
+    def _computed_below_start(self, request_id: int, kv: _KVCache, start: int) -> int:
         """What a fetch from ``start`` keeps of what was computed before it, since it may overwrite
         every block from ``start`` on. It never passes the history, which no shrink goes below;
         delivered rows past it keep their own record."""
-        return min(self._computed_before(request_id, kv), start)
+        return min(self._computed_tokens(request_id, kv), start)
 
     def _names(self, layer_group: int, keys: np.ndarray) -> np.ndarray:
         """The rows' names: ``uint8 (n, 54)`` for ``keys`` ``uint8 (n, 32)``."""
@@ -890,17 +896,17 @@ class Staging:
         """A lease or a hold is unreleased, or a slot is lost to a failed copy: the memory stays."""
         return bool(self._unreleased) or bool(self._holds) or bool(self._quarantined)
 
-    def _keep_index_buffer(self, manager: KVCacheManagerV2) -> None:
-        """Keep the manager's page-index buffer until its shutdown has closed every cache: a cache a
-        lease or a record holds writes its page indices there as it closes, also once the manager
+    def _retain_index_buffer(self, manager: KVCacheManagerV2) -> None:
+        """Retain the manager's page-index buffer until its shutdown has closed every cache: a cache
+        a lease or a record holds writes its page indices there as it closes, also once the manager
         is gone."""
         self._index_buffer = _manager.index_buffer(manager)
-        _keep(self._index_buffer)
+        _retain_until_exit(self._index_buffer)
 
-    def _let_go_index_buffer(self) -> None:
+    def _release_index_buffer(self) -> None:
         """Once the manager's shutdown has closed every cache: no cache writes into the page-index
         buffer any more."""
-        _let_go(self._index_buffer)
+        _release_retained(self._index_buffer)
         self._index_buffer = None
 
     def _end_hold(self, hold: _PartsHold) -> None:
@@ -924,6 +930,139 @@ class Staging:
     def _open_count(self) -> int:
         """Leases not yet released; for tests."""
         return len(self._unreleased)
+
+    # The phases of a lend.
+
+    def _cache_to_lend(
+        self, manager: KVCacheManagerV2, request: LlmRequest, request_id: int
+    ) -> tuple[_KVCache | None, str | None]:
+        """The request's cache, or why this rank lends none of it: a reuse reset, no cache, or KV
+        that depends on more than the request's names cover."""
+        if self._reset:
+            return None, _RESET
+        kv = _manager.kv_of(manager, request_id)
+        if kv is None:
+            return None, _no_cache(request_id)
+        unnamed = self._unnamed(request)
+        if unnamed is not None:
+            return None, unnamed
+        return kv, None
+
+    def _check_write_range(
+        self, manager: KVCacheManagerV2, request: LlmRequest, start: int, end: int
+    ) -> tuple[dict[int, int], list[np.ndarray]]:
+        """``ValueError`` for a fetch range wrong by the request's prompt or the layout; else the
+        rows it needs per pool group, and per layer group the ordinals a history of ``end`` reads."""
+        layout = self._layout
+        tpb = int(layout.tokens_per_block)
+        # The request computes its last prompt token itself, for its logits, so a fetch ends at
+        # the whole blocks before it.
+        prompt = _manager.prompt_length(request)
+        if end > (prompt - 1) // tpb * tpb:
+            raise ValueError(
+                f"the range ends at {end}, past the whole blocks before the request's last prompt "
+                f"token ({prompt} prompt tokens)"
+            )
+        # Rows and their names come from the layout for a history of ``end``, so every
+        # ValueError is raised before the cache changes. The rows are counted from their ranges
+        # and checked to fit before any array is built.
+        ranges = [
+            _needed_block_ranges(manager, layout, lg, start // tpb, end // tpb, end)
+            for lg in range(layout.num_layer_groups)
+        ]
+        counts = self._counts([sum(e - b for b, e in lg_ranges) for lg_ranges in ranges])
+        self._check_fits(counts)
+        return counts, [_ordinals(lg_ranges) for lg_ranges in ranges]
+
+    def _check_write_against_cache(
+        self,
+        manager: KVCacheManagerV2,
+        request: LlmRequest,
+        kv: _KVCache,
+        state: _manager.CacheState,
+        start: int,
+        end: int,
+        ordinals: Sequence[np.ndarray],
+    ) -> list[np.ndarray]:
+        """``ValueError`` for a fetch range the cache rules out, raised before the cache changes;
+        else the rows' reuse keys, which raise for a request with too few whole blocks."""
+        tpb = int(self._layout.tokens_per_block)
+        if start < (state.committed // tpb) * tpb:
+            raise ValueError(
+                f"the range starts at {start}, inside the committed whole blocks of "
+                f"{state.committed} tokens"
+            )
+        keys = self._keys_for(manager, request, kv, ordinals)
+        if self._any_window and end < state.history:
+            raise ValueError(
+                f"the range ends at {end}, below the history of {state.history} tokens its "
+                "windows keep"
+            )
+        return keys
+
+    def _write_refusal(
+        self,
+        manager: KVCacheManagerV2,
+        request: LlmRequest,
+        kv: _KVCache,
+        state: _manager.CacheState,
+        end: int,
+        new_history: int,
+    ) -> str | None:
+        """Why this rank fails the fetch at the call, once no ``ValueError`` is due, or ``None``."""
+        split = self._splits_bidirectional_span(request, end)
+        if split is not None:
+            return split
+        if not state.active:
+            return _SUSPENDED
+        if self._scratch_reuse_on(kv):
+            return _SCRATCH
+        if self._returns_context_outputs(request):
+            return _CONTEXT_OUTPUTS
+        # After every ValueError: whether an earlier fetch settled is this rank's own timing.
+        unsettled = self._unsettled(int(request.py_request_id), kv)
+        if unsettled is not None:
+            return unsettled
+        refusal = self._history_refusal(manager, state.history, new_history, end)
+        # TODO: a later lease can move the history past rows an earlier lease of the fetch missed,
+        # and the commit then stores their pages, which nothing wrote.
+        if refusal is None:
+            refusal = self._unwritten_pages_refusal(manager, kv, state.history, new_history)
+        return refusal
+
+    # Request records.
+
+    def _record(self, request_id: int, kv: _KVCache) -> _RequestRecord | None:
+        """The request's record if it is of ``kv``; a record of another cache stays as it is."""
+        record = self._records.get(request_id)
+        return record if record is not None and record.kv is kv else None
+
+    def _record_for(self, request_id: int, kv: _KVCache) -> _RequestRecord:
+        """The request's record of ``kv``: a new one in place of none or of a replaced cache's."""
+        record = self._record(request_id, kv)
+        if record is None:
+            record = self._records[request_id] = _RequestRecord(kv)
+        return record
+
+    def _waits_for(self, fetch: _Fetch | None) -> bool:
+        """Readiness and a new fetch into the cache wait for ``fetch``: neither abandoned nor
+        settled."""
+        return (
+            fetch is not None
+            and fetch.state is not _FetchState.ABANDONED
+            and not self._fetch_settled(fetch)
+        )
+
+    def _is_latest_fetch(self, lease: _StagingLease) -> bool:
+        """The write lease's fetch is its request's latest, and not abandoned."""
+        fetch = lease._fetch
+        record = self._records.get(lease._request_id)
+        return (
+            fetch is not None
+            and record is not None
+            and record.fetch is fetch
+            and fetch.state is not _FetchState.ABANDONED
+        )
 
     # Lease records, slots and grants.
 
@@ -989,7 +1128,7 @@ class Staging:
                 if head is fresh and head._kind == "write":
                     # The cache grew for it, so it fails at its first poll, which abandons the
                     # fetch, as a lease missing pages does.
-                    head._doomed = reason
+                    head._fail_at_first_poll(reason)
                     head._view = head._runs = None
                 else:
                     self._fail(head, reason)
@@ -1005,6 +1144,7 @@ class Staging:
                 return
         self._assign_staging(lease._rows, runs)
         lease._view = self._view(lease._rows, lease._keys)
+        lease._state = _LeaseState.GRANTED
         if runs is None:
             return
         lease._runs = runs
@@ -1028,10 +1168,10 @@ class Staging:
         state = _manager.cache_state(kv)
         if not state.active:
             return "the request's cache was suspended while the lease waited"
-        rows = lease._rows
-        for lg, ordinals, slots in zip(rows.layer_groups, rows.ordinals, rows.device_slots):
+        for group in lease._rows.groups:
+            lg, ordinals = group.layer_group, group.ordinals
             pages = _manager.locked_pages(kv, lg)
-            if np.any(ordinals >= len(pages)) or np.any(pages[ordinals] != slots):
+            if np.any(ordinals >= len(pages)) or np.any(pages[ordinals] != group.device_pages):
                 return f"layer group {lg}: pages changed while the lease waited"
             stale_beg, stale_end = _stale(manager, self._layout, lg, state.history)
             if np.any((ordinals >= stale_beg) & (ordinals < stale_end)):
@@ -1040,7 +1180,7 @@ class Staging:
 
     def _fail(self, lease: _StagingLease, reason: str) -> None:
         """Fail a lease never seen ready: it leaves the line, and a write abandons its fetch."""
-        if lease.failure is not None:
+        if lease._state is _LeaseState.FAILED:
             return
         lease._set_failure(reason)
         if lease._ticket is not None:
@@ -1065,14 +1205,14 @@ class Staging:
     # TODO: every lender call checks every lease holding slots, even with no copy pending, so
     # polling H such leases once each costs about H*H checks.
     def _recycle(self) -> None:
-        """Return the slots of every lease ``_recyclable`` allows."""
+        """Return the slots of every lease ``_slots_returnable`` allows."""
         # Every lease is judged before any slot returns: an event query that raises returns none
         # and leaves every lease held for the next call.
-        recyclable = [self._recyclable(lease) for lease in self._holding]
+        returnable = [self._slots_returnable(lease) for lease in self._holding]
         # TODO: an exception while slots return, a MemoryError say, can leave a lease held after
         # some or all of its slots returned, so every later round of progress raises "freed twice".
         holding = []
-        for lease, done in zip(self._holding, recyclable):
+        for lease, done in zip(self._holding, returnable):
             if done:
                 self._slots.give(lease._runs)
             else:
@@ -1087,27 +1227,26 @@ class Staging:
             return
         if lease._ticket is not None:
             self._fail(lease, "released while waiting for staging slots")
-        elif lease._kind == "write" and not lease._seen_ready and lease.failure is None:
+        elif lease._kind == "write" and lease._state in _BEFORE_VIEW:
             # Released before anyone saw it ready: no backend wrote, and no marks are due.
-            lease._doomed = None
             self._abandon(lease)
         self._progress()
 
     def _apply_marks(self, lease: _StagingLease, masks: list[np.ndarray]) -> None:
         """Copy the marked rows whose page is still the one lent into the request's pages. The
-        fetch stays abandoned until that copy is queued without error; then its rows add to the
-        cache's deliveries."""
+        fetch stays abandoned until that copy is queued without error; then it is delivered and its
+        rows add to the cache's deliveries."""
         fetch = lease._fetch
-        current = fetch is not None and self._fetches.get(lease._request_id) is fetch
-        if current:
-            del self._fetches[lease._request_id]
+        latest = self._is_latest_fetch(lease)
+        if latest:
+            fetch.state = _FetchState.ABANDONED
         kv = _manager.kv_of(self._manager_ref(), lease._request_id)
-        lent = self._still_lent(kv, lease)
+        lent = self._rows_on_lent_pages(kv, lease)
         copy = [mask & still for mask, still in zip(masks, lent)]
         error = None
         if any(c.any() for c in copy):
             segments = self._segments(lease._rows, copy)
-            self._overwrite(lease, copy)
+            self._forget_overwritten_rows(lease, copy)
             tail = self._covers_committed_tail(kv, lease._rows, copy)
             queued = None
             try:
@@ -1117,12 +1256,11 @@ class Staging:
                 if queued is None:
                     self._quarantine(lease)
                 if tail and (queued is None or error is not None):
-                    self._tainted[lease._request_id] = kv
+                    self._record_for(lease._request_id, kv).torn_tail = True
             lease._copy = queued
-        if current and error is None:
+        if latest and error is None:
             fetch.copy = lease._copy
-            fetch.delivered = True
-            self._fetches[lease._request_id] = fetch
+            fetch.state = _FetchState.DELIVERED
             self._deliver(lease._request_id, fetch, lease._rows, copy)
         self._progress()
 
@@ -1134,18 +1272,21 @@ class Staging:
         if committed % tpb == 0:
             return False
         tail = committed // tpb
-        return any(bool(np.any(o[m] == tail)) for o, m in zip(rows.ordinals, copied))
+        return any(
+            bool(np.any(group.ordinals[mask] == tail)) for group, mask in zip(rows.groups, copied)
+        )
 
-    def _overwrite(self, lease: _StagingLease, copied: list[np.ndarray]) -> None:
+    def _forget_overwritten_rows(self, lease: _StagingLease, copied: list[np.ndarray]) -> None:
         """Stop counting the delivered rows ``copied`` selects, before their copy is queued: one
         that fails partway can leave a row holding each fetch's bytes in different pools.
         ``_deliver`` counts them again once the copy is queued without error."""
-        delivered = self._delivered.get(lease._request_id)
-        if delivered is None or delivered.kv is not lease._kv:
+        record = self._record(lease._request_id, lease._kv)
+        if record is None or record.delivered is None:
             return
-        for lg, ordinals, mask in zip(lease._rows.layer_groups, lease._rows.ordinals, copied):
-            blocks = delivered.blocks[lg]
-            rows = ordinals[mask]
+        delivered = record.delivered
+        for group, mask in zip(lease._rows.groups, copied):
+            blocks = delivered.blocks[group.layer_group]
+            rows = group.ordinals[mask]
             rows = rows[rows < len(blocks)]
             if blocks[rows].any():
                 blocks[rows] = False
@@ -1156,60 +1297,69 @@ class Staging:
     ) -> None:
         """Add a fetch's copied rows to what earlier fetches into the same cache delivered, so a
         fetch split into consecutive leases counts as one."""
-        delivered = self._delivered.get(request_id)
-        if delivered is None or delivered.kv is not fetch.kv:
+        record = self._records[request_id]  # the record of the cache ``fetch`` went into
+        if record.delivered is None:
             empty = [np.zeros(0, dtype=bool) for _ in range(self._layout.num_layer_groups)]
-            delivered = _Delivered(fetch.kv, fetch.start, empty)
-            self._delivered[request_id] = delivered
+            record.delivered = _Delivered(fetch.start, empty)
+        delivered = record.delivered
         delivered.origin = min(delivered.origin, fetch.start)
-        for lg, ordinals, mask in zip(rows.layer_groups, rows.ordinals, copied):
-            got = ordinals[mask]
+        for group, mask in zip(rows.groups, copied):
+            got = group.ordinals[mask]
             if not len(got):
                 continue
-            blocks = delivered.blocks[lg]
+            blocks = delivered.blocks[group.layer_group]
             if int(got.max()) >= len(blocks):
                 blocks = np.concatenate([blocks, np.zeros(int(got.max()) + 1 - len(blocks), bool)])
             blocks[got] = True
-            delivered.blocks[lg] = blocks
+            delivered.blocks[group.layer_group] = blocks
         delivered.usable = None
 
-    def _void_past(self, delivered: _Delivered, kv: _KVCache) -> None:
+    def _forget_rows_past_capacity(self, delivered: _Delivered, kv: _KVCache) -> None:
         """Forget delivered rows at or past the cache's block count: a shrink freed their pages,
         and a regrow brings pages without their contents."""
-        kept = _manager.num_blocks(kv)
+        num_blocks = _manager.num_blocks(kv)
         for blocks in delivered.blocks:
-            if blocks[kept:].any():
-                blocks[kept:] = False
+            if blocks[num_blocks:].any():
+                blocks[num_blocks:] = False
                 delivered.usable = None
 
     def _rows(self, manager: KVCacheManagerV2, kv: _KVCache, start: int, end: int) -> _Rows:
         """The blocks of ``[start, end)`` a history of ``end`` reads, per layer group, with their
-        device slots (-1 where a block has no page)."""
+        device pages (-1 where a block has no page)."""
         layout = self._layout
         tpb = int(layout.tokens_per_block)
-        rows = _Rows([], [], [])
+        groups = []
         for lg in range(layout.num_layer_groups):
             ordinals = _needed_ordinals(manager, layout, lg, start // tpb, end // tpb, end)
             pages = _manager.pages(kv, lg)
-            slots = np.full(len(ordinals), -1, dtype=np.int64)
+            device_pages = np.full(len(ordinals), -1, dtype=np.int64)
             inside = ordinals < len(pages)
-            slots[inside] = pages[ordinals[inside]]
-            rows.layer_groups.append(lg)
-            rows.ordinals.append(ordinals)
-            rows.device_slots.append(slots)
-        return rows
+            device_pages[inside] = pages[ordinals[inside]]
+            groups.append(_GroupRows(lg, ordinals, device_pages))
+        return _Rows(groups)
 
-    def _lendable(self, manager: KVCacheManagerV2, history: int, rows: _Rows) -> _Rows:
+    def _drop_unpaged_and_stale(
+        self, manager: KVCacheManagerV2, history: int, rows: _Rows
+    ) -> _Rows:
         """``rows`` without blocks that have no page or that the request's own window has passed
         (their page may hold something else)."""
-        out = _Rows([], [], [])
-        for lg, ordinals, slots in zip(rows.layer_groups, rows.ordinals, rows.device_slots):
+        groups = []
+        for group in rows.groups:
+            lg, ordinals, pages = group.layer_group, group.ordinals, group.device_pages
             stale_beg, stale_end = _stale(manager, self._layout, lg, history)
-            ok = (slots >= 0) & ~((ordinals >= stale_beg) & (ordinals < stale_end))
-            out.layer_groups.append(lg)
-            out.ordinals.append(ordinals[ok])
-            out.device_slots.append(slots[ok])
-        return out
+            ok = (pages >= 0) & ~((ordinals >= stale_beg) & (ordinals < stale_end))
+            groups.append(_GroupRows(lg, ordinals[ok], pages[ok]))
+        return _Rows(groups)
+
+    def _missing_pages(self, rows: _Rows) -> str | None:
+        """Why a fetch into ``rows`` cannot go on, if so: the first layer group with blocks that
+        have no page."""
+        for group in rows.groups:
+            unpaged = group.device_pages < 0
+            if np.any(unpaged):
+                missing = group.ordinals[unpaged].tolist()
+                return f"layer group {group.layer_group}: blocks {missing[:8]} have no page"
+        return None
 
     def _keys_for(
         self,
@@ -1220,8 +1370,8 @@ class Staging:
     ) -> list[np.ndarray]:
         """Per layer group, the reuse keys of its rows' blocks, ``uint8 (n, 32)``."""
         # TODO: every lease hashes the request's whole prefix again from block 0.
-        top = max((int(o.max()) + 1 for o in ordinals if len(o)), default=0)
-        keys = _manager.block_keys(manager, request, kv, top)
+        blocks_hashed = max((int(o.max()) + 1 for o in ordinals if len(o)), default=0)
+        keys = _manager.block_keys(manager, request, kv, blocks_hashed)
         columns = [b"".join(keys[int(o)] for o in lg_ordinals) for lg_ordinals in ordinals]
         return [np.frombuffer(column, dtype=np.uint8).reshape(-1, 32) for column in columns]
 
@@ -1229,29 +1379,26 @@ class Staging:
         """Each pool group's run goes to its layer groups in order, so the rows of one pool group
         occupy consecutive slots."""
         cursor: dict[int, int] = {}
-        rows.staging_slots = []
-        for lg, ordinals in zip(rows.layer_groups, rows.ordinals):
-            g = int(self._layout.pool_group_of[lg])
+        for group in rows.groups:
+            g = int(self._layout.pool_group_of[group.layer_group])
             start = runs.runs.get(g, (0, 0))[0] if runs is not None else 0
             offset = cursor.get(g, 0)
-            rows.staging_slots.append(
-                np.arange(start + offset, start + offset + len(ordinals), dtype=np.int64)
-            )
-            cursor[g] = offset + len(ordinals)
+            count = len(group.ordinals)
+            group.staging_slots = np.arange(start + offset, start + offset + count, dtype=np.int64)
+            cursor[g] = offset + count
 
     def _view(self, rows: _Rows, keys: list[np.ndarray]) -> RegionView:
         runs = []
-        for lg, ordinals, lg_keys, slots in zip(
-            rows.layer_groups, rows.ordinals, keys, rows.staging_slots
-        ):
+        for group, lg_keys in zip(rows.groups, keys):
+            lg = group.layer_group
             index = self._part_of_group[int(self._layout.pool_group_of[lg])]
             part = self._parts[index]
             runs.append(
                 GroupRun(
                     lg,
-                    ordinals,
+                    group.ordinals,
                     names=self._names(lg, lg_keys),
-                    addresses=part.address + slots * part.slot_bytes,
+                    addresses=part.address + group.staging_slots * part.slot_bytes,
                     part=index,
                 )
             )
@@ -1262,12 +1409,12 @@ class Staging:
         (one boolean array per layer group; ``None``: every row), by device pool group. Segments
         that continue each other on both sides are merged."""
         by_group: dict[int, list[int]] = {}
-        for i, lg in enumerate(rows.layer_groups):
-            by_group.setdefault(int(self._layout.pool_group_of[lg]), []).append(i)
+        for i, group in enumerate(rows.groups):
+            by_group.setdefault(int(self._layout.pool_group_of[group.layer_group]), []).append(i)
         out: list[list[int]] = []
         for g, members in by_group.items():
-            dev = np.concatenate([rows.device_slots[i] for i in members])
-            stg = np.concatenate([rows.staging_slots[i] for i in members])
+            dev = np.concatenate([rows.groups[i].device_pages for i in members])
+            stg = np.concatenate([rows.groups[i].staging_slots for i in members])
             if mask is not None:
                 keep = np.concatenate([np.asarray(mask[i], dtype=bool) for i in members])
                 dev, stg = dev[keep], stg[keep]
@@ -1290,12 +1437,10 @@ class Staging:
     # TODO: copies run serially with the forward passes on the execution stream, and a copy call
     # per row and pool, which rows share only where they continue each other in a pool group of
     # one pool, keeps small rows below the host-to-device bandwidth.
-    def _memcpy(
-        self, segments: Sequence[Sequence[int]], to_staging: bool
-    ) -> tuple[_Copy | None, str | None]:
+    def _memcpy(self, segments: Sequence[Sequence[int]], to_staging: bool) -> _CopyResult:
         """Queue async copies on the manager's execution stream, then record an event covering
-        every copy queued, even after one failed; ``(None, error)`` if it could record none. With
-        page-locked staging the CPU does not wait for them; pageable staging may hold the call."""
+        every copy queued, even after one failed; no copy if it could record none. With page-locked
+        staging the CPU does not wait for them; pageable staging may hold the call."""
         # The execution stream orders a copy after the forward passes that wrote its pages and
         # before later work on it, which a page's new owner waits for; no path that releases a page
         # waits for the copies, and a writer off that stream is not ordered after them.
@@ -1316,12 +1461,12 @@ class Staging:
         except RuntimeError as record_error:
             error = error or f"recording the copy's event failed: {record_error}"
             logger.warning(f"KV cache lender: {error}")
-            return None, error
+            return _CopyResult(None, error)
         if error is not None:
             logger.warning(f"KV cache lender: {error}")
-        return _Copy(event), error
+        return _CopyResult(_Copy(event), error)
 
-    def _floor(self, manager: KVCacheManagerV2, history: int, origin: int) -> int:
+    def _restart_floor(self, manager: KVCacheManagerV2, history: int, origin: int) -> int:
         """The lowest start that needs no restart: the history where a chunk resumed below it may
         end below it and raise, or a window has released blocks at it (they have no pages), else
         the smaller of the lowest start of a delivered fetch and the history."""
@@ -1333,44 +1478,48 @@ class Staging:
                 return history
         return min(origin, history)
 
-    def _usable_until(self, manager: KVCacheManagerV2, delivered: _Delivered, known: int) -> int:
-        """The largest start ``P >= known`` where every layer group has what it reads among the
-        blocks below ``known``, computed before the fetches, and delivered rows: full attention
+    def _usable_until(self, manager: KVCacheManagerV2, delivered: _Delivered, computed: int) -> int:
+        """The largest start ``P >= computed`` where every layer group has what it reads among the
+        blocks below ``computed``, computed before the fetches, and delivered rows: full attention
         every block below ``P``, a window its sinks and in-window blocks."""
         tpb = int(self._layout.tokens_per_block)
-        first = known // tpb  # the blocks below were computed
-        last = max((len(blocks) for blocks in delivered.blocks), default=0)
-        if last <= first:
-            return known
-        # Non-monotonic in P under windows, so each is checked. Blocks below known behind a window's
-        # history have no pages, but no start at or above the floor reads them.
-        top = last  # no start past a full-attention group's first missing block passes that group
-        missing = []  # per layer group: missing[j], the undelivered blocks of [first, first + j)
+        base = computed // tpb  # the blocks below were computed
+        delivered_end = max((len(blocks) for blocks in delivered.blocks), default=0)
+        if delivered_end <= base:
+            return computed
+        # Non-monotonic in P under windows, so each is checked. Blocks below ``computed`` behind a
+        # window's history have no pages, but no start at or above the floor reads them.
+        # No start past a full-attention group's first undelivered block passes that group.
+        highest_end = delivered_end
+        # Per layer group: undelivered[j], how many of the j blocks from ``base`` were not delivered.
+        undelivered = []
         for lg, blocks in enumerate(delivered.blocks):
-            have = np.zeros(last - first, dtype=bool)
-            mine = blocks[first:last]
+            have = np.zeros(delivered_end - base, dtype=bool)
+            mine = blocks[base:delivered_end]
             have[: len(mine)] = mine
-            missing.append(np.concatenate([[0], np.cumsum(~have)]))
+            undelivered.append(np.concatenate([[0], np.cumsum(~have)]))
             if self._layout.windows[lg] is None and not have.all():
-                top = min(top, first + int(np.argmin(have)))
+                highest_end = min(highest_end, base + int(np.argmin(have)))
 
-        def gap(lg: int, a: int, b: int) -> bool:
-            a, b = max(a, first), min(b, last)
-            return b > a and missing[lg][b - first] - missing[lg][a - first] > 0
+        def has_gap(lg: int, a: int, b: int) -> bool:
+            """A block of ``[a, b)`` that layer group ``lg`` neither computed nor got delivered."""
+            a, b = max(a, base), min(b, delivered_end)
+            return b > a and undelivered[lg][b - base] - undelivered[lg][a - base] > 0
 
         # The largest start first: a fetch whose leases all landed is usable at its end at once.
-        for end_block in range(top, first, -1):
+        for end_block in range(highest_end, base, -1):
             for lg in range(len(delivered.blocks)):
                 stale_beg, stale_end = _stale(manager, self._layout, lg, end_block * tpb)
                 if stale_end > stale_beg:
-                    bad = gap(lg, first, min(stale_beg, end_block)) or gap(lg, stale_end, end_block)
+                    lacking = has_gap(lg, base, min(stale_beg, end_block))
+                    lacking = lacking or has_gap(lg, stale_end, end_block)
                 else:
-                    bad = gap(lg, first, end_block)
-                if bad:
+                    lacking = has_gap(lg, base, end_block)
+                if lacking:
                     break
             else:
                 return end_block * tpb
-        return known
+        return computed
 
 
 # TODO: an in-place lease gets none of the staging guarantees: nothing guards its pages against
@@ -1380,15 +1529,15 @@ class InPlace:
     """``InPlaceLender`` over one manager, which it references weakly. A lease holds a loan on the
     request's cache; the request's free keeps a lent cache open until its last loan ends."""
 
-    def __init__(self, manager: weakref.ref, layout: ManagerLayout) -> None:
+    def __init__(self, manager: weakref.ref[KVCacheManagerV2], layout: ManagerLayout) -> None:
         self._manager_ref = manager
         self._layout = layout
         # Open loans per cache, holding the cache strongly so that dropping a lease never lets a
         # collector close it on another thread.
-        self._loans: dict[object, int] = {}
-        self._freed: dict[object, Callable[[], None]] = {}  # lent caches the manager freed
-        self._kept: frozenset[object] | None = None  # set by the manager's shutdown
-        # Kept while a loan is open, and until exit once the manager is gone.
+        self._loans: dict[_KVCache, int] = {}
+        self._freed: dict[_KVCache, Callable[[], None]] = {}  # lent caches the manager freed
+        self._kept_at_shutdown: frozenset[object] | None = None  # set by the manager's shutdown
+        # Retained while a loan is open, and until exit once the manager is gone.
         self._index_buffer: object | None = None
 
     def lend_read(self, request: LlmRequest, start: int, end: int) -> _InPlaceLease:
@@ -1426,36 +1575,36 @@ class InPlace:
         no names."""
 
     def _on_shutdown(self, impl: KVCacheManager) -> frozenset[object]:
-        """Manager hook: the caches still on loan, kept with ``impl`` until the process exits; the
-        same set on every later call."""
-        if self._kept is not None:
-            return self._kept
+        """Manager hook: the caches still on loan, retained with ``impl`` until the process exits;
+        the same set on every later call."""
+        if self._kept_at_shutdown is not None:
+            return self._kept_at_shutdown
         # Outside the try: a hook that cannot list the caches on loan raises, so the manager's
         # shutdown stops before it closes or frees anything.
-        self._kept = frozenset(self._loans)
-        if self._kept:
+        self._kept_at_shutdown = frozenset(self._loans)
+        if self._kept_at_shutdown:
             try:
                 # A device pool cannot be freed in part, so the pools stay with the lent caches.
-                for owner in (impl, *self._kept):
-                    _keep(owner)
+                for owner in (impl, *self._kept_at_shutdown):
+                    _retain_until_exit(owner)
                 logger.warning(
-                    f"KV cache lender: keeping {len(self._kept)} lent caches and their pools "
-                    "until exit"
+                    f"KV cache lender: keeping {len(self._kept_at_shutdown)} lent caches and their "
+                    "pools until exit"
                 )
             except Exception:
                 # Logged, not raised into the manager's shutdown, which still leaves the lent
                 # caches open and the pools unfreed.
                 logger.error(f"KV cache lender: shutting down: {traceback.format_exc()}")
-        return self._kept
+        return self._kept_at_shutdown
 
     def _on_caches_closed(self) -> None:
-        """Manager hook after its shutdown closed every cache: nothing to do, since a loan keeps the
-        page-index buffer itself and a release drops its cache."""
+        """Manager hook after its shutdown closed every cache: nothing to do, since a loan retains
+        the page-index buffer itself and a release drops its cache."""
 
     def _end_loan(self, kv_cache: _KVCache) -> None:
         """End one loan on ``kv_cache``; the last loan on a freed cache closes it in this call."""
-        if self._kept is not None:
-            return  # every cache on loan at the manager's shutdown is kept until exit
+        if self._kept_at_shutdown is not None:
+            return  # every cache on loan at the manager's shutdown is retained until exit
         left = self._loans.get(kv_cache, 0) - 1
         if left > 0:
             self._loans[kv_cache] = left
@@ -1468,31 +1617,32 @@ class InPlace:
             _manager.close_cache(kv_cache)
             after_close()
         if not self._loans:
-            self._let_go_index_buffer()
+            self._release_index_buffer()
 
-    def _keep_index_buffer(self, manager: KVCacheManagerV2) -> None:
-        """Keep the manager's page-index buffer while a loan is open: a lent cache the manager does
-        not detach writes its page indices there as it closes, even after the manager is gone."""
+    def _retain_index_buffer(self, manager: KVCacheManagerV2) -> None:
+        """Retain the manager's page-index buffer while a loan is open: a lent cache the manager
+        does not detach writes its page indices there as it closes, even after the manager is
+        gone."""
         # TODO: without a shutdown nothing detaches a lent cache from the buffer, so a lease still
-        # held when the keep list goes at process exit closes its cache into the freed buffer.
+        # held when the exit registry goes at process exit closes its cache into the freed buffer.
         self._index_buffer = _manager.index_buffer(manager)
-        _keep(self._index_buffer)
+        _retain_until_exit(self._index_buffer)
 
-    def _let_go_index_buffer(self) -> None:
-        """The last loan ended: let the buffer go to its manager. With the manager gone, a cache
+    def _release_index_buffer(self) -> None:
+        """The last loan ended: release the buffer to its manager. With the manager gone, a cache
         this lender held may still close after this call, so the buffer stays until exit."""
         if self._manager_ref() is None:
             return
-        _let_go(self._index_buffer)
+        _release_retained(self._index_buffer)
         self._index_buffer = None
 
-    def _lend(self, request: LlmRequest, start: int, end: int, kind: str) -> _InPlaceLease:
+    def _lend(self, request: LlmRequest, start: int, end: int, kind: _LeaseKind) -> _InPlaceLease:
         start, end = int(start), int(end)
         if start < 0 or end < 0 or start > end:
             raise ValueError(f"bad token range [{start}, {end})")
         request_id = int(request.py_request_id)
         manager = self._manager_ref()
-        if self._kept is not None or manager is None:
+        if self._kept_at_shutdown is not None or manager is None:
             return _InPlaceLease._failed(self, kind, _SHUT_DOWN)
         kv = _manager.kv_of(manager, request_id)
         if kv is None:
@@ -1502,8 +1652,8 @@ class InPlace:
             return _InPlaceLease._failed(self, kind, _SUSPENDED)
         runs = []
         for lg in range(self._layout.num_layer_groups):
-            ordinals, slots, beyond = self._device_slots(manager, kv, lg, start, end)
-            paged = slots >= 0
+            ordinals, pages, beyond = self._device_pages(manager, kv, lg, start, end)
+            paged = pages >= 0
             if kind == "write" and (beyond or not paged.all()):
                 missing = ordinals[~paged].tolist() + beyond
                 return _InPlaceLease._failed(
@@ -1515,49 +1665,71 @@ class InPlace:
         # request's free.
         # The loan opens here: from now on the request's free keeps the cache open.
         if not self._loans:
-            self._keep_index_buffer(manager)
+            self._retain_index_buffer(manager)
         self._loans[kv] = self._loans.get(kv, 0) + 1
         return _InPlaceLease(self, kind, RegionView(tuple(runs)), kv)
 
-    def _device_slots(
+    def _device_pages(
         self, manager: KVCacheManagerV2, kv: _KVCache, lg: int, start: int, end: int
     ) -> tuple[np.ndarray, np.ndarray, list[int]]:
         """The blocks of ``lg`` that ``[start, end)`` touches, a partial last one included and none
         for an empty range, that a history of ``end`` reads: those the cache has, with their device
-        slots (-1 where a block has no locked page), and up to eight past them as Python ints."""
+        pages (-1 where a block has no locked page), and up to eight past them as Python ints."""
         tpb = int(self._layout.tokens_per_block)
         # Only pages the cache locks: a window block behind its history keeps at most a held page,
         # which a lower cache tier may take at any time.
         pages = _manager.locked_pages(kv, lg)
         held = len(pages)
-        last = -(-end // tpb) if end > start else start // tpb
-        runs = _needed_runs(manager, self._layout, lg, start // tpb, last, end)
-        inside = _ordinals([(beg, min(stop, held)) for beg, stop in runs if held > beg])
+        end_block = -(-end // tpb) if end > start else start // tpb
+        ranges = _needed_block_ranges(manager, self._layout, lg, start // tpb, end_block, end)
+        inside = _ordinals([(beg, min(stop, held)) for beg, stop in ranges if held > beg])
         # Past the cache's blocks, which have no page, only the first eight are listed, as many as a
         # failed write names, and as Python ints: a range of any length and start stays small.
         beyond: list[int] = []
-        for beg, stop in runs:
-            first = max(beg, held)
-            beyond.extend(range(first, min(stop, first + 8 - len(beyond))))
+        for beg, stop in ranges:
+            first_beyond = max(beg, held)
+            beyond.extend(range(first_beyond, min(stop, first_beyond + 8 - len(beyond))))
         return inside, pages[inside], beyond
 
 
+class _LeaseState(enum.Enum):
+    """Where a lease is in its life; ``_StagingLease`` lists what moves a staging lease between
+    them. An in-place lease starts ``GRANTED``, or ``FAILED`` at its call."""
+
+    WAITING = "waiting"
+    GRANTED = "granted"
+    VIEW_RETURNED = "view returned"
+    MARKED = "marked"
+    FAILS_AT_FIRST_POLL = "fails at first poll"
+    FAILED = "failed"
+
+
+# A write released in one of these abandons its fetch: no backend saw its view.
+_BEFORE_VIEW = (_LeaseState.WAITING, _LeaseState.GRANTED, _LeaseState.FAILS_AT_FIRST_POLL)
+
+
 class _LeaseBase:
-    """What both leases share: their failure, and the checks of a write's one mark."""
+    """What both leases share: their state and failure, and the checks of a write's one mark."""
 
     @property
     def failure(self) -> str | None:
         """See ``Lease.failure``."""
-        return self._failure
+        return self._reason if self._state is _LeaseState.FAILED else None
+
+    def _return_view(self) -> RegionView | None:
+        """The view ``poll`` returns; a granted lease is then ``VIEW_RETURNED``."""
+        if self._state is _LeaseState.GRANTED:
+            self._state = _LeaseState.VIEW_RETURNED
+        return self._view
 
     def _take_marks(self, masks: Sequence[np.ndarray]) -> list[np.ndarray]:
         """Copies of ``masks`` for the one mark of a write whose view ``poll()`` returned;
         ``ValueError`` unless one bool mask of shape ``(len(run),)`` per run."""
         if self._kind != "write":
             raise RuntimeError("mark_arrived is for write leases")
-        if not self._seen_ready:
+        if self._state not in (_LeaseState.VIEW_RETURNED, _LeaseState.MARKED):
             raise RuntimeError("mark_arrived before poll() returned the view")
-        if self._marked:
+        if self._state is _LeaseState.MARKED:
             raise RuntimeError("mark_arrived called twice")
         masks, runs = list(masks), self._view.runs
         if len(masks) != len(runs):
@@ -1571,18 +1743,36 @@ class _LeaseBase:
                     f"({len(run)},), got {mask.dtype} {mask.shape}"
                 )
             out.append(mask.copy())
-        self._marked = True
+        self._state = _LeaseState.MARKED
         return out
 
 
 class _StagingLease(_LeaseBase):
     """A staging lease; holds its lender weakly and has no finalizer. Backends may read its view's
-    arrays on their own threads until release, and never call it."""
+    arrays on their own threads until release, and never call it.
+
+    Its state, and what moves it on (``_reason`` says why it failed or fails at its first poll):
+
+    - ``WAITING``: not granted yet; in line for slots while it holds ``_ticket``. ``_grant`` moves
+      it to ``GRANTED``; ``_fail`` to ``FAILED``.
+    - ``GRANTED``: it has its view, and its slots if it has rows; a read's copy into staging may
+      still run. ``poll`` returning the view moves it to ``VIEW_RETURNED``; a read whose copy into
+      staging failed is ``FAILED``.
+    - ``VIEW_RETURNED``: a backend may use its slots. ``mark_arrived`` moves a write to ``MARKED``.
+    - ``MARKED``: ``mark_arrived`` took a write's masks; the marked rows still lent are copied
+      into the request's pages.
+    - ``FAILS_AT_FIRST_POLL``: a write whose cache grew but that cannot go on: a block without a
+      page, or a grant within its call that raised. ``poll`` and the shutdown move it to
+      ``FAILED``.
+    - ``FAILED``: ``failure`` says why; it never returns its view.
+
+    Release is separate, legal in every state: a released lease is never polled again, and a write
+    released before its view was returned abandons its fetch."""
 
     def __init__(
         self,
         lender: Staging,
-        kind: str,
+        kind: _LeaseKind,
         request_id: int,
         kv: _KVCache | None = None,
         rows: _Rows | None = None,
@@ -1596,18 +1786,18 @@ class _StagingLease(_LeaseBase):
         self._rows = rows
         self._keys = keys
         self._fetch = fetch
-        self._doomed: str | None = None  # why it fails at its first poll
+        self._state = _LeaseState.WAITING
+        self._reason: str | None = None
         self._ticket: int | None = None  # its place in line while it waits for slots
         self._runs: Runs | None = None
         self._view: RegionView | None = None
         self._copy: _Copy | None = None
-        self._seen_ready = False
         self._released = False
-        self._marked = False
-        self._failure: str | None = None
 
     @classmethod
-    def _failed(cls, lender: Staging, kind: str, request_id: int, reason: str) -> _StagingLease:
+    def _failed(
+        cls, lender: Staging, kind: _LeaseKind, request_id: int, reason: str
+    ) -> _StagingLease:
         """A lease failed at the call; open until released, like any other."""
         lease = cls(lender, kind, request_id)
         lease._set_failure(reason)
@@ -1615,9 +1805,18 @@ class _StagingLease(_LeaseBase):
             lender._unreleased.add(lease)
         return lease
 
+    @property
+    def _first_poll_failure(self) -> str | None:
+        """Why it fails at its first poll, while it is ``FAILS_AT_FIRST_POLL``."""
+        return self._reason if self._state is _LeaseState.FAILS_AT_FIRST_POLL else None
+
     def _set_failure(self, reason: str) -> None:
-        self._failure = reason
-        self._doomed = None
+        self._state = _LeaseState.FAILED
+        self._reason = reason
+
+    def _fail_at_first_poll(self, reason: str) -> None:
+        self._state = _LeaseState.FAILS_AT_FIRST_POLL
+        self._reason = reason
 
     def poll(self) -> RegionView | None:
         """See ``Lease.poll``."""
@@ -1627,17 +1826,16 @@ class _StagingLease(_LeaseBase):
         if lender is None or lender._live() is None:
             return self._ended_poll()
         lender._progress()
-        if self._failure is not None:
+        if self._state is _LeaseState.FAILED:
             return None
-        if self._doomed is not None:
-            lender._fail(self, self._doomed)
+        if self._state is _LeaseState.FAILS_AT_FIRST_POLL:
+            lender._fail(self, self._reason)
             return None
-        if self._view is None:
+        if self._state is _LeaseState.WAITING:
             return None
-        if self._kind == "read" and not lender._copy_landed(self):
+        if self._kind == "read" and not lender._read_copy_done(self):
             return None
-        self._seen_ready = True
-        return self._view
+        return self._return_view()
 
     def mark_arrived(self, masks: Sequence[np.ndarray]) -> None:
         """See ``Lease.mark_arrived``."""
@@ -1657,12 +1855,15 @@ class _StagingLease(_LeaseBase):
 
     def _ended_poll(self) -> RegionView | None:
         """``poll`` after the lender stopped serving: no grant or copy, just what already landed."""
-        if self._failure is not None or self._view is None:
+        if self._state not in (
+            _LeaseState.GRANTED,
+            _LeaseState.VIEW_RETURNED,
+            _LeaseState.MARKED,
+        ):
             return None
         if self._kind == "read" and self._copy is not None and not self._copy.done():
             return None
-        self._seen_ready = True
-        return self._view
+        return self._return_view()
 
 
 class _InPlaceLease(_LeaseBase):
@@ -1672,7 +1873,7 @@ class _InPlaceLease(_LeaseBase):
     def __init__(
         self,
         lender: InPlace,
-        kind: str,
+        kind: _LeaseKind,
         view: RegionView | None,
         kv_cache: _KVCache | None = None,
         failure: str | None = None,
@@ -1681,13 +1882,12 @@ class _InPlaceLease(_LeaseBase):
         self._kind = kind
         self._view = view
         self._cache = kv_cache  # the loan, until release
-        self._failure = failure
-        self._seen_ready = False
+        self._state = _LeaseState.GRANTED if failure is None else _LeaseState.FAILED
+        self._reason = failure
         self._released = False
-        self._marked = False
 
     @classmethod
-    def _failed(cls, lender: InPlace, kind: str, reason: str) -> _InPlaceLease:
+    def _failed(cls, lender: InPlace, kind: _LeaseKind, reason: str) -> _InPlaceLease:
         """A lease failed at the call; it holds no loan."""
         return cls(lender, kind, None, failure=reason)
 
@@ -1695,11 +1895,10 @@ class _InPlaceLease(_LeaseBase):
         """See ``Lease.poll``."""
         if self._released:
             raise RuntimeError("poll after release")
-        if self._failure is not None:
+        if self._state is _LeaseState.FAILED:
             return None
         # The request's own pages: ready at once; the caller has let the stream's work on them end.
-        self._seen_ready = True
-        return self._view
+        return self._return_view()
 
     def mark_arrived(self, masks: Sequence[np.ndarray]) -> None:
         """See ``Lease.mark_arrived``."""

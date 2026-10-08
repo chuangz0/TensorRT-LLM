@@ -1001,5 +1001,6 @@ def _let_go_of_what_the_test_kept():
     # A lease or lender a cycle still holds closes its cache while what the cache writes to is kept.
     gc.collect()
     while added:
-        lender._let_go(added.pop())  # newest first: what a shutdown kept, then the earlier buffer
+        # Newest first: what a shutdown kept, then the earlier buffer.
+        lender._release_retained(added.pop())
     gc.collect()

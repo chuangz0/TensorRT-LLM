@@ -289,13 +289,13 @@ def test_the_check_catches_an_in_place_lender_listing_blocks_past_the_cache_as_i
 ):
     from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _lender
 
-    real = _lender.InPlace._device_slots
+    real = _lender.InPlace._device_pages
 
     def as_int64(self, manager, kv, lg, start, end):  # the blocks past the cache as int64 too
         inside, slots, beyond = real(self, manager, kv, lg, start, end)
         return inside, slots, np.array(beyond, dtype=np.int64).tolist()
 
-    monkeypatch.setattr(_lender.InPlace, "_device_slots", as_int64)
+    monkeypatch.setattr(_lender.InPlace, "_device_pages", as_int64)
     with pytest.raises(AssertionError, match="raised OverflowError"):
         test_a_range_starting_past_every_block_lends_no_rows_and_fails_a_write(
             kit, real_manager, False
@@ -422,7 +422,9 @@ def test_the_check_catches_an_in_place_lender_stopping_at_a_reuse_reset(
 ):
     from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _lender
 
-    monkeypatch.setattr(_lender.InPlace, "_on_reset", lambda self: setattr(self, "_kept", ()))
+    monkeypatch.setattr(
+        _lender.InPlace, "_on_reset", lambda self: setattr(self, "_kept_at_shutdown", ())
+    )
     with pytest.raises(AssertionError, match="stopped at the reset"):
         test_a_reuse_reset_leaves_in_place_lending_as_it_was(kit, real_manager)
 
@@ -897,7 +899,7 @@ def test_a_freed_request_s_cache_is_detached_before_its_manager_goes(kit, monkey
     buffer goes with the manager: only the free's detach keeps the lent cache off it."""
     from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _lender
 
-    monkeypatch.setattr(_lender.InPlace, "_keep_index_buffer", lambda self, manager: None)
+    monkeypatch.setattr(_lender.InPlace, "_retain_index_buffer", lambda self, manager: None)
     check_a_lease_outliving_its_manager(kit, free_first=True)
 
 
@@ -933,7 +935,7 @@ def check_a_cache_kept_at_shutdown(kit):
     gc.collect()
     added = [o for o in kit.retained() if not any(o is b for b in before)]
     for owner in added:  # what the process exit does to the keep list
-        _lender._let_go(owner)
+        _lender._release_retained(owner)
     del added, owner
     gc.collect()
     canary = None if buffer() is not None else kit.reclaim(row)
@@ -1044,10 +1046,10 @@ def test_the_check_catches_a_lender_letting_the_buffer_go_after_its_manager(
     from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _lender
 
     def let_go_regardless(self):
-        _lender._let_go(self._index_buffer)
+        _lender._release_retained(self._index_buffer)
         self._index_buffer = None
 
-    monkeypatch.setattr(_lender.InPlace, "_let_go_index_buffer", let_go_regardless)
+    monkeypatch.setattr(_lender.InPlace, "_release_index_buffer", let_go_regardless)
     with pytest.raises(AssertionError, match=FREED):
         check_a_last_release_after_its_manager(kit, cache_held)
 
@@ -1075,7 +1077,7 @@ def test_the_checks_catch_a_lender_not_keeping_the_index_buffer(kit, monkeypatch
     from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _lender
 
     for cls in (_lender.Staging, _lender.InPlace):
-        monkeypatch.setattr(cls, "_keep_index_buffer", lambda self, manager: None)
+        monkeypatch.setattr(cls, "_retain_index_buffer", lambda self, manager: None)
     with pytest.raises(AssertionError, match=FREED):
         OUTLIVING[check](kit)
 
@@ -1114,7 +1116,7 @@ def test_the_check_catches_a_lender_keeping_the_index_buffer_for_good(
 ):
     from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _lender
 
-    monkeypatch.setattr(_lender.InPlace, "_let_go_index_buffer", lambda self: None)
+    monkeypatch.setattr(_lender.InPlace, "_release_index_buffer", lambda self: None)
     with pytest.raises(AssertionError, match="kept after the last loan ended"):
         test_the_index_buffer_is_kept_only_while_a_loan_is_open(kit, real_manager)
 
@@ -1136,7 +1138,7 @@ def switching_in_let_go(step, call, switch):
         return line
 
     def tracer(frame, event, arg):
-        if switched or frame.f_code is not _lender._let_go.__code__:
+        if switched or frame.f_code is not _lender._release_retained.__code__:
             return None
         return line
 
