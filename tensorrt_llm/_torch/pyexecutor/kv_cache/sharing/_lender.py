@@ -822,24 +822,46 @@ class Staging:
         return None
 
     def _unwritten_pages_refusal(
-        self, manager: KVCacheManagerV2, kv: _KVCache, history: int, new_history: int
+        self,
+        manager: KVCacheManagerV2,
+        request_id: int,
+        kv: _KVCache,
+        history: int,
+        new_history: int,
     ) -> str | None:
         """Why moving the history to ``new_history`` would have the commit store bytes the request
         never wrote, or ``None``: a window leaving behind a block whose page holds tokens past the
-        history keeps that page for the commit (a partial match's copy, a page grown early)."""
+        history keeps that page for the commit (a partial match's copy, a page grown early), and so
+        does one an earlier windowed lease moved the history past without delivering it."""
         if not _manager.keeps_passed_pages(manager):
             return None
-        first_past_history = history // int(self._layout.tokens_per_block)
+        tpb = int(self._layout.tokens_per_block)
+        # Below the history the request wrote what it computed and the rows fetches delivered; only
+        # an earlier windowed lease's grow leaves the history past what it computed.
+        first = min(history, self._computed_tokens(request_id, kv)) // tpb
+        record = self._record(request_id, kv)
+        delivered = record.delivered if record is not None else None
         for lg in range(self._layout.num_layer_groups):
             stale_beg, stale_end = _stale(manager, self._layout, lg, new_history)
-            beg = max(first_past_history, stale_beg)
+            beg = max(first, stale_beg)
             if beg >= stale_end:
                 continue
-            paged = _manager.locked_pages(kv, lg)[beg:stale_end] >= 0
-            blocks = (beg + np.nonzero(paged)[0]).tolist()
+            unwritten = _manager.locked_pages(kv, lg)[beg:stale_end] >= 0
+            if delivered is not None:
+                got = delivered.blocks[lg][beg : beg + len(unwritten)]
+                unwritten[: len(got)] &= ~got
+            blocks = (beg + np.nonzero(unwritten)[0]).tolist()
+            missed = [b for b in blocks if b < history // tpb]
+            # TODO: no runtime call drops one block's page in one layer group, so the fetch fails
+            # where the commit could store no page for those blocks instead.
+            if missed:
+                return (
+                    f"layer group {lg} leaves blocks {missed[:8]} behind its window at "
+                    f"{new_history} tokens; an earlier lease moved the history past them to "
+                    f"{history} tokens without delivering them, so their pages hold bytes the "
+                    "request never wrote, which the commit would store"
+                )
             if blocks:
-                # TODO: no runtime call drops one block's page in one layer group, so the fetch
-                # fails where the commit could store no page for those blocks instead.
                 return (
                     f"layer group {lg} leaves blocks {blocks[:8]} behind its window at "
                     f"{new_history} tokens; past the history of {history} tokens their pages hold "
@@ -1020,14 +1042,15 @@ class Staging:
         if self._returns_context_outputs(request):
             return _CONTEXT_OUTPUTS
         # After every ValueError: whether an earlier fetch settled is this rank's own timing.
-        unsettled = self._unsettled(int(request.py_request_id), kv)
+        request_id = int(request.py_request_id)
+        unsettled = self._unsettled(request_id, kv)
         if unsettled is not None:
             return unsettled
         refusal = self._history_refusal(manager, state.history, new_history, end)
-        # TODO: a later lease can move the history past rows an earlier lease of the fetch missed,
-        # and the commit then stores their pages, which nothing wrote.
         if refusal is None:
-            refusal = self._unwritten_pages_refusal(manager, kv, state.history, new_history)
+            refusal = self._unwritten_pages_refusal(
+                manager, request_id, kv, state.history, new_history
+            )
         return refusal
 
     # Request records.

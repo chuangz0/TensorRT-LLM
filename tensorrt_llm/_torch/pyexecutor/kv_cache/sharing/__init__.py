@@ -85,7 +85,7 @@ Caller checklist for staging:
     4. Fetch: ``lend_write``, park the request, poll, fill, ``mark_arrived``, release. Split a fetch
        only by the rule in ``StagingLender.lend_write``: the next lease once ``readiness`` is not
        None on every rank and, with a sliding window, its ``usable_until`` reaches the previous
-       lease's end (not checked yet).
+       lease's end. A windowed lease that breaks it can fail at the call.
     5. Each executor iteration, poll every open lease and ask ``readiness`` for every parked
        request; combine ranks (``Readiness``).
     6. Resume within the interval; on an empty one, drop the cache in every manager and compute from

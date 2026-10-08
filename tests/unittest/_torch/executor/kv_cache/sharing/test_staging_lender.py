@@ -1604,6 +1604,147 @@ def test_the_check_catches_a_lender_lending_past_the_extra_tokens_page(kit, real
         )
 
 
+def all_marks_but(view, layer_group, ordinals):
+    """One mask per run of ``view``, marking every row but layer group ``layer_group``'s blocks
+    ``ordinals``."""
+    return tuple(
+        ~np.isin(run.ordinals, ordinals if run.layer_group == layer_group else [])
+        for run in view.runs
+    )
+
+
+def test_a_later_lease_past_window_rows_the_publisher_never_lent_fails_at_the_call(
+    kit, real_manager, attach=attach
+):
+    """All-reusable, a window of ``WINDOW`` tokens: at its full history the publisher's window has
+    passed blocks 0 and 1, so it lends the window group's rows of blocks 2 and 3 alone. A fetch
+    split into ``[0, 64)`` and ``[64, 128)`` relays what the publisher lent: its first lease gets no
+    window row, and readiness, not empty, stops short of 64. The later lease would leave window
+    blocks 0 and 1 behind, whose pages nothing wrote and the commit would store, so it fails at the
+    call, naming them, and changes nothing. The request then computes from ``usable_until``."""
+    windows = [WINDOW, 256]
+    with real_manager(windows=windows) as mgr_a, real_manager(windows=windows) as mgr_b:
+        source = kit.published(mgr_a, SOURCE, SPLIT_PROMPT)
+        lender_a = attach(mgr_a, fetch_tokens=4 * TPB)
+        publish = lender_a.lend_read(source, 0, 4 * TPB)
+        publish_view = ready_view(publish, mgr_a)
+        sliding = kit.windows(mgr_a).index(WINDOW)
+        assert by_group(publish_view)[sliding] == [2, 3], "the window kept blocks: nothing checked"
+        lent = {name.tobytes() for run in publish_view.runs for name in run.names}
+        target = kit.admitted(mgr_b, TARGET, SPLIT_PROMPT)
+        lender_b = attach(mgr_b, fetch_tokens=2 * TPB)
+        first = lender_b.lend_write(target, 0, 2 * TPB)
+        view = ready_view(first, mgr_b)
+
+        def published(run, row):  # a row the publisher lent
+            return view.runs[run].names[row].tobytes() in lent
+
+        first.mark_arrived(kit.relay(lender_a, publish_view, lender_b, view, published))
+        first.release()
+        publish.release()
+        mgr_b._stream.synchronize()
+        before = state_of(kit, mgr_b, lender_b, target)
+        readiness = before[1]
+        assert readiness.restart_floor <= readiness.usable_until < 2 * TPB, tuple(readiness)
+        later = lender_b.lend_write(target, 2 * TPB, 4 * TPB)
+        assert later.failure is not None and "blocks [0, 1]" in later.failure, (
+            f"a later lease was lent past window rows nothing wrote: {later.failure}"
+        )
+        later.release()
+        assert state_of(kit, mgr_b, lender_b, target) == before, (
+            "the failed lease changed the cache"
+        )
+        resumed(kit, mgr_b, target, readiness.usable_until)
+        assert next_chunk(kit, mgr_b, target, tokens=len(SPLIT_PROMPT)) is None
+        assert kit.kv(mgr_b, target).num_committed_tokens == len(SPLIT_PROMPT)
+
+
+def from_the_history_alone(self, manager, request_id, kv, *rest):  # as if no lease came before
+    return real("_unwritten_pages_refusal")(self, manager, None, kv, *rest)
+
+
+def test_the_check_catches_a_lender_checking_only_past_the_history(kit, real_manager):
+    liar = attach_breaking({"_unwritten_pages_refusal": from_the_history_alone})
+    with pytest.raises(CAUGHT, match="was lent past window rows nothing wrote"):
+        test_a_later_lease_past_window_rows_the_publisher_never_lent_fails_at_the_call(
+            kit, real_manager, liar
+        )
+
+
+LATER_LEASES = {
+    # name: (manager kwargs, the window group's blocks the first lease [0, 64) misses, the blocks
+    # the later lease [64, 128) then names failing at the call (None: lent), how the caller then
+    # writes them)
+    "nothing_missed": ({}, [], None, None),
+    "refetched": ({}, [1], [1], "fetch"),
+    "computed": ({}, [1], [1], "compute"),
+    # The commit keeps no page a window passed.
+    "per_request": ({"block_reuse_config": {"policy": "per_request"}}, [1], None, None),
+}
+
+
+@pytest.mark.parametrize("case", list(LATER_LEASES))
+def test_a_later_windowed_lease_fails_at_the_call_until_the_rows_it_leaves_behind_are_written(
+    kit, real_manager, case, attach=attach
+):
+    """A window of ``WINDOW`` tokens and a fetch split into ``[0, 64)`` and ``[64, 128)``: the
+    later lease leaves window blocks 0 and 1 behind. All-reusable, the commit stores their pages, so
+    where the first lease missed one, the later lease fails at the call, naming it, and changes
+    nothing; it goes through once the caller fetches the block again or computes it. Per request,
+    no commit stores them and it goes through at once. Then the fetch is usable to its end."""
+    kwargs, missed, refused, rewrite = LATER_LEASES[case]
+    with real_manager(windows=[WINDOW, 256], **kwargs) as mgr:
+        sliding = kit.windows(mgr).index(WINDOW)
+        target = kit.admitted(mgr, TARGET, SPLIT_PROMPT)
+        lender = attach(mgr, fetch_tokens=2 * TPB)
+        first = lender.lend_write(target, 0, 2 * TPB)
+        view = ready_view(first, mgr)
+        kit.stage(lender, view, 0x11)
+        first.mark_arrived(all_marks_but(view, sliding, missed))
+        first.release()
+        mgr._stream.synchronize()
+        if refused is not None:
+            before = state_of(kit, mgr, lender, target)
+            usable = before[1].usable_until
+            assert before[1].restart_floor <= usable < 2 * TPB, tuple(before[1])
+            later = lender.lend_write(target, 2 * TPB, 4 * TPB)
+            assert later.failure is not None and f"blocks {refused}" in later.failure, (
+                f"a later lease was lent past window rows the first missed: {later.failure}"
+            )
+            later.release()
+            assert state_of(kit, mgr, lender, target) == before, (
+                "the failed lease changed the cache"
+            )
+            if rewrite == "fetch":
+                fetch_segment(kit, mgr, lender, target, usable, 2 * TPB, 0x22)
+            else:
+                resumed(kit, mgr, target, usable)
+                assert next_chunk(kit, mgr, target, tokens=2 * TPB - usable) is None
+        fetch_segment(kit, mgr, lender, target, 2 * TPB, 4 * TPB, 0x33)
+        readiness = lender.readiness(target)
+        assert readiness == (4 * TPB, 4 * TPB), (
+            f"readiness {tuple(readiness)} after the later lease"
+        )
+
+
+def ignoring_what_earlier_leases_delivered(self, manager, request_id, kv, *rest):
+    from unittest import mock
+
+    record = self._record(request_id, kv)  # their rows count as unwritten
+    if record is None:
+        return real("_unwritten_pages_refusal")(self, manager, request_id, kv, *rest)
+    with mock.patch.object(record, "delivered", None):
+        return real("_unwritten_pages_refusal")(self, manager, request_id, kv, *rest)
+
+
+def test_the_check_catches_a_lender_refusing_rows_an_earlier_lease_delivered(kit, real_manager):
+    liar = attach_breaking({"_unwritten_pages_refusal": ignoring_what_earlier_leases_delivered})
+    with pytest.raises(CAUGHT, match="the write lease was not ready"):
+        test_a_later_windowed_lease_fails_at_the_call_until_the_rows_it_leaves_behind_are_written(
+            kit, real_manager, "nothing_missed", liar
+        )
+
+
 def test_an_abandoned_segment_keeps_what_earlier_ones_delivered(kit, real_manager, attach=attach):
     with real_manager() as mgr:
         target = kit.admitted(mgr, TARGET, SPLIT_PROMPT)
@@ -3662,7 +3803,7 @@ def test_a_fetch_from_a_partially_matched_block(kit, real_manager, case, attach=
         assert got == kit.digest(expected(dev, window_lg, 1)), "block 1 holds other bytes"
 
 
-def letting_unwritten_pages_through(self, manager, kv, history, position):  # whatever they hold
+def letting_unwritten_pages_through(self, *args):  # whatever they hold
     return None
 
 
@@ -3672,7 +3813,8 @@ def test_the_check_catches_a_lender_leaving_a_partially_matched_block_behind(kit
         test_a_fetch_from_a_partially_matched_block(kit, real_manager, "window_leaves_it", liar)
 
 
-def refusing_inside_any_block(self, manager, kv, history, position):  # wherever the window ends
+def refusing_inside_any_block(self, manager, request_id, kv, history, new_history):
+    # wherever the window ends
     return "the history ends inside a block" if history % TPB else None
 
 
@@ -3795,13 +3937,13 @@ def test_a_fetch_past_pages_grown_before_it_goes_through_where_the_commit_keeps_
         assert next_chunk(kit, mgr, target, tokens=len(MATCHED_PROMPT)) is None
 
 
-def refusing_under_every_policy(self, manager, kv, history, position):  # as if all-reusable
+def refusing_under_every_policy(self, manager, *args):  # as if all-reusable
     from unittest import mock
 
     from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import _manager
 
     with mock.patch.object(_manager, "keeps_passed_pages", lambda manager: True):
-        return real("_unwritten_pages_refusal")(self, manager, kv, history, position)
+        return real("_unwritten_pages_refusal")(self, manager, *args)
 
 
 def test_the_check_catches_a_lender_refusing_passed_pages_under_every_policy(kit, real_manager):

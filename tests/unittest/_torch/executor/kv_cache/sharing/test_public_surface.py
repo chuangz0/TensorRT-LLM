@@ -176,7 +176,11 @@ SPLIT_RULE = fact(
     "rank's own)"
 )
 SPLIT_WINDOW = fact("also wait until ``usable_until`` reaches the previous lease's end")
-SPLIT_UNCHECKED = fact("Not checked yet")
+SPLIT_CHECKED = fact(
+    "Under the all-reusable policy a later lease fails at the call if its window would leave "
+    "behind a row that no lease delivered and the request did not compute"
+)
+SPLIT_BREACH = fact("A windowed lease that breaks it can fail at the call")
 WINDOWED_FETCH_END = fact(
     "lends a sliding-window layer group's rows only for the window at its ``end``"
 )
@@ -194,7 +198,7 @@ STAGING_LIMITS = (
     WINDOW_GAP,
     DSV4_MARGIN,
     UNWRITTEN_PAGES,
-    fact("Rows an earlier lease missed are not checked: the split rule covers those"),
+    fact("or a row an earlier lease did not deliver (``lend_write``)"),
     SCHEDULER_REACH,
     STAGING_ROOM,
     fact("A share of each pool group for the parked fetches alone does not ensure it"),
@@ -271,7 +275,7 @@ DOC_FACTS = {
         fact("or a KV cache connector's load is pending"),
         ROOM_TO_RESUME,
         fact("Split a fetch only by the rule in ``StagingLender.lend_write``"),
-        fact("reaches the previous lease's end (not checked yet)"),
+        SPLIT_BREACH,
     ),
     "attach_staging": ATTACH_LIMITS
     + ATTACH_ORDER
@@ -354,7 +358,7 @@ DOC_FACTS = {
         fact("resume within both intervals and publish both"),
         fact("copies only the rows whose pages stayed"),
         fact("Split a fetch only by the rule in ``lend_write``"),
-        fact("The lender does not check this yet"),
+        SPLIT_BREACH,
     )
     + STAGING_LIMITS,
     "InPlaceLender": (THREADS_SEE, fact("access the lent memory"), fact("own page-table code"))
@@ -393,11 +397,12 @@ DOC_FACTS = {
         fact("while an earlier fetch into the request has not settled on this rank"),
         SPLIT_RULE,
         SPLIT_WINDOW,
-        SPLIT_UNCHECKED,
+        SPLIT_CHECKED,
         fact("leaves behind at ``end`` a block whose page holds tokens past the cache's history"),
         fact("what the local match copied from another request's page"),
         fact("pages grown before the fetch"),
-        fact("or compute from ``usable_until`` through that end"),
+        fact("or compute from ``usable_until`` through that end, or fetch the missed blocks again"),
+        fact("the page of a row an earlier lease did not deliver"),
         DROP_BOTH,
         fact("the request may resume only at its history"),
         fact("sets ``mm_bidirectional_blocks``"),

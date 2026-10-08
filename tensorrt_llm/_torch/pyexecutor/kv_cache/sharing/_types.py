@@ -438,7 +438,7 @@ class StagingLender(Protocol):
           the waiter asks ``readiness`` for every parked request.
         - Split a fetch only by the rule in ``lend_write``: the next lease once ``readiness`` is not
           None on every rank and, with a sliding window, its ``usable_until`` reaches the previous
-          lease's end. The lender does not check this yet.
+          lease's end. A windowed lease that breaks it can fail at the call (``lend_write``).
         - For a one-model draft with its own joint-reuse pool, which shares the request's context
           cursor, fetch the same range into both managers through their own lenders, resume within
           both intervals and publish both. A fetch into one alone leaves the other without the
@@ -460,8 +460,8 @@ class StagingLender(Protocol):
           reuse fails fetches (``lend_write``): set
           ``kv_cache_config.enable_swa_scratch_reuse=False``.
         - Under the all-reusable policy, a fetch fails at the call where a window leaves behind a
-          block whose page holds tokens past the cache's history (``lend_write``). Rows an earlier
-          lease missed are not checked: the split rule covers those.
+          block whose page holds tokens past the cache's history, or a row an earlier lease did not
+          deliver (``lend_write``).
         - Names exist only in ready views: a caller cannot ask a source how far it holds a prefix
           before a fetch grows the cache.
         - A publish lends a sliding-window layer group's rows only for the window at its ``end``,
@@ -595,9 +595,10 @@ class StagingLender(Protocol):
               on every rank (settling is this rank's own).
             - With a sliding window, also wait until ``usable_until`` reaches the previous lease's
               end. If it falls short, first drop the request's cache in every manager it fetched
-              into, or compute from ``usable_until`` through that end. Not checked yet: a later
-              lease would move the history past rows nothing computed, which under the all-reusable
-              policy the commit stores.
+              into, or compute from ``usable_until`` through that end, or fetch the missed blocks
+              again. Under the all-reusable policy a later lease fails at the call if its window
+              would leave behind a row that no lease delivered and the request did not compute: the
+              commit would store that row's page, which nothing wrote.
             - Fetch only into a request whose pages hold what its history covers, since the lender
               takes the tokens below the cache's history as computed: not one whose history runs
               ahead of its data, such as a disaggregated generation request before its transfer
@@ -632,9 +633,10 @@ class StagingLender(Protocol):
               breaks the old capacity's scratch rewind, and a window's next chunk overwrites scratch
               slots;
             - where the history already stands past the positions ``readiness`` would count, as
-              after computing past ``end`` under another policy;
+              after computing past ``end`` under a policy other than all-reusable;
             - under the all-reusable policy, where a window leaves behind at ``end`` a block whose
-              page holds tokens past the cache's history (see Unwritten pages below);
+              page holds tokens past the cache's history, or a row an earlier lease did not deliver
+              (see Unwritten pages below);
             - where the request's multimodal data sets ``mm_bidirectional_blocks`` and ``end`` falls
               strictly inside a run of multimodal tokens, whatever the run's length: a chunk resumed
               there sees the run only within the model's sliding window, which the lender cannot
@@ -661,11 +663,13 @@ class StagingLender(Protocol):
               copied from another request's page (common with partial reuse: on a sliding-window
               model such a request computes from its local match);
             - pages grown before the fetch;
+            - the page of a row an earlier lease did not deliver, which the request has not computed
+              since (the split rule above);
             - with speculative decoding's extra KV tokens (``num_extra_kv_tokens``, the draft length
-              less one under one-model speculative decoding), their block, which each lease's grow
-              pages past the history it leaves. Under a ``W``-token window, a later consecutive
-              lease spanning at least ``W + tokens_per_block - 1`` tokens leaves it behind and
-              fails: keep later leases shorter, or compute the rest.
+              less one under one-model speculative decoding), their block, to which each lease's
+              grow gives a page past the history it leaves. Under a ``W``-token window, a later
+              consecutive lease spanning at least ``W + tokens_per_block - 1`` tokens leaves it
+              behind and fails: keep later leases shorter, or compute the rest.
         """
         ...
 
