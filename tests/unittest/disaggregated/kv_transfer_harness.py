@@ -347,7 +347,6 @@ def run_kv_transfer_test(
     config = CacheTransceiverConfig(
         backend="NIXL",
         transceiver_runtime="PYTHON",
-        max_tokens_in_buffer=512,
     )
     ctx_tcs = create_instance_transceivers(ctx_tp, ctx_pp, ctx_enable_dp, ctx_managers, config)
     gen_tcs = create_instance_transceivers(gen_tp, gen_pp, gen_enable_dp, gen_managers, config)

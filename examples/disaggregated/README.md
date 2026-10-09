@@ -110,7 +110,6 @@ To use NIXL for KV cache exchange, configure the `cache_transceiver_config` with
 disable_overlap_scheduler: True
 cache_transceiver_config:
   backend: NIXL
-  max_tokens_in_buffer: 2048
 ```
 
 **Generation server configuration:**
@@ -118,6 +117,7 @@ cache_transceiver_config:
 # gen_config_nixl.yml
 cache_transceiver_config:
   backend: NIXL
+  # Caps prompt tokens received at once (with KV cache manager V1, PP>1, or synchronous transfer).
   max_tokens_in_buffer: 2048
 ```
 
@@ -431,10 +431,10 @@ data:
     disable_overlap_scheduler: true
     cache_transceiver_config:
       backend: NIXL
-      max_tokens_in_buffer: 2048
   generation.yaml: |
     cache_transceiver_config:
       backend: NIXL
+      # Caps prompt tokens received at once (with KV cache manager V1, PP>1, or synchronous transfer).
       max_tokens_in_buffer: 2048
 ```
 

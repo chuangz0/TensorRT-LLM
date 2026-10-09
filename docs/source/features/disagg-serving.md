@@ -153,7 +153,7 @@ cache_transceiver_config:
 
 `backend` selects the communication library used to transfer the KV cache. Set it to `NIXL`, which transfers over RDMA / NVLink. The field has no default — if it is left unset, the worker still starts, but it brings up no cache transceiver and rejects the disaggregated requests it is then routed. Set the same value on the context and the generation worker.
 
-`max_tokens_in_buffer` is best left unset. It bounds how many KV transfers a generation worker admits concurrently, and the built-in default is derived from the model's maximum sequence length, so a small hand-written value only throttles the transfer path.
+`max_tokens_in_buffer` is best left unset; it defaults to the worker's `max_seq_len`. The C++ transceiver uses it as the size of its transfer buffer. On a generation worker it also caps the prompt tokens being received at once: requests beyond the cap wait until earlier transfers finish. With the Python transceiver, the executor skips this cap when the worker uses KV cache manager V2, has no pipeline parallelism, and transfers asynchronously. Asynchronous is the default; `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1` makes transfers synchronous.
 
 `kv_transfer_timeout_ms` bounds how long a request may wait for its KV cache before it is cancelled and cleaned up. The default is `60000`.
 

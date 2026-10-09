@@ -721,6 +721,7 @@ def run_parallel_test(model_name: str,
         "kv_cache_config": kv_cache_config,
         "cache_transceiver_config": {
             "backend": cache_transceiver_backend,
+            # Transfer buffer size if backend DEFAULT resolves to the C++ transceiver.
             "max_tokens_in_buffer": 4096
         }
     }
@@ -731,6 +732,7 @@ def run_parallel_test(model_name: str,
         "kv_cache_config": kv_cache_config,
         "cache_transceiver_config": {
             "backend": cache_transceiver_backend,
+            # Caps prompt tokens received at once (C++ transceiver or KV cache manager V1).
             "max_tokens_in_buffer": 4096
         }
     }
@@ -785,7 +787,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096,
             },
         }
         gen_server_config = {
@@ -793,6 +794,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
+                # Caps prompt tokens received at once (synchronous transfer).
                 "max_tokens_in_buffer": 4096,
             },
         }
@@ -829,7 +831,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         }
         cache_transceiver_config = {
             "backend": "NIXL",
-            "max_tokens_in_buffer": 4096,
             "transceiver_runtime": "PYTHON",
         }
         ctx_server_config["cache_transceiver_config"] = cache_transceiver_config
@@ -964,12 +965,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         ctx_server_config["cache_transceiver_config"] = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096
         }
         gen_server_config["cache_transceiver_config"] = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096
         }
         if mtp_nextn > 0:
             ctx_server_config["speculative_config"] = {
@@ -1019,7 +1018,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             }
         }
         gen_server_config = {
@@ -1031,7 +1029,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             }
         }
         if mtp_nextn > 0:
@@ -1153,7 +1150,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4
         }
@@ -1162,7 +1158,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4
         }
@@ -1214,7 +1209,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 2,
             "kv_cache_config": {
@@ -1229,6 +1223,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
+                # Caps prompt tokens received at once (KV cache manager V1).
                 "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 2,
@@ -1290,7 +1285,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4,
             "kv_cache_config": {
@@ -1306,7 +1300,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4,
             "kv_cache_config": {
@@ -1353,13 +1346,13 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
             }
         }
         gen_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": "NIXL",
+                # Caps prompt tokens received at once (KV cache manager V1).
                 "max_tokens_in_buffer": 4096
             }
         }
@@ -1718,7 +1711,6 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
             }
         }
         gen_server_config = {
@@ -1730,7 +1722,6 @@ class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
             },
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
             }
         }
         disaggregated_server_config = {
@@ -1802,7 +1793,6 @@ class TestGPTOSS20B(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "max_tokens_in_buffer": 4096
             }
         }
         gen_server_config = {
@@ -1811,6 +1801,7 @@ class TestGPTOSS20B(LlmapiAccuracyTestHarness):
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
                 "backend": "NIXL",
+                # Caps prompt tokens received at once (KV cache manager V1).
                 "max_tokens_in_buffer": 4096
             }
         }
@@ -1876,7 +1867,6 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4,
             "enable_attention_dp": True,
@@ -1893,7 +1883,6 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4,
             "enable_attention_dp": True,
@@ -1928,7 +1917,6 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     def _make_configs(self, use_py_transceiver: bool = False):
         cache_transceiver_config = {
             "backend": "NIXL",
-            "max_tokens_in_buffer": 8192,
         }
         if use_py_transceiver:
             cache_transceiver_config["transceiver_runtime"] = "PYTHON"
@@ -2050,6 +2038,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     def _make_configs(self, use_py_transceiver: bool):
         cache_transceiver_config = {
             "backend": "NIXL",
+            # Caps prompt tokens received at once (gen server with PP>1).
             "max_tokens_in_buffer": 8192,
         }
         if use_py_transceiver:
@@ -2163,7 +2152,6 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 8192,
         }
         kv_cache_config = {
             "enable_block_reuse": snapshot_policy is not None,
@@ -2329,7 +2317,6 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096,
         }
         ctx_server_config = {
             "tensor_parallel_size": 2,
@@ -2382,7 +2369,6 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096,
         }
         ctx_server_config = {
             "tensor_parallel_size": 2,
@@ -2464,7 +2450,6 @@ class TestDeepSeekV4FlashDSpark(LlmapiAccuracyTestHarness):
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096,
         }
         # The drafter runs between target steps and its hidden-state capture
         # needs a whole-sequence prefill, hence no overlap scheduler and no
@@ -2601,7 +2586,6 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
-            "max_tokens_in_buffer": 4096,
         }
         ctx_server_config = {
             "tensor_parallel_size": 2,
@@ -2675,7 +2659,6 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
-                "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,
@@ -2692,6 +2675,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             "cache_transceiver_config": {
                 "backend": "NIXL",
                 "transceiver_runtime": "PYTHON",
+                # Caps prompt tokens received at once (KV cache manager V1).
                 "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 2,

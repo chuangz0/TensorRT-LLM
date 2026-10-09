@@ -631,7 +631,6 @@ def run_mamba_transfer_test(
     config = CacheTransceiverConfig(
         backend="NIXL",
         transceiver_runtime="PYTHON",
-        max_tokens_in_buffer=512,
     )
     ctx_tcs = _create_transceivers(ctx_tp, ctx_mgrs, config)
     gen_tcs = _create_transceivers(gen_tp, gen_mgrs, config)

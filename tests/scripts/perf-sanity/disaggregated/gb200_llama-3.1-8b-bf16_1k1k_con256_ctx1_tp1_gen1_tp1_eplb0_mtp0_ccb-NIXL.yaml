@@ -73,6 +73,7 @@ worker_config:
       free_gpu_memory_fraction: 0.85
       dtype: auto
     cache_transceiver_config:
+      # Caps prompt tokens received at once (KV cache manager V1).
       max_tokens_in_buffer: 4096
       backend: NIXL
       transceiver_runtime: PYTHON
@@ -95,7 +96,6 @@ worker_config:
       free_gpu_memory_fraction: 0.85
       dtype: auto
     cache_transceiver_config:
-      max_tokens_in_buffer: 4096
       backend: NIXL
       transceiver_runtime: PYTHON
     disable_overlap_scheduler: false

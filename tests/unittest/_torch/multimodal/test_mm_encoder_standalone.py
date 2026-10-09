@@ -78,6 +78,7 @@ def _create_llm(
     pd_disagg: bool,
     disable_overlap_scheduler: bool = False,
 ) -> LLM:
+    # Caps prompt tokens received at once (C++ transceiver or KV cache manager V1).
     cache_transceiver_cfg = CacheTransceiverConfig(
         backend="DEFAULT", max_tokens_in_buffer=10240) if pd_disagg else None
     kv_cache_config = KvCacheConfig(
@@ -130,9 +131,9 @@ def _create_mm_disagg_llm(
         cache_transceiver_cfg = CacheTransceiverConfig(
             backend="NIXL",
             transceiver_runtime="PYTHON",
-            max_tokens_in_buffer=10240,
         )
     else:
+        # Caps prompt tokens received at once (C++ transceiver or KV cache manager V1).
         cache_transceiver_cfg = CacheTransceiverConfig(
             backend="DEFAULT", max_tokens_in_buffer=10240)
     return LLM(model=model_dir,

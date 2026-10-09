@@ -389,7 +389,7 @@ def worker_fn(
 
         # Create cache transceiver config
         cache_transceiver_config = CacheTransceiverConfig(
-            backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
+            backend="NIXL", transceiver_runtime="PYTHON"
         )
 
         # Create KvCacheTransceiverV2
@@ -456,7 +456,7 @@ def worker_fn(
 
         # Create cache transceiver config
         cache_transceiver_config = CacheTransceiverConfig(
-            backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
+            backend="NIXL", transceiver_runtime="PYTHON"
         )
 
         # Create KvCacheTransceiverV2

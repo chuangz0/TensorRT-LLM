@@ -87,6 +87,7 @@ worker_config:
         num_slots: 288
         layer_updates_per_iter: 1
     cache_transceiver_config:
+      # Caps prompt tokens received at once (C++ transceiver, KV cache manager V1, or gen_only mode).
       max_tokens_in_buffer: 8448
       backend: DEFAULT
     stream_interval: 20
@@ -110,6 +111,7 @@ worker_config:
       free_gpu_memory_fraction: 0.75
       dtype: fp8
     cache_transceiver_config:
+      # Transfer buffer size if backend DEFAULT resolves to the C++ transceiver.
       max_tokens_in_buffer: 8448
       backend: DEFAULT
     speculative_config:

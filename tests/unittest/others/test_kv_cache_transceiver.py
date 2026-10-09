@@ -908,7 +908,7 @@ def test_hybrid_cache_transceiver_single_process(hybrid_dtypes, request):
     request.addfinalizer(hybrid_cache_manager_gen.shutdown)
 
     cache_transceiver_config = CacheTransceiverConfig(
-        backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512)
+        backend="NIXL", transceiver_runtime="PYTHON")
     dist = Distributed.get(mapping)
 
     # Create transceivers - the hybrid manager serves as both kv_cache_manager and mamba_cache_manager
@@ -1033,7 +1033,7 @@ def test_hybrid_cache_transceiver_cancel_request(request):
     request.addfinalizer(hybrid_cache_manager_gen.shutdown)
 
     cache_transceiver_config = CacheTransceiverConfig(
-        backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512)
+        backend="NIXL", transceiver_runtime="PYTHON")
     dist = Distributed.get(mapping)
 
     cache_transceiver_ctx = create_kv_cache_transceiver(

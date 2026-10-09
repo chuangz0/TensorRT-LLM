@@ -5033,7 +5033,12 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
 
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
-        description="The max number of tokens the transfer buffer can fit.")
+        description=
+        "Unset means the worker's max_seq_len. The C++ transceiver uses it as "
+        "the size of its transfer buffer, in tokens. On a generation worker "
+        "it also caps the prompt tokens being received at once. With the "
+        "Python transceiver, the executor skips this cap on KV cache manager "
+        "V2 with PP1 and asynchronous transfer.")
 
     kv_transfer_timeout_ms: Optional[PositiveInt] = Field(
         default=60000,

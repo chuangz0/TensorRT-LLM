@@ -1285,7 +1285,6 @@ def run_transfer_test(
     config = CacheTransceiverConfig(
         backend="NIXL",
         transceiver_runtime="PYTHON",
-        max_tokens_in_buffer=512,
         # Bounce is off unless expect_cpp_bounce. Then a positive kv_cache_bounce_size_mb
         # enables the C++ agent bounce, and agent_bounce_params (a loose gate) exercises
         # the config plumbing end to end.
@@ -2168,9 +2167,7 @@ def test_cache_transceiver_v1_sends_primary_slots_under_host_offload():
         )
         _init_pool_data_v1([ctx_mgr], 1, False, fill_random=True, seed_base=1000)
         _init_pool_data_v1([gen_mgr], 1, False, fill_random=False)
-        config = CacheTransceiverConfig(
-            backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
-        )
+        config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
         (ctx_tc,) = create_instance_transceivers(1, 1, False, [ctx_mgr], config, False)
         transceivers.append(ctx_tc)
         (gen_tc,) = create_instance_transceivers(1, 1, False, [gen_mgr], config, False)
@@ -2398,9 +2395,7 @@ def test_cache_transceiver_host_offload_scheduler_lifecycle(monkeypatch) -> None
         assert ctx_mgr.blocks_in_secondary_pool >= 4
         assert ctx_mgr.get_num_free_blocks() == 4
         gen_free = gen_mgr.get_num_free_blocks()
-        config = CacheTransceiverConfig(
-            backend="NIXL", transceiver_runtime="PYTHON", max_tokens_in_buffer=512
-        )
+        config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
         (ctx_tc,) = create_instance_transceivers(1, 1, False, [ctx_mgr], config, False)
         cleanup.callback(shutdown, "context transceiver", ctx_tc.shutdown)
         (gen_tc,) = create_instance_transceivers(1, 1, False, [gen_mgr], config, False)

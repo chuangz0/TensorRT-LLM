@@ -559,7 +559,6 @@ def run_kda_transfer_test(ctx_tp: int, gen_tp: int, enable_attention_dp: bool = 
         config = CacheTransceiverConfig(
             backend="NIXL",
             transceiver_runtime="PYTHON",
-            max_tokens_in_buffer=512,
         )
         ctx_tcs = _create_transceivers(
             ctx_tp, ctx_mgrs, config, enable_attention_dp=enable_attention_dp
