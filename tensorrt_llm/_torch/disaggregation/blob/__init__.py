@@ -2,13 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """The blob backend: KV rows shared through a byte store.
 
-No module here imports torch, ``tensorrt_llm._torch.pyexecutor`` or a store SDK at import time.
+Read top down; a fetch or publish flows ``BlobBackend`` -> ``StoreDriver`` -> store SDK:
 
-- ``store`` (the private driver boundary) imports only the standard library and ``base.memory``,
-  whose ``MemoryKind`` it shares with the public contract; ``keys`` imports only the standard
-  library. How an object is laid out in a store is its driver's private format.
-- ``backend`` (the public backend over a driver) imports only ``store``, ``keys``,
-  ``base.backend`` and ``base.memory``, plus numpy and ``tensorrt_llm.logger``.
-- ``mooncake`` (the Mooncake driver) imports only ``store``, ``base.memory`` and
-  ``tensorrt_llm.logger``; it takes an SDK object already set up.
+- ``backend``: ``BlobBackend``, the public ``base.backend.Backend``. It cuts each view into
+  batches and hands them to a ``store.StoreDriver`` on worker threads. ``RegionBinding``
+  registers the lender's regions the driver can access, under the lender's hold.
+- ``store`` and ``keys``: the private driver boundary, which shares only ``MemoryKind`` with the
+  public contract, and the store key encoding. How an object is laid out in a store is its
+  driver's private format.
+- ``mooncake``: ``MooncakeDriver``, a ``StoreDriver`` over a set-up Mooncake SDK client.
+- ``mooncake_setup``: reads a store config and opens the SDK client; ``open_mooncake_driver``
+  reads the config's ``blob`` section with the caller's reader (``BlobConfig`` for the backend)
+  before it opens the SDK, and returns the driver with what the reader returned.
+
+No module imports torch, ``tensorrt_llm._torch.pyexecutor`` or a store SDK at import time; only
+``mooncake_setup.open_sdk`` imports ``mooncake.store``, when called. Each module's imports are
+checked by ``test_mooncake_setup.py::test_blob_modules_import_only_their_layer``.
 """
