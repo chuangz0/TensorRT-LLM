@@ -58,11 +58,15 @@ MASTER_WAIT_S = 60.0
 MASTER_RETRY_S = 0.5
 SECTIONS = ("blob", "mooncake")
 # How the blob backend batches calls of the Mooncake driver: a store config's ``blob`` section is
-# laid over these, so a deployment sets only what it changes.
+# laid over these, so a deployment sets only what it changes. Measured on GB200 over RDMA.
 MOONCAKE_BLOB_DEFAULTS: Mapping[str, object] = MappingProxyType(
     {
-        "workers": 2,
-        "rows_per_batch": 64,
+        # One put call does not fill the links, and each running get busy-polls a core; publishes
+        # still leave one worker to fetches.
+        "workers": 4,
+        # A call prepares and maps its rows in Python for a few microseconds each, holding the GIL,
+        # so this also bounds that stretch.
+        "rows_per_batch": 256,
         # Larger calls return into Python fewer times per byte, and next to a busy executor thread
         # each return waits for the GIL; but a call must end well inside the read lease (10 s), and
         # its submission holds every slot until it returns, or for good once a get answers

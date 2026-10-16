@@ -113,7 +113,9 @@ class BlobConfig:
     Attributes:
         key_prefix: The deployment's key namespace; matches ``[A-Za-z0-9_-]{1,64}``.
         workers: Driver calls at once, each on a backend thread of its own. A driver whose calls
-            block until their transfers end needs several to overlap them.
+            block until their transfers end needs several to overlap them. Publishes take at most
+            ``max(1, workers - 1)`` of them, so unless there is one worker, one is always left for
+            fetches.
         rows_per_batch: Most rows in one driver call, or None for no limit of the backend's own.
         bytes_per_batch: Most payload bytes in one driver call, or None for no limit of the
             backend's own; a call always carries at least one row, however large its slot. A call
@@ -447,6 +449,8 @@ class BlobBackend:
         )
         self._unprovable_batches = 0
         self._workers_alive = config.workers
+        self._publish_limit = max(1, config.workers - 1)
+        self._publishes_running = 0
         self._workers = [
             threading.Thread(target=self._worker_loop, name=f"{name}-worker-{i}", daemon=True)
             for i in range(config.workers)
@@ -639,6 +643,8 @@ class BlobBackend:
                 attempt = batch.attempt
                 if attempt._stopped:  # its queued count was cleared when it stopped
                     continue
+                if not attempt.is_fetch:
+                    self._publishes_running += 1
                 # Counts only the fetches a waiting publish let go first.
                 publish_waits = bool(self._publish_queue)
                 fetch_ahead = attempt.is_fetch and publish_waits
@@ -652,8 +658,10 @@ class BlobBackend:
                 return batch
 
     def _pop_next(self) -> _Batch | None:
-        publish_due = self._publish_queue and (
-            not self._fetch_queue or self._fetches_in_a_row >= FETCH_BATCHES_PER_PUBLISH_BATCH
+        publish_due = (
+            self._publish_queue
+            and self._publishes_running < self._publish_limit
+            and (not self._fetch_queue or self._fetches_in_a_row >= FETCH_BATCHES_PER_PUBLISH_BATCH)
         )
         if publish_due:
             return self._publish_queue.popleft()
@@ -730,6 +738,10 @@ class BlobBackend:
     def _finish(self, batch: _Batch, observed: _Observation) -> None:
         with self._lock:
             del self._driver_call_started[batch]
+            # No notify when a publish ends: this worker calls _take next and uses the publish room
+            # it freed itself; an idle worker waits only while nothing it may take is queued.
+            if not batch.attempt.is_fetch:
+                self._publishes_running -= 1
             wake_due = self._record(batch, observed)
             if batch.op is not None and not batch.settled:
                 self._watched.add(batch)
