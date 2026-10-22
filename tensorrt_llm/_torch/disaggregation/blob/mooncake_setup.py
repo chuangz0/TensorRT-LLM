@@ -5,7 +5,7 @@
 A store config has two sections: ``blob``, handed back untouched for the backend to read, and
 ``mooncake``, read here. Mooncake reads its own environment variables, some once per process
 (``MOONCAKE_STORE_CHECKSUM``), some per client (``MC_STORE_MEMCPY``) and ``MC_TCP_PROTO`` on every
-transfer; this module logs them before setup and never sets them.
+transfer; this module logs them before setup and sets only the two RPC timeouts, from the config.
 
 Over RDMA, a process that used ibverbs before its first Mooncake client (importing
 ``tensorrt_llm`` does) logs ``RDMA context setup failed: fork compatibility: Invalid argument``
@@ -41,6 +41,8 @@ SECTIONS = ("blob", "mooncake")
 
 # Logged before setup, as Mooncake will read them.
 _LOGGED_ENVIRONMENT = (
+    "MC_RPC_TIMEOUT_MS",
+    "MC_RPC_CONNECT_TIMEOUT_MS",
     "MC_STORE_MEMCPY",
     "MOONCAKE_STORE_CHECKSUM",
     "WITH_NVIDIA_PEERMEM",
@@ -70,6 +72,9 @@ class MooncakeConfig:
         metadata_server: Where segments are described; ``P2PHANDSHAKE`` needs no server.
         local_buffer_size: Bytes for the SDK's copying calls, which the driver never makes; 0 is
             allowed, and the default is the SDK's.
+        rpc_timeout_ms: How long one call to the master may take. It bounds the store calls
+            that take no deadline of their own, an existence check say.
+        rpc_connect_timeout_ms: How long connecting to the master may take.
     """
 
     master_server_address: str
@@ -79,6 +84,8 @@ class MooncakeConfig:
     local_hostname: str = ""
     metadata_server: str = "P2PHANDSHAKE"
     local_buffer_size: int = 16 << 20
+    rpc_timeout_ms: int = 10_000
+    rpc_connect_timeout_ms: int = 5_000
 
     def __post_init__(self) -> None:
         for name in ("master_server_address", "device_name", "local_hostname", "metadata_server"):
@@ -86,7 +93,12 @@ class MooncakeConfig:
                 raise ValueError(f"{name} must be a str, got {getattr(self, name)!r}")
         if self.protocol not in ("rdma", "tcp"):
             raise ValueError(f"protocol must be rdma or tcp, got {self.protocol!r}")
-        for name, least in (("global_segment_size", 0), ("local_buffer_size", 0)):
+        for name, least in (
+            ("global_segment_size", 0),
+            ("local_buffer_size", 0),
+            ("rpc_timeout_ms", 1),
+            ("rpc_connect_timeout_ms", 1),
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < least:
                 raise ValueError(f"{name} must be an int of at least {least}, got {value!r}")
@@ -124,7 +136,8 @@ def load_store_config(
 
 def open_sdk(config: MooncakeConfig) -> Any:
     """Opens a set-up ``MooncakeDistributedStore``, on the builder thread: ``setup`` holds the GIL
-    while it mounts this process's segment.
+    while it mounts this process's segment. Sets the process's ``MC_RPC_TIMEOUT_MS`` and
+    ``MC_RPC_CONNECT_TIMEOUT_MS`` from ``config`` first.
 
     Raises:
         ValueError: TCP would use its legacy framing, or the local hot cache is on.
@@ -134,6 +147,9 @@ def open_sdk(config: MooncakeConfig) -> Any:
     """
     _refuse_legacy_tcp_framing(config.protocol)
     _refuse_hot_cache()
+    # Mooncake reads both when a client is created; unset, each is 30 s.
+    os.environ["MC_RPC_TIMEOUT_MS"] = str(config.rpc_timeout_ms)
+    os.environ["MC_RPC_CONNECT_TIMEOUT_MS"] = str(config.rpc_connect_timeout_ms)
     _log_environment()
     try:
         from mooncake.store import MooncakeDistributedStore

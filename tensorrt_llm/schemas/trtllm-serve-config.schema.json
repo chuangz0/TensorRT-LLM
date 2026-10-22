@@ -3307,6 +3307,81 @@
       "title": "KvPoolRebalanceConfig",
       "type": "object"
     },
+    "KvSharingBackendConfig": {
+      "additionalProperties": false,
+      "description": "A KV store that servers share prompt KV cache blocks through.",
+      "properties": {
+        "config": {
+          "description": "Path to the store config, a YAML file every server and provider of the store reads: a 'mooncake' section (master address, protocol, RDMA devices, RPC timeouts; servers set global_segment_size to 0, since 'trtllm-serve mooncake_provider' lends the store its memory) and an optional 'blob' section (key prefix, store workers, rows and bytes per store call).",
+          "title": "Config",
+          "type": "string"
+        },
+        "roles": {
+          "description": "'fetch' reads stored prompt prefixes instead of computing them; 'publish' stores the prompt blocks this server computes.",
+          "items": {
+            "enum": [
+              "fetch",
+              "publish"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Roles",
+          "type": "array"
+        },
+        "type": {
+          "const": "mooncake",
+          "description": "The kind of store. Only a Mooncake store is supported.",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "config"
+      ],
+      "title": "KvSharingBackendConfig",
+      "type": "object"
+    },
+    "KvSharingConfig": {
+      "additionalProperties": false,
+      "description": "Share prompt KV cache blocks with other servers through a KV store.\n\nA server fetches the stored part of a prompt instead of computing it, and\nstores the whole prompt blocks it computes.",
+      "properties": {
+        "backends": {
+          "description": "The store to share through; one for now.",
+          "items": {
+            "$ref": "#/$defs/KvSharingBackendConfig"
+          },
+          "maxItems": 1,
+          "minItems": 1,
+          "title": "Backends",
+          "type": "array"
+        },
+        "data_path": {
+          "default": "auto",
+          "description": "How blocks move between the store and the KV cache: 'gpu_direct' reads and writes KV cache pages in place, 'host_staging' copies them through pinned host memory. 'auto' chooses host staging for now.",
+          "enum": [
+            "auto",
+            "gpu_direct",
+            "host_staging"
+          ],
+          "title": "Data Path",
+          "type": "string"
+        },
+        "max_fetch_tokens": {
+          "default": 32768,
+          "description": "Longest prompt prefix one fetch reads. Each rank pins host memory for two of max(max_fetch_tokens, max_num_tokens) tokens of KV cache, at most 8 GiB; the server refuses to start when one of them does not fit in 8 GiB.",
+          "exclusiveMinimum": 0,
+          "title": "Max Fetch Tokens",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "backends"
+      ],
+      "title": "KvSharingConfig",
+      "type": "object"
+    },
     "LayerwiseBenchmarksConfig": {
       "additionalProperties": false,
       "description": "Configuration for layer-wise benchmarks calibration.",
@@ -6996,6 +7071,19 @@
       ],
       "default": null,
       "description": "The config for KV cache connector.",
+      "status": "prototype"
+    },
+    "kv_sharing": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/KvSharingConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Share prompt KV cache blocks with other servers through a KV store.",
       "status": "prototype"
     },
     "layer_wise_benchmarks_config": {

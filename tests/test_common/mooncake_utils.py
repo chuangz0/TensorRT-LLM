@@ -22,7 +22,7 @@ master binds, and the master then exits before it accepts connections. Each
 attempt picks a fresh pair.
 
 The master stores nothing itself: `running_segment_provider` gives a pool its
-memory from a separate process.
+memory from a separate process, `trtllm-serve mooncake_provider`.
 """
 
 import contextlib
@@ -32,10 +32,10 @@ import sys
 import time
 from typing import Iterator
 
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import local_address
+import yaml
+
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
     LaunchedMaster,
-    resolve_device_name,
     running_master,
 )
 from tensorrt_llm._utils import get_free_ports
@@ -43,21 +43,9 @@ from tensorrt_llm._utils import get_free_ports
 __all__ = ["running_master_on_free_ports", "running_segment_provider"]
 
 PORT_ATTEMPTS = 5
-SEGMENT_PROVIDER_TIMEOUT = 60.0
-
-# Runs in the provider process: join the pool, mount the segment, and hold it until stdin closes.
-_SEGMENT_PROVIDER = """
-import pathlib, sys
-from mooncake.store import MooncakeDistributedStore
-master, segment_size, protocol, devices, hostname, ready = sys.argv[1:]
-store = MooncakeDistributedStore()
-code = store.setup(hostname, "P2PHANDSHAKE", int(segment_size), 16 << 20, protocol, devices, master)
-if code != 0:
-    sys.exit(f"segment provider: setup failed with {code}")
-pathlib.Path(ready).touch()
-sys.stdin.read()
-store.close()
-"""
+# The provider imports tensorrt_llm before it joins the pool, which takes long on a cold network
+# file system.
+SEGMENT_PROVIDER_TIMEOUT = 300.0
 
 
 def _start_master(
@@ -111,30 +99,38 @@ def running_segment_provider(
     device_name: str = "",
     timeout: float = SEGMENT_PROVIDER_TIMEOUT,
 ) -> Iterator[subprocess.Popen]:
-    """Give the pool a `segment_size`-byte segment from a separate process, for the body's duration.
+    """Give the pool a `segment_size`-byte segment for the body's duration.
 
+    The segment comes from `trtllm-serve mooncake_provider`, a separate process.
     A client with no segment of its own then finds every object in another
     process's memory, so each transfer goes through the transfer engine as it
     would across hosts, never through a copy inside one process.
 
     Args:
         master_address: The pool's master, `host:port`.
-        run_dir: Where the provider's log and readiness marker go.
+        run_dir: Where the provider's store config, log and readiness marker go.
         segment_size: Bytes of the provider's segment.
         protocol: `rdma` or `tcp`.
         device_name: RDMA devices; empty picks the host's fastest InfiniBand ones.
         timeout: Seconds to wait for the provider to join the pool.
     """
     os.makedirs(run_dir, exist_ok=True)
+    config = os.path.join(run_dir, "segment_provider.yaml")
     ready = os.path.join(run_dir, "segment_provider.ready")
     log_path = os.path.join(run_dir, "segment_provider.log")
-    devices = resolve_device_name(protocol, device_name)
-    command = [sys.executable, "-c", _SEGMENT_PROVIDER, master_address, str(segment_size)]
-    command += [protocol, devices, local_address(master_address), ready]
+    mooncake = {
+        "master_server_address": master_address,
+        "global_segment_size": 0,  # the command lends --segment_size instead
+        "protocol": protocol,
+        "device_name": device_name,
+    }
+    with open(config, "w") as file:
+        yaml.safe_dump({"mooncake": mooncake}, file)
+    command = [sys.executable, "-m", "tensorrt_llm.commands.serve", "mooncake_provider"]
+    command += ["--no-telemetry", "--config", config, "--segment_size", str(segment_size)]
+    command += ["--ready_file", ready]
     with open(log_path, "wb") as log:
-        process = subprocess.Popen(  # nosec B603
-            command, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT
-        )
+        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)  # nosec B603
     try:
         deadline = time.monotonic() + timeout
         while not os.path.exists(ready):
@@ -145,7 +141,7 @@ def running_segment_provider(
             time.sleep(0.1)
         yield process
     finally:
-        process.stdin.close()
+        process.terminate()  # the provider unmounts its segment on SIGTERM
         try:
             process.wait(timeout=30)
         except subprocess.TimeoutExpired:

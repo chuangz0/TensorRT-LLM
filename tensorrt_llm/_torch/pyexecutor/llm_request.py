@@ -1016,6 +1016,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # cannot reconstruct it.
         self.py_served_prefix_end = 0
 
+        # End of the prompt range handed to KV store publication (kv_sharing),
+        # a whole-block position; None before the first publication pass.
+        self.py_published_end: Optional[int] = None
+
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
             max_new_tokens=self.py_max_new_tokens,

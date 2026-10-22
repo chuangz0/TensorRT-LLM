@@ -137,6 +137,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.bindings import MpiProgressThread
 
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
+    from .kv_sharing.orchestrator import SharedKvOrchestrator
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
@@ -427,6 +428,10 @@ class PyExecutor:
     # If the number of micro batches is too large, the executor will spend too much host memory (No additional GPU memory is required).
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
+
+    # Set by kv_sharing startup. A class default keeps executors that tests
+    # build partially working.
+    kv_sharing: Optional["SharedKvOrchestrator"] = None
 
     def __init__(
         self,
@@ -2268,8 +2273,11 @@ class PyExecutor:
                         and transfers.has_any_inflight_requests())):
                 return True
         coordinator = self.__dict__.get("_disagg_coordinator")
-        return (coordinator is not None
-                and coordinator.has_pending_shared_transfers())
+        kv_sharing = self.__dict__.get("kv_sharing")
+        return ((coordinator is not None
+                 and coordinator.has_pending_shared_transfers())
+                or (kv_sharing is not None
+                    and kv_sharing.has_waiting_publications()))
 
     @contextmanager
     def _profiler(self):
@@ -3066,6 +3074,13 @@ class PyExecutor:
             except Exception as error:
                 # Waiters are already awake; retained resources still block manager teardown.
                 logger.error(f"Shared KV shutdown initiation failed: {error}")
+        kv_sharing = self.__dict__.get("kv_sharing")
+        if kv_sharing is not None:
+            try:
+                kv_sharing.shutdown()
+            except Exception as error:
+                # Cleanup also runs after a crash; teardown goes on.
+                logger.error(f"kv_sharing shutdown failed: {error}")
 
         # The loop may exit while the benchmark fill gate is still closed.
         keepalive = getattr(self, "_gpu_keepalive", None)
@@ -4377,6 +4392,9 @@ class PyExecutor:
 
         self._handle_control_request()
 
+        if self.kv_sharing is not None:
+            self.kv_sharing.before_scheduling()
+
         self.disagg.prepare_context_schedulable(new_requests)
         self.disagg.poll_gen_transfers()
         self._activate_completed_remote_tails()
@@ -5144,6 +5162,9 @@ class PyExecutor:
                             self._update_v2_context_resources(scheduled_batch)
                             self._update_v2_generation_resources(
                                 scheduled_batch)
+                            if self.kv_sharing is not None:
+                                self.kv_sharing.publish_committed_blocks(
+                                    scheduled_batch.context_requests)
                         self._send_kv_async(scheduled_batch.all_requests())
 
                         self._handle_canceled_requests()
@@ -6147,6 +6168,9 @@ class PyExecutor:
                     if (self._is_kv_manager_v2
                             and scheduled_batch.context_requests):
                         self._update_v2_context_resources(scheduled_batch)
+                        if self.kv_sharing is not None:
+                            self.kv_sharing.publish_committed_blocks(
+                                scheduled_batch.context_requests)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._commit_kv_cache_stats(
@@ -6935,6 +6959,8 @@ class PyExecutor:
                     req_item.finished_prefix_load_ids)
             elif req_item.is_shutdown_request:
                 self.is_shutdown = True
+                if self.kv_sharing is not None:
+                    self.kv_sharing.begin_shutdown()
                 self.disagg.begin_shared_shutdown()
                 break
             elif req_item.is_canceled_request:

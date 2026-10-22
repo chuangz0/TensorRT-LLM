@@ -2760,6 +2760,57 @@ class KvCacheConnectorConfig(StrictBaseModel):
         return self
 
 
+class KvSharingBackendConfig(StrictBaseModel):
+    """A KV store that servers share prompt KV cache blocks through."""
+
+    type: Literal["mooncake"] = Field(
+        description="The kind of store. Only a Mooncake store is supported.")
+    config: str = Field(
+        description="Path to the store config, a YAML file every server and "
+        "provider of the store reads: a 'mooncake' section (master address, "
+        "protocol, RDMA devices, RPC timeouts; servers set "
+        "global_segment_size to 0, since 'trtllm-serve mooncake_provider' "
+        "lends the store its memory) and an optional 'blob' section (key "
+        "prefix, store workers, rows and bytes per store call).")
+    roles: List[Literal["fetch", "publish"]] = Field(
+        default_factory=lambda: ["fetch", "publish"],
+        min_length=1,
+        description="'fetch' reads stored prompt prefixes instead of computing "
+        "them; 'publish' stores the prompt blocks this server computes.")
+
+    @field_validator("config")
+    @classmethod
+    def _config_is_a_file(cls, path: str) -> str:
+        if not os.path.isfile(path):
+            raise ValueError(f"the store config {path!r} is not a file")
+        return path
+
+
+class KvSharingConfig(StrictBaseModel):
+    """Share prompt KV cache blocks with other servers through a KV store.
+
+    A server fetches the stored part of a prompt instead of computing it, and
+    stores the whole prompt blocks it computes.
+    """
+
+    backends: List[KvSharingBackendConfig] = Field(
+        min_length=1,
+        max_length=1,
+        description="The store to share through; one for now.")
+    data_path: Literal["auto", "gpu_direct", "host_staging"] = Field(
+        default="auto",
+        description="How blocks move between the store and the KV cache: "
+        "'gpu_direct' reads and writes KV cache pages in place, "
+        "'host_staging' copies them through pinned host memory. 'auto' "
+        "chooses host staging for now.")
+    max_fetch_tokens: PositiveInt = Field(
+        default=32768,
+        description="Longest prompt prefix one fetch reads. Each rank pins "
+        "host memory for two of max(max_fetch_tokens, max_num_tokens) tokens "
+        "of KV cache, at most 8 GiB; the server refuses to start when one of "
+        "them does not fit in 8 GiB.")
+
+
 class LayerwiseBenchmarksConfig(StrictBaseModel):
     """Configuration for layer-wise benchmarks calibration."""
     calibration_mode: Literal["NONE", "MARK", "COLLECT"] = Field(
@@ -6955,6 +7006,13 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    kv_sharing: Optional[KvSharingConfig] = Field(
+        default=None,
+        description="Share prompt KV cache blocks with other servers through "
+        "a KV store.",
+        status="prototype",
+    )
+
     mm_encoder_only: bool = Field(
         default=False,
         description=
@@ -7912,6 +7970,57 @@ class TorchLlmArgs(BaseLlmArgs):
                 raise ValueError(
                     f"Failed to load MoE load balancer config: {self.moe_config.load_balancer}"
                 ) from e
+        return self
+
+    @model_validator(mode="after")
+    def validate_kv_sharing(self) -> 'TorchLlmArgs':
+        """Refuse setups kv_sharing cannot serve yet, naming every reason.
+
+        Model facts (sliding windows, MLA, the KV cache dtype a checkpoint
+        resolves to) are checked when the executor starts.
+        """
+        if self.kv_sharing is None:
+            return self
+        kv_cache = self.kv_cache_config
+        checks = (
+            ("kv_connector_config: one way to load KV cache from outside per "
+             "server", self.kv_connector_config is not None),
+            ("kv_cache_config.use_kv_cache_manager_v2=False",
+             kv_cache.use_kv_cache_manager_v2 is False),
+            ("block reuse off or a block_reuse_config.policy other than "
+             "'all_reusable': stored blocks are the committed ones",
+             not kv_cache.enable_block_reuse
+             or kv_cache.block_reuse_config.policy != "all_reusable"),
+            ("kv_cache_config.enable_swa_scratch_reuse",
+             kv_cache.enable_swa_scratch_reuse),
+            (f"kv_cache_config.dtype={kv_cache.dtype!r}: BF16 KV caches only "
+             "for now", kv_cache.dtype not in ("auto", "bfloat16")),
+            ("tensor, pipeline or context parallelism or attention DP: one "
+             "GPU per server for now", self.tensor_parallel_size > 1
+             or self.pipeline_parallel_size > 1
+             or self.context_parallel_size > 1 or self.enable_attention_dp),
+            ("speculative decoding", self.speculative_config is not None),
+            ("LoRA", self.enable_lora or self.lora_config is not None),
+            ("beam search", (self.max_beam_width or 1) > 1),
+            ("sparse attention", self.sparse_attention_config is not None),
+            ("disaggregated serving (cache_transceiver_config) for now",
+             self.cache_transceiver_config is not None
+             and self.cache_transceiver_config.backend is not None),
+            ("sleep_config: sleep releases the KV cache memory",
+             self.sleep_config is not None),
+            ("orchestrator_type='ray'", self.orchestrator_type == "ray"),
+            (f"load_format={self.load_format}: stored blocks are named after "
+             "the checkpoint, not the weights in memory", self.load_format
+             != LoadFormat.AUTO),
+            (f"attn_backend={self.attn_backend!r}: stored blocks have the "
+             "TRTLLM backend's layout", self.attn_backend != "TRTLLM"),
+            ("data_path='gpu_direct' for now; use 'auto' or 'host_staging'",
+             self.kv_sharing.data_path == "gpu_direct"),
+        )
+        reasons = [reason for reason, applies in checks if applies]
+        if reasons:
+            raise ValueError("kv_sharing does not support: " +
+                             "; ".join(reasons))
         return self
 
     @model_validator(mode='after')

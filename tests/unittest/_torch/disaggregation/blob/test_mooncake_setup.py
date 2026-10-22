@@ -10,6 +10,7 @@ a Mooncake install or a GPU.
 from __future__ import annotations
 
 import ast
+import os
 import pathlib
 import sys
 import types
@@ -117,6 +118,7 @@ BAD_VALUES = {
     "mooncake.local_buffer_size=-1": ("mooncake", "local_buffer_size", -1),
     "mooncake.master_server_address=5": ("mooncake", "master_server_address", 5),
     "mooncake.device_name=None": ("mooncake", "device_name", None),
+    "mooncake.rpc_timeout_ms=0": ("mooncake", "rpc_timeout_ms", 0),
 }
 
 
@@ -153,7 +155,11 @@ def test_open_passes_setup_arguments_in_order(
     ib_device(sysfs, "mlx5_0", "InfiniBand", "4: ACTIVE", "400 Gb/sec (4X NDR)")
     ib_device(sysfs, "mlx5_1", "InfiniBand", "4: ACTIVE", "400 Gb/sec (4X NDR)")
     monkeypatch.setattr(mooncake_setup, "IB_SYSFS_ROOT", str(sysfs))
+    for name in ("MC_RPC_TIMEOUT_MS", "MC_RPC_CONNECT_TIMEOUT_MS"):
+        monkeypatch.setenv(name, "1")  # records the value to restore: open_sdk sets them
     driver, blob = open_mooncake_driver(store_config("rdma"))
+    assert os.environ["MC_RPC_TIMEOUT_MS"] == "10000"
+    assert os.environ["MC_RPC_CONNECT_TIMEOUT_MS"] == "5000"
     (store,) = sdk.stores
     (setup,) = store.calls_to("setup")
     assert setup.args == (

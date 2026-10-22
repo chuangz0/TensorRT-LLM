@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Which setups the ``kv_sharing`` LLM argument accepts, checked where the user builds the args."""
+
+import re
+
+import pytest
+
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+pytestmark = pytest.mark.cpu_only
+
+
+@pytest.fixture
+def store_config(tmp_path) -> str:
+    path = tmp_path / "store.yaml"
+    path.write_text(
+        "mooncake:\n  master_server_address: 10.0.0.1:50051\n  global_segment_size: 0\n"
+    )
+    return str(path)
+
+
+def llm_args(store_config: str, kv_sharing: dict | None = None, **kwargs) -> TorchLlmArgs:
+    sharing = {"backends": [{"type": "mooncake", "config": store_config}], **(kv_sharing or {})}
+    return TorchLlmArgs(
+        model="/tmp/dummy_model", skip_tokenizer_init=True, kv_sharing=sharing, **kwargs
+    )
+
+
+def test_minimal_kv_sharing_config_is_accepted(store_config: str) -> None:
+    sharing = llm_args(store_config).kv_sharing
+    assert sharing.backends[0].roles == ["fetch", "publish"]
+    assert sharing.data_path == "auto"
+
+
+UNSUPPORTED = {
+    "a KV cache connector": (
+        {
+            "kv_connector_config": {
+                "connector_module": "my_connector",
+                "connector_scheduler_class": "Scheduler",
+                "connector_worker_class": "Worker",
+            }
+        },
+        "kv_connector_config",
+    ),
+    "block reuse off": ({"kv_cache_config": {"enable_block_reuse": False}}, "block reuse off"),
+    "TP2": ({"tensor_parallel_size": 2}, "tensor, pipeline or context parallelism"),
+    "an FP8 KV cache": ({"kv_cache_config": {"dtype": "fp8"}}, "BF16 KV caches only"),
+    "speculative decoding": (
+        {"speculative_config": {"decoding_type": "NGram", "max_draft_len": 1}},
+        "speculative decoding",
+    ),
+    "GPU Direct": ({"kv_sharing": {"data_path": "gpu_direct"}}, "data_path='gpu_direct'"),
+    "a missing store config": (
+        {"kv_sharing": {"backends": [{"type": "mooncake", "config": "/no/such/store.yaml"}]}},
+        "'/no/such/store.yaml' is not a file",
+    ),
+}
+
+
+@pytest.mark.parametrize("setup", UNSUPPORTED)
+def test_kv_sharing_rejects_setups_it_cannot_serve(store_config: str, setup: str) -> None:
+    kwargs, reason = UNSUPPORTED[setup]
+    with pytest.raises(ValueError, match=re.escape(reason)):
+        llm_args(store_config, **kwargs)

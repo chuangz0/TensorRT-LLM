@@ -19,11 +19,14 @@ servers share a pool and keeps the pool's own settings stated once. It
 publishes them as a manifest that each server's
 `kv_connector_config.mooncake_store.pool` names.
 
-Capacity needs no command: every rank that joins the pool lends the memory its
-own config asks for.
+Capacity needs no command for the connector: every rank that joins the pool
+lends the memory its own config asks for. Servers that share KV cache through
+`kv_sharing` lend none; `mooncake_provider` lends the pool host memory for them.
 """
 
 import contextlib
+import dataclasses
+import pathlib
 import signal
 import tempfile
 import time
@@ -242,6 +245,56 @@ def mooncake_master(
                     f"mooncake-store: master at {master.address} alive after "
                     f"{(now - started) / 60:.0f}m"
                 )
+
+
+@click.command("mooncake_provider")
+@click.option(
+    "--config",
+    type=str,
+    required=True,
+    help="The store config the pool's servers read; its 'mooncake' section "
+    "names the master, the protocol and the RDMA devices.",
+)
+@click.option(
+    "--segment_size",
+    type=click.IntRange(min=1),
+    required=True,
+    help="Bytes of this process's host memory that hold the pool's objects.",
+)
+@click.option(
+    "--ready_file",
+    type=str,
+    default=None,
+    help="Created once the memory joined the pool, for job scripts that start servers after it.",
+)
+@_telemetry_option
+def mooncake_provider(config: str, segment_size: int, ready_file: Optional[str], telemetry: bool):
+    """Lend host memory to a Mooncake pool for as long as this command runs.
+
+    Start it after the master and before the servers that share KV cache
+    through the pool. Stop those servers first: a server reading from a
+    provider that goes away may have to end with an error.
+    """
+    _apply_cli_telemetry(telemetry)
+
+    from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import load_store_config, open_sdk
+
+    _, mooncake = load_store_config(config)
+    with _signal_handoff():
+        store = open_sdk(dataclasses.replace(mooncake, global_segment_size=segment_size))
+        try:
+            logger.warning(
+                f"mooncake-store: lending {segment_size} bytes to the pool at "
+                f"{mooncake.master_server_address} until this command stops"
+            )
+            if ready_file:
+                pathlib.Path(ready_file).touch()
+            while True:
+                # The handler raises, so a signal ends this wait rather than resuming it.
+                time.sleep(1.0)
+        finally:
+            # Unmounts the segment now rather than when the master's client TTL expires.
+            store.close()
 
 
 @click.command("mooncake_pool_report")
