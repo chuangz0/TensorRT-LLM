@@ -641,6 +641,12 @@ class Lender(Protocol):
         type and quantization, and the position in ``regions`` of each pool's region."""
         ...
 
+    @property
+    def stopped(self) -> bool:
+        """Whether the lender lends no more: it stopped for good after an error it logged, or its
+        manager shut down. Its leases still go back."""
+        ...
+
     def held_page_counts(self) -> HeldPages:
         """Pages lending holds, per local pool group (``HeldPages``); use them separately on each
         rank and pipeline stage. The value stays the same, ``version`` included, while no count
@@ -864,4 +870,24 @@ class Lender(Protocol):
 
         Raises:
             ValueError: No request cache, including after manager shutdown."""
+        ...
+
+    def prompt_object_keys(
+        self,
+        prompt_tokens: Sequence[int],
+        *,
+        cache_salt: Optional[str],
+        layer_group_index: int,
+        num_blocks: int,
+    ) -> np.ndarray:
+        """``uint8 (num_blocks, 54)``: the object keys a NAMED lease of this rank gives the first
+        ``num_blocks`` whole blocks of a text prompt in layer group ``layer_group_index``, for a
+        request with this ``cache_salt`` and no LoRA. Unlike the other methods it may run on any
+        thread at any time after attach: it reads only what attach fixed. Prompts with multimodal
+        content or a LoRA adapter are named by their leases alone.
+
+        Raises:
+            ValueError: The prompt has fewer whole blocks, the layer group is unknown, or this
+                lender names no blocks.
+            RuntimeError: The lender's manager is gone."""
         ...

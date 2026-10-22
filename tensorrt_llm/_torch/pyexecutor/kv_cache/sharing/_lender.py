@@ -735,6 +735,11 @@ class _ManagerLender:
             )
         return self._page_layout
 
+    @property
+    def stopped(self) -> bool:
+        """See ``Lender.stopped``."""
+        return self._stop_reason is not None or self._shut_down
+
     def held_page_counts(self) -> HeldPages:
         """See ``Lender.held_page_counts``."""
         return self._locks.held_page_counts()
@@ -1142,6 +1147,26 @@ class _ManagerLender:
             kv,
             state,
         )
+
+    def prompt_object_keys(
+        self,
+        prompt_tokens: Sequence[int],
+        *,
+        cache_salt: str | None,
+        layer_group_index: int,
+        num_blocks: int,
+    ) -> np.ndarray:
+        """See ``Lender.prompt_object_keys``."""
+        manager = self._manager_ref()
+        if manager is None:
+            raise RuntimeError("the lender's manager is gone")
+        if self._no_names is not None:
+            raise ValueError(f"this lender names no blocks: {self._no_names}")
+        scope = _manager.prompt_reuse_scope(manager, cache_salt)
+        keys = _manager.reuse_keys_of_tokens(
+            self._tokens_per_block, scope, prompt_tokens, num_blocks
+        )
+        return self._object_keys(layer_group_index, np.frombuffer(b"".join(keys), dtype=np.uint8))
 
     def return_writes(
         self,

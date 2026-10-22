@@ -603,10 +603,6 @@ def block_keys(
     and reuse scope the manager commits with. ``ValueError`` if the request has fewer."""
     # TODO: reuse keys miss a request's encoder input, multimodal embeddings without digests and
     # how the input processor treats a digested item, so requests that differ only there share keys.
-    if count <= 0:
-        return []
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import sequence_to_blockchain_keys
-
     tpb = int(manager.tokens_per_block)
     source = manager._reuse_token_source(request)
     need = count * tpb
@@ -617,24 +613,42 @@ def block_keys(
         )
     # Multimodal digests take the place of placeholder tokens, as when the manager commits.
     tokens = manager._augment_tokens_for_block_reuse(source, request, 0, need)
+    return reuse_keys_of_tokens(tpb, kv.reuse_scope, tokens, count)
+
+
+def reuse_keys_of_tokens(
+    tokens_per_block: int, reuse_scope: object, tokens: Sequence[object], count: int
+) -> list[bytes]:
+    """The 32-byte reuse keys of the first ``count`` whole blocks of ``tokens`` under
+    ``reuse_scope``, as the radix tree keys them, root excluded. ``ValueError`` if ``tokens`` has
+    fewer whole blocks. Reads no manager state, so it may run on any thread."""
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import sequence_to_blockchain_keys
+
+    if count <= 0:
+        return []
     if isinstance(tokens, np.ndarray):
         tokens = tokens.tolist()
     keys: list[bytes] = []
     for i, (block_tokens, key) in enumerate(
-        sequence_to_blockchain_keys(tpb, kv.reuse_scope, tokens)
+        sequence_to_blockchain_keys(tokens_per_block, reuse_scope, tokens)
     ):
         if i == 0:
             continue  # the root: the reuse scope's own key
-        if len(block_tokens) < tpb:
+        if len(block_tokens) < tokens_per_block:
             break
         keys.append(bytes(key))
         if len(keys) == count:
             break
     if len(keys) < count:
-        raise ValueError(
-            f"request {request.py_request_id} has {len(keys)} whole blocks of tokens, {count} asked"
-        )
+        raise ValueError(f"the tokens hold {len(keys)} whole blocks, {count} asked")
     return keys
+
+
+def prompt_reuse_scope(manager: KVCacheManagerV2, cache_salt: str | None) -> object:
+    """The reuse scope the manager gives a request with this ``cache_salt`` and no LoRA."""
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import ReuseScope
+
+    return ReuseScope(lora_id=None, salt=manager._derive_reuse_salt(cache_salt))
 
 
 def grow(

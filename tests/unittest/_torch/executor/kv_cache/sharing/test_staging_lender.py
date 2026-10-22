@@ -923,6 +923,13 @@ def test_a_publish_is_named_under_the_request_s_reuse_scope(kit, real_manager, s
         ]
         kv = kit.kv(mgr, scoped)
         assert keys[1] == kit.chain_keys(kv, PROMPT)[:BLOCKS], "a name ignores the reuse scope"
+        # A prober names a salted prompt's blocks from the prompt and the salt alone.
+        if "cache_salt" in scope:
+            named = lender.prompt_object_keys(
+                PROMPT, cache_salt=scope["cache_salt"], layer_group_index=0, num_blocks=BLOCKS
+            )
+            lent = kit.ready_view(leases[1], mgr).groups[0]
+            assert np.array_equal(named[lent.page_ordinals], lent.object_keys)
         # The manager committed under those keys: its tree finds the block after them by them.
         extra = list(range(7000, 7000 + TPB))
         probed = mgr.impl.probe_first_new_block_key(kv.reuse_scope, PROMPT[:END] + extra)
