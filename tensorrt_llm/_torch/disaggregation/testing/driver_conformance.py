@@ -841,7 +841,12 @@ class DriverConformance:
                 (put,) = h.settle(h.put(write))
                 assert put.status is RowStatus.NOT_READY, put
                 if driver.capabilities.probe:
-                    assert driver.probe([key], h.timeout) == (ProbeStatus.NOT_READY,)
+                    # A store that cannot see an unfinished write answers MISS, as Mooncake's
+                    # existence check does.
+                    assert driver.probe([key], h.timeout) in (
+                        (ProbeStatus.NOT_READY,),
+                        (ProbeStatus.MISS,),
+                    )
             finally:
                 release()
             (put,) = h.settle(h.put(write))

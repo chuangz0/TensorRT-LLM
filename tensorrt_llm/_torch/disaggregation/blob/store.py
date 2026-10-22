@@ -380,13 +380,15 @@ class StoreDriver(Protocol):
         self, keys: Sequence[str], budget_s: float, hint: Hint = None
     ) -> tuple[ProbeStatus, ...]:
         """Advisory presence of ``keys``, at the source ``hint`` names when given, answered within
-        ``budget_s`` seconds.
+        ``budget_s`` seconds, or within the store's own request timeout where its client takes no
+        per-call deadline.
 
         Keys the store did not answer in time are UNKNOWN, never MISS; the call returns within the
         budget whatever the store does, and a driver with no capacity to ask answers UNKNOWN at
-        once. A key held by an unfinished write is NOT_READY, as a get would report. Called only
-        when ``capabilities.probe`` is set, and with a hint only when ``capabilities.hints`` is.
-        Raises on a store error rather than answering MISS.
+        once. A key held by an unfinished write is NOT_READY, as a get would report, or MISS where
+        the store cannot tell it from an absent key. Called only when ``capabilities.probe`` is
+        set, and with a hint only when ``capabilities.hints`` is. Raises on a store error rather
+        than answering MISS.
         """
         ...
 

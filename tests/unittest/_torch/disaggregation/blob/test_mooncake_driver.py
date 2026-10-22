@@ -45,6 +45,7 @@ PUT_RANGES = "batch_put_from_multi_buffer_ranges"
 PUT_END = "batch_put_session_end"
 PUT_REVOKE = "batch_put_session_revoke"
 GET = "batch_get_into"
+IS_EXIST = "batch_is_exist"
 DATA_CALL = {"put": PUT_RANGES, "get": GET}
 CALL_FAILED = "existence check: CALL_FAILED(-100000)"
 
@@ -103,7 +104,7 @@ def test_the_driver_follows_the_driver_protocol() -> None:
         get=True,
         put=True,
         cancel=False,
-        probe=False,
+        probe=True,
         max_rows_per_op=None,
         hints=False,
         absent_is_miss=True,
@@ -113,8 +114,8 @@ def test_the_driver_follows_the_driver_protocol() -> None:
 
 
 class TestMooncakeDriverConformance(DriverConformance):
-    """The shared driver checks over the fake SDK, with every scenario it can stage. Probe is not
-    declared, so the blocked and failing presence queries are not staged."""
+    """The shared driver checks over the fake SDK, with every scenario it can stage. A probe
+    cannot be blocked past its budget: the SDK's existence check takes no deadline."""
 
     def make_driver(self) -> StoreDriver:
         return MooncakeDriver(FakeMooncakeStore())
@@ -144,6 +145,11 @@ class TestMooncakeDriverConformance(DriverConformance):
         fake = FakeMooncakeStore()
         fake.script(PUT_START, RuntimeError("the SDK crashed"))
         return MooncakeDriver(fake)
+
+    def make_failing_presence(self):
+        fake = FakeMooncakeStore()
+        fake.script(IS_EXIST, [-900])  # the existence check fails with RPC_FAIL
+        return MooncakeDriver(fake), key("failing")
 
     def make_failing_get(self):
         fake = FakeMooncakeStore()

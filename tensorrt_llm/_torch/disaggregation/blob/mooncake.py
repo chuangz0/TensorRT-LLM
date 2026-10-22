@@ -86,11 +86,14 @@ class _Code(IntEnum):
 
 OBJECT_EXISTS, OBJECT_ABSENT = 1, 0  # batch_is_exist answers
 MAX_ROW_BYTES = (1 << 31) - 1  # the put scatter answers each row's bytes as a 32-bit int
+# Keys in one batch_is_exist call: bounds the RPC's message and the master's lock time. A
+# 32k-token prompt of 32-token blocks is 1,024 keys.
+PROBE_KEYS_PER_CALL = 8192
 _CAPABILITIES = DriverCapabilities(
     get=True,
     put=True,
     cancel=False,
-    probe=False,
+    probe=True,
     max_rows_per_op=None,
     # The master answers OBJECT_NOT_FOUND for a key it does not hold; failures keep their own
     # codes and stay FAULT.
@@ -286,9 +289,28 @@ class MooncakeDriver:
     def probe(
         self, keys: Sequence[str], budget_s: float, hint: Hint = None
     ) -> tuple[ProbeStatus, ...]:
-        """Never called: ``capabilities.probe`` is false."""
+        """Asks the master which keys hold a readable object, ``PROBE_KEYS_PER_CALL`` keys per
+        call. ``batch_is_exist`` answers 0 both for an absent key and for one whose put is still
+        open, so both are MISS. It takes no deadline: the client's RPC timeout
+        (``rpc_timeout_ms`` of the store config), not ``budget_s``, bounds each call; a key it
+        timed out on is UNKNOWN. Any other error code raises ``StoreError``.
+
+        It also grants every existing key a read lease of the master's ``default_kv_lease_ttl``,
+        so probed objects outlive eviction that long.
+
+        TODO(mooncake): a per-call deadline for batch_is_exist, and an answer that tells an open
+        put from an absent key."""
+        if hint is not None:
+            raise DriverRejected("this driver reads no hints")
         self._require_open()
-        return tuple(ProbeStatus.UNKNOWN for _ in keys)
+        statuses: list[ProbeStatus] = []
+        for start in range(0, len(keys), PROBE_KEYS_PER_CALL):
+            chunk = list(keys[start : start + PROBE_KEYS_PER_CALL])
+            statuses += [
+                _probe_status(answer)
+                for answer in _answers(self._store.batch_is_exist(chunk), len(chunk))
+            ]
+        return tuple(statuses)
 
     def drain(self, budget_s: float) -> bool:
         """Refuses new work for good and waits up to ``budget_s`` for the calls in progress;
@@ -564,6 +586,16 @@ def _gone(revoke_answer: int) -> bool:
 
 def _moved(answer: int, size: int) -> str:
     return f"moved {answer} of {size} bytes" if answer >= 0 else _describe(answer)
+
+
+def _probe_status(answer: int) -> ProbeStatus:
+    if answer == OBJECT_EXISTS:
+        return ProbeStatus.HIT
+    if answer == OBJECT_ABSENT:
+        return ProbeStatus.MISS
+    if answer == _Code.RPC_TIMEOUT:
+        return ProbeStatus.UNKNOWN
+    raise StoreError(f"batch_is_exist answered {_describe(answer)}")
 
 
 def _answers(answers: Sequence[int], count: int) -> list[int]:
