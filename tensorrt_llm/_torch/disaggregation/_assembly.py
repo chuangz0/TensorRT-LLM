@@ -367,12 +367,12 @@ class DomainBinding:
     The executor owns the manager; this binding does not retain it. Orchestration
     keeps the manager and this lender association alive through transfer cleanup.
     For normal shutdown, stop submissions and confirm ended backend access before
-    returning consuming writes or releasing reads and discarded writes. Consuming
-    returns also require coordinated permission. Progress lender copies and finish
-    deregistration, hold release and accepted owner-thread finalizers before manager
-    shutdown. Missing evidence requires retention under the selected containment policy.
-    The holder receives only ``namespace``, never this association. The lender
-    remains the only memory-access authority.
+    returning writes with their arrived rows or releasing reads and discarded writes.
+    Keep lender progress running for pending copies, then finish deregistration, hold
+    release and accepted owner-thread finalizers before manager shutdown. Missing
+    evidence requires retention under the selected containment policy.
+    The holder receives ``namespace`` and ``lender``, never this association. The
+    lender remains the only memory-access authority.
 
     Attributes:
         lender: Canonical access-granting interface.

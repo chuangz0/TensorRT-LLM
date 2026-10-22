@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Request-free ownership of acquired leases, backend Attempts and safe retirement."""
+"""Ownership of acquired leases, backend Attempts and safe retirement."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from ._assembly import (
     FactoryRejected,
     ProviderCleanupCompleteFn,
     RegionNamespace,
-    WriteReturnFn,
     check_view_compatibility,
 )
 from .base.backend import (
@@ -36,7 +35,7 @@ from .base.backend import (
 from .lifecycle.retirement import RetirementDeadline, RetirementWatchdog
 
 if TYPE_CHECKING:
-    from ..pyexecutor.kv_cache.sharing import Lease, LeaseView, ResumeBounds
+    from ..pyexecutor.kv_cache.sharing import Lease, LeaseView, Lender
 
 
 class Direction(Enum):
@@ -85,51 +84,34 @@ class Rejected:
 SubmitResult = Accepted | Deferred | Rejected
 
 
-class ConsumptionDecision(Enum):
-    """Consumption intent, separate from the result of returning the lease."""
+class Marking(Enum):
+    """How a fetch's write lease, once its view was polled, went back to the lender.
 
-    UNDECIDED = "undecided"
-    CONSUME = "consume"
-    DISCARD = "discard"
-
-
-class ReturnStatus(Enum):
-    """Whether ownership ended through a consuming return or discard release."""
-
-    PENDING = "pending"
-    RETURNED = "returned"
-    FAILED = "failed"
-
-
-@dataclass(frozen=True)
-class ReturnDecision:
-    """Caller assurance that the complete transfer group permits write return.
-
-    Orchestration settles Outcomes and backend access across all required managers
-    and participating ranks before granting this permission. The holder verifies
-    local evidence; this flag alone does not establish distributed completion.
+    UNDECIDED until it is returned. DELIVERED returned it through ``return_writes``
+    with the Outcome's delivered rows, which a lender still lending counts; a stopped
+    lender counts nothing and its bounds come back empty. ABANDONED released it with
+    no row counted; LENDER_FAILED released it after its lender domain stopped.
     """
 
-    reusable: bool
-    all_ranks_returnable: bool
-
-    def __post_init__(self) -> None:
-        """Require explicit Boolean consumption and coordination decisions."""
-        if type(self.reusable) is not bool or type(self.all_ranks_returnable) is not bool:
-            raise TypeError("return decisions require Boolean permissions")
+    UNDECIDED = "undecided"
+    DELIVERED = "delivered"
+    ABANDONED = "abandoned"
+    LENDER_FAILED = "lender_failed"
 
 
 @dataclass(frozen=True)
 class OperationObservation:
-    """Operation facts only; orchestration owns readiness and request recovery."""
+    """Operation facts only; orchestration owns readiness and request recovery.
+
+    For a fetch, ``access_ended`` does not mean the lease went back: ``marking`` other
+    than UNDECIDED, or ``retired``, does.
+    """
 
     operation_id: int
     outcome: Outcome | None
     fault: str | None
-    decision: ConsumptionDecision
+    marking: Marking
     access_ended: bool
-    return_status: ReturnStatus
-    resume_bounds: ResumeBounds | None
     retired: bool
 
 
@@ -242,7 +224,7 @@ class _OwnerCleanup:
 
 @dataclass
 class BackendBinding:
-    """A provider root with descriptors and cleanup, never a manager/lender service."""
+    """A provider root with descriptors, cleanup and the lender its leases come from."""
 
     namespace: RegionNamespace
     profile_id: str
@@ -251,6 +233,7 @@ class BackendBinding:
     cleanup: _OwnerCleanup
     provider_cleanup_complete: ProviderCleanupCompleteFn
     domain_id: str
+    lender: Lender
     backend: Backend | None = None
     capabilities: Capabilities | None = None
     accepting: bool = True
@@ -271,7 +254,7 @@ class BackendBinding:
 
 @dataclass
 class OperationRecord:
-    """One accepted lease and one fixed-source Attempt, independent of requests."""
+    """One accepted lease and one fixed-source Attempt."""
 
     id: int
     intent: TransferIntent
@@ -281,12 +264,7 @@ class OperationRecord:
     attempt: Attempt | None = None
     submission: Submission = Submission.NOT_CALLED
     outcome: Outcome | None = None
-    write_return: WriteReturnFn | None = None
-    decision: ConsumptionDecision = ConsumptionDecision.UNDECIDED
-    return_decision: ReturnDecision | None = None
-    return_status: ReturnStatus = ReturnStatus.PENDING
-    resume_bounds: ResumeBounds | None = None
-    return_attempted: bool = False
+    marking: Marking = Marking.UNDECIDED
     released: bool = False
     release_attempted: bool = False
     cancel_sent: bool = False
@@ -407,6 +385,7 @@ class TransferManager:
         factory: BackendFactory,
         *,
         domain_id: str,
+        lender: Lender,
         lifecycle: LifecycleBinding,
         provider_cleanup_complete: ProviderCleanupCompleteFn,
         config: object = None,
@@ -418,6 +397,8 @@ class TransferManager:
             namespace: Verified complete regions and assembly-known memory kind.
             domain_id: Opaque lender identity shared by every binding using that lender.
                 It identifies failure scope, not a lender service or a memory region.
+            lender: The lender of every lease submitted to this binding. ``advance``
+                runs its progress, and fetches return their write leases through it.
             profile_id: Exact compatible assembly profile.
             factory: Private construction owner retaining partial resources on failure.
             lifecycle: Implemented policy selected explicitly for this profile.
@@ -442,7 +423,14 @@ class TransferManager:
             raise RuntimeError("backend assembly is unavailable for a failed lender domain")
         cleanup = _OwnerCleanup(self.notify)
         binding = BackendBinding(
-            namespace, profile_id, lifecycle, factory, cleanup, provider_cleanup_complete, domain_id
+            namespace,
+            profile_id,
+            lifecycle,
+            factory,
+            cleanup,
+            provider_cleanup_complete,
+            domain_id,
+            lender,
         )
         # Reserve the teardown owner before construction or watchdog admission can
         # close. No claim or active clock is needed while the binding is healthy.
@@ -470,16 +458,12 @@ class TransferManager:
             self._stop_binding(binding_id, f"backend construction failed: {error}")
             raise
 
-    def submit(
-        self, lease: Lease, intent: TransferIntent, *, write_return: WriteReturnFn | None = None
-    ) -> SubmitResult:
+    def submit(self, lease: Lease, intent: TransferIntent) -> SubmitResult:
         """Accept ownership before polling or exposing an acquired lease.
 
         Args:
             lease: Caller-owned read or write lease, possibly still pending.
             intent: Frozen fixed-binding intent consistent with its lending call.
-            write_return: Endpoint bound to the originating lender for FETCH;
-                PUBLISH does not use one. The caller proves lease provenance.
 
         Returns:
             Accepted transfers ownership permanently. Deferred/Rejected leave the
@@ -496,10 +480,6 @@ class TransferManager:
             return Rejected("intent does not match verified assembly metadata")
         if intent.direction not in (Direction.FETCH, Direction.PUBLISH):
             return Rejected("unsupported transfer direction")
-        if intent.direction is Direction.FETCH and not callable(write_return):
-            return Rejected("fetch requires its originating lender's write-return endpoint")
-        if intent.direction is Direction.PUBLISH and write_return is not None:
-            return Rejected("publish cannot have a write-return endpoint")
         if any(record.lease is lease for record in self.operations.values()):
             return Rejected("lease ownership already transferred")
         watchdog = binding.lifecycle_binding.watchdog
@@ -515,9 +495,7 @@ class TransferManager:
         if not (caps.fetch if intent.direction is Direction.FETCH else caps.publish):
             return Rejected("backend does not support the requested direction")
         self._operation_id += 1
-        record = OperationRecord(
-            self._operation_id, intent, lease, self._clock(), write_return=write_return
-        )
+        record = OperationRecord(self._operation_id, intent, lease, self._clock())
         self.operations[record.id] = record
         self._count("accepted")
         return Accepted(record.id)
@@ -545,7 +523,8 @@ class TransferManager:
             return
         self._domain_faults[domain_id] = fault
         self._domain_updates.append(DomainFailure(domain_id, fault))
-        # Publish the stop before abandonment can fail and start provider cleanup.
+        # Publish the domain stop before abandoning any operation: cancellation
+        # can fail and start shutdown partway through this sweep.
         for key, binding in self.bindings.items():
             if binding.domain_id == domain_id:
                 self._stop_binding(key, fault)
@@ -575,8 +554,6 @@ class TransferManager:
             record.fault = reason
         if record.lifecycle is not None:
             record.lifecycle.request_drain(reason)
-        if not record.return_attempted:
-            record.decision = ConsumptionDecision.DISCARD
         binding = self.bindings[record.intent.binding_id]
         if (
             record.attempt is not None
@@ -594,81 +571,11 @@ class TransferManager:
             except Exception as error:
                 self._stop_binding(record.intent.binding_id, f"backend cancel failed: {error}")
 
-    def authorize_return(self, operation_id: int, decision: ReturnDecision) -> None:
-        """Return one consuming write after orchestration's collective return gate.
-
-        Args:
-            operation_id: Current operation from the coordinated transfer group.
-            decision: Reuse permission and assurance that every manager/rank has a
-                settled result and ended access. Orchestration prevalidates all
-                group inputs and invokes their returns in the same owner iteration.
-
-        Raises:
-            KeyError: The operation is unknown or already retired.
-            TypeError: The decision has the wrong type.
-            ValueError: The decision conflicts or required local/collective evidence
-                is absent. These checks perform no lender call.
-        """
-        self._owner()
-        record = self.operations[operation_id]
-        if not isinstance(decision, ReturnDecision):
-            raise TypeError("write return requires a ReturnDecision")
-        if not decision.all_ranks_returnable:
-            raise ValueError("write return requires all-rank return assurance")
-        if record.intent.direction is not Direction.FETCH:
-            raise ValueError("only fetch operations consume write returns")
-        if record.return_decision is not None:
-            if record.return_decision != decision:
-                raise ValueError("conflicting write-return authorization")
-            return
-        # Consumption cannot resume after discard, even if evidence arrives later.
-        if record.abandoned:
-            return
-        binding = self.bindings[record.intent.binding_id]
-        if (
-            record.outcome is None
-            or not record.access_ended
-            or record.write_return is None
-            or binding.domain_id in self._domain_faults
-        ):
-            raise ValueError("write return requires a settled Outcome and ended access")
-        policy = binding.lifecycle_binding
-        with policy.watchdog.lock:
-            if record.lifecycle is not None:
-                record.lifecycle.check()
-            if record.timeout.is_set():
-                self._abandon(record, "Lifecycle exposure timeout")
-            if record.abandoned or policy.watchdog.fatal is not None:
-                return
-            if record.lifecycle is not None and not record.lifecycle.settle(record):
-                return
-            record.return_decision = decision
-            record.decision = ConsumptionDecision.CONSUME
-            record.return_attempted = True
-            try:
-                record.resume_bounds = record.write_return(
-                    record.lease, record.outcome.delivered_masks, decision.reusable
-                )
-            except Exception as error:
-                # Return can partly consume a lease. Retain it and never retry or
-                # substitute release after the operational call has failed.
-                record.return_status = ReturnStatus.FAILED
-                record.fault = record.fault or f"write return failed: {error}"
-                if record.lifecycle is not None:
-                    record.lifecycle.retain_unproven(record, record.fault)
-                self.stop_lender_domain(binding.domain_id, record.fault)
-                return
-            record.released = True
-            record.return_status = ReturnStatus.RETURNED
-            self._count("returned")
-
     def advance(self, now: float) -> tuple[OperationObservation, ...]:
-        """Observe operation facts and perform bounded manager-thread cleanup.
+        """Run lender progress, observe operation facts and perform bounded cleanup.
 
-        Orchestration calls each active lender's progress once per executor
-        iteration before this method. Keep that progress running through idle and
-        shutdown rounds, including pending copies after a consuming lease return.
-        This holder polls ready facts and never advances lender or backend I/O.
+        Call it once each executor iteration on the manager thread: the lenders'
+        staging grants and copy completions advance only through it.
 
         Args:
             now: Monotonic observation timestamp; safety timing belongs to Lifecycle.
@@ -680,19 +587,12 @@ class TransferManager:
         for watchdog in {item.lifecycle_binding.watchdog for item in self.bindings.values()}:
             watchdog.progress()
         self._observe_shutdowns()
+        self._progress_lenders()
         updates: list[OperationObservation] = []
         for record in tuple(self.operations.values()):
             self._progress_operation(record)
             retired = self._retire(record)
-            state = (
-                id(record.outcome),
-                record.fault,
-                record.decision,
-                record.access_ended,
-                record.return_status,
-                record.resume_bounds,
-                retired,
-            )
+            state = (id(record.outcome), record.fault, record.marking, record.access_ended, retired)
             if state != record.observed:
                 record.observed = state
                 updates.append(
@@ -700,14 +600,25 @@ class TransferManager:
                         record.id,
                         record.outcome,
                         record.fault,
-                        record.decision,
+                        record.marking,
                         record.access_ended,
-                        record.return_status,
-                        record.resume_bounds,
                         retired,
                     )
                 )
         return tuple(updates)
+
+    def _progress_lenders(self) -> None:
+        """Run one round of progress of each lender whose domain has not stopped."""
+        lenders = {
+            binding.domain_id: binding.lender
+            for binding in self.bindings.values()
+            if binding.domain_id not in self._domain_faults
+        }
+        for domain_id, lender in lenders.items():
+            try:
+                lender.progress()
+            except Exception as error:
+                self.stop_lender_domain(domain_id, f"lender progress failed: {error}")
 
     def _progress_operation(self, record: OperationRecord) -> None:
         """Observe delivery and access independently without driving provider I/O."""
@@ -731,7 +642,7 @@ class TransferManager:
                 else:
                     if outcome is not None:
                         self._observe_outcome(record, outcome)
-            # A failed poll can hand off this binding while
+            # A failed poll or an invalid outcome can hand off this binding while
             # processing the outcome. Do not resume provider calls afterward.
             if not record.access_ended and not binding.shutdown_started:
                 try:
@@ -745,13 +656,11 @@ class TransferManager:
             record.access_ended = True
         if binding.retained_labels == frozenset():
             record.access_ended = True
-        if record.access_ended and (
-            record.intent.direction is Direction.PUBLISH or record.abandoned
-        ):
-            self._release(record)
+        if record.access_ended:
+            self._return_lease(record)
 
     def _poll_lease(self, record: OperationRecord) -> None:
-        """Poll only until a view is ready; lender progress belongs to orchestration."""
+        """Poll an unreleased lease on its owner thread until its view is ready."""
         if record.lease_view is not None or record.released:
             return
         binding = self.bindings[record.intent.binding_id]
@@ -763,7 +672,7 @@ class TransferManager:
         except Exception as error:
             self.stop_lender_domain(binding.domain_id, f"lease poll failed: {error}")
             return
-        if view is not None and record.lease_view is None:
+        if view is not None:
             record.lease_view = view
         if failure is not None:
             self._abandon(record, failure)
@@ -773,8 +682,8 @@ class TransferManager:
         binding = self.bindings[record.intent.binding_id]
         try:
             check_view_compatibility(record.lease_view, binding.namespace)
-        except ValueError as error:
-            self._abandon(record, f"incompatible lender view: {error}")
+        except (TypeError, ValueError) as error:
+            self._abandon(record, f"invalid lender view: {error}")
             return
         policy = binding.lifecycle_binding
         try:
@@ -809,7 +718,7 @@ class TransferManager:
             record.submission = Submission.RETURNED
 
     def _observe_outcome(self, record: OperationRecord, outcome: Outcome) -> None:
-        """Retain the fixed result without granting consumption or release."""
+        """Retain a fixed validated result; a timeout it commits abandons the operation."""
         try:
             if not isinstance(outcome, Outcome) or record.lease_view is None:
                 raise ValueError("Attempt returned a noncanonical Outcome")
@@ -830,36 +739,70 @@ class TransferManager:
         if record.timeout.is_set():
             self._abandon(record, "Lifecycle exposure timeout")
 
-    def _release(self, record: OperationRecord) -> None:
-        """Return protection only after ended access wins Lifecycle arbitration."""
-        policy = self.bindings[record.intent.binding_id].lifecycle_binding
-        if (
-            record.return_attempted
-            or record.release_attempted
-            or record.released
-            or policy.watchdog.fatal is not None
-        ):
+    def _counts_arrivals(self, record: OperationRecord) -> bool:
+        """Whether the lease goes back through ``return_writes`` with its delivered rows.
+
+        That is a fetch's write lease whose view was polled, not abandoned, through
+        a lender that has not stopped. Any other lease is released, which counts no
+        rows of a write lease whose view was polled.
+        """
+        return (
+            record.intent.direction is Direction.FETCH
+            and record.lease_view is not None
+            and not record.abandoned
+            and self.bindings[record.intent.binding_id].domain_id not in self._domain_faults
+        )
+
+    def _return_lease(self, record: OperationRecord) -> None:
+        """Return the lease once ended access wins Lifecycle arbitration.
+
+        A write lease that counts arrivals waits for its Outcome as well: the lender
+        counts the arrived rows and returns the lease in one call.
+        """
+        binding = self.bindings[record.intent.binding_id]
+        if record.release_attempted or binding.lifecycle_binding.watchdog.fatal is not None:
+            return
+        if self._counts_arrivals(record) and record.outcome is None:
             return
         if record.lifecycle is not None and not record.lifecycle.settle(record):
             return
+        # A deadline that passed before access ended counts no rows; settle commits it.
+        if record.timeout.is_set():
+            self._abandon(record, "Lifecycle exposure timeout")
+        counts_arrivals = self._counts_arrivals(record)
         record.release_attempted = True
         try:
-            record.lease.release()
+            if counts_arrivals:
+                binding.lender.return_writes([(record.lease, record.outcome.delivered_masks, True)])
+            else:
+                record.lease.release()
         except Exception as error:
+            if counts_arrivals:
+                # A return refused before any change leaves the lease held; release is
+                # idempotent, so it returns the lease at most once with no row counted.
+                try:
+                    record.lease.release()
+                except Exception as release_error:
+                    logger.error(f"Shared KV lease release after a failed return: {release_error}")
             record.release_failed = True
-            record.return_status = ReturnStatus.FAILED
-            record.fault = record.fault or f"lease release failed: {error}"
+            record.fault = record.fault or f"lease return failed: {error}"
             if record.lifecycle is not None:
                 record.lifecycle.retain_unproven(record, record.fault)
-            self.stop_lender_domain(self.bindings[record.intent.binding_id].domain_id, record.fault)
+            self.stop_lender_domain(binding.domain_id, record.fault)
             return
         record.released = True
-        record.return_status = ReturnStatus.RETURNED
         self._count("released")
+        if record.intent.direction is Direction.FETCH and record.lease_view is not None:
+            if counts_arrivals:
+                record.marking = Marking.DELIVERED
+            elif binding.domain_id in self._domain_faults:
+                record.marking = Marking.LENDER_FAILED
+            else:
+                record.marking = Marking.ABANDONED
 
     def _retire(self, record: OperationRecord) -> bool:
         """Keep final result observation even after abandonment and early release."""
-        if not record.released or record.return_status is ReturnStatus.FAILED:
+        if not record.released or record.release_failed:
             return False
         if record.submission is Submission.RETURNED and record.outcome is None:
             return False

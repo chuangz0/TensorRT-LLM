@@ -16,22 +16,21 @@
 
 One manager publishes a request's KV blocks through its lender's staging slots; another fetches
 them into a request of its own. A test lease holder drives the lender as the runtime does: lend,
-wait for the view, submit it to the backend as it stands, wait until the attempt quiesces, mark
-what arrived, release. The store is the in-memory one, or with ``TRTLLM_MOONCAKE_REAL=1`` a real
-Mooncake pool (``TRTLLM_MOONCAKE_PROTOCOL``, default rdma). Allocates device pools.
+wait for the view, submit it to the backend as it stands, wait until the attempt quiesces, then
+release a read lease or return a write lease with what arrived. The store is the in-memory one, or
+with ``TRTLLM_MOONCAKE_REAL=1`` a real Mooncake pool (``TRTLLM_MOONCAKE_PROTOCOL``, default rdma).
+Allocates device pools.
 """
 
 from __future__ import annotations
 
 import os
 import threading
-from dataclasses import dataclass
 
 import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.disaggregation.base.backend import MemoryKind
 from tensorrt_llm._torch.disaggregation.blob.backend import BlobBackend, BlobConfig, RegionBinding
 from tensorrt_llm._torch.disaggregation.blob.keys import encode_key
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
@@ -44,7 +43,9 @@ from tensorrt_llm._torch.disaggregation.testing.memory_store import (
 from tensorrt_llm._torch.disaggregation.testing.object_trailer import Checksum, encode_trailer
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     LeaseView,
+    MemoryKind,
     ResumeBounds,
+    RowSelection,
     StagingOptions,
     attach_lender,
 )
@@ -139,37 +140,11 @@ def attach(mgr):
     return attach_lender(mgr, scope=SCOPE, staging=StagingOptions(END))
 
 
-def ready_view(lease, mgr, tries: int = 3):
-    for _ in range(tries):
-        mgr._stream.synchronize()
-        view = lease.poll()
-        if view is not None:
-            return view
-    raise AssertionError(f"the lease never became ready: {lease.failure}")
-
-
-@dataclass(frozen=True)
-class HostRegion:
-    """A lender region as the contract's ``SlotRegion``. The lender's own regions do not name their
-    memory kind, which ``SlotRegion`` requires; the lender stages in host memory."""
-
-    layout_label: str
-    address: int
-    nbytes: int
-    slot_bytes: int
-    slot_count: int
-    memory_kind: MemoryKind = MemoryKind.HOST
-
-
 def build(stores: Stores, lender, wake: Wake):
     """A backend over ``lender``'s regions, built on this thread: a driver, the lender's hold, the
     regions registered under it, and the backend. Returns the binding, whose ``release_hold``
     gives the hold back once the backend shut down, and the backend."""
-    regions = [
-        HostRegion(r.layout_label, r.address, r.nbytes, r.slot_bytes, r.slot_count)
-        for r in lender.regions
-    ]
-    binding = RegionBinding(regions, stores.open_driver(), lender.hold_regions())
+    binding = RegionBinding(lender.regions, stores.open_driver(), lender.hold_regions())
     binding.register()
     config = BlobConfig(key_prefix=KEY_PREFIX, workers=2, rows_per_batch=1)
     backend = BlobBackend(binding, wake, config)
@@ -182,9 +157,15 @@ def publish(stores, kit, mgr, select=None):
     source = kit.published(mgr, SOURCE, PROMPT)
     lender, wake = attach(mgr), Wake()
     binding, backend = build(stores, lender, wake)
-    lease = lender.lend_read(source, 0, END)
-    view = ready_view(lease, mgr)
-    submitted = view if select is None else LeaseView(tuple(g.select(select) for g in view.groups))
+    lease = lender.lend_read(
+        source, 0, END, memory_kind=MemoryKind.HOST, rows=RowSelection.NAMED, ready_event=None
+    )
+    view = kit.ready_view(lease, mgr)
+    submitted = (
+        view
+        if select is None
+        else LeaseView(tuple(g.select(select) for g in view.groups), view.start, view.end)
+    )
     outcome = wake.settled(backend.publish(submitted, None))
     assert outcome.fault is None
     assert all(mask.all() for mask in outcome.delivered_masks)
@@ -196,12 +177,14 @@ def publish(stores, kit, mgr, select=None):
 
 def fetch(stores, kit, mgr):
     """Fetches every block of the target request; returns the target, lender, lease, outcome,
-    backend and binding, the lease not yet marked."""
+    backend and binding, the lease not yet returned."""
     target = kit.admitted(mgr, TARGET, PROMPT)
     lender, wake = attach(mgr), Wake()
     binding, backend = build(stores, lender, wake)
-    lease = lender.lend_write(target, 0, END)
-    view = lease.poll()
+    lease = lender.lend_write(
+        target, 0, END, memory_kind=MemoryKind.HOST, rows=RowSelection.NAMED, ready_event=None
+    )
+    view = kit.ready_view(lease, mgr)
     kit.fill_sentinel(mgr, target)
     outcome = wake.settled(backend.fetch(view, None))
     return target, lender, lease, outcome, backend, binding
@@ -212,13 +195,11 @@ def test_publish_then_fetch_restores_pages(kit, real_manager, stores) -> None:
         source, _ = publish(stores, kit, mgr_a)
         target, lender, lease, outcome, backend, binding = fetch(stores, kit, mgr_b)
         assert outcome.fault is None
-        lease.mark_arrived([np.array(mask) for mask in outcome.delivered_masks])
-        mgr_b._stream.synchronize()
-        assert lender.resume_bounds(target) == ResumeBounds(END, 0)
+        kit.return_write(lender, lease, outcome.delivered_masks)
+        assert kit.settled_bounds(lender, mgr_b, target) == ResumeBounds(END, 0)
         for ordinal in range(BLOCKS):
             got = kit.digest(kit.page(mgr_b, target, 0, ordinal))
             assert got == kit.digest(kit.page(mgr_a, source, 0, ordinal)), "a fetched page differs"
-        lease.release()
         assert backend.shutdown(WAIT_S) == frozenset()
         binding.release_hold()
 
@@ -233,12 +214,11 @@ def test_partial_fetch_marks_only_delivered_rows(kit, real_manager) -> None:
         target, lender, lease, outcome, backend, binding = fetch(stores, kit, mgr_b)
         assert outcome.delivered_masks[0].tolist() == [True, False, False]
         assert "object is 5 bytes" in outcome.fault
-        lease.mark_arrived([np.array(mask) for mask in outcome.delivered_masks])
-        mgr_b._stream.synchronize()
-        assert lender.resume_bounds(target) == ResumeBounds(TPB, 0)  # usable up to the first gap
+        kit.return_write(lender, lease, outcome.delivered_masks)
+        # Usable up to the first gap.
+        assert kit.settled_bounds(lender, mgr_b, target) == ResumeBounds(TPB, 0)
         sentinel = kit.digest(bytes([kit.SENTINEL]) * kit.DevicePages(mgr_b).page_bytes(0))
         pages = [kit.digest(kit.page(mgr_b, target, 0, ordinal)) for ordinal in range(BLOCKS)]
         assert pages == [kit.digest(kit.page(mgr_a, source, 0, 0)), sentinel, sentinel]
-        lease.release()
         assert backend.shutdown(WAIT_S) == frozenset()
         binding.release_hold()
