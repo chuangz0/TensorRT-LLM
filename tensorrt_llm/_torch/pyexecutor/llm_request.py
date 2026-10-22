@@ -1019,6 +1019,9 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # End of the prompt range handed to KV store publication (kv_sharing),
         # a whole-block position; None before the first publication pass.
         self.py_published_end: Optional[int] = None
+        # Leading prompt tokens, in whole blocks, a KV store held when rank 0
+        # probed the request (kv_sharing); None when not probed.
+        self.py_store_hit_tokens: Optional[int] = None
 
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,

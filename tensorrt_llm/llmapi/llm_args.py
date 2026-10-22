@@ -2803,12 +2803,35 @@ class KvSharingConfig(StrictBaseModel):
         "'gpu_direct' reads and writes KV cache pages in place, "
         "'host_staging' copies them through pinned host memory. 'auto' "
         "chooses host staging for now.")
+    min_fetch_tokens: PositiveInt = Field(
+        default=2048,
+        description="Shortest stored prompt prefix worth fetching; a request "
+        "whose stored prefix extends its locally cached one by less computes "
+        "it instead.")
     max_fetch_tokens: PositiveInt = Field(
         default=32768,
-        description="Longest prompt prefix one fetch reads. Each rank pins "
-        "host memory for two of max(max_fetch_tokens, max_num_tokens) tokens "
-        "of KV cache, at most 8 GiB; the server refuses to start when one of "
-        "them does not fit in 8 GiB.")
+        description="Longest prompt prefix one fetch reads. Each rank pins at "
+        "most 8 GiB of host memory: one fetch of max(max_fetch_tokens, "
+        "max_num_tokens) tokens of KV cache, and up to as much again for "
+        "publications; the server refuses to start when one fetch does not "
+        "fit.")
+    probe_hold_ms: NonNegativeFloat = Field(
+        default=50.0,
+        description="Longest a new request waits for the store to say how "
+        "much of its prompt it holds before it is scheduled without fetching.")
+    fetch_timeout_s: float = Field(
+        default=5.0,
+        gt=0,
+        description="A fetch still running this long after it started is "
+        "abandoned and its request computes its prompt.")
+
+    @model_validator(mode="after")
+    def _fetch_limits_are_ordered(self) -> "KvSharingConfig":
+        if self.max_fetch_tokens < self.min_fetch_tokens:
+            raise ValueError(
+                f"max_fetch_tokens ({self.max_fetch_tokens}) is below "
+                f"min_fetch_tokens ({self.min_fetch_tokens})")
+        return self
 
 
 class LayerwiseBenchmarksConfig(StrictBaseModel):
@@ -8003,9 +8026,6 @@ class TorchLlmArgs(BaseLlmArgs):
             ("LoRA", self.enable_lora or self.lora_config is not None),
             ("beam search", (self.max_beam_width or 1) > 1),
             ("sparse attention", self.sparse_attention_config is not None),
-            ("disaggregated serving (cache_transceiver_config) for now",
-             self.cache_transceiver_config is not None
-             and self.cache_transceiver_config.backend is not None),
             ("sleep_config: sleep releases the KV cache memory",
              self.sleep_config is not None),
             ("orchestrator_type='ray'", self.orchestrator_type == "ray"),

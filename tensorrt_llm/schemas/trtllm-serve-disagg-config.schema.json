@@ -4945,12 +4945,33 @@
           "title": "Data Path",
           "type": "string"
         },
+        "fetch_timeout_s": {
+          "default": 5.0,
+          "description": "A fetch still running this long after it started is abandoned and its request computes its prompt.",
+          "exclusiveMinimum": 0,
+          "title": "Fetch Timeout S",
+          "type": "number"
+        },
         "max_fetch_tokens": {
           "default": 32768,
-          "description": "Longest prompt prefix one fetch reads. Each rank pins host memory for two of max(max_fetch_tokens, max_num_tokens) tokens of KV cache, at most 8 GiB; the server refuses to start when one of them does not fit in 8 GiB.",
+          "description": "Longest prompt prefix one fetch reads. Each rank pins at most 8 GiB of host memory: one fetch of max(max_fetch_tokens, max_num_tokens) tokens of KV cache, and up to as much again for publications; the server refuses to start when one fetch does not fit.",
           "exclusiveMinimum": 0,
           "title": "Max Fetch Tokens",
           "type": "integer"
+        },
+        "min_fetch_tokens": {
+          "default": 2048,
+          "description": "Shortest stored prompt prefix worth fetching; a request whose stored prefix extends its locally cached one by less computes it instead.",
+          "exclusiveMinimum": 0,
+          "title": "Min Fetch Tokens",
+          "type": "integer"
+        },
+        "probe_hold_ms": {
+          "default": 50.0,
+          "description": "Longest a new request waits for the store to say how much of its prompt it holds before it is scheduled without fetching.",
+          "minimum": 0,
+          "title": "Probe Hold Ms",
+          "type": "number"
         }
       },
       "required": [

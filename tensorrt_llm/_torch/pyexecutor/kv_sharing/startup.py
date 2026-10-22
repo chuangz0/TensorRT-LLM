@@ -13,6 +13,7 @@ import torch
 import tensorrt_llm
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
+from tensorrt_llm.math_utils import ceil_div
 
 from ...disaggregation._assembly import FactoryRejected, OwnerCleanupFn, ProfileSpec, attach_domain
 from ...disaggregation.base.backend import CacheKind, SlotRegion, WakeFn
@@ -22,6 +23,7 @@ from ...disaggregation.blob.backend import (
     ConstructionRejected,
     RegionBinding,
 )
+from ...disaggregation.blob.keys import key_stem
 from ...disaggregation.blob.mooncake import MooncakeDriver
 from ...disaggregation.blob.mooncake_setup import load_store_config, open_sdk
 from ...disaggregation.lifecycle.retirement import QuiescenceFatalEvent, RetirementWatchdog
@@ -31,7 +33,9 @@ from ..config_utils import is_mla
 from ..hang_detector import propagate_hard_kill
 from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ..kv_cache.sharing import Lender, MemoryKind, StagingOptions
-from .orchestrator import BINDING_ID, DOMAIN_ID, PROFILE_ID, SharedKvOrchestrator
+from ..scheduler.scheduler_v2 import KVCacheV2Scheduler
+from .orchestrator import BINDING_ID, DOMAIN_ID, PROFILE_ID, SharedKvOrchestrator, SharingPolicy
+from .probe import ProbeService
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -82,6 +86,11 @@ def start_kv_sharing(
             "kv_sharing needs KV cache manager v2 with block reuse; this executor built "
             f"{type(manager).__name__} (block reuse {getattr(manager, 'enable_block_reuse', None)})"
         )
+    if not isinstance(py_executor.scheduler, KVCacheV2Scheduler):
+        raise ValueError(
+            "kv_sharing fetches through the KV cache manager v2 scheduler; this executor built "
+            f"{type(py_executor.scheduler).__name__}"
+        )
     checkpoint = checkpoint_dir or llm_args.model
     if not os.path.isdir(checkpoint):
         raise ValueError(
@@ -100,19 +109,19 @@ def start_kv_sharing(
     # Before the lender pins its staging memory: an unreachable master fails here, within a minute.
     driver = MooncakeDriver(open_sdk(mooncake))
 
-    staging_unit_tokens = max(config.max_fetch_tokens, max_num_tokens)
+    # Host staging holds one fetch, and publications the rest of two fetches within the cap.
+    fetch_tokens = max(config.max_fetch_tokens, max_num_tokens)
     staging = StagingOptions(
-        guaranteed_fetch_tokens=staging_unit_tokens,
-        capacity_in_fetches=2,  # one unit for a fetch, one for publications
-        max_bytes=HOST_STAGING_BYTES,
+        guaranteed_fetch_tokens=fetch_tokens, capacity_in_fetches=2, max_bytes=HOST_STAGING_BYTES
     )
     try:
         domain = attach_domain(manager, _profile(py_executor, llm_args, checkpoint, staging))
     except (TypeError, ValueError) as error:
         # The lender may stay attached; startup fails, so nothing lends through it.
         raise ValueError(f"{SUPPORTED_MODELS}; this server is refused: {error}") from error
+    publication_tokens = _publication_tokens(domain.lender, fetch_tokens, manager.tokens_per_block)
 
-    transfers = TransferManager(wake=_nothing_to_wake)
+    transfers = TransferManager(wake=_nothing_to_wake, hold_returns=True)
     watchdog = RetirementWatchdog(_end_process)
     factory = _BlobBackendFactory(driver, domain.lender)
     transfers.assemble(
@@ -130,25 +139,68 @@ def start_kv_sharing(
     py_executor.disagg.attach_shared_transfer_manager(transfers)
 
     tokens_per_block = manager.tokens_per_block
-    orchestrator = SharedKvOrchestrator(
+    policy = SharingPolicy(
+        fetch="fetch" in backend.roles,
         publish="publish" in backend.roles,
-        tokens_per_block=tokens_per_block,
-        publication_tokens=staging_unit_tokens // tokens_per_block * tokens_per_block,
+        min_fetch_tokens=config.min_fetch_tokens,
+        max_fetch_tokens=config.max_fetch_tokens,
+        fetch_timeout_s=config.fetch_timeout_s,
+        publication_tokens=publication_tokens,
+        max_util_for_resume=llm_args.kv_cache_config.max_util_for_resume,
+    )
+    probe = None
+    if policy.fetch and py_executor.dist.rank == 0:
+        probe = ProbeService(
+            domain.lender,
+            driver,
+            key_stem(blob_config.key_prefix),
+            tokens_per_block=tokens_per_block,
+            # A fetch leaves the prompt's last token to compute.
+            min_prompt_tokens=config.min_fetch_tokens + 1,
+            hold_s=config.probe_hold_ms / 1000,
+        )
+        py_executor.executor_request_queue.probe_on_enqueue = probe.submit
+    orchestrator = SharedKvOrchestrator(
+        policy=policy,
+        kv_cache_manager=manager,
         lender=domain.lender,
         transfers=transfers,
         coordinator=py_executor.disagg,
         execution_stream=py_executor.execution_stream,
         watchdog=watchdog,
+        probe=probe,
     )
     py_executor.kv_sharing = orchestrator
+    py_executor.scheduler.store_fetches = orchestrator
     staging_bytes = sum(
         region.nbytes for region in domain.lender.regions if region.memory_kind is MemoryKind.HOST
     )
     logger.info(
         f"kv_sharing: store master {mooncake.master_server_address} over {mooncake.protocol}, "
-        f"roles {backend.roles}, host staging of {staging_bytes >> 20} MiB"
+        f"roles {backend.roles}, host staging of {staging_bytes >> 20} MiB: one fetch of "
+        f"{fetch_tokens} tokens and {publication_tokens} tokens for publications"
     )
     return orchestrator
+
+
+def _publication_tokens(lender: Lender, fetch_tokens: int, tokens_per_block: int) -> int:
+    """Tokens open publications may hold, whole blocks: host staging less one fetch.
+
+    Raises:
+        ValueError: Host staging holds no block beside one fetch.
+    """
+    regions = [region for region in lender.regions if region.memory_kind is MemoryKind.HOST]
+    # A block takes one slot of its pool group's region for each layer group the region serves.
+    staged_blocks = min(region.slot_count // len(region.layer_group_indices) for region in regions)
+    fetch_blocks = ceil_div(fetch_tokens, tokens_per_block)
+    if staged_blocks <= fetch_blocks:
+        staged_gib = sum(region.nbytes for region in regions) / (1 << 30)
+        raise ValueError(
+            f"kv_sharing: {staged_gib:.1f} GiB of host staging hold one fetch of {fetch_tokens} "
+            "tokens, max(max_fetch_tokens, max_num_tokens), and no block for publications; "
+            "lower max_fetch_tokens or max_num_tokens"
+        )
+    return (staged_blocks - fetch_blocks) * tokens_per_block
 
 
 def _profile(

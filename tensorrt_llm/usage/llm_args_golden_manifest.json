@@ -922,9 +922,24 @@
       "path": "kv_sharing.data_path"
     },
     {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_sharing.fetch_timeout_s"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_sharing.max_fetch_tokens"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_sharing.min_fetch_tokens"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_sharing.probe_hold_ms"
     },
     {
       "capture_policy": "list[int]|none",

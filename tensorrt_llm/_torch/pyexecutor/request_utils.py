@@ -275,6 +275,7 @@ def merge_requests_to_llm_requests(
         req = executor_request_to_llm_request(
             req_item.id, req_item.request, req_item.child_req_ids, exclude_last_generation_logits
         )
+        req.py_store_hit_tokens = req_item.store_hit_tokens
         req_with_children.append(req)
         if req.child_requests:
             req_with_children.extend(req.child_requests)

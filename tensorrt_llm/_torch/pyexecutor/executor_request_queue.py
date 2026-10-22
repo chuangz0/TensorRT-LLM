@@ -7,7 +7,7 @@ import enum
 import queue
 import threading
 import time
-from typing import Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
@@ -54,6 +54,9 @@ class RequestQueueItem:
     # applies when the broadcast reaches them.
     profile_config: Optional[dict] = None
     finished_prefix_load_ids: Optional[list[int]] = None
+    # Leading prompt tokens, in whole blocks, a KV store held when rank 0
+    # probed the request (kv_sharing); None when not probed.
+    store_hit_tokens: Optional[int] = None
 
     @property
     def is_shutdown_request(self):
@@ -85,6 +88,10 @@ class RequestQueueItem:
 
 class ExecutorRequestQueue:
     """Handles basic queue operations for executor requests."""
+
+    # Set by kv_sharing startup on rank 0: starts a store probe of each new
+    # request, on the enqueuing thread, before the request enters the queue.
+    probe_on_enqueue: Optional[Callable[[RequestQueueItem], None]] = None
 
     def __init__(
         self,
@@ -238,10 +245,12 @@ class ExecutorRequestQueue:
                     self.start_times[req_id] = start_time
                 child_req_ids = self._generate_child_request_ids(request)
 
-                self.request_queue.put(
-                    RequestQueueItem(req_id,
-                                     request,
-                                     child_req_ids=child_req_ids))
+                item = RequestQueueItem(req_id,
+                                        request,
+                                        child_req_ids=child_req_ids)
+                if self.probe_on_enqueue is not None:
+                    self.probe_on_enqueue(item)
+                self.request_queue.put(item)
                 req_ids.append(req_id)
         return req_ids
 

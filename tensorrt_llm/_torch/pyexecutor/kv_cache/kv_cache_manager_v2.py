@@ -5134,6 +5134,21 @@ class KVCacheManagerV2(BaseResourceManager):
         # back. Carry the served end across that gap.
         req.py_served_prefix_end = position
 
+    def resume_served_prefix(self, req: LlmRequest, position: int) -> None:
+        """Make a request parked for a fetch schedulable again, with its first ``position``
+        prompt tokens held: the fetched rows are back in its pages and its cache grew over them.
+        """
+        kv_cache = self.kv_cache_map[req.py_request_id]
+        # The prepopulated-length setter checks for a context state.
+        req.state = LlmRequestState.CONTEXT_INIT
+        if kv_cache.history_length < position:
+            self._resize_context_history(req, kv_cache, position)
+        self._mark_connector_prefix_populated(req, position, req.prompt_len - position)
+        # A failed allocation must not shrink the cache below the fetched rows.
+        req.py_ctx_pre_resize_cap = None
+        # Commit [claim, position): a first chunk that fails admission re-claims them by reuse.
+        self.try_commit_blocks(req, kv_cache)
+
     def _mirror_draft_kv_cache(self, req: LlmRequest):
         """The draft manager's entry for ``req``, created on first sight.
 

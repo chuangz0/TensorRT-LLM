@@ -43,6 +43,8 @@ def test_minimal_kv_sharing_config_is_accepted(store_config: str) -> None:
     sharing = llm_args(store_config).kv_sharing
     assert sharing.backends[0].roles == ["fetch", "publish"]
     assert sharing.data_path == "auto"
+    # A disaggregated context server shares through the store too.
+    llm_args(store_config, cache_transceiver_config={"backend": "NIXL"})
 
 
 UNSUPPORTED = {
@@ -64,6 +66,10 @@ UNSUPPORTED = {
         "speculative decoding",
     ),
     "GPU Direct": ({"kv_sharing": {"data_path": "gpu_direct"}}, "data_path='gpu_direct'"),
+    "fetch limits out of order": (
+        {"kv_sharing": {"min_fetch_tokens": 4096, "max_fetch_tokens": 1024}},
+        "max_fetch_tokens (1024) is below min_fetch_tokens (4096)",
+    ),
     "a missing store config": (
         {"kv_sharing": {"backends": [{"type": "mooncake", "config": "/no/such/store.yaml"}]}},
         "'/no/such/store.yaml' is not a file",

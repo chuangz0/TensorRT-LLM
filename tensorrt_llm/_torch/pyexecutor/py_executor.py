@@ -2260,23 +2260,13 @@ class PyExecutor:
             len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers()
 
     def _has_pending_connector_transfers(self) -> bool:
-        """Return whether connector work or waiting publications need another owner-loop round.
-
-        A shared holder still draining does not count: it drains after the loop,
-        so the loop stops on state every rank agrees on.
-
-        Returns:
-            Whether retained transfers prevent an indefinite idle wait or teardown.
-        """
         connector = getattr(self, "kv_connector_manager", None)
-        if connector is not None:
-            transfers = getattr(self, "async_transfer_manager", None)
-            if (connector.has_pending_loads()
-                    or (transfers is not None
-                        and transfers.has_any_inflight_requests())):
-                return True
-        kv_sharing = self.__dict__.get("kv_sharing")
-        return kv_sharing is not None and kv_sharing.has_waiting_publications()
+        if connector is None:
+            return False
+        transfers = getattr(self, "async_transfer_manager", None)
+        return (connector.has_pending_loads()
+                or (transfers is not None
+                    and transfers.has_any_inflight_requests()))
 
     @contextmanager
     def _profiler(self):
@@ -4383,6 +4373,10 @@ class PyExecutor:
         return all_ranks_fetched and any_rank_terminal_no_fit
 
     def _prepare_and_schedule_batch(self):
+        if self.kv_sharing is not None:
+            # Returns leases, resumes and drops parked fetches. Both loops call
+            # this method after the input-copy wait, so page tables may change.
+            self.kv_sharing.resolve_store_operations()
         self._release_unused_connector_reservations()
         self._poll_encoder_steps()
         new_requests = self._fetch_and_activate_new_requests()
@@ -4392,7 +4386,7 @@ class PyExecutor:
         self._handle_control_request()
 
         if self.kv_sharing is not None:
-            self.kv_sharing.before_scheduling()
+            self.kv_sharing.add_fetch_candidates(new_requests)
 
         self.disagg.prepare_context_schedulable(new_requests)
         self.disagg.poll_gen_transfers()
@@ -6627,6 +6621,9 @@ class PyExecutor:
                 seconds=1200) if self._disable_mpi else None
         else:
             timeout = datetime.timedelta(0)
+        kv_sharing = self.kv_sharing
+        if kv_sharing is not None:
+            timeout = kv_sharing.request_queue_wait(timeout)
 
         # Fetch requests from rank 0
         new_requests = []
@@ -6638,8 +6635,11 @@ class PyExecutor:
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
             with self.hang_detector.pause():
-                new_requests.extend(
-                    self.executor_request_queue.get_from_request_queue(timeout))
+                fetched = self.executor_request_queue.get_from_request_queue(
+                    timeout)
+            if kv_sharing is not None:
+                fetched = kv_sharing.hold_until_probed(fetched)
+            new_requests.extend(fetched)
 
         if connector is not None and self.dist.rank == 0:
             completed = connector.take_finished_prefix_loads()
@@ -9278,6 +9278,9 @@ class PyExecutor:
         Returns:
             bool: True if the request can be canceled (either successfully cancelled or doesn't need cancellation).
         """
+        if self.kv_sharing is not None:
+            # A request parked for a store fetch reads as in transfer below.
+            self.kv_sharing.cancel_fetch(request)
         connector = getattr(self, "kv_connector_manager", None)
         if connector is not None:
             connector.release_unstarted_prefix_loads(request)
