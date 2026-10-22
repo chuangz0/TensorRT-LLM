@@ -82,6 +82,7 @@ class _Lender:
     """Lender boundary: progress rounds and write returns that count rows, then release."""
 
     progress_rounds: int = 0
+    stopped: bool = False
 
     def progress(self) -> None:
         """Count one round of lender progress."""
@@ -201,13 +202,15 @@ class _Backend:
 class _Harness:
     """Real holder and Lifecycle with canonical lender metadata."""
 
-    def __init__(self, *, cancel: bool = True) -> None:
+    def __init__(self, *, cancel: bool = True, hold_returns: bool = False) -> None:
         """Construct the explicitly known HOST fixture without claiming activation."""
         self.now = 10.0
         self.fatals: list[object] = []
         self.watchdog = RetirementWatchdog(self.fatals.append, clock=lambda: self.now)
         self.wake = threading.Event()
-        self.manager = TransferManager(wake=self.wake.set, clock=lambda: self.now)
+        self.manager = TransferManager(
+            wake=self.wake.set, clock=lambda: self.now, hold_returns=hold_returns
+        )
         self.namespace = RegionNamespace(
             (MemoryRegion("layout", 4096, 64, 16, 4, (7,), MemoryKind.HOST),),
             MemoryKind.HOST,
@@ -278,8 +281,18 @@ class _Harness:
         """Finish or contain test operations before the thread-leak check runs."""
         self.close()
 
+    def tick_until(self, condition: Callable[[], bool]) -> None:
+        """Run holder progress until ``condition`` holds, the shutdown worker included."""
+        stop = time.monotonic() + 1
+        while not condition() and time.monotonic() < stop:
+            self.tick()
+            self.wake.wait(0.001)
+            self.wake.clear()
+        assert condition()
+
     def close(self) -> None:
         """End fake I/O, finish real cleanup, or contain intentionally violated contracts."""
+        self.manager.stop_holding()
         for binding in self.manager.bindings.values():
             if isinstance(binding.backend, _Backend):
                 binding.backend.labels = frozenset()
@@ -1000,3 +1013,76 @@ def test_shutdown_keeps_binding_owner_before_pending_lease_release_can_fail(h: _
         h.now = 15.0
         h.watchdog.progress()
         assert h.fatals and operation in h.manager.operations and not lease.released
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "delivered",
+        "short",
+        "abandoned",
+        "domain stopped",
+        "lender stopped",
+        "timed out",
+        "shut down",
+    ],
+)
+def test_a_held_lease_goes_back_only_by_return_now(path: str) -> None:
+    """With returns held, the end of access settles the Lifecycle and returns nothing, whatever
+    ended the operation; the caller returns the lease with every row or with none."""
+    with _Harness(hold_returns=True) as h:
+        lease, operation = h.submit()
+        h.tick()
+        attempt = h.backend.attempts[0]
+        if path == "abandoned":
+            h.manager.abandon(operation, "the fetch is late")
+        elif path == "domain stopped":
+            h.manager.stop_lender_domain("lender", "a lend failed")
+        elif path == "lender stopped":
+            h.lender.stopped = True
+        elif path == "timed out":
+            attempt.before_poll = lambda: setattr(h, "now", 15.0)
+        elif path == "shut down":
+            h.manager.begin_shutdown(h.now + 5)
+        h.complete(delivered=path != "short")
+        attempt.ended = True
+        h.tick_until(lambda: h.manager.ended(operation))
+        for _ in range(3):
+            h.tick()
+        assert not lease.released and not lease.marks and not h.fatals
+        ready = h.manager.ready(operation)
+        assert ready is (path == "delivered")
+        h.manager.return_now(operation, deliver=ready)
+        assert lease.released and bool(lease.marks) is ready
+        h.tick_until(lambda: operation not in h.manager.operations)
+        with pytest.raises(RuntimeError, match="holds no lease"):
+            h.manager.return_now(operation, deliver=False)
+
+
+def test_stop_holding_returns_held_leases_with_the_rows_their_outcomes_delivered() -> None:
+    with _Harness(hold_returns=True) as h:
+        lease, operation = h.submit()
+        h.tick()
+        h.backend.attempts[0].outcome = Outcome.for_view(h.view, (np.array([True, False]),), None)
+        h.backend.attempts[0].ended = True
+        h.tick()
+        assert h.manager.ended(operation) and not h.manager.ready(operation)
+        assert not lease.released
+        h.manager.stop_holding()
+        (update,) = h.tick()
+        assert update.retired and update.marking is Marking.DELIVERED
+        assert lease.released and lease.marks[0][0].tolist() == [True, False]
+
+
+def test_shutdown_leaves_a_held_lease_ready_for_its_return() -> None:
+    """A lease held when shutdown begins ended its access already: nothing is left to abandon."""
+    with _Harness(hold_returns=True) as h:
+        lease, operation = h.submit()
+        h.tick()
+        h.complete()
+        h.backend.attempts[0].ended = True
+        h.tick()
+        h.manager.begin_shutdown(h.now + 5)
+        assert h.manager.ready(operation) and "abandoned" not in h.manager.counters
+        h.manager.return_now(operation, deliver=True)
+        assert lease.released and lease.marks[0][0].all()

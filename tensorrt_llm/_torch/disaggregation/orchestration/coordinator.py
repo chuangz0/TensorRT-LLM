@@ -28,11 +28,7 @@ from .interfaces import ActiveRequestRegistry, ExecutorEffects
 if TYPE_CHECKING:
     import torch
 
-    from tensorrt_llm._torch.disaggregation.transfer_manager import (
-        DomainFailure,
-        OperationObservation,
-        TransferManager,
-    )
+    from tensorrt_llm._torch.disaggregation.transfer_manager import DomainFailure, TransferManager
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 
 
@@ -137,7 +133,6 @@ class DisaggTransferCoordinator:
             int, Tuple[LlmRequest, Optional["torch.cuda.Event"]]
         ] = {}
         self._shared_transfer_manager: Optional["TransferManager"] = None
-        self._shared_updates: List["OperationObservation"] = []
 
     def attach_shared_transfer_manager(self, manager: "TransferManager") -> None:
         """Attach the shared holder on its owner thread before submitting work.
@@ -160,16 +155,6 @@ class DisaggTransferCoordinator:
         manager = self._shared_transfer_manager
         return manager is not None and manager.pending()
 
-    def take_shared_updates(self) -> Tuple["OperationObservation", ...]:
-        """Drain local observations for orchestration to reconcile across ranks.
-
-        Returns:
-            Operation facts; request associations and readiness belong to orchestration.
-        """
-        updates = tuple(self._shared_updates)
-        self._shared_updates.clear()
-        return updates
-
     def take_shared_domain_failures(self) -> Tuple["DomainFailure", ...]:
         """Drain lender-wide stops for orchestration to apply at its recovery boundary."""
         manager = self._shared_transfer_manager
@@ -187,10 +172,11 @@ class DisaggTransferCoordinator:
         return manager is None or manager.shutdown_status().complete
 
     def _advance_shared_transfers(self) -> None:
-        """Observe shared work locally without entering native collectives."""
+        """Progress shared work locally without entering native collectives. Orchestration
+        reads operation state from the holder itself, at its own agreed point."""
         manager = self._shared_transfer_manager
         if manager is not None:
-            self._shared_updates.extend(manager.advance(time.monotonic()))
+            manager.advance(time.monotonic())
 
     # -- loop head -----------------------------------------------------------
 

@@ -222,10 +222,9 @@ _SCHEDULE_HEAD = [
 # Non-PP loops flush at loop exit; the PP loop does not.
 _SHUTDOWN_PASS = [
     ("handle_errors_synced",),
-    ("has_pending_shared_transfers",),
     ("flush_pending_transfer_responses",),
 ]
-_PP_SHUTDOWN_PASS = [("handle_errors_synced",), ("has_pending_shared_transfers",)]
+_PP_SHUTDOWN_PASS = [("handle_errors_synced",)]
 
 
 def test_executor_loop_transcript(monkeypatch) -> None:

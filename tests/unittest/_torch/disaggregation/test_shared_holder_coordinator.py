@@ -32,19 +32,15 @@ def _holder() -> Mock:
 
 
 @pytest.mark.parametrize("native", [False, True])
-def test_loop_head_progresses_shared_holder_and_defers_request_updates(native: bool) -> None:
-    """Both coordinator variants observe shared work without applying scheduler state."""
+def test_loop_head_progresses_shared_holder_without_scheduler_state(native: bool) -> None:
+    """Both coordinator variants progress shared work without applying scheduler state."""
     coordinator = CoordinatorHarness().coordinator if native else NoopDisaggCoordinator()
     holder = _holder()
-    update = object()
-    holder.advance.return_value = (update,)
     coordinator.attach_shared_transfer_manager(holder)
 
     coordinator.handle_errors_synced()
 
     holder.advance.assert_called_once()
-    assert coordinator.take_shared_updates() == (update,)
-    assert coordinator.take_shared_updates() == ()
     assert coordinator.has_pending_shared_transfers()
 
 
@@ -101,10 +97,11 @@ def test_cleanup_initiation_exception_still_wakes_waiters_and_runs_safe_cleanup(
     assert executor.shutdown_event.is_set()
 
 
-def test_shutdown_keeps_shared_only_executor_running_until_cleanup(
+def test_shared_work_does_not_keep_the_executor_loop_from_stopping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A no-native executor must not stop or wait indefinitely while a holder drains."""
+    """Whether the loop stops reads only state every rank agrees on: shared work drains after the
+    loop (kv_sharing's shutdown), so a holder still draining does not keep the loop running."""
     executor = object.__new__(PyExecutor)
     executor.is_shutdown = True
     executor.active_requests = []
@@ -121,14 +118,10 @@ def test_shutdown_keeps_shared_only_executor_running_until_cleanup(
 
     coordinator.begin_shared_shutdown()
     holder.begin_shutdown.assert_called_once_with(15.0)
-    assert executor._has_pending_connector_transfers()
-    assert not executor.should_stop_processing
+    assert executor.should_stop_processing
     assert not coordinator.shared_shutdown_complete()
 
-    holder.pending.return_value = False
     holder.shutdown_status.return_value = SimpleNamespace(complete=True)
-    assert not executor._has_pending_connector_transfers()
-    assert executor.should_stop_processing
     assert coordinator.shared_shutdown_complete()
 
 
@@ -140,39 +133,4 @@ def test_unattached_shared_hooks_preserve_no_native_behavior() -> None:
     coordinator.pace_idle()
     assert not coordinator.has_pending_shared_transfers()
     assert coordinator.shared_shutdown_complete()
-    assert coordinator.take_shared_updates() == ()
     assert coordinator.take_shared_domain_failures() == ()
-
-
-@pytest.mark.parametrize(
-    "connector_state,shared_pending,expected",
-    [
-        ("none", True, True),
-        ("loads", False, True),
-        ("inflight", False, True),
-        ("empty", True, True),
-        ("empty", False, False),
-        ("none", False, False),
-    ],
-)
-def test_pending_transfer_predicate_combines_connector_and_shared_work(
-    connector_state: str, shared_pending: bool, expected: bool
-) -> None:
-    """Stop, idle and control-drain checks include either source of retained work."""
-    executor = object.__new__(PyExecutor)
-    executor.kv_connector_manager = None
-    executor.async_transfer_manager = None
-    if connector_state != "none":
-        executor.kv_connector_manager = Mock()
-        executor.kv_connector_manager.has_pending_loads.return_value = connector_state == "loads"
-        executor.async_transfer_manager = Mock()
-        executor.async_transfer_manager.has_any_inflight_requests.return_value = (
-            connector_state == "inflight"
-        )
-    coordinator = NoopDisaggCoordinator()
-    holder = _holder()
-    holder.pending.return_value = shared_pending
-    coordinator.attach_shared_transfer_manager(holder)
-    executor._disagg_coordinator = coordinator
-
-    assert executor._has_pending_connector_transfers() is expected

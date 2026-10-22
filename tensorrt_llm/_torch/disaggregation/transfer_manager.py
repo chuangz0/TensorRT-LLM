@@ -267,6 +267,8 @@ class OperationRecord:
     marking: Marking = Marking.UNDECIDED
     released: bool = False
     release_attempted: bool = False
+    # Access ended and the Lifecycle settled; the lease waits for ``return_now``.
+    held: bool = False
     cancel_sent: bool = False
     abandoned: bool = False
     access_ended: bool = False
@@ -321,22 +323,32 @@ class _ShutdownAttempt:
 class TransferManager:
     """Hold operations on one manager thread while backend I/O progresses independently.
 
-    There is no production activation here: request admission, loop-head lending,
-    readiness and fallback belong to orchestration. Scoped Lifecycle qualification
-    and general lender memory/row capabilities remain activation prerequisites.
+    Orchestration (``pyexecutor.kv_sharing``) owns admission, readiness and fallback;
+    this class owns leases and backend Attempts. Scoped Lifecycle qualification and
+    general lender memory/row capabilities remain activation prerequisites.
     """
 
-    def __init__(self, *, wake: WakeFn, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        *,
+        wake: WakeFn,
+        clock: Callable[[], float] = time.monotonic,
+        hold_returns: bool = False,
+    ) -> None:
         """Create an empty operation holder.
 
         Args:
             wake: Thread-safe, nonblocking notification; it must never raise.
             clock: Monotonic observation clock, shared with bound Lifecycle clocks.
+            hold_returns: Keep each lease, once its access ended and its Lifecycle
+                settled, until ``return_now`` returns it, so that every rank returns
+                leases at the same point; ``stop_holding`` lifts this.
         """
         self.bindings: dict[str, BackendBinding] = {}
         self.operations: dict[int, OperationRecord] = {}
         self._wake = wake
         self._clock = clock
+        self._holding = hold_returns
         self._owner_thread: int | None = None
         self._builder_thread = threading.get_ident()
         self._operation_id = 0
@@ -754,13 +766,18 @@ class TransferManager:
         )
 
     def _return_lease(self, record: OperationRecord) -> None:
-        """Return the lease once ended access wins Lifecycle arbitration.
+        """Return the lease once ended access wins Lifecycle arbitration, or, while returns
+        are held, keep it there for ``return_now``.
 
         A write lease that counts arrivals waits for its Outcome as well: the lender
         counts the arrived rows and returns the lease in one call.
         """
         binding = self.bindings[record.intent.binding_id]
-        if record.release_attempted or binding.lifecycle_binding.watchdog.fatal is not None:
+        if (
+            record.held
+            or record.release_attempted
+            or binding.lifecycle_binding.watchdog.fatal is not None
+        ):
             return
         if self._counts_arrivals(record) and record.outcome is None:
             return
@@ -769,15 +786,67 @@ class TransferManager:
         # A deadline that passed before access ended counts no rows; settle commits it.
         if record.timeout.is_set():
             self._abandon(record, "Lifecycle exposure timeout")
-        counts_arrivals = self._counts_arrivals(record)
+        if self._holding:
+            record.held = True
+            return
+        self._give_back(record, deliver=self._counts_arrivals(record))
+
+    def ended(self, operation_id: int) -> bool:
+        """Whether the operation's backend access ended and its lease is held for
+        ``return_now`` (or was returned)."""
+        record = self.operations[operation_id]
+        return record.held or record.released
+
+    def ready(self, operation_id: int) -> bool:
+        """Whether the operation's Outcome delivered every row of its view without a fault,
+        and neither it, its lender domain nor its lender stopped."""
+        record = self.operations[operation_id]
+        binding = self.bindings[record.intent.binding_id]
+        outcome = record.outcome
+        return (
+            outcome is not None
+            and outcome.fault is None
+            and record.fault is None
+            and not record.abandoned
+            and binding.domain_id not in self._domain_faults
+            and not binding.lender.stopped
+            and all(bool(mask.all()) for mask in outcome.delivered_masks)
+        )
+
+    def return_now(self, operation_id: int, deliver: bool) -> None:
+        """Return a held lease: a fetch's with the rows its Outcome delivered when ``deliver``
+        (where its lender still counts arrivals), otherwise with none.
+
+        Raises:
+            RuntimeError: Called on another thread, or the operation holds no lease.
+        """
+        self._owner()
+        record = self.operations.get(operation_id)
+        if record is None or not record.held:
+            raise RuntimeError(f"operation {operation_id} holds no lease to return")
+        record.held = False
+        self._give_back(record, deliver=deliver and self._counts_arrivals(record))
+
+    def stop_holding(self) -> None:
+        """Return held leases, and later ones, as if returns were never held: at the next
+        ``advance``, with the rows their Outcomes delivered."""
+        self._owner()
+        self._holding = False
+        for record in self.operations.values():
+            record.held = False
+
+    def _give_back(self, record: OperationRecord, deliver: bool) -> None:
+        """Return the lease through ``return_writes`` with the rows its Outcome delivered, or
+        release it with none."""
+        binding = self.bindings[record.intent.binding_id]
         record.release_attempted = True
         try:
-            if counts_arrivals:
+            if deliver:
                 binding.lender.return_writes([(record.lease, record.outcome.delivered_masks, True)])
             else:
                 record.lease.release()
         except Exception as error:
-            if counts_arrivals:
+            if deliver:
                 # A return refused before any change leaves the lease held; release is
                 # idempotent, so it returns the lease at most once with no row counted.
                 try:
@@ -793,7 +862,7 @@ class TransferManager:
         record.released = True
         self._count("released")
         if record.intent.direction is Direction.FETCH and record.lease_view is not None:
-            if counts_arrivals:
+            if deliver:
                 record.marking = Marking.DELIVERED
             elif binding.domain_id in self._domain_faults:
                 record.marking = Marking.LENDER_FAILED
@@ -842,7 +911,9 @@ class TransferManager:
             deadline if self._shutdown_deadline is None else min(self._shutdown_deadline, deadline)
         )
         for record in tuple(self.operations.values()):
-            self._abandon(record, "holder shutdown")
+            # A held lease's access ended: its Outcome is final and nothing is left to cancel.
+            if not record.held:
+                self._abandon(record, "holder shutdown")
         for binding in self.bindings.values():
             binding.accepting = False
             self._binding_deadline(binding, "backend shutdown")
