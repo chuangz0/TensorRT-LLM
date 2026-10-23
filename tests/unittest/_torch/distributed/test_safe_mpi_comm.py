@@ -24,6 +24,7 @@ Run with mpirun:
 """
 
 import pickle
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -703,3 +704,23 @@ class TestInt64Exchange:
         ]
         assert dist.tp_cp_broadcast_int64([3 if self.rank == 0 else 0]).tolist() == [3]
         assert dist.broadcast_int64([9 if self.rank == 0 else 0]).tolist() == [9]
+
+
+def test_the_tp_minimum_of_an_int64_vector_is_one_allreduce():
+    """MPIDist reduces with one buffer Allreduce; the base class reduces what it gathers."""
+    from mpi4py import MPI
+
+    ops = []
+
+    class Comm:
+        def Allreduce(self, sendbuf, recvbuf, op):
+            ops.append(op)
+            recvbuf[0][:] = sendbuf[0]
+
+    reduced = communicator.MPIDist._allreduce_int64_comm(Comm(), [3, 1], communicator.ReduceOp.MIN)
+    assert reduced.tolist() == [3, 1] and reduced.dtype == np.int64 and ops == [MPI.MIN]
+    gathered = SimpleNamespace(tp_allgather_int64=lambda values: np.array([[3, 1], [2, 5]]))
+    minimum = communicator.Distributed.tp_allreduce_int64(
+        gathered, [3, 1], communicator.ReduceOp.MIN
+    )
+    assert minimum.tolist() == [2, 1]

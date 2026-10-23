@@ -102,6 +102,13 @@ def reduce_op_to_mpi(op: ReduceOp) -> MPI.Op:
     return _reduce_op_to_mpi_dict[op]
 
 
+_reduce_op_to_numpy_dict = {
+    ReduceOp.SUM: np.sum,
+    ReduceOp.MIN: np.min,
+    ReduceOp.MAX: np.max,
+}
+
+
 class Distributed(ABC):
 
     def __init__(self, mapping: Mapping):
@@ -309,6 +316,13 @@ class Distributed(ABC):
         vec = np.asarray(values, dtype=np.int64).reshape(-1)
         gathered = self.tp_allgather(vec.tolist(), small_payload=True)
         return np.asarray(gathered, dtype=np.int64).reshape(len(gathered), -1)
+
+    def tp_allreduce_int64(self, values: ArrayLike, op: ReduceOp) -> np.ndarray:
+        """Reduce a fixed-size int64 vector elementwise across the TP group
+        with ``op`` (SUM, MIN or MAX). Every rank must pass the same length;
+        every rank gets the result."""
+        return _reduce_op_to_numpy_dict[op](self.tp_allgather_int64(values),
+                                            axis=0)
 
     def cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
         """All-gather a fixed-size int64 vector across the CP group; rows are
@@ -920,6 +934,16 @@ class MPIDist(Distributed):
         return recvbuf.reshape(size, sendbuf.size)
 
     @staticmethod
+    def _allreduce_int64_comm(comm, values: ArrayLike,
+                              op: ReduceOp) -> np.ndarray:
+        sendbuf = np.ascontiguousarray(
+            np.asarray(values, dtype=np.int64).reshape(-1))
+        recvbuf = np.empty_like(sendbuf)
+        comm.Allreduce([sendbuf, MPI.INT64_T], [recvbuf, MPI.INT64_T],
+                       op=reduce_op_to_mpi(op))
+        return recvbuf
+
+    @staticmethod
     def _broadcast_int64_comm(comm, values: ArrayLike, root: int) -> np.ndarray:
         buf = np.ascontiguousarray(
             np.asarray(values, dtype=np.int64).reshape(-1))
@@ -928,6 +952,9 @@ class MPIDist(Distributed):
 
     def tp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
         return self._allgather_int64_comm(self.tp_comm, values)
+
+    def tp_allreduce_int64(self, values: ArrayLike, op: ReduceOp) -> np.ndarray:
+        return self._allreduce_int64_comm(self.tp_comm, values, op)
 
     def cp_allgather_int64(self, values: ArrayLike) -> np.ndarray:
         return self._allgather_int64_comm(self.cp_comm, values)
