@@ -143,8 +143,10 @@ class LayerGroupRows(Protocol):
 
     A row is one transfer unit. When addresses are provided, each row occupies one slot in the
     region. These members are all a backend reads of a group, apart from those a capability it
-    declares names. Row addresses need not be consecutive. A backend given rows it does not
-    recognize rejects the submission with :class:`InvalidSubmission`; it never skips them.
+    declares names: rows placed by slot instead of address reach only a backend that declares
+    ``slot_rows``, which reads their ``slots`` and ``region_indices``. Row addresses need not be
+    consecutive. A backend given rows it does not recognize rejects the submission with
+    :class:`InvalidSubmission`; it never skips them.
     """
 
     @property
@@ -219,6 +221,10 @@ class Capabilities:
         fetch: Implements :meth:`Backend.fetch`.
         publish: Implements :meth:`Backend.publish`.
         cancel: Implements the advisory :meth:`Attempt.cancel`.
+        slot_rows: Reads groups placed by slot: ``slots`` (``int64`` of shape ``[rows]``) and
+            ``region_indices`` (region indices in row-byte order) instead of ``addresses``. Row
+            ``i`` is slot ``slots[i]`` of each listed region, and its object is those slots'
+            bytes back to back, in list order.
 
     Raises:
         ValueError: Neither ``fetch`` nor ``publish`` is set.
@@ -227,6 +233,7 @@ class Capabilities:
     fetch: bool
     publish: bool
     cancel: bool = False
+    slot_rows: bool = False
 
     def __post_init__(self):
         if not (self.fetch or self.publish):

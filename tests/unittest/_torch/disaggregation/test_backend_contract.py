@@ -274,7 +274,10 @@ def test_runtime_protocol_checks_require_every_member(name):
 
 # The constructors and methods of the concrete types a backend builds or calls.
 SIGNATURES = {
-    "Capabilities": "(fetch: 'bool', publish: 'bool', cancel: 'bool' = False) -> None",
+    "Capabilities": (
+        "(fetch: 'bool', publish: 'bool', cancel: 'bool' = False, slot_rows: 'bool' = False) "
+        "-> None"
+    ),
     "Outcome": "(delivered_masks: 'tuple[np.ndarray, ...]', fault: 'str | None' = None) -> None",
     "Outcome.for_view": (
         "(view: 'View', delivered_masks: 'Sequence[np.ndarray] | None' = None,"
@@ -295,9 +298,9 @@ def test_each_concrete_type_has_its_signature(name):
 def test_capabilities_fields_defaults_and_validation():
     capabilities = contract_module.Capabilities
     fields = {f.name: f.default for f in dataclasses.fields(capabilities)}
-    assert list(fields) == ["fetch", "publish", "cancel"]
+    assert list(fields) == ["fetch", "publish", "cancel", "slot_rows"]
     assert fields["fetch"] is fields["publish"] is dataclasses.MISSING
-    assert fields["cancel"] is False
+    assert fields["cancel"] is fields["slot_rows"] is False
     assert capabilities.__dataclass_params__.frozen
     caps = capabilities(fetch=True, publish=False)
     assert [name for name in dir(caps) if not name.startswith("_")] == sorted(fields)
