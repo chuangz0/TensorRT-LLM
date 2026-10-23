@@ -138,6 +138,11 @@ _SKIPS = {
     "uncommitted": _NOT_READY,  # put start -705, and the master shows the object uncommitted
     "pool_full": _DECLINED,  # put start -200: no space for the object
 }
+# The skip of a put whose object another writer is still putting. That writer normally completes
+# the object (the same answer also follows a put revoked or discarded meanwhile, which nobody
+# completes), and two servers computing one prompt prefix at once do this in normal traffic, so
+# the row is no failure to warn about (``stats()`` counts it).
+_ANOTHER_WRITER = "uncommitted"
 _PUT_START_SKIPS = {
     _Code.NO_AVAILABLE_HANDLE: "pool_full",
     _Code.INVALID_PARAMS: "own_session_open",
@@ -478,7 +483,7 @@ class MooncakeDriver:
             if answer == OBJECT_EXISTS:
                 batch.results[i] = _READY
             elif answer == OBJECT_ABSENT:
-                batch.skip(i, "uncommitted")
+                batch.skip(i, _ANOTHER_WRITER)
             else:
                 batch.fault([i], _existence_fault(answer))
 
@@ -612,7 +617,11 @@ class MooncakeDriver:
     def _conclude(self, direction: str, batch: _Batch, ended: bool, seconds: float) -> _Op:
         self._release(batch.regions, ended, batch.skip_reasons.values())
         expected = (RowStatus.READY, RowStatus.MISS)
-        failed = [i for i, r in enumerate(batch.results) if r.status not in expected]
+        failed = [
+            i
+            for i, r in enumerate(batch.results)
+            if r.status not in expected and batch.skip_reasons.get(i) != _ANOTHER_WRITER
+        ]
         first = None
         if failed:
             result = batch.results[failed[0]]
@@ -794,7 +803,8 @@ def _report(
     direction: str, *, rows: int, failed: int, first: str | None, ended: bool, seconds: float
 ) -> None:
     """One warning per operation that failed or skipped a row (``first`` names the first, with
-    why) or left access open; none otherwise. Cancelled rows count as neither."""
+    why) or left access open; none otherwise. Cancelled rows, and puts of objects another writer
+    is still putting, count as neither."""
     if ended and not failed:
         return
     detail = f"; first {first}" if first else ""

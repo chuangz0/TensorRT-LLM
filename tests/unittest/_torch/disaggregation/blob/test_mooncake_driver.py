@@ -448,6 +448,9 @@ def test_rows_whose_lease_expired_are_reread_once_and_both_reads_must_end_access
 
 
 def test_an_object_being_written_is_not_ready_for_put_and_get(make_driver, monkeypatch) -> None:
+    """Another writer's put of the key is still open. A get of it is a skip worth a warning; a put
+    of it is not: that writer completes the object, which servers computing one prompt prefix at
+    once do in normal traffic."""
     warnings: list[str] = []
     monkeypatch.setattr(mooncake_module.logger, "warning", warnings.append)
     pool = FakePool()
@@ -461,7 +464,7 @@ def test_an_object_being_written_is_not_ready_for_put_and_get(make_driver, monke
     stats = bench.driver.stats()
     assert stats["rows_not_ready_being_written"] == stats["rows_not_ready_uncommitted"] == 1
     assert any(key("K") in line and "not_ready (being_written)" in line for line in warnings)
-    assert any(key("K") in line and "not_ready (uncommitted)" in line for line in warnings)
+    assert [line for line in warnings if "mooncake put" in line] == []
 
 
 # Access end.

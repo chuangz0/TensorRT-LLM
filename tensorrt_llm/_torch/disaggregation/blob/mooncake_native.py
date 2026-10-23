@@ -28,6 +28,7 @@ import numpy as np
 from tensorrt_llm.logger import logger
 
 from .mooncake import (
+    _ANOTHER_WRITER,
     _PUT_START_SKIPS,
     AllocationRange,
     MooncakeDriver,
@@ -111,6 +112,7 @@ class _NativeOp:
     submitted: float
     finished: FinishedOp | None = None
     other_statuses: dict[int, RowStatus] = field(default_factory=dict)  # neither READY, MISS
+    puts_of_another_writer: int = 0  # other_statuses rows another writer is still putting
     cancelled: np.ndarray | None = None  # bool [rows]; None when no row was cancelled
     first_failure: str | None = None  # the first row in other_statuses, with why, for the log
     call_errors: list[str] = field(default_factory=list)  # metadata calls' raises, for the log
@@ -328,6 +330,9 @@ class NativeMooncakeDriver(MooncakeDriver):
             else:  # NOT_READY or DECLINED
                 reason = _skip_reason(call, code)
                 skip_reasons.append(reason)
+                if reason == _ANOTHER_WRITER:
+                    op.puts_of_another_writer += 1
+                    continue
                 why = f"{status.value} ({reason})"
             op.first_failure = op.first_failure or f"{op.key(row)}: {why}"
         op.cancelled = done.cancelled
@@ -365,7 +370,7 @@ def _log_finished(op: _NativeOp) -> None:
     _report(
         "put" if op.is_put else "get",
         rows=len(op.names),
-        failed=len(op.other_statuses),
+        failed=len(op.other_statuses) - op.puts_of_another_writer,
         first=op.first_failure,
         ended=op.finished.access_ended,
         seconds=time.monotonic() - op.submitted,
@@ -396,7 +401,7 @@ def _skip_reason(call: _StoreCall, code: int) -> str:
     if call is _StoreCall.PUT_START:
         return _PUT_START_SKIPS[code]
     if call is _StoreCall.EXISTENCE:
-        return "uncommitted"
+        return _ANOTHER_WRITER
     if call is _StoreCall.GET:  # REPLICA_IS_NOT_READY
         return "being_written"
     raise AssertionError(f"no row skips on {call!r}")
