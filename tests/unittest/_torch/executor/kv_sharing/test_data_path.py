@@ -101,7 +101,8 @@ def test_auto_takes_host_staging_when_the_device_round_trip_fails(store, monkeyp
     monkeypatch.setattr(data_path.logger, "warning", warnings.append)
     store.script(GET, [None])  # the host get reads
     store.script(GET, [-600])  # the get into device memory fails
-    memory_kind, driver = data_path.open_store("auto", CONFIG, BlobConfig())
+    memory_kind, client = data_path.open_store("auto", CONFIG, gather=lambda check: [check])
+    driver = data_path.serving_driver(client, memory_kind, CONFIG, BlobConfig())
     assert memory_kind is MemoryKind.HOST and not driver.capabilities.device_memory
     (fallback,) = [warning for warning in warnings if "through host staging" in warning]
     assert "a round trip through device memory" in fallback and "INVALID_PARAMS" in fallback
@@ -110,7 +111,24 @@ def test_auto_takes_host_staging_when_the_device_round_trip_fails(store, monkeyp
 def test_a_store_failing_the_host_round_trip_refuses_the_server(store) -> None:
     store.script(GET, [-900])  # RPC_FAIL
     with pytest.raises(ValueError, match="on rank 0: a round trip through host memory"):
-        data_path.open_store("auto", CONFIG, BlobConfig())
+        data_path.open_store("auto", CONFIG, gather=lambda check: [check])
+
+
+@pytest.mark.cpu_only
+def test_a_client_that_does_not_open_on_one_rank_refuses_the_server_on_every_rank(
+    monkeypatch,
+) -> None:
+    """The rank whose client failed still reaches the gather, so every rank refuses alike."""
+
+    def unreachable(config):
+        raise TimeoutError("the master does not answer")
+
+    monkeypatch.setattr(data_path, "open_sdk", unreachable)
+    monkeypatch.setattr(data_path, "prepare_gpu_direct", lambda protocol: None)
+    with pytest.raises(
+        ValueError, match="on rank 1: the store could not be opened and checked: the master"
+    ):
+        data_path.open_store("auto", CONFIG, gather=lambda check: [PASSED, check])
 
 
 @pytest.mark.parametrize("half", ["host", "device"])

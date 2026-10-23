@@ -29,6 +29,7 @@ from tensorrt_llm.logger import logger
 from ...disaggregation.base.memory import MemoryKind
 from ...disaggregation.blob.backend import BlobConfig
 from ...disaggregation.blob.mooncake import MooncakeDriver
+from ...disaggregation.blob.mooncake_native import NativeMooncakeDriver
 from ...disaggregation.blob.mooncake_setup import MooncakeConfig, make_store_driver, open_sdk
 from ...disaggregation.blob.store import RegionLayout, RowIO, RowStatus, Span
 from ..connectors.mooncake_store.gpudirect import (
@@ -67,34 +68,50 @@ class PathCheck:
 
 
 def open_store(
-    requested: str, mooncake: MooncakeConfig, blob: BlobConfig
-) -> tuple[MemoryKind, MooncakeDriver]:
-    """Opens the store client, checks it with one round trip and picks the data path.
+    requested: str,
+    mooncake: MooncakeConfig,
+    gather: Callable[[PathCheck], Sequence[PathCheck]],
+) -> tuple[MemoryKind, Any]:
+    """Opens the store client, checks it with one round trip and picks the data path every rank
+    takes from every rank's check, which ``gather`` collects (a collective every rank reaches,
+    whether its client opened or not).
 
     Run it before any other Mooncake client of the process opens: the first one fixes how the
     process registers device memory.
 
     Returns:
-        DEVICE for GPU Direct or HOST for host staging, and the serving driver over the client
-        (``mooncake.driver`` picks native or Python), which registers device memory exactly under
-        GPU Direct.
+        DEVICE for GPU Direct or HOST for host staging, and the opened client.
 
     Raises:
-        ValueError: The store failed the check, or 'gpu_direct' was asked for and is not possible.
-        RuntimeError: The driver 'native' was asked for and cannot run here.
+        ValueError: Some rank's store failed the check or did not open, or 'gpu_direct' was asked
+            for and is not possible on some rank.
     """
     if requested == HOST_STAGING:
         gpu_direct_error = "host staging was asked for"
     else:
         gpu_direct_error = prepare_gpu_direct(mooncake.protocol)
-    store = open_sdk(mooncake)
-    # The check runs on its own Python driver, before any store worker thread exists.
-    path = choose_data_path(requested, [check_store(store, gpu_direct_error)])
-    if path == HOST_STAGING:
-        return MemoryKind.HOST, make_store_driver(store, mooncake, blob)
-    return MemoryKind.DEVICE, make_store_driver(
-        store, mooncake, blob, allocation_range=allocation_range
-    )
+    store = None
+    try:
+        store = open_sdk(mooncake)
+        # The check runs on its own Python driver, before any store worker thread exists.
+        check = check_store(store, gpu_direct_error)
+    except Exception as error:  # noqa: BLE001 - every rank must reach the gather below
+        check = PathCheck(f"the store could not be opened and checked: {error}", None)
+    path = choose_data_path(requested, gather(check))
+    return (MemoryKind.HOST if path == HOST_STAGING else MemoryKind.DEVICE), store
+
+
+def serving_driver(
+    store: Any, memory_kind: MemoryKind, mooncake: MooncakeConfig, blob: BlobConfig
+) -> MooncakeDriver | NativeMooncakeDriver:
+    """The serving driver over the client ``open_store`` opened: native or Python as
+    ``mooncake.driver`` picks; it registers device memory exactly under GPU Direct.
+
+    Raises:
+        RuntimeError: The driver 'native' was asked for and cannot run here.
+    """
+    lookup = allocation_range if memory_kind is MemoryKind.DEVICE else None
+    return make_store_driver(store, mooncake, blob, allocation_range=lookup)
 
 
 def prepare_gpu_direct(protocol: str) -> Optional[str]:

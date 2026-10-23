@@ -380,12 +380,15 @@ class RequestBroadcaster:
         self.send_requests_handler = None
 
     def broadcast(
-        self, new_requests: List, prefer_cpu: bool = False
-    ) -> Tuple[List, Optional[Tuple]]:
+        self, new_requests: List, store_round_size: int = 0, prefer_cpu: bool = False
+    ) -> Tuple[List, Optional[Tuple], int]:
         """Broadcast requests and Python objects across ranks.
 
         Args:
             new_requests: Requests fetched on rank 0 (ignored on other ranks).
+            store_round_size: On rank 0, how many store operations kv_sharing's next round
+                covers. It rides the request-count broadcast; every rank gets rank 0's value
+                back as the third result.
             prefer_cpu: Keep the request-count probe on the CPU transport.
                 Pass True from the idle fetch path, where non-root ranks park
                 in the probe while rank 0 blocks on the request queue: a
@@ -394,15 +397,20 @@ class RequestBroadcaster:
                 be passed with the same value on all ranks.
         """
         if self._single_round(prefer_cpu):
-            return self._broadcast_single_round(new_requests)
+            # Only a communicator without MPI has the single round, and kv_sharing runs with MPI.
+            assert store_round_size == 0, "a store round rides only the request-count probe"
+            new_requests, py_request_objects = self._broadcast_single_round(new_requests)
+            return new_requests, py_request_objects, 0
         request_count = len(new_requests) if self.dist.rank == 0 else 0
         # Idle non-root ranks can wait here while rank 0 blocks in the
         # pause-wrapped request queue fetch, so keep the probe pause-wrapped too.
         with self.hang_detector.pause():
-            request_count = self._broadcast_request_count(request_count, prefer_cpu=prefer_cpu)
+            request_count, store_round_size = self._broadcast_request_count(
+                request_count, store_round_size, prefer_cpu=prefer_cpu
+            )
 
         if request_count == 0:
-            return [], None
+            return [], None, store_round_size
 
         if self.dist.rank == 0:
             py_request_objects = self._collect_py_objects(new_requests)
@@ -418,7 +426,7 @@ class RequestBroadcaster:
                     new_requests, py_request_objects
                 )
 
-        return new_requests, py_request_objects
+        return new_requests, py_request_objects, store_round_size
 
     def _single_round(self, prefer_cpu: bool) -> bool:
         """Whether the count probe + payload pair collapses into one collective.
@@ -459,13 +467,19 @@ class RequestBroadcaster:
             return new_requests, payloads[1]
         return received
 
-    def _broadcast_request_count(self, request_count: int, prefer_cpu: bool = False) -> int:
-        """Broadcast rank 0's request count using the same PP route as requests."""
+    def _broadcast_request_count(
+        self, request_count: int, store_round_size: int, prefer_cpu: bool = False
+    ) -> Tuple[int, int]:
+        """Broadcast rank 0's request count and store round size using the same PP route as
+        requests."""
         if self.dist.world_size == 1:
-            return request_count
+            return request_count, store_round_size
 
         if not self.dist.has_pp:
-            return int(self.dist.broadcast_int64([request_count], root=0, prefer_cpu=prefer_cpu)[0])
+            request_count, store_round_size = self.dist.broadcast_int64(
+                [request_count, store_round_size], root=0, prefer_cpu=prefer_cpu
+            )
+            return int(request_count), int(store_round_size)
 
         if self.dist.is_first_pp_rank:
             with nvtx_range("tp_broadcast_request_count"):
@@ -481,7 +495,7 @@ class RequestBroadcaster:
             with nvtx_range("send_request_count_to_next_pp"):
                 self.dist.send_object(request_count, self.dist.next_pp_rank, tag)
 
-        return request_count
+        return request_count, 0  # kv_sharing refuses pipeline parallelism
 
     def _collect_py_objects(self, new_requests: List) -> Tuple:
         """Collect Python-only objects from requests."""

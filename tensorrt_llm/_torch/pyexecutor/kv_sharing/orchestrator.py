@@ -13,8 +13,9 @@ import datetime
 import itertools
 import re
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, TextIO
 
 import numpy as np
 import torch
@@ -25,7 +26,7 @@ from tensorrt_llm.math_utils import ceil_div
 from ...disaggregation.transfer_manager import Accepted, Direction, TransferIntent, TransferManager
 from ..kv_cache.sharing import Lender, MemoryKind, RowSelection
 from ..llm_request import LlmRequestState, rewind_context_after_cache_drop
-from .store_ops import Action, Decision, OpKind, OpState, StoreOp, decide, report
+from .store_ops import Action, Decision, OpKind, OpState, StoreOp, decide, report, table_hash
 
 if TYPE_CHECKING:
     from ...disaggregation.lifecycle.retirement import RetirementWatchdog
@@ -125,7 +126,9 @@ class SharedKvOrchestrator:
     every rank runs the same code with the same inputs: a fetch's admission inside the scheduler
     and a publication after the context commit, whatever this rank's own lend or submit did. Only
     ``resolve_store_operations``, at the start of each scheduling pass, closes them: there every
-    lease goes back and every parked request resumes or computes its prompt, by ``decide``.
+    lease goes back and every parked request resumes or computes its prompt, by ``decide``. Under
+    tensor parallelism the round covers the entries rank 0 announced with the request count, and
+    every rank enters its one collective exactly when that count is not zero.
 
     Args:
         policy: What the server does with the store.
@@ -136,6 +139,10 @@ class SharedKvOrchestrator:
         execution_stream: The stream the forward passes run on.
         watchdog: The watchdog of the transfer manager's store accesses, stopped at shutdown.
         probe: Rank 0's probe service, or None where this server does not fetch.
+        min_over_ranks: The elementwise minimum of a report over the tensor-parallel ranks, a
+            collective every rank enters; None where this rank decides alone (one rank).
+        trace: Where each round and the exit are written, one line each, for tests to compare
+            across ranks; None writes nothing.
     """
 
     def __init__(
@@ -149,6 +156,8 @@ class SharedKvOrchestrator:
         execution_stream: torch.cuda.Stream,
         watchdog: RetirementWatchdog,
         probe: Optional[ProbeService],
+        min_over_ranks: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        trace: Optional[TextIO] = None,
     ) -> None:
         self.counters: collections.Counter[str] = collections.Counter()
         self._policy = policy
@@ -160,6 +169,11 @@ class SharedKvOrchestrator:
         self._execution_stream = execution_stream
         self._watchdog = watchdog
         self._probe = probe
+        self._min_over_ranks = min_over_ranks
+        self._trace = trace
+        # The entries the next round covers, as rank 0 announced them; read once.
+        self._announced = 0
+        self._passes = 0
         # Made once: freeing an event lets go of the GIL.
         self._ready_events = itertools.cycle([torch.cuda.Event() for _ in range(READY_EVENTS)])
         self._ops: list[StoreOp] = []
@@ -170,8 +184,9 @@ class SharedKvOrchestrator:
         self._unpublished: dict[int, LlmRequest] = {}
         # Whether new store operations are admitted; alike on every rank.
         self._admitting = True
-        # This rank's lender and store binding still serve; reported in each round.
-        self._lender_ok = True
+        # Why this rank's lender or store binding stopped; None while they serve. Reported in each
+        # round. With peers it stays None: a failure ends the server instead.
+        self._stopped: Optional[str] = None
         self._bytes_per_block = sum(
             region.slot_bytes for region in lender.regions if region.memory_kind is MemoryKind.HOST
         )
@@ -203,16 +218,63 @@ class SharedKvOrchestrator:
             return HELD_REQUEST_POLL if timeout is None else min(timeout, HELD_REQUEST_POLL)
         return timeout
 
+    def take_refreshed_hits(
+        self, waiting: Iterable[RequestQueueItem]
+    ) -> tuple[tuple[int, int], ...]:
+        """``(request id, hit)`` of waiting requests whose store hit changed since their last
+        probe; rank 0 broadcasts them for every rank to apply before activation. Call it before
+        ``hold_until_probed`` in a pass."""
+        if self._probe is None or not self._admitting:
+            return ()
+        return self._probe.take_refreshed_hits(waiting)
+
+    def round_to_announce(self) -> int:
+        """Rank 0, before the request broadcast: how many open entries the next round covers.
+        Every one with peers; alone, 0, as a rank's own rounds need no announcement."""
+        return len(self._ops) if self._with_peers else 0
+
+    # Every rank, around the request broadcast.
+
+    def round_announced(self, entries: int) -> None:
+        """Every rank, right after each request broadcast: rank 0's round size. The next
+        ``resolve_store_operations`` enters the round's collective exactly when it is not zero,
+        so every rank makes these two calls once per pass, in this order."""
+        self._announced = entries
+
+    def apply_refreshed_hits(
+        self, waiting: Iterable[RequestQueueItem], hits: tuple[tuple[int, int], ...]
+    ) -> None:
+        """Sets the store hit of each waiting request rank 0 measured again. Runs at the
+        store-hits item, before any request of the broadcast is activated, so every rank admits
+        from the same hit."""
+        by_id = dict(hits)
+        for item in waiting:
+            if item.id in by_id:
+                item.store_hit_tokens = by_id[item.id]
+                self.counters["hits_refreshed"] += 1
+
     # Each scheduling pass.
 
     def resolve_store_operations(self) -> None:
         """The round: returns the leases whose store access ended, resumes or drops parked
         requests, then publishes what waited for room. Call it first in each scheduling pass,
-        after the overlap loop's input-copy wait: returns and drops change host page tables."""
-        if self._coordinator.take_shared_domain_failures() or self._lender.stopped:
-            self._lender_ok = False
-        if self._ops:
-            self._close_ops()
+        after the overlap loop's input-copy wait: returns and drops change host page tables.
+
+        Raises:
+            RuntimeError: The server must end: with peers, this rank's lender or store binding
+                stopped or the ranks' tables differ; on any server, a lender or store binding
+                stopped with GPU Direct leases out.
+        """
+        self._passes += 1
+        failure = self._store_failure()
+        if failure is not None:
+            self._store_failed(failure)
+        announced, self._announced = self._announced, 0
+        # With peers, rank 0's announcement (alike on every rank) decides whether all enter the
+        # round; alone, a rank covers its whole table.
+        round_size = announced if self._with_peers else len(self._ops)
+        if round_size:
+            self._close_ops(round_size)
         if self._unpublished:
             self._publish_waiting()
 
@@ -276,6 +338,10 @@ class SharedKvOrchestrator:
         shutdown deadline, logs the counters and stops the access watchdog. Call it when the
         executor loop ended, after the transfer manager's shutdown began: no rank schedules any
         more, so each returns its leases on its own."""
+        if self._trace is not None:
+            self._trace.write(f"exit passes={self._passes} open={len(self._ops)}\n")
+            self._trace.close()
+            self._trace = None
         self._stop_admitting()
         # Counted here; the transfer manager returns the rest uncounted.
         for op in self._ops:
@@ -300,19 +366,58 @@ class SharedKvOrchestrator:
 
     # The round.
 
-    def _close_ops(self) -> None:
-        """Reports on every open operation and applies the decisions."""
+    @property
+    def _with_peers(self) -> bool:
+        """The tensor-parallel ranks keep one table and close it together."""
+        return self._min_over_ranks is not None
+
+    def _store_failure(self) -> Optional[str]:
+        """Why this rank's lender, its transfer-manager domain or its store binding stopped, or
+        None."""
+        failures = self._coordinator.take_shared_domain_failures()
+        if failures:
+            return failures[0].fault
+        if self._lender.stopped:
+            return "the KV cache lender stopped"
+        return self._transfers.bindings[BINDING_ID].fault
+
+    def _close_ops(self, round_size: int) -> None:
+        """Reports on the first ``round_size`` open operations (fewer where some closed since the
+        announcement), reduces the reports over the ranks and applies the decisions."""
         for op in self._ops:
             if op.kind is OpKind.FETCH and op.state is not OpState.OPEN and op.request.is_finished:
                 self._let_go(op)  # the request ended while parked, as by an error
-        entries = [op for op in self._ops if not op.closed]
+        self._ops = [op for op in self._ops if not op.closed]
+        # After closures this may cover entries appended since the announcement: every rank's
+        # table changed alike, so every rank covers the same entries.
+        entries = self._ops[:round_size]
         now = time.monotonic()
         columns = np.array([self._report_on(op, now) for op in entries], dtype=np.int64)
-        # On one rank the minimum over ranks is this rank's own report.
-        reduced = report(entries, len(entries), self._lender_ok, columns)
-        for decision in decide(entries, reduced):
+        own = report(entries, round_size, self._stopped is None, columns)
+        # Alone, the minimum over ranks is this rank's own report.
+        reduced = self._min_over_ranks(own) if self._with_peers else own
+        decisions = decide(entries, reduced)
+        if self._trace is not None:  # before a FATAL raises
+            self._trace_round(round_size, entries, decisions)
+        for decision in decisions:
             self._apply(decision)
         self._ops = [op for op in self._ops if not op.closed]
+
+    def _trace_round(
+        self, round_size: int, entries: list[StoreOp], decisions: list[Decision]
+    ) -> None:
+        """One line per round, equal on every rank of a tensor-parallel group: what it covered,
+        the page counts every rank must share, and the decisions."""
+        used, total = self._kv_cache_manager.get_primary_block_counts()
+        deferred = sum(self._lender.deferred_close_page_counts().values())
+        actions = ",".join(
+            d.action.value if d.op is None else f"{d.action.value}:{d.op.seq}" for d in decisions
+        )
+        self._trace.write(
+            f"round pass={self._passes} size={round_size} covered={len(entries)} "
+            f"hash={table_hash(entries)} pages={used}/{total} deferred={deferred} "
+            f"decisions={actions}\n"
+        )
 
     def _report_on(self, op: StoreOp, now: float) -> tuple[int, int, int]:
         """``(done, ready, on_time)`` on this rank: whether the operation's lease may go back, a
@@ -328,7 +433,9 @@ class SharedKvOrchestrator:
             )
         if op.state is OpState.SETTLING:
             # A stopped lender is queried no more; the round drops the request.
-            settled = not self._lender_ok or self._lender.poll_resume_bounds(op.request) is not None
+            settled = (
+                self._stopped is not None or self._lender.poll_resume_bounds(op.request) is not None
+            )
             return int(settled), 1, 1
         return int(op.operation_id is None or self._transfers.ended(op.operation_id)), 1, 1
 
@@ -355,7 +462,8 @@ class SharedKvOrchestrator:
                     )
                 self._stop_admitting()
             case Action.FATAL:
-                raise RuntimeError(f"kv_sharing: {decision.reason}")
+                cause = "" if self._stopped is None else f" ({self._stopped})"
+                raise RuntimeError(f"kv_sharing: {decision.reason}{cause}")
 
     def _return_none(self, op: StoreOp) -> None:
         """The lease goes back with nothing delivered; the entry closes."""
@@ -599,13 +707,9 @@ class SharedKvOrchestrator:
             end=end,
         )
         request.py_published_end = end
+        # A range that does not start (a lend refused) closes like one that put nothing.
         if not self._start(op, ready):
             self.counters["publications_not_started"] += 1
-            if op.lease is not None and op.lease.failure is not None:
-                # The lender refused the range by the request's own state, which every rank
-                # shares: its next range would be refused too.
-                request.py_published_end = request.prompt_len
-                self._unpublished.pop(request.py_request_id, None)
         self._ops.append(op)
         self.counters["publications_started"] += 1
 
@@ -615,7 +719,7 @@ class SharedKvOrchestrator:
         """Lends the operation's rows by name, in place or in host staging, and hands the lease
         to the transfer manager. Returns whether the store access started; where it did not, the
         entry reports nothing delivered and a decision returns any lease it holds."""
-        if not self._lender_ok:
+        if self._stopped is not None:
             return False
         fetch = op.kind is OpKind.FETCH
         lend = self._lender.lend_write if fetch else self._lender.lend_read
@@ -629,7 +733,7 @@ class SharedKvOrchestrator:
                 ready_event=ready,
             )
         except RuntimeError as error:  # the lender lends no more
-            self._lender_failed(f"a lend failed: {error}")
+            self._store_failed(f"a lend failed: {error}")
             return False
         if lease.failure is not None:
             op.lease = lease
@@ -645,18 +749,26 @@ class SharedKvOrchestrator:
         result = self._transfers.submit(lease, intent)
         if not isinstance(result, Accepted):
             op.lease = lease
-            self._lender_failed(f"the transfer manager refused an operation: {result.reason}")
+            self._store_failed(f"the transfer manager refused an operation: {result.reason}")
             return False
         op.operation_id = result.operation_id
         return True
 
-    def _lender_failed(self, reason: str) -> None:
-        """This rank's lender or store binding stopped: report it in the next round, which stops
-        sharing on every rank, and stop the transfer manager's lender calls."""
-        if self._lender_ok:
+    def _store_failed(self, reason: str) -> None:
+        """This rank's lender or store binding stopped. With peers the server ends: this rank's
+        KV cache and locks would no longer follow its peers'. The executor's rank-crash path then
+        kills every rank (``hard_kill_on_rank_crash``), so peers waiting in a collective do not
+        hang. Alone, report it in the next round, which stops sharing, and stop the transfer
+        manager's lender calls."""
+        if self._with_peers:
+            raise RuntimeError(
+                f"kv_sharing: {reason}; a store failure on one rank of a tensor-parallel server "
+                "ends the server, as its ranks' KV caches would no longer match"
+            )
+        if self._stopped is None:
             logger.error(f"kv_sharing: {reason}")
             self._transfers.stop_lender_domain(DOMAIN_ID, reason)
-        self._lender_ok = False
+            self._stopped = reason
 
     def _free_cache(self, request: LlmRequest) -> None:
         if request.py_request_id in self._kv_cache_manager.kv_cache_map:

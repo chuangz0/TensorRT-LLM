@@ -208,7 +208,12 @@ def request(request_id: int, stored: int = 8, computed: int = 0) -> SimpleNamesp
 class Server:
     """One rank: the orchestrator, the transfer manager in hold mode, and an iteration."""
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch, memory_kind: MemoryKind = MemoryKind.HOST):
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        memory_kind: MemoryKind = MemoryKind.HOST,
+        min_over_ranks=None,
+    ):
         monkeypatch.setattr(torch.cuda, "Event", Event)
         self.lender, self.store, self.manager = Lender(), Store(), Manager()
         self.transfers = TransferManager(wake=lambda: None, hold_returns=True)
@@ -244,6 +249,7 @@ class Server:
             execution_stream=None,
             watchdog=SimpleNamespace(stop=lambda: None),
             probe=None,
+            min_over_ranks=min_over_ranks,
         )
 
     def park(self, *requests) -> None:
@@ -252,9 +258,11 @@ class Server:
         assert all(r.state == PARKED_STATE for r in requests)
 
     def iterate(self) -> None:
-        """A loop head (the transfer manager advances) and the start of scheduling (a round)."""
+        """A loop head (the transfer manager advances), the start of scheduling (a round) and
+        the request broadcast, which announces the next round to every rank."""
         self.transfers.advance(time.monotonic())
         self.orchestrator.resolve_store_operations()
+        self.orchestrator.round_announced(self.orchestrator.round_to_announce())
 
     @property
     def counters(self):
@@ -460,3 +468,31 @@ def test_a_gpu_direct_publication_that_can_never_fit_is_dropped_once_and_logged(
     assert not server.lender.leases and dropped.py_published_end == PROMPT
     assert server.counters["publications_dropped_for_pages"] == 1
     assert len(warnings) == 1 and "does not fit the 0 pages left" in warnings[0]
+
+
+def test_under_tensor_parallelism_a_stopped_store_binding_ends_the_server_before_the_round(
+    monkeypatch,
+):
+    """One rank's store binding stops: that rank's shares would go unread and unwritten, so the
+    server ends at the next round, before its collective."""
+
+    def collective(report):
+        pytest.fail("the round entered its collective")
+
+    server = Server(monkeypatch, min_over_ranks=collective)
+    try:
+        server.park(request(1))
+        server.orchestrator.round_announced(1)  # the next round covers the parked fetch
+        # As the transfer manager does when a store call fails in a way it cannot contain.
+        server.transfers._stop_binding(BINDING_ID, "a store call failed")
+        with pytest.raises(RuntimeError, match="a store call failed; .* ends the server"):
+            server.iterate()
+    finally:
+        server.shut_down()
+
+
+def test_refreshed_hits_update_only_waiting_requests(server):
+    waiting = [SimpleNamespace(id=1, store_hit_tokens=8), SimpleNamespace(id=2, store_hit_tokens=8)]
+    server.orchestrator.apply_refreshed_hits(waiting, ((1, 16), (9, 4)))  # 9 no longer waits
+    assert [item.store_hit_tokens for item in waiting] == [16, 8]
+    assert server.counters["hits_refreshed"] == 1

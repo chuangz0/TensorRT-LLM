@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Rank 0 keeps a new request out of the broadcast until the store said how much of its prompt it
-holds, the hold limit passed, or a cancel or shutdown needs it broadcast."""
+holds, the hold limit passed, or a cancel or shutdown needs it broadcast. A block counts only where
+the store holds every rank's share of it, and the hits of requests that still wait are measured
+again."""
 
 import threading
 import time
@@ -27,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.kv_sharing import probe as probe_module
 from tensorrt_llm._torch.pyexecutor.kv_sharing.probe import ProbeService
 from tensorrt_llm.bindings import executor as tllm_executor
 
@@ -39,24 +42,48 @@ HOLD_S = 0.05
 WAIT_S = 5.0
 
 
-class Lender:
-    """Names block ``i`` of any prompt ``bytes([i]) * 54``."""
+def name(block: int, share: int = 0) -> str:
+    """The key of share ``share`` of block ``block`` of any prompt."""
+    return STEM + (bytes([block]) * 53 + bytes([share])).hex()
 
-    def prompt_object_keys(self, tokens, *, cache_salt, layer_group_index, num_blocks):
+
+class Lender:
+    """Names share ``s`` of block ``i`` of any prompt ``bytes([i]) * 53 + bytes([s])``."""
+
+    def prompt_object_keys(self, tokens, *, cache_salt, layer_group_index, num_blocks, shares):
         assert layer_group_index == 0 and cache_salt == "tenant"
-        return np.array([[i] * 54 for i in range(num_blocks)], dtype=np.uint8)
+        return np.array([[i] * 53 + [s] for s in shares for i in range(num_blocks)], dtype=np.uint8)
 
 
 class Driver:
-    """Holds each probe until ``answer`` is set, then finds the first ``STORED_BLOCKS`` blocks."""
+    """Holds each probe until ``answer`` is set, then finds the ``stored`` keys; raises while
+    ``fails``."""
 
-    def __init__(self) -> None:
+    def __init__(self, stored_blocks: int = STORED_BLOCKS) -> None:
         self.answer = threading.Event()
+        self.stored = {name(i) for i in range(stored_blocks)}
+        self.probed: list[tuple[str, ...]] = []
+        self.fails = False
 
     def probe(self, keys, budget_s, hint=None):
         assert self.answer.wait(WAIT_S)
-        stored = {STEM + (bytes([i]) * 54).hex() for i in range(STORED_BLOCKS)}
-        return tuple(ProbeStatus.HIT if key in stored else ProbeStatus.MISS for key in keys)
+        self.probed.append(tuple(keys))
+        if self.fails:
+            raise RuntimeError("the store is gone")
+        return tuple(ProbeStatus.HIT if key in self.stored else ProbeStatus.MISS for key in keys)
+
+
+def probe_service(driver: Driver, shares: int = 1, clock=time.monotonic) -> ProbeService:
+    return ProbeService(
+        Lender(),
+        driver,
+        STEM,
+        tokens_per_block=TPB,
+        min_fetch_tokens=2 * TPB,
+        shares_per_group=(shares,),
+        hold_s=HOLD_S,
+        clock=clock,
+    )
 
 
 def request_item(request_id: int, prompt_tokens: int = 6 * TPB) -> RequestQueueItem:
@@ -84,15 +111,7 @@ def leave_with_answer(service: ProbeService, item: RequestQueueItem) -> None:
 def test_held_requests_leave_with_their_answer_ahead_of_their_cancel_or_at_the_hold_limit():
     now = [0.0]
     driver = Driver()
-    service = ProbeService(
-        Lender(),
-        driver,
-        STEM,
-        tokens_per_block=TPB,
-        min_prompt_tokens=3 * TPB,
-        hold_s=HOLD_S,
-        clock=lambda: now[0],
-    )
+    service = probe_service(driver, clock=lambda: now[0])
     try:
         # A prompt too short to fetch passes at once; an eligible one waits for the store.
         short, answered = request_item(1, 2 * TPB), request_item(2, 6 * TPB + 1)
@@ -128,4 +147,81 @@ def test_held_requests_leave_with_their_answer_ahead_of_their_cancel_or_at_the_h
         assert not service.holds_requests()
     finally:
         driver.answer.set()
+        service.stop(wait_s=WAIT_S)
+
+
+def probe_until_answered(service: ProbeService, item: RequestQueueItem) -> None:
+    """Submits ``item`` and waits until it leaves the hold with the store's answer."""
+    service.submit(item)
+    if service.hold_until_probed([item]) != [item]:
+        leave_with_answer(service, item)
+
+
+def test_the_probe_answers_the_run_of_blocks_every_share_holds():
+    driver = Driver()
+    driver.answer.set()
+    # Rank 1's share of block 3 is missing; rank 0's shares are all there.
+    driver.stored |= {name(i, 1) for i in range(STORED_BLOCKS + 3) if i != 3}
+    driver.stored |= {name(i) for i in range(STORED_BLOCKS + 3)}
+    service = probe_service(driver, shares=2)
+    try:
+        item = request_item(1)
+        probe_until_answered(service, item)
+    finally:
+        service.stop(wait_s=WAIT_S)
+    assert item.store_hit_tokens == 3 * TPB
+    (keys,) = driver.probed
+    assert keys == tuple(name(i, share) for share in (0, 1) for i in range(6))
+
+
+def wait_for(condition) -> None:
+    deadline = time.monotonic() + WAIT_S
+    while not condition():
+        assert time.monotonic() < deadline, "timed out"
+        time.sleep(0.001)
+
+
+def test_waiting_hits_are_refreshed_and_a_failed_refresh_keeps_the_old_hit():
+    now = [0.0]
+    driver = Driver()
+    driver.answer.set()
+    service = probe_service(driver, clock=lambda: now[0])
+    item = request_item(1)
+    try:
+        probe_until_answered(service, item)
+        assert item.store_hit_tokens == STORED_BLOCKS * TPB
+        # Not due before REFRESH_AFTER_S has passed since the probe.
+        now[0] = probe_module.REFRESH_AFTER_S / 2
+        assert service.take_refreshed_hits([item]) == () and len(driver.probed) == 1
+
+        # Due: the store now holds two blocks more, and the change is reported once.
+        driver.stored |= {name(i) for i in range(STORED_BLOCKS + 2)}
+        now[0] = probe_module.REFRESH_AFTER_S
+        changed = []
+
+        def refreshed() -> bool:
+            changed.extend(service.take_refreshed_hits([item]))
+            return bool(changed)
+
+        wait_for(refreshed)
+        assert changed == [(1, (STORED_BLOCKS + 2) * TPB)]
+        assert service.take_refreshed_hits([item]) == ()
+
+        # A refresh whose store call fails changes nothing and is counted.
+        driver.fails = True
+        now[0] += probe_module.REFRESH_AFTER_S
+        assert service.take_refreshed_hits([item]) == ()
+        wait_for(
+            lambda: service.take_refreshed_hits([item]) == () and service.counters["refresh_errors"]
+        )
+
+        # A request no longer waiting is forgotten: nothing probes it again.
+        now[0] += probe_module.REFRESH_SCAN_S
+        service.take_refreshed_hits([])
+        probes = len(driver.probed)
+        now[0] += 2 * probe_module.REFRESH_AFTER_S
+        assert service.take_refreshed_hits([item]) == ()
+        time.sleep(0.05)
+        assert len(driver.probed) == probes
+    finally:
         service.stop(wait_s=WAIT_S)

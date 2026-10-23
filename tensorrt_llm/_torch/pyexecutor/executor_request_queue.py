@@ -23,6 +23,9 @@ CONTROL_REQUEST_ID = -2
 PROFILE_START_REQUEST_ID = -3
 PROFILE_STOP_REQUEST_ID = -4
 PREFIX_LOAD_COMPLETION_REQUEST_ID = -5
+# Rank 0's new store hits of waiting requests (kv_sharing); every rank
+# applies them to its waiting queue before it activates any request.
+STORE_HITS_REQUEST_ID = -6
 
 
 class RequestAdmissionState(enum.Enum):
@@ -57,6 +60,9 @@ class RequestQueueItem:
     # Leading prompt tokens, in whole blocks, a KV store held when rank 0
     # probed the request (kv_sharing); None when not probed.
     store_hit_tokens: Optional[int] = None
+    # Only on the store-hits item: (request id, hit) of waiting requests whose
+    # store hit rank 0 measured again (kv_sharing).
+    store_hits: Optional[tuple[tuple[int, int], ...]] = None
 
     @property
     def is_shutdown_request(self):
@@ -67,11 +73,16 @@ class RequestQueueItem:
         return not (self.is_shutdown_request or self.is_canceled_request
                     or self.is_control_request or self.is_profile_start_request
                     or self.is_profile_stop_request
-                    or self.is_prefix_load_completion_request)
+                    or self.is_prefix_load_completion_request
+                    or self.is_store_hits_request)
 
     @property
     def is_prefix_load_completion_request(self):
         return self.id == PREFIX_LOAD_COMPLETION_REQUEST_ID
+
+    @property
+    def is_store_hits_request(self):
+        return self.id == STORE_HITS_REQUEST_ID
 
     @property
     def is_control_request(self):

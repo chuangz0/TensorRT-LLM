@@ -4,9 +4,10 @@
 
 Every rank of a tensor-parallel group keeps the same ordered table: entries are appended only by
 code that runs alike on every rank with the same inputs, whatever this rank's own lend or submit
-did, and only a round removes them. A round reduces each rank's report on the first entries
-(the minimum over ranks; the identity on one rank), and every rank turns the reduced report into
-the same decisions with ``decide``, which reads nothing but its arguments.
+did, and only a round removes them. Rank 0 announces how many entries a round covers; each rank
+reports on its first open ones, every report padded to that length, and the round reduces the
+reports (the minimum over ranks; the identity on one rank). Every rank turns the reduced report
+into the same decisions with ``decide``, which reads nothing but its arguments.
 """
 
 from __future__ import annotations
@@ -25,7 +26,8 @@ if TYPE_CHECKING:
     from ..kv_cache.sharing import Lease
     from ..llm_request import LlmRequest
 
-# The report header: ok, the table hash, the negated table hash. Then three values per entry.
+# The report header: ok, the table hash h and -h. Under the minimum over ranks, min(h) equals
+# -min(-h) only where every rank sent the same h. Then three values per entry.
 HEADER = 3
 COLUMNS = 3
 # A table hash fits a signed 64-bit integer with room to negate it.
@@ -102,23 +104,30 @@ class Decision(NamedTuple):
 
 
 def table_hash(entries: Sequence[StoreOp]) -> int:
-    """A hash of the fields every rank must agree on, stable across processes."""
+    """A hash of the fields every rank must agree on, stable across processes: the range too, as
+    it sets the pages each entry pins."""
     fields = np.array(
-        [(op.seq, op.kind.value, op.request_id, op.state.value) for op in entries], dtype=np.int64
+        [
+            (op.seq, op.kind.value, op.request_id, op.state.value, op.start, op.end)
+            for op in entries
+        ],
+        dtype=np.int64,
     )
     digest = hashlib.blake2b(fields.tobytes(), digest_size=8).digest()
     return int.from_bytes(digest, "little") & _HASH_MASK
 
 
-def report(entries: Sequence[StoreOp], covered: int, ok: bool, columns: np.ndarray) -> np.ndarray:
-    """This rank's report on the first ``covered`` entries: ``[ok, h, -h]``, then ``columns``
-    (``[done, ready, on_time]`` per entry). ``ok`` is -1 where this rank holds fewer entries."""
-    if len(entries) < covered:
-        header = [-1, 0, 0]
-    else:
-        digest = table_hash(entries[:covered])
-        header = [int(ok), digest, -digest]
-    return np.concatenate([np.array(header, dtype=np.int64), columns.reshape(-1)])
+def report(entries: Sequence[StoreOp], announced: int, ok: bool, columns: np.ndarray) -> np.ndarray:
+    """This rank's report for a round covering ``announced`` entries: ``[ok, h, -h]``, ``h`` the
+    hash of ``entries`` (the first open ones, at most ``announced``: entries every rank closed
+    alike since the announcement are gone), then ``columns`` (``[done, ready, on_time]`` per entry)
+    padded with ones, which change no minimum, to ``announced`` rows. Every rank's report has the
+    same length; a rank whose table differs reports another hash."""
+    rows = np.ones((announced, COLUMNS), dtype=np.int64)
+    rows[: len(entries)] = columns.reshape(-1, COLUMNS)
+    digest = table_hash(entries)
+    header = np.array([int(ok), digest, -digest], dtype=np.int64)
+    return np.concatenate([header, rows.reshape(-1)])
 
 
 def decide(entries: Sequence[StoreOp], reduced: np.ndarray) -> list[Decision]:
@@ -128,10 +137,14 @@ def decide(entries: Sequence[StoreOp], reduced: np.ndarray) -> list[Decision]:
     is dropped and computes from its local prefix. No lease goes back but by a decision.
     """
     ok, digest, negated = (int(value) for value in reduced[:HEADER])
-    if ok < 0 or digest != -negated:
+    if digest != -negated:  # some rank's table differs
         return [Decision(Action.FATAL, reason="store operation tables differ across ranks")]
     if ok == 0 and any(op.memory_kind is MemoryKind.DEVICE for op in entries):
-        return [Decision(Action.FATAL, reason="a lender stopped with GPU Direct leases out")]
+        return [
+            Decision(
+                Action.FATAL, reason="a lender or store binding stopped with GPU Direct leases out"
+            )
+        ]
     decisions = [] if ok else [Decision(Action.STOP_SHARING)]
     # Every rank stops waiting for a late fetch: some rank's lender stopped or deadline passed.
     late_reason = "late" if ok else "stopped"

@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import MemoryKind
+from tensorrt_llm._torch.pyexecutor.kv_sharing import store_ops
 from tensorrt_llm._torch.pyexecutor.kv_sharing.store_ops import (
     Action,
     OpKind,
@@ -39,9 +40,9 @@ DONE_READY = (1, 1, 1)
 NOT_DONE = (0, 0, 1)
 
 
-def op(seq: int, kind=FETCH, state=PARKED, memory_kind=HOST) -> StoreOp:
+def op(seq: int, kind=FETCH, state=PARKED, memory_kind=HOST, end=64) -> StoreOp:
     request = SimpleNamespace(py_request_id=100 + seq)
-    return StoreOp(seq, kind, request, memory_kind, state, start=0, end=64)
+    return StoreOp(seq, kind, request, memory_kind, state, start=0, end=end)
 
 
 def reduced(entries, *ranks, ok=(True, True)) -> np.ndarray:
@@ -147,14 +148,27 @@ def test_a_stopped_lender_with_gpu_direct_leases_out_is_fatal() -> None:
     assert actions(decisions) == ["fatal"]
 
 
-def test_tables_that_differ_across_ranks_are_fatal() -> None:
-    rank0, rank1 = [op(1)], [op(1, state=SETTLING)]
-    reports = [
-        report(rank0, 1, True, np.array([DONE_READY], dtype=np.int64)),
-        report(rank1, 1, True, np.array([DONE_READY], dtype=np.int64)),
-    ]
-    assert actions(decide(rank0, np.minimum.reduce(reports))) == ["fatal"]
-    # A rank holding fewer entries than the round covers reports -1.
-    short = report([], 1, True, np.zeros((1, 3), dtype=np.int64))
-    full = report(rank0, 1, True, np.array([DONE_READY], dtype=np.int64))
-    assert actions(decide(rank0, np.minimum(short, full))) == ["fatal"]
+def own_report(entries, announced: int) -> np.ndarray:
+    """A rank's report with every entry done and ready."""
+    return report(entries, announced, True, np.array([DONE_READY] * len(entries), dtype=np.int64))
+
+
+@pytest.mark.parametrize(
+    "rank1",
+    [[op(1, state=SETTLING)], [op(1, end=96)], []],
+    ids=["another state", "another range", "fewer entries"],
+)
+def test_tables_that_differ_across_ranks_are_fatal(rank1) -> None:
+    rank0 = [op(1)]
+    reports = own_report(rank0, 1), own_report(rank1, 1)
+    assert len(reports[0]) == len(reports[1])
+    assert actions(decide(rank0, np.minimum(*reports))) == ["fatal"]
+
+
+def test_a_round_covering_entries_closed_since_its_announcement_agrees() -> None:
+    """Two entries were announced; a cancel closed the first on every rank before the round."""
+    tables = [[op(2)], [op(2)]]
+    reports = [own_report(table, 2) for table in tables]
+    assert all(len(r) == store_ops.HEADER + 2 * store_ops.COLUMNS for r in reports)
+    assert reports[0][1] == reports[1][1]
+    assert actions(decide(tables[0], np.minimum(*reports))) == ["return_all 2", "settle 2"]

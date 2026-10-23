@@ -87,6 +87,7 @@ from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
+                                     STORE_HITS_REQUEST_ID,
                                      ExecutorRequestQueue,
                                      RequestAdmissionState, RequestQueueItem)
 from .gpu_keepalive import GpuKeepalive
@@ -6637,9 +6638,19 @@ class PyExecutor:
             with self.hang_detector.pause():
                 fetched = self.executor_request_queue.get_from_request_queue(
                     timeout)
+            hits = ()
             if kv_sharing is not None:
+                # Before the hold: a request it releases joins the waiting
+                # queue only after the broadcast, and a refresh scan forgets
+                # hits not in the waiting queue.
+                hits = kv_sharing.take_refreshed_hits(waiting_queue)
                 fetched = kv_sharing.hold_until_probed(fetched)
             new_requests.extend(fetched)
+            if hits:
+                # First, so a shutdown or control item ending the envelope
+                # does not cut it off.
+                new_requests.insert(
+                    0, RequestQueueItem(STORE_HITS_REQUEST_ID, store_hits=hits))
 
         if connector is not None and self.dist.rank == 0:
             completed = connector.take_finished_prefix_loads()
@@ -6660,8 +6671,15 @@ class PyExecutor:
         # The transport choice must be identical on every rank, so `idle` has
         # to be too: it follows the all-rank live-request count and the
         # replicated waiting queue.
-        new_requests, py_request_objects = self.request_broadcaster.broadcast(
-            new_requests, prefer_cpu=idle)
+        # kv_sharing: rank 0's round size rides the request count; on every
+        # rank the next resolve_store_operations enters the round's collective
+        # exactly when it is not zero.
+        store_round_size = (kv_sharing.round_to_announce()
+                            if kv_sharing is not None else 0)
+        new_requests, py_request_objects, store_round_size = self.request_broadcaster.broadcast(
+            new_requests, store_round_size, prefer_cpu=idle)
+        if kv_sharing is not None:
+            kv_sharing.round_announced(store_round_size)
 
         # Validate and filter requests
         new_requests = self._handle_special_queue_items(new_requests)
@@ -6956,6 +6974,9 @@ class PyExecutor:
             if req_item.is_prefix_load_completion_request:
                 finished_prefix_load_ids.extend(
                     req_item.finished_prefix_load_ids)
+            elif req_item.is_store_hits_request:
+                self.kv_sharing.apply_refreshed_hits(self.waiting_queue,
+                                                     req_item.store_hits)
             elif req_item.is_shutdown_request:
                 self.is_shutdown = True
                 if self.kv_sharing is not None:

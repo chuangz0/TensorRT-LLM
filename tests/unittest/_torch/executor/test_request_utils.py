@@ -10,9 +10,11 @@ This module tests:
 """
 
 import pickle
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -507,9 +509,7 @@ def test_single_round_empty_iteration_is_one_collective():
     hang_detector = MagicMock()
     broadcaster = RequestBroadcaster(dist, hang_detector)
 
-    new_requests, py_request_objects = broadcaster.broadcast([])
-
-    assert (new_requests, py_request_objects) == ([], None)
+    assert broadcaster.broadcast([]) == ([], None, 0)
     assert dist.calls == [("broadcast_or_none", None)]
     hang_detector.pause.assert_called_once()
 
@@ -519,7 +519,7 @@ def test_single_round_busy_iteration_sends_requests_and_py_objects_once():
     broadcaster = RequestBroadcaster(dist, MagicMock())
     items = [_make_broadcast_item(1), _make_broadcast_item(2)]
 
-    new_requests, py_request_objects = broadcaster.broadcast(items)
+    new_requests, py_request_objects, _ = broadcaster.broadcast(items)
 
     assert new_requests == items
     assert py_request_objects == broadcaster._collect_py_objects(items)
@@ -536,11 +536,11 @@ def test_single_round_non_root_receives_payload_or_nothing():
     )
 
     dist = _SingleRoundDist(rank=1, received=(items, py_objects))
-    assert RequestBroadcaster(dist, MagicMock()).broadcast([]) == (items, py_objects)
+    assert RequestBroadcaster(dist, MagicMock()).broadcast([]) == (items, py_objects, 0)
     assert dist.calls == [("broadcast_or_none", None)]
 
     dist = _SingleRoundDist(rank=1, received=None)
-    assert RequestBroadcaster(dist, MagicMock()).broadcast([]) == ([], None)
+    assert RequestBroadcaster(dist, MagicMock()).broadcast([]) == ([], None, 0)
 
 
 @pytest.mark.parametrize(
@@ -556,7 +556,7 @@ def test_single_round_falls_back_to_probe_when_not_applicable(kwargs, reason):
     broadcaster = RequestBroadcaster(dist, MagicMock())
     items = [_make_broadcast_item(1)]
 
-    new_requests, _ = broadcaster.broadcast(items)
+    new_requests, _, _ = broadcaster.broadcast(items)
 
     assert new_requests == items, reason
     assert all(kind != "broadcast_or_none" for kind, *_ in dist.calls), reason
@@ -569,10 +569,8 @@ def test_single_round_idle_path_keeps_cpu_probe():
     dist = _SingleRoundDist(rank=0)
     broadcaster = RequestBroadcaster(dist, MagicMock())
 
-    new_requests, py_request_objects = broadcaster.broadcast([], prefer_cpu=True)
-
-    assert (new_requests, py_request_objects) == ([], None)
-    assert dist.calls == [("broadcast_int64", [0], True)]
+    assert broadcaster.broadcast([], prefer_cpu=True) == ([], None, 0)
+    assert dist.calls == [("broadcast_int64", [0, 0], True)]
 
 
 def test_merge_helix_requests_with_padding():
@@ -1071,3 +1069,24 @@ def test_executor_request_to_llm_request_adopts_return_routed_experts() -> None:
 
     assert _build(None).py_return_routed_experts is False  # default: opted out
     assert _build(True).py_return_routed_experts is True
+
+
+def test_the_store_round_rides_the_request_count_to_every_rank():
+    """kv_sharing: rank 0's count of store operations the next round covers reaches every rank
+    with the request count, also when no request is broadcast."""
+    wire = {}
+
+    def broadcaster(rank: int) -> RequestBroadcaster:
+        def broadcast_int64(values, root, prefer_cpu):
+            if rank == root:
+                wire["count"] = list(values)
+            return np.asarray(wire["count"], dtype=np.int64)
+
+        dist = SimpleNamespace(
+            rank=rank, world_size=2, has_pp=False, broadcast_int64=broadcast_int64
+        )
+        return RequestBroadcaster(dist, SimpleNamespace(pause=nullcontext))
+
+    assert broadcaster(0).broadcast([], store_round_size=3) == ([], None, 3)
+    assert wire["count"] == [0, 3]
+    assert broadcaster(1).broadcast([], store_round_size=0) == ([], None, 3)

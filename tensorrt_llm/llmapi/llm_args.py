@@ -8018,11 +8018,16 @@ class TorchLlmArgs(BaseLlmArgs):
             ("kv_cache_config.enable_swa_scratch_reuse",
              kv_cache.enable_swa_scratch_reuse),
             (f"kv_cache_config.dtype={kv_cache.dtype!r}: BF16 KV caches only "
-             "for now", kv_cache.dtype not in ("auto", "bfloat16")),
-            ("tensor, pipeline or context parallelism or attention DP: one "
-             "GPU per server for now", self.tensor_parallel_size > 1
-             or self.pipeline_parallel_size > 1
-             or self.context_parallel_size > 1 or self.enable_attention_dp),
+             "for now (FP8 comes later)", kv_cache.dtype
+             not in ("auto", "bfloat16")),
+            ("pipeline or context parallelism", self.pipeline_parallel_size > 1
+             or self.context_parallel_size > 1),
+            ("attention DP, for now (it comes later)",
+             self.enable_attention_dp),
+            ("disaggregated serving with more than one GPU per server, for now",
+             self.cache_transceiver_config is not None
+             and self.cache_transceiver_config.backend is not None
+             and self.tensor_parallel_size > 1),
             ("speculative decoding", self.speculative_config is not None),
             ("LoRA", self.enable_lora or self.lora_config is not None),
             ("beam search", (self.max_beam_width or 1) > 1),

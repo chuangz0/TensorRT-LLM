@@ -12,22 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""KV sharing through a real Mooncake store, end to end.
+"""KV sharing through a real Mooncake store, end to end, one GPU per server.
 
-A master and one provider (``trtllm-serve mooncake_provider``) run for the module; servers lend the
-store no memory. A server publishes the whole blocks of every prompt it computes, and nothing it
-generates, and serves the same tokens as a server without the store. A fresh server fetches the
-stored prefix of a prompt instead of computing it, and its tokens equal those of a server that
-reused the same blocks locally; a fetch that cannot deliver every block, or runs late, leaves the
-request to compute its prompt. Servers move blocks over GPU Direct, which 'auto' picks here, or
-through host staging, and a block either path stores reads exactly on the other. Every server makes
-its store calls through the driver ``TRTLLM_MOONCAKE_E2E_DRIVER`` names: ``native`` (the default,
-the C++ store worker; a server refuses to start without it) or ``python``.
+A server publishes the whole blocks of every prompt it computes, and nothing it generates, and
+serves the same tokens as a server without the store. A fresh server fetches the stored prefix of a
+prompt instead of computing it, and its tokens equal those of a server that reused the same blocks
+locally, also when part of the prefix is in its own cache already; a request whose prefix left the
+store while it waited computes it. Servers move blocks over GPU Direct, which 'auto' picks here, or
+through host staging, and a block either path stores reads exactly on the other. Two instances of
+one service share system prompts and follow-up turns under concurrent load. The store and its
+drivers are the module's (``conftest.py``).
 
-Needs a GPU (three for the disaggregated test), ``mooncake_master`` on the path, the
+Needs a GPU (three for the disaggregated test, two for the service), ``mooncake_master`` on the path, the
 ``mooncake.store`` SDK and, for the native driver, the built ``tensorrt_llm.mooncake_store_worker``,
-and fails without them. ``TRTLLM_MOONCAKE_PROTOCOL`` (default rdma) and ``TRTLLM_MOONCAKE_DEVICES``
-(default: the fastest InfiniBand devices) pick the transport.
+and fails without them.
 """
 
 from __future__ import annotations
@@ -36,36 +34,26 @@ import gc
 import json
 import os
 import random
-import shutil
 import subprocess
-import time
-import urllib.request
-from collections.abc import Callable, Iterator
+import threading
+from collections.abc import Iterator
 from contextlib import ExitStack
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 import torch
-import yaml
+from conftest import WAIT_S, Store, run_two_turn_workload, wait_until
 from llmapi.apps.openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
-from tensorrt_llm._torch.disaggregation.blob.mooncake_native import NativeMooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.store import ProbeStatus
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import MemoryKind
-from tensorrt_llm._torch.pyexecutor.kv_sharing import data_path
+from tensorrt_llm._torch.pyexecutor.kv_sharing import data_path, probe
 from tensorrt_llm.llmapi import KvCacheConfig
 
-PROTOCOL = os.environ.get("TRTLLM_MOONCAKE_PROTOCOL", "rdma")
-DRIVER = os.environ.get("TRTLLM_MOONCAKE_E2E_DRIVER", "native")
-assert DRIVER in ("native", "python"), f"TRTLLM_MOONCAKE_E2E_DRIVER={DRIVER!r}"
-DEVICES = os.environ.get("TRTLLM_MOONCAKE_DEVICES", "")
 TOKENS_PER_BLOCK = 32
-PROVIDER_BYTES = 4 << 30
-WAIT_S = 60.0
 # Fills the last partial block of P and of Q: whole blocks then hold generated tokens.
 NEW_TOKENS = 32
 CHUNKED_PREFILL = {"enable_chunked_prefill": True, "max_num_tokens": 256}
@@ -81,65 +69,24 @@ P_BLOCKS, Q_BLOCKS = len(P) // TOKENS_PER_BLOCK, len(Q) // TOKENS_PER_BLOCK
 # each test's publications are its own. A server holding P reuses exactly the 16 blocks.
 FETCHED = 512
 FETCHED_BLOCKS = FETCHED // TOKENS_PER_BLOCK
-SIBLINGS = ("exact", "lost", "late", "cancelled", "disaggregated")
+SIBLINGS = ("exact", "refreshed", "disaggregated")
 T = {name: P[:FETCHED] + [_tokens.randrange(1000, 30000) for _ in range(200)] for name in SIBLINGS}
 # The aggregated tests compare with a server without the store; the disaggregated one with its own.
 REFERENCED = SIBLINGS[:-1]
 T_BLOCKS = (FETCHED + 200) // TOKENS_PER_BLOCK  # 22
+# A follow-up turn: P's first 24 blocks (a system prompt of 16 blocks and a first turn of 8, which
+# another server computed), then a question of its own.
+SYSTEM, FIRST_TURN = 512, 256
+FOLLOW_UP = P[: SYSTEM + FIRST_TURN] + [_tokens.randrange(1000, 30000) for _ in range(200)]
 # The key prefix under which a writer published P for the readers.
 FETCH_PREFIX = "fetch"
 # Readers fetch prefixes of at least two blocks.
 READER = {"min_fetch_tokens": 2 * TOKENS_PER_BLOCK}
 
 
-@dataclass
-class Store:
-    """The module's Mooncake store, and a client that lends it nothing, to ask what it holds."""
-
-    master: str
-    metrics_url: str
-    run_dir: Path
-    client: object  # mooncake.store.MooncakeDistributedStore
-
-    def config(self, key_prefix: str) -> str:
-        """Writes a server's store config whose keys start with ``key_prefix``."""
-        mooncake = {
-            "master_server_address": self.master,
-            "global_segment_size": 0,
-            "protocol": PROTOCOL,
-            "device_name": DEVICES,
-            "driver": DRIVER,
-        }
-        path = self.run_dir / f"{key_prefix}.yaml"
-        path.write_text(yaml.safe_dump({"mooncake": mooncake, "blob": {"key_prefix": key_prefix}}))
-        return str(path)
-
-    def readable_objects(self, key_prefix: str) -> tuple[int, int]:
-        """How many objects the store has under ``key_prefix``, and how many of them a get could
-        read now (an object whose put is still open is not readable)."""
-        with urllib.request.urlopen(f"{self.metrics_url}/get_all_keys", timeout=10) as reply:
-            keys = [k for k in reply.read().decode().split() if k.startswith(f"{key_prefix}/")]
-        readable = sum(answer == 1 for answer in self.client.batch_is_exist(keys)) if keys else 0
-        return len(keys), readable
-
-
-def require_environment() -> None:
-    """Fails, not skips, where the test cannot run."""
-    assert torch.cuda.is_available(), "needs a GPU"
-    assert shutil.which("mooncake_master"), "needs mooncake_master (mooncake-transfer-engine)"
-    import mooncake.store  # noqa: F401
-
-
-def wait_until(condition: Callable[[], bool]) -> bool:
-    deadline = time.monotonic() + WAIT_S
-    while not condition():
-        if time.monotonic() > deadline:
-            return False
-        time.sleep(0.2)
-    return True
-
-
-def server(monkeypatch: pytest.MonkeyPatch, *, in_process: bool, **kwargs) -> LLM:
+def server(
+    monkeypatch: pytest.MonkeyPatch, *, in_process: bool, max_batch_size: int = 8, **kwargs
+) -> LLM:
     """A Qwen3-0.6B server. In process, a test reads its executor; otherwise the executor runs in a
     worker process, as it does in production."""
     if in_process:
@@ -151,7 +98,7 @@ def server(monkeypatch: pytest.MonkeyPatch, *, in_process: bool, **kwargs) -> LL
         kv_cache_config=KvCacheConfig(
             tokens_per_block=TOKENS_PER_BLOCK, free_gpu_memory_fraction=0.3
         ),
-        max_batch_size=8,
+        max_batch_size=max_batch_size,
         max_seq_len=2048,
         **kwargs,
     )
@@ -186,40 +133,6 @@ def shut_down(llm: LLM) -> None:
     llm.shutdown()
     gc.collect()
     torch.cuda.empty_cache()
-
-
-@pytest.fixture(scope="module")
-def store(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Store]:
-    require_environment()
-    from test_common.mooncake_utils import running_master_on_free_ports, running_segment_provider
-
-    from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import MooncakeConfig, open_sdk
-    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.gpudirect import (
-        select_registration_path,
-    )
-
-    # The first Mooncake client of the process fixes how it registers device memory, and the
-    # servers in this process register theirs after the test's own client.
-    select_registration_path(PROTOCOL, registers_device_memory=True)
-    run_dir = tmp_path_factory.mktemp("mooncake")
-    with ExitStack() as stack:
-        master = stack.enter_context(
-            running_master_on_free_ports(str(run_dir), protocol=PROTOCOL, eviction_ratio=0.0)
-        )
-        stack.enter_context(
-            running_segment_provider(
-                master.address,
-                str(run_dir),
-                segment_size=PROVIDER_BYTES,
-                protocol=PROTOCOL,
-                device_name=DEVICES,
-            )
-        )
-        metrics_port = json.loads((run_dir / "pool.json").read_text())["metrics_port"]
-        host = master.address.rsplit(":", 1)[0]
-        client = open_sdk(MooncakeConfig(master.address, 0, PROTOCOL, DEVICES, local_buffer_size=0))
-        stack.callback(client.close)
-        yield Store(master.address, f"http://{host}:{metrics_port}", run_dir, client)
 
 
 @pytest.fixture(scope="module")
@@ -357,37 +270,6 @@ def settled(executor) -> bool:
     return not executor.disagg.has_pending_shared_transfers()
 
 
-def slow_store_reads(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
-    """Every store read in this process ends ``seconds`` after it was queued, as far as the
-    server can tell; the executor runs on meanwhile. The Python driver's read sleeps on its
-    backend thread; the native driver hands the backend no finished read younger than that."""
-    if DRIVER == "python":
-        get = MooncakeDriver.get
-
-        def slow_get(self, rows, hint=None):
-            time.sleep(seconds)
-            return get(self, rows, hint)
-
-        monkeypatch.setattr(MooncakeDriver, "get", slow_get)
-        return
-    take, waiting = NativeMooncakeDriver.take_finished, NativeMooncakeDriver.finished_waiting_s
-    held: dict[NativeMooncakeDriver, list] = {}  # by driver: finished reads not handed out yet
-
-    def take_when_old(self):
-        mine = held.setdefault(self, [])
-        mine += take(self)
-        now = time.monotonic()
-        due = [done for done in mine if done.op.is_put or now - done.op.submitted >= seconds]
-        mine[:] = [done for done in mine if done not in due]
-        return due
-
-    def waiting_while_held(self):  # the backend asks this before it takes
-        return float("inf") if held.get(self) else waiting(self)
-
-    monkeypatch.setattr(NativeMooncakeDriver, "take_finished", take_when_old)
-    monkeypatch.setattr(NativeMooncakeDriver, "finished_waiting_s", waiting_while_held)
-
-
 @pytest.fixture(scope="module")
 def sibling_references() -> dict[str, dict[str, list[int]]]:
     """Greedy tokens of each sibling from a server without the store: computed whole, and with P's
@@ -399,10 +281,13 @@ def sibling_references() -> dict[str, dict[str, list[int]]]:
         whole = {name: complete(llm, T[name], cache_salt=f"whole-{name}") for name in REFERENCED}
         generate(llm, P)
         reused = {name: complete(llm, T[name]) for name in REFERENCED}
+        follow_up = complete(llm, FOLLOW_UP)
     finally:
         shut_down(llm)
     assert all(output.cached_tokens == 0 for output in whole.values())
     assert all(output.cached_tokens == FETCHED for output in reused.values())
+    assert follow_up.cached_tokens == SYSTEM + FIRST_TURN
+    reused["follow-up"] = follow_up
     return {
         kind: {name: list(output.outputs[0].token_ids) for name, output in outputs.items()}
         for kind, outputs in (("whole", whole), ("reused", reused))
@@ -460,38 +345,6 @@ def test_a_fresh_server_fetches_a_prefix_published_on_the_other_data_path_exactl
     assert salted.cached_tokens == 0
 
 
-def test_an_object_lost_after_the_probe_drops_the_fetch_and_computes_the_prompt(
-    store: Store, sibling_references: dict, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # A prefix of its own: the test removes one of its objects.
-    publish_p(store, "lost")
-    probe = MooncakeDriver.probe
-    lost: list[str] = []
-
-    def probe_then_lose_a_block(self, keys, budget_s, hint=None):
-        answer = probe(self, keys, budget_s, hint)
-        if not lost:  # the fifth block goes after the store said it holds it
-            lost.append(keys[4])
-            assert store.client.remove(keys[4], True) == 0
-        return answer
-
-    monkeypatch.setattr(MooncakeDriver, "probe", probe_then_lose_a_block)
-    llm = reader(monkeypatch, store, key_prefix="lost")
-    executor = llm._executor.engine
-    try:
-        output = complete(llm, T["lost"])
-        # The request computed its whole prompt and published it, the lost block included.
-        assert wait_until(lambda: settled(executor))
-        assert store.client.batch_is_exist(lost) == [1]
-    finally:
-        shut_down(llm)
-    assert list(output.outputs[0].token_ids) == sibling_references["whole"]["lost"]
-    assert output.cached_tokens == 0
-    counters = executor.kv_sharing.counters
-    assert counters["fetches_started"] == counters["fetches_dropped_short"] == 1
-    assert counters["fetches_resumed"] == 0
-
-
 def test_a_prompt_of_whole_blocks_fetches_all_but_its_last_block_and_puts_none_again(
     store: Store, published_p: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -523,53 +376,92 @@ def test_a_prompt_of_whole_blocks_fetches_all_but_its_last_block_and_puts_none_a
     assert store.readable_objects(FETCH_PREFIX) == before
 
 
-def test_a_fetch_past_its_timeout_is_dropped_and_the_request_completes(
-    store: Store, published_p: None, sibling_references: dict, monkeypatch: pytest.MonkeyPatch
+def test_a_prefix_partly_in_the_local_cache_reads_only_the_rest_from_the_store(
+    store: Store, sibling_references: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    slow_store_reads(monkeypatch, seconds=2.0)
-    llm = reader(monkeypatch, store, fetch_timeout_s=0.5)
-    executor = llm._executor.engine
-    try:
-        output = complete(llm, T["late"])
-        # The abandoned read returns later; its lease goes back then.
-        assert wait_until(lambda: settled(executor))
-    finally:
-        shut_down(llm)
-    assert list(output.outputs[0].token_ids) == sibling_references["whole"]["late"]
-    assert output.cached_tokens == 0
-    counters = executor.kv_sharing.counters
-    assert counters["fetches_started"] == counters["fetches_dropped_late"] == 1
-    assert counters["fetches_resumed"] == 0
-
-
-def test_a_request_cancelled_while_parked_lets_its_fetch_go(
-    store: Store, published_p: None, sibling_references: dict, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    slow_store_reads(monkeypatch, seconds=3.0)
-    llm = reader(monkeypatch, store, fetch_timeout_s=30.0)
+    """A follow-up turn: the system prompt is in the server's own cache, the first turn only in
+    the store (another server computed it). The request reads the first turn's blocks alone,
+    and the store gains only the new question's blocks."""
+    publish_p(store, "follow-up")
+    llm = reader(monkeypatch, store, key_prefix="follow-up")
     executor = llm._executor.engine
     counters = executor.kv_sharing.counters
     try:
-        # A long generation keeps the forward running, so cancels are handled every iteration.
-        busy = llm.generate_async(
-            Q, SamplingParams(max_tokens=1000, temperature=0.0, ignore_eos=True)
-        )
-        parked = llm.generate_async(T["cancelled"], GREEDY)
-        assert wait_until(lambda: counters["fetches_started"] == 1)
-        parked.abort()
-        # The request ends at once, with no token, while its read still runs.
-        assert parked.result(timeout=WAIT_S).outputs[0].token_ids == []
-        assert not settled(executor)
-        busy.result(timeout=WAIT_S)
+        # The system prompt and one token: all 16 of its blocks are read from the store, so the
+        # reader's own cache holds them as the other server computed them in one pass (a block
+        # computed here over a cached prefix can differ from that in the last bits).
+        complete(llm, P[: SYSTEM + 1])
         assert wait_until(lambda: settled(executor))
-        # The server goes on fetching.
-        again = complete(llm, T["cancelled"])
-        assert wait_until(lambda: settled(executor))
+        fetched_before = counters["fetched_blocks"]
+        before, _ = store.readable_objects("follow-up")
+        output = complete(llm, FOLLOW_UP)
+        new_blocks = len(FOLLOW_UP) // TOKENS_PER_BLOCK - (SYSTEM + FIRST_TURN) // TOKENS_PER_BLOCK
+        published = before + new_blocks
+        assert wait_until(lambda: store.readable_objects("follow-up") == (published, published))
     finally:
         shut_down(llm)
-    assert list(again.outputs[0].token_ids) == sibling_references["reused"]["cancelled"]
-    assert again.cached_tokens == FETCHED
-    assert counters["fetches_started"] == 2 and counters["fetches_resumed"] == 1
+    assert list(output.outputs[0].token_ids) == sibling_references["reused"]["follow-up"]
+    assert output.cached_tokens == SYSTEM + FIRST_TURN
+    assert counters["fetched_blocks"] - fetched_before == FIRST_TURN // TOKENS_PER_BLOCK
+
+
+def test_two_instances_of_one_service_share_system_prompts_and_follow_up_turns(
+    store: Store, tmp_path: Path
+) -> None:
+    """Two one-GPU instances of one service."""
+    run_two_turn_workload(store, model_path(), tp=1, gpu_groups=("0", "1"), run_dir=tmp_path)
+
+
+def test_a_waiting_request_takes_the_normal_path_after_its_prefix_left_the_store(
+    store: Store, sibling_references: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rank 0 measures a waiting request's hit again; the new hit reaches the request before its
+    admission, so it computes the prompt instead of fetching what the store lost. (The test
+    removes the prefix; in service, the store evicts it once its read lease ran out.)"""
+    publish_p(store, "refresh")  # a prefix of its own: the test removes its objects
+    monkeypatch.setattr(probe, "REFRESH_AFTER_S", 0.5)
+    monkeypatch.setattr(probe, "REFRESH_SCAN_S", 0.1)
+    probe_store = MooncakeDriver.probe
+    told: list[tuple] = []  # the request's keys and the store's first answer
+    answered = threading.Event()
+
+    def probe_and_tell(self, keys, budget_s, hint=None):
+        answer = probe_store(self, keys, budget_s, hint)
+        if ProbeStatus.HIT in answer and not answered.is_set():
+            told.append((keys, answer))
+            answered.set()
+        return answer
+
+    monkeypatch.setattr(MooncakeDriver, "probe", probe_and_tell)
+    llm = server(
+        monkeypatch,
+        in_process=True,
+        max_batch_size=1,
+        kv_sharing=sharing(store, "refresh", **READER),
+    )
+    executor = llm._executor.engine
+    counters = executor.kv_sharing.counters
+    try:
+        # Two long generations hold both seats (the overlap scheduler admits two requests per
+        # batch slot), so the request waits in the queue.
+        busy = SamplingParams(max_tokens=1000, temperature=0.0, ignore_eos=True)
+        occupiers = [llm.generate_async(prompt, busy) for prompt in (Q, [1002] + Q[1:])]
+        assert wait_until(lambda: counters["publications_started"] >= 2)
+        waiting = llm.generate_async(T["refreshed"], GREEDY)
+        assert answered.wait(WAIT_S)
+        keys, _ = told[0]
+        for key in keys:  # the request was told; now its prefix leaves the store
+            store.client.remove(key, True)
+        assert wait_until(lambda: counters["hits_refreshed"] >= 1), dict(counters)
+        output = waiting.result(timeout=WAIT_S)
+        for occupier in occupiers:
+            occupier.result(timeout=WAIT_S)
+    finally:
+        shut_down(llm)
+    _, answer = told[0]
+    assert answer[:FETCHED_BLOCKS] == (ProbeStatus.HIT,) * FETCHED_BLOCKS
+    assert list(output.outputs[0].token_ids) == sibling_references["whole"]["refreshed"]
+    assert output.cached_tokens == 0 and counters["fetches_started"] == 0
 
 
 # Disaggregated serving: the context server shares through the store; P->D is unchanged.
@@ -606,6 +498,7 @@ def test_disaggregated_context_server_fetches_computes_the_rest_and_publishes(
                 os.environ,
                 CUDA_VISIBLE_DEVICES=gpu,
                 UCX_TLS=SERVER_UCX_TLS,
+                # 4 KiB host pages: THP compaction can outlast the start-up wait (nvbugs/6888251).
                 TLLM_KV_CACHE_MANAGER_V2_THP="0",
             )
             env.pop("TLLM_WORKER_USE_SINGLE_PROCESS", None)
