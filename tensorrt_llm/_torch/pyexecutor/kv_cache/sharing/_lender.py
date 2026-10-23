@@ -1155,6 +1155,7 @@ class _ManagerLender:
         cache_salt: str | None,
         layer_group_index: int,
         num_blocks: int,
+        shares: Sequence[int] | None = None,
     ) -> np.ndarray:
         """See ``Lender.prompt_object_keys``."""
         manager = self._manager_ref()
@@ -1166,7 +1167,12 @@ class _ManagerLender:
         keys = _manager.reuse_keys_of_tokens(
             self._tokens_per_block, scope, prompt_tokens, num_blocks
         )
-        return self._object_keys(layer_group_index, np.frombuffer(b"".join(keys), dtype=np.uint8))
+        reuse_keys = np.frombuffer(b"".join(keys), dtype=np.uint8)
+        if shares is None:
+            return self._object_keys(layer_group_index, reuse_keys)
+        return np.concatenate(
+            [self._identity.object_keys(layer_group_index, reuse_keys, share) for share in shares]
+        )
 
     def return_writes(
         self,

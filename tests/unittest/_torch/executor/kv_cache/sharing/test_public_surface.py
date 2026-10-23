@@ -425,6 +425,7 @@ def test_the_protocols_keep_their_members_and_stay_unrelated():
         "cache_salt",
         "layer_group_index",
         "num_blocks",
+        "shares",
     ]
     assert params(_lender._ManagerLender.prompt_object_keys) == params(Lender.prompt_object_keys)
 

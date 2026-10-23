@@ -75,6 +75,16 @@ def test_a_name_is_namespace_then_key_then_the_layer_group_s_identity():
     assert len(set(names)) == 3
 
 
+def test_a_rank_names_another_rank_s_share_as_that_rank_does():
+    """Rank 0 of a tensor-parallel group asks the store about every rank's share of a block."""
+    ranks = [_identity(shards=[(4, rank)]) for rank in range(4)]
+    for share, holder in enumerate(ranks):
+        named = ranks[0].object_keys(0, _reuse_keys(3), share)
+        assert np.array_equal(named, holder.object_keys(0, _reuse_keys(3)))
+    with pytest.raises(ValueError, match="shard 4 of 4"):
+        ranks[0].object_keys(0, _reuse_keys(1), 4)
+
+
 def test_one_full_name_is_pinned():
     """Any change to these bytes must bump ``KEY_FORMAT_VERSION``, so old objects become misses."""
     key = np.frombuffer(bytes(range(REUSE_KEY_BYTES)), dtype=np.uint8).reshape(1, REUSE_KEY_BYTES)

@@ -879,6 +879,7 @@ class Lender(Protocol):
         cache_salt: Optional[str],
         layer_group_index: int,
         num_blocks: int,
+        shares: Optional[Sequence[int]] = None,
     ) -> np.ndarray:
         """``uint8 (num_blocks, 54)``: the object keys a NAMED lease of this rank gives the first
         ``num_blocks`` whole blocks of a text prompt in layer group ``layer_group_index``, for a
@@ -886,8 +887,12 @@ class Lender(Protocol):
         thread at any time after attach: it reads only what attach fixed. Prompts with multimodal
         content or a LoRA adapter are named by their leases alone.
 
+        ``shares`` names those shares of the layer group instead, as the ranks holding them name
+        them (the ranks of one server name a group alike but for the share):
+        ``uint8 (len(shares) * num_blocks, 54)``, share-major.
+
         Raises:
-            ValueError: The prompt has fewer whole blocks, the layer group is unknown, or this
-                lender names no blocks.
+            ValueError: The prompt has fewer whole blocks, the layer group is unknown, a share
+                lies outside the group's shard count, or this lender names no blocks.
             RuntimeError: The lender's manager is gone."""
         ...

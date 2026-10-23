@@ -107,6 +107,7 @@ def _sources(immutable_mutant=None):
     for name in ("_stale_range", "_needed_ranges", "_last_history_keeping"):
         setattr(ranges, name, _load("_ranges.py", name, ns))
     ns["_ranges"] = ranges
+    _load("_identity.py", "_u16", ns)
     _load("_identity.py", "Identity.object_keys", ns)
     result = SimpleNamespace(
         object_keys=ns["object_keys"],
@@ -757,7 +758,7 @@ def _slow_object_keys(identity, group, keys):
     out = np.empty((len(keys), 54), dtype=np.uint8)
     out[:, :16] = np.frombuffer(identity.namespace, dtype=np.uint8)
     out[:, 16:48] = keys
-    out[:, 48:] = identity._groups[group]
+    out[:, 48:] = np.frombuffer(struct.pack(">HHH", *identity._groups[group]), dtype=np.uint8)
     return out
 
 
@@ -767,9 +768,8 @@ def test_object_key_bytes_and_snapshots_match_eager_layout(sources):
         count = rng.choice((0, 0, 1, 4, 15))
         raw = np.frombuffer(rng.randbytes(count * 64), dtype=np.uint8).copy().reshape(count, 64)
         keys = raw[:, ::2]
-        suffix = struct.pack(">HHH", rng.randrange(65536), 4, 2)
         identity = SimpleNamespace(
-            namespace=bytes(range(16)), _groups=[np.frombuffer(suffix, dtype=np.uint8).copy()]
+            namespace=bytes(range(16)), _groups=[(rng.randrange(65536), 4, 2)]
         )
         expected = _slow_object_keys(identity, 0, keys)
         result = sources.object_keys(identity, 0, keys)
@@ -780,10 +780,11 @@ def test_object_key_bytes_and_snapshots_match_eager_layout(sources):
             result.flags.writeable = True
         assert all(row[:16].tobytes() == identity.namespace for row in result)
         assert np.array_equal(result[:, 16:48], keys)
-        assert np.array_equal(result[:, 48:], np.broadcast_to(identity._groups[0], (count, 6)))
+        suffix = np.frombuffer(struct.pack(">HHH", *identity._groups[0]), dtype=np.uint8)
+        assert np.array_equal(result[:, 48:], np.broadcast_to(suffix, (count, 6)))
         snapshot = result.tobytes()
         raw[:] = 0
-        identity._groups[0][:] = 0
+        identity._groups[0] = (0, 4, 2)
         identity.namespace = b"!" * 16
         assert result.tobytes() == snapshot
     for invalid in (-1, 1):
@@ -997,7 +998,7 @@ def test_named_pipeline_reuses_frozen_metadata_and_preserves_old_views(
     lender = _metadata_lender(sources, layout([False, False], tpb=4), manager)
     identity = SimpleNamespace(
         namespace=bytes(range(16)),
-        _groups=[np.frombuffer(struct.pack(">HHH", lg, 4, 2), dtype=np.uint8) for lg in range(2)],
+        _groups=[(lg, 4, 2) for lg in range(2)],
     )
     emitted = {}
 
@@ -1044,7 +1045,7 @@ def test_named_pipeline_reuses_frozen_metadata_and_preserves_old_views(
             assert np.shares_memory(rows.page_ordinals, entries.block_ordinals[lg])
             assert np.shares_memory(rows.object_keys, emitted[lg])
             expected_keys = b"".join(
-                identity.namespace + row.tobytes() + identity._groups[lg].tobytes()
+                identity.namespace + row.tobytes() + struct.pack(">HHH", *identity._groups[lg])
                 for row in keys[lg]
             )
             assert rows.object_keys.tobytes() == expected_keys
