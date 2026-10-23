@@ -13,9 +13,10 @@ Unscripted calls follow SDK 0.3.13:
   ``batch_put_from_multi_buffer_ranges`` copies into the reservation (-600 without a session).
   ``batch_put_session_end`` commits it and ``batch_put_session_revoke`` drops it; both answer -600
   without a session and keep the session when scripted to fail.
-- ``batch_get_into`` answers each object's size after copying it (-704 absent, -703 reserved only,
-  -600 when the object is longer than its buffer).
-- A buffer outside every registration fails with TRANSFER_FAIL, as RDMA does.
+- ``batch_get_into_multi_buffers`` answers each object's size after copying it into the key's
+  buffers back to back (-704 absent, -703 reserved only, -600 when the object is longer than its
+  buffers, -800 when shorter, as the SDK's transfer submission refuses it).
+- A buffer outside every registration, or crossing two, fails with TRANSFER_FAIL, as RDMA does.
 
 ``GetsOfKeyWait`` holds the gets of one key in front of any SDK client, this fake or a real one.
 """
@@ -77,12 +78,12 @@ class GetsOfKeyWait:
     def __getattr__(self, name: str):
         return getattr(self.store, name)
 
-    def batch_get_into(self, keys, *args):
+    def batch_get_into_multi_buffers(self, keys, *args):
         if self.key in keys:
             self.entered.set()
             # Past the suite's timeout: only the check's unblock lets it go.
             self.release.wait(HELD_CALL_S)
-        return self.store.batch_get_into(keys, *args)
+        return self.store.batch_get_into_multi_buffers(keys, *args)
 
 
 class FakeMooncakeStore:
@@ -184,14 +185,14 @@ class FakeMooncakeStore:
             "batch_is_exist", (keys,), {}, len(keys), lambda i: self._exists(keys[i])
         )
 
-    def batch_get_into(self, *args, **kwargs) -> list[int]:
-        keys, pointers, sizes = args
+    def batch_get_into_multi_buffers(self, *args, **kwargs) -> list[int]:
+        keys, all_buffer_ptrs, all_sizes = args
         return self._answer(
-            "batch_get_into",
+            "batch_get_into_multi_buffers",
             args,
             kwargs,
             len(keys),
-            lambda i: self._read(keys[i], pointers[i], sizes[i]),
+            lambda i: self._read(keys[i], all_buffer_ptrs[i], all_sizes[i]),
         )
 
     # Real behaviour, one key at a time.
@@ -246,16 +247,21 @@ class FakeMooncakeStore:
         with self.pool.lock:
             return OBJECT_EXISTS if key in self.pool.objects else OBJECT_ABSENT
 
-    def _read(self, key: str, pointer: int, size: int) -> int:
+    def _read(self, key: str, pointers: list[int], sizes: list[int]) -> int:
         with self.pool.lock:
             data, reserved = self.pool.objects.get(key), key in self.pool.reserved
         if data is None:
             return REPLICA_IS_NOT_READY if reserved else OBJECT_NOT_FOUND
-        if len(data) > size:
+        if len(data) > sum(sizes):
             return INVALID_PARAMS
-        if not self._is_registered(pointer, size):
+        if len(data) < sum(sizes):
             return TRANSFER_FAIL
-        ctypes.memmove(pointer, data, len(data))
+        if not all(self._is_registered(p, n) for p, n in zip(pointers, sizes)):
+            return TRANSFER_FAIL
+        offset = 0
+        for pointer, size in zip(pointers, sizes):
+            ctypes.memmove(pointer, data[offset : offset + size], size)
+            offset += size
         return len(data)
 
     def _is_registered(self, pointer: int, size: int) -> bool:

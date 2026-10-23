@@ -540,7 +540,14 @@ class DriverConformance:
             assert got.status is RowStatus.READY
             assert parts.read_row(2) == b"aaaa" and parts.read_row(0) == b"cccc"
             assert parts.read_row(1) == b"----"
-            assert writer.intact() and whole.intact() and parts.intact()
+
+            # Out of that memory again, as a publication of pages fetched in place is.
+            (put,) = h.settle(h.put([RowIO(h.key("N"), (parts.span(0), parts.span(2)))]))
+            assert put.status is RowStatus.READY
+            again = h.endpoint(["N"], slot=8, fill=0x2D)
+            (got,) = h.settle(h.get(again.rows()))
+            assert got.status is RowStatus.READY and again.read_row(0) == b"ccccaaaa"
+            assert writer.intact() and whole.intact() and parts.intact() and again.intact()
 
     def test_a_row_may_cover_parts_of_slots_across_regions(self) -> None:
         """Spans need not be whole slots or share a region, and put and get may split a row

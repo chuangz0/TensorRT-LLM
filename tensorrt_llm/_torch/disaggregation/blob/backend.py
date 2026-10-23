@@ -240,11 +240,12 @@ class RegionBinding:
 
 
 class _GroupRows(NamedTuple):
-    """One group's arrays, taken from the view at submission."""
+    """One group's arrays, taken from the view at submission: row ``i`` is the spans starting at
+    ``starts[i, j]``, ``span_bytes[j]`` bytes each, back to back."""
 
     object_keys: np.ndarray  # uint8 [rows, width]
-    addresses: np.ndarray  # int64 [rows]
-    region: SlotRegion
+    starts: np.ndarray  # int64 [rows, spans]
+    span_bytes: tuple[int, ...]
 
 
 @dataclass(eq=False)
@@ -285,7 +286,7 @@ class BlobAttempt:
         self.is_fetch = is_fetch
         self._backend = backend
         self._groups: list[_GroupRows] | None = groups
-        self._masks = [np.zeros(len(rows.addresses), dtype=bool) for rows in groups]
+        self._masks = [np.zeros(len(rows.object_keys), dtype=bool) for rows in groups]
         self._queued_batches = 0  # zeroed by a stop; the deque keeps the batches, _take skips them
         self._results_pending = 0
         self._access_open = 0  # an unprovable batch stays in it for good
@@ -383,7 +384,11 @@ class BlobBackend:
         capabilities = self._driver.capabilities
         self._max_rows_per_op = capabilities.max_rows_per_op
         self._capabilities = Capabilities(
-            fetch=capabilities.get, publish=capabilities.put, cancel=True
+            fetch=capabilities.get,
+            publish=capabilities.put,
+            cancel=True,
+            # A row placed by slot is one span per region it lists.
+            slot_rows=capabilities.multi_span,
         )
         self._unprovable_batches = 0
         self._workers_alive = config.workers
@@ -463,43 +468,76 @@ class BlobBackend:
         return attempt
 
     def _group_rows(self, group: LayerGroupRows) -> _GroupRows:
+        """The group's keys and the spans of each row, checked; rows placed by address or, where
+        the driver takes rows of several spans, by slot."""
         where = f"layer group {group.layer_group_index}"
-        if group.object_keys is None or group.addresses is None or group.region_index is None:
-            raise InvalidSubmission(f"{where}: rows need object keys, addresses and a region")
-        keys = np.asarray(group.object_keys)
-        addresses = np.asarray(group.addresses)
         rows = len(group)
+        if group.object_keys is None:
+            raise InvalidSubmission(f"{where}: rows need object keys")
+        keys = np.asarray(group.object_keys)
         if keys.dtype != np.uint8 or keys.ndim != 2 or keys.shape[0] != rows or keys.shape[1] == 0:
             raise InvalidSubmission(
                 f"{where}: object keys must be uint8 [{rows}, width > 0], got {keys.dtype} "
                 f"{keys.shape}"
             )
+        if group.addresses is not None and group.region_index is not None:
+            starts, span_bytes = self._address_spans(where, rows, group)
+        else:
+            # Optional members of the contract: only a backend declaring slot_rows reads them.
+            slots, indices = getattr(group, "slots", None), getattr(group, "region_indices", None)
+            if not (self._capabilities.slot_rows and slots is not None and indices is not None):
+                raise InvalidSubmission(f"{where}: rows need a placement this backend reads")
+            starts, span_bytes = self._slot_spans(where, rows, np.asarray(slots), indices)
+        return _GroupRows(keys, starts, span_bytes)
+
+    def _address_spans(
+        self, where: str, rows: int, group: LayerGroupRows
+    ) -> tuple[np.ndarray, tuple[int, ...]]:
+        addresses = np.asarray(group.addresses)
         if addresses.dtype != np.int64 or addresses.shape != (rows,):
             raise InvalidSubmission(
                 f"{where}: addresses must be int64 [{rows}], got {addresses.dtype} "
                 f"{addresses.shape}"
             )
-        if group.region_index not in self._binding.registered:  # refused, never skipped
-            raise InvalidSubmission(f"{where}: region {group.region_index} is not registered")
-        region = self._regions[group.region_index]
+        region = self._registered_region(where, group.region_index)
         slot, misalignment = np.divmod(addresses - region.address, region.slot_bytes)
         if np.any((slot < 0) | (slot >= region.slot_count) | (misalignment != 0)):
             raise InvalidSubmission(f"{where}: an address is not a slot of its region")
-        return _GroupRows(keys, addresses, region)
+        return addresses[:, None], (region.slot_bytes,)
+
+    def _slot_spans(
+        self, where: str, rows: int, slots: np.ndarray, region_indices: Sequence[int]
+    ) -> tuple[np.ndarray, tuple[int, ...]]:
+        if slots.dtype != np.int64 or slots.shape != (rows,):
+            raise InvalidSubmission(
+                f"{where}: slots must be int64 [{rows}], got {slots.dtype} {slots.shape}"
+            )
+        if not region_indices:
+            raise InvalidSubmission(f"{where}: rows placed by slot name no region")
+        regions = [self._registered_region(where, index) for index in region_indices]
+        if np.any((slots < 0) | (slots >= min(region.slot_count for region in regions))):
+            raise InvalidSubmission(f"{where}: a slot is outside its regions")
+        starts = np.stack([region.address + slots * region.slot_bytes for region in regions], 1)
+        return starts, tuple(region.slot_bytes for region in regions)
+
+    def _registered_region(self, where: str, index: int) -> SlotRegion:
+        if index not in self._binding.registered:  # refused, never skipped
+            raise InvalidSubmission(f"{where}: region {index} is not registered")
+        return self._regions[index]
 
     def _cut(self, attempt: BlobAttempt, groups: list[_GroupRows]) -> list[_Batch]:
         batches = []
         for group, group_rows in enumerate(groups):
-            step = self._rows_per_batch(group_rows.region)
-            count = len(group_rows.addresses)
+            step = self._rows_per_batch(sum(group_rows.span_bytes))
+            count = len(group_rows.object_keys)
             batches += [
                 _Batch(attempt, group, start, min(start + step, count))
                 for start in range(0, count, step)
             ]
         return batches
 
-    def _rows_per_batch(self, region: SlotRegion) -> int:
-        limits = [self._config.rows_per_batch, self._config.bytes_per_batch // region.slot_bytes]
+    def _rows_per_batch(self, row_bytes: int) -> int:
+        limits = [self._config.rows_per_batch, self._config.bytes_per_batch // row_bytes]
         if self._max_rows_per_op is not None:
             limits.append(self._max_rows_per_op)
         return max(1, min(limits))
@@ -575,13 +613,16 @@ class BlobBackend:
 
     def _row_ios(self, batch: _Batch) -> list[RowIO]:
         group_rows = batch.attempt._groups[batch.group]
-        slot_bytes, stem = group_rows.region.slot_bytes, self._key_stem
+        span_bytes, stem = group_rows.span_bytes, self._key_stem
         names = group_rows.object_keys[batch.start : batch.stop]
         hexed, width = names.tobytes().hex(), 2 * names.shape[1]  # one pass for the batch
-        addresses = group_rows.addresses[batch.start : batch.stop].tolist()
+        starts = group_rows.starts[batch.start : batch.stop].tolist()
         return [
-            RowIO(stem + hexed[i * width : (i + 1) * width], (Span(address, slot_bytes),))
-            for i, address in enumerate(addresses)
+            RowIO(
+                stem + hexed[i * width : (i + 1) * width],
+                tuple(Span(start, nbytes) for start, nbytes in zip(row, span_bytes)),
+            )
+            for i, row in enumerate(starts)
         ]
 
     def _observe(self, batch: _Batch) -> tuple[_Results, bool, bool]:
@@ -750,9 +791,10 @@ class BlobBackend:
 
 def _refuse_shared_destinations(groups: list[_GroupRows]) -> None:
     """Two fetched rows in one slot would let one report READY over the other's bytes. A publish
-    only reads its slots, so only a fetch is checked."""
-    addresses = np.concatenate([rows.addresses for rows in groups]) if groups else np.empty(0)
-    if np.unique(addresses).size != addresses.size:
+    only reads its slots, so only a fetch is checked. Rows on one slot share their first span,
+    and the spans of rows in different slots never meet."""
+    firsts = np.concatenate([rows.starts[:, 0] for rows in groups]) if groups else np.empty(0)
+    if np.unique(firsts).size != firsts.size:
         raise InvalidSubmission("two rows of a fetch write the same slot")
 
 

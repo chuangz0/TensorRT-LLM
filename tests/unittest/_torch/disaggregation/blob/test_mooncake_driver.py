@@ -4,10 +4,10 @@
 
 Pins the mapping of SDK 0.3.13 answers to row results, the put session bookkeeping (every session
 the driver starts is ended, revoked or left open; only rows written whole are ended), the access-end
-rules (a put scatter that returns ends access, whatever it answers; a ``batch_get_into`` ends it
-unless a row answers TRANSFER_FAIL; a call that raises or miscounts does not, and its access is
-unprovable), registration, drain and close, and a backend round trip over the fake SDK. The shared
-``driver_conformance`` checks run over the fake SDK too.
+rules (a put scatter that returns ends access, whatever it answers; a get ends it unless a row
+answers TRANSFER_FAIL; a call that raises or miscounts does not, and its access is unprovable),
+registration (device memory one piece per CUDA allocation), drain and close, and a backend round
+trip over the fake SDK. The shared ``driver_conformance`` checks run over the fake SDK too.
 """
 
 from __future__ import annotations
@@ -15,12 +15,14 @@ from __future__ import annotations
 import threading
 import time
 from collections import Counter
+from dataclasses import replace
 
 import pytest
 from cpu_fixtures import PROMPT_S, WAIT_S, Endpoint, store_key
 from fake_mooncake import FakeMooncakeStore, FakePool, GetsOfKeyWait
 
 from tensorrt_llm._torch.disaggregation.base.backend import Attempt, Backend, Capabilities
+from tensorrt_llm._torch.disaggregation.base.memory import MemoryKind
 from tensorrt_llm._torch.disaggregation.blob import mooncake as mooncake_module
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.store import (
@@ -44,7 +46,7 @@ PUT_START = "batch_put_session_start"
 PUT_RANGES = "batch_put_from_multi_buffer_ranges"
 PUT_END = "batch_put_session_end"
 PUT_REVOKE = "batch_put_session_revoke"
-GET = "batch_get_into"
+GET = "batch_get_into_multi_buffers"
 IS_EXIST = "batch_is_exist"
 DATA_CALL = {"put": PUT_RANGES, "get": GET}
 CALL_FAILED = "existence check: CALL_FAILED(-100000)"
@@ -109,7 +111,10 @@ def test_the_driver_follows_the_driver_protocol() -> None:
         hints=False,
         absent_is_miss=True,
         device_memory=False,
-        multi_span=False,
+        multi_span=True,
+    )
+    assert MooncakeDriver(bench.fake, allocation_range=lambda address: None).capabilities == (
+        replace(bench.driver.capabilities, device_memory=True)
     )
 
 
@@ -170,16 +175,16 @@ def skipped_counts(bench: Bench) -> dict[str, int]:
 
 
 GET_ANSWERS = {
-    # name: (batch_get_into's answer (None: real), status, fault, the stat counting a skipped row)
+    # name: (the answer to the get (None: real), status, fault, the stat counting a skipped row)
     "object_size": (None, "ready", None, None),  # unscripted
     "short_object": (5, "fault", "object is 5 bytes, expected 8", None),
     "OBJECT_NOT_FOUND": (-704, "miss", None, None),
     "REPLICA_IS_NOT_READY": (-703, "not_ready", None, "rows_not_ready_being_written"),
-    "INVALID_REPLICA": (-702, "fault", "batch_get_into: INVALID_REPLICA(-702)", None),
-    "INVALID_PARAMS": (-600, "fault", "batch_get_into: INVALID_PARAMS(-600)", None),
-    "RPC_FAIL": (-900, "fault", "batch_get_into: RPC_FAIL(-900)", None),
-    "TRANSFER_FAIL": (-800, "fault", "batch_get_into: TRANSFER_FAIL(-800)", None),
-    "unknown_code": (-9999, "fault", "batch_get_into: code(-9999)", None),
+    "INVALID_REPLICA": (-702, "fault", f"{GET}: INVALID_REPLICA(-702)", None),
+    "INVALID_PARAMS": (-600, "fault", f"{GET}: INVALID_PARAMS(-600)", None),
+    "RPC_FAIL": (-900, "fault", f"{GET}: RPC_FAIL(-900)", None),
+    "TRANSFER_FAIL": (-800, "fault", f"{GET}: TRANSFER_FAIL(-800)", None),
+    "unknown_code": (-9999, "fault", f"{GET}: code(-9999)", None),
 }
 
 
@@ -455,9 +460,6 @@ def test_bad_rows_are_rejected_before_the_sdk() -> None:
         bench.driver.get([])
     with pytest.raises(DriverRejected, match="at most"):
         bench.driver.put([RowIO(key("A"), (Span(bench.buffer.address, 1 << 31),))])
-    two_spans = (bench.buffer.span(0, SLOT), bench.buffer.span(2 * SLOT, SLOT))
-    with pytest.raises(DriverRejected, match="one span"):
-        bench.driver.put([RowIO(key("A"), two_spans)])
     assert [c for c in bench.fake.calls if c.method.startswith("batch_")] == []
 
 
@@ -503,6 +505,59 @@ def test_register_and_unregister_follow_the_protocol() -> None:
     assert revocations() == 2
     driver.unregister(handle)  # and is idempotent once it succeeded
     assert revocations() == 2
+
+
+class Allocations:
+    """A CUDA allocation lookup over host memory: allocations of ``SLOT`` bytes back to back over
+    ``buffer``, and none elsewhere."""
+
+    def __init__(self, buffer: HostBuffer) -> None:
+        self.buffer = buffer
+
+    def __call__(self, address: int) -> tuple[int, int] | None:
+        offset = address - self.buffer.address
+        if not 0 <= offset < self.buffer.nbytes:
+            return None
+        return self.buffer.address + offset // SLOT * SLOT, SLOT
+
+
+def test_a_device_region_registers_one_piece_per_allocation_and_rolls_back_a_failed_piece() -> None:
+    fake = FakeMooncakeStore()
+    region = HostBuffer(3 * SLOT)  # stands in for device memory of three allocations
+    driver = MooncakeDriver(fake, allocation_range=Allocations(region))
+    layout = RegionLayout(SLOT, 3, "kv", MemoryKind.DEVICE)
+    pieces = [(region.address + i * SLOT, SLOT) for i in range(3)]
+    for answer in (None, None, -1):  # the third piece fails
+        fake.script("register_buffer", [answer])
+    with pytest.raises(RegistrationError, match="INTERNAL_ERROR") as failed:
+        driver.register(region.address, region.nbytes, layout)
+    assert [call.args for call in fake.calls_to("register_buffer")] == pieces
+    assert failed.value.handle is None and fake.registered == {}  # the first two rolled back
+    handle = driver.register(region.address, region.nbytes, layout)
+    assert sorted(fake.registered.items()) == pieces
+    driver.unregister(handle)
+    assert fake.registered == {}
+
+
+def test_a_span_across_allocations_reaches_the_sdk_as_one_buffer_per_allocation() -> None:
+    fake = FakeMooncakeStore()
+    region = HostBuffer(3 * SLOT, fill=0x2D)
+    driver = MooncakeDriver(fake, allocation_range=Allocations(region))
+    driver.register(region.address, region.nbytes, RegionLayout(SLOT, 3, "kv", MemoryKind.DEVICE))
+    region.write(b"0123456789abcdef", SLOT // 2)  # bytes 4 to 20: across both inner boundaries
+    row = RowIO(key("A"), (region.span(SLOT // 2, 2 * SLOT), region.span(0, SLOT // 2)))
+    assert summary(driver.poll(driver.put([row]))) == [("ready", None)]
+    (scatter,) = fake.calls_to(PUT_RANGES)
+    _, buffers, lengths, offsets = scatter.args
+    assert lengths == [[4, 8, 4, 4]] and offsets == [[0, 4, 12, 16]]
+    assert buffers[0][:3] == [region.address + 4, region.address + 8, region.address + 16]
+    assert fake.pool.objects[key("A")] == b"0123456789abcdef----"
+
+    region.write(b"-" * 3 * SLOT)
+    assert summary(driver.poll(driver.get([row]))) == [("ready", None)]
+    (get,) = fake.calls_to(GET)
+    assert get.args[2] == [[4, 8, 4, 4]]
+    assert region.read() == b"----0123456789abcdef----"
 
 
 def wait_until_draining(driver: MooncakeDriver) -> None:
@@ -603,10 +658,12 @@ def test_backend_round_trip_over_the_fake_store() -> None:
     writer = Endpoint(MooncakeDriver(FakeMooncakeStore(pool)), ["A", "B"])
     reader = Endpoint(MooncakeDriver(FakeMooncakeStore(pool)), ["A", "B", "C", "D"], fill=0x2D)
     assert isinstance(writer.backend, Backend)
-    assert writer.backend.capabilities == Capabilities(fetch=True, publish=True, cancel=True)
+    assert writer.backend.capabilities == Capabilities(
+        fetch=True, publish=True, cancel=True, slot_rows=True
+    )
     writer.write("A", b"aaaaaaaa")
     writer.write("B", b"bbbbbbbb")
-    pool.objects[store_key("D")] = b"short"
+    pool.objects[store_key("D")] = b"too long!"
 
     published = writer.backend.publish(writer.view("A", "B"), None)
     assert isinstance(published, Attempt)
@@ -626,7 +683,7 @@ def test_backend_round_trip_over_the_fake_store() -> None:
     wrong = reader.backend.fetch(reader.view("D"), None)
     outcome = reader.wait_outcome(wrong)
     assert outcome.delivered_masks[0].tolist() == [False]
-    assert "object is 5 bytes, expected 8" in outcome.fault
+    assert f"{GET}: INVALID_PARAMS(-600)" in outcome.fault  # refused before any transfer
     reader.wait_quiesced(wrong)
     assert reader.region.buffer.canaries_intact()
     writer.close()

@@ -8,7 +8,8 @@ the other process's segment and every transfer goes through the transfer engine;
 ``TRTLLM_MOONCAKE_REAL=1``, on a host with ``mooncake_master`` and ``mooncake.store``. The
 transport is ``TRTLLM_MOONCAKE_PROTOCOL`` (default rdma) over ``TRTLLM_MOONCAKE_DEVICES`` (default:
 the host's fastest active InfiniBand devices). The shared ``driver_conformance`` checks run here
-too, each over a fresh client and under a key prefix of its own.
+too, each over a fresh client and under a key prefix of its own, with a driver that registers
+device memory: over RDMA, rows of several spans move into and out of GPU memory in place.
 """
 
 from __future__ import annotations
@@ -22,14 +23,21 @@ import threading
 
 import numpy as np
 import pytest
+import torch
 from cpu_fixtures import WAIT_S, Endpoint, masks
 from fake_mooncake import GetsOfKeyWait
 
 from tensorrt_llm._torch.disaggregation.base.backend import Outcome
+from tensorrt_llm._torch.disaggregation.base.memory import MemoryKind
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import MooncakeConfig, open_sdk
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import SLOT as CHECK_SLOT
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import DriverConformance
+from tensorrt_llm._torch.disaggregation.testing.host_memory import CANARY, GUARD, HostBuffer
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.gpudirect import (
+    allocation_range,
+    select_registration_path,
+)
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("TRTLLM_MOONCAKE_REAL") != "1",
@@ -51,6 +59,8 @@ def _require_mooncake() -> None:
         found = False
     if not found:
         pytest.skip("mooncake.store does not import")
+    # Before the process's first client, which fixes how every client registers device memory.
+    select_registration_path(PROTOCOL, registers_device_memory=True)
 
 
 def _running_pool(run_dir: str, segment_size: int) -> tuple[contextlib.ExitStack, str]:
@@ -161,31 +171,61 @@ def test_real_store_full_is_declined(tmp_path, request) -> None:
         clients.close()  # while the master still answers
 
 
-def test_real_get_lands_a_shorter_object_and_refuses_a_longer_one(clients, request) -> None:
-    # batch_get_into reads an object shorter than the buffer into the buffer's head and answers
-    # its size; it refuses a longer one before any transfer (INVALID_PARAMS).
+# The reader's backend keeps polling the get whose access is unproven, as it would in production.
+@pytest.mark.threadleak(enabled=False)
+def test_real_get_refuses_an_object_of_another_size_before_moving_a_byte(clients, request) -> None:
+    # batch_get_into_multi_buffers refuses an object longer than its buffers (INVALID_PARAMS),
+    # and its transfer submission one shorter (TRANSFER_FAIL, which proves no access end).
     short, long = f"{request.node.name}-short", f"{request.node.name}-long"
     half = clients.endpoint([short], slot_bytes=SLOT_BYTES // 2)
     double = clients.endpoint([long], slot_bytes=2 * SLOT_BYTES)
-    head = random_rows(half, seed=9)[short]
+    random_rows(half, seed=9)
     random_rows(double, seed=10)
     assert masks(finish(half, half.backend.publish, short)) == [[True]]
     assert masks(finish(double, double.backend.publish, long)) == [[True]]
     reader = clients.endpoint([short, long], fill=0x2D, rows_per_batch=1)
-    outcome = finish(reader, reader.backend.fetch, short)  # access ends: finish waits for it
-    assert masks(outcome) == [[False]]
-    assert f"object is {SLOT_BYTES // 2} bytes, expected {SLOT_BYTES}" in outcome.fault
-    assert reader.read(short) == head + b"-" * (SLOT_BYTES // 2)
     outcome = finish(reader, reader.backend.fetch, long)
     assert masks(outcome) == [[False]] and "INVALID_PARAMS(-600)" in outcome.fault
     assert reader.read(long) == b"-" * SLOT_BYTES
-    for each in (half, double, reader):
+    attempt = reader.backend.fetch(reader.view(short), None)
+    outcome = reader.wait_outcome(attempt)
+    assert masks(outcome) == [[False]] and "TRANSFER_FAIL(-800)" in outcome.fault
+    assert reader.read(short) == b"-" * SLOT_BYTES
+    assert not attempt.quiesced() and reader.driver.inner.stats()["ops_unprovable"] == 1
+    for each in (half, double):
         each.close()
+
+
+class DeviceBuffer:
+    """GPU memory with canaries on both sides: a ``Memory`` for the checks' device rows."""
+
+    def __init__(self, nbytes: int, fill: int) -> None:
+        canary = torch.frombuffer(bytearray(CANARY), dtype=torch.uint8)
+        self._tensor = torch.full((nbytes + 2 * GUARD,), fill, dtype=torch.uint8, device="cuda")
+        self._tensor[:GUARD] = canary
+        self._tensor[-GUARD:] = canary
+        torch.cuda.synchronize()  # written before the NIC touches it
+        self.address = self._tensor.data_ptr() + GUARD
+        self.nbytes = nbytes
+
+    def read(self, offset: int = 0, nbytes: int | None = None) -> bytes:
+        nbytes = self.nbytes - offset if nbytes is None else nbytes
+        return self._tensor[GUARD + offset : GUARD + offset + nbytes].cpu().numpy().tobytes()
+
+    def write(self, data: bytes, offset: int = 0) -> None:
+        part = torch.frombuffer(bytearray(data), dtype=torch.uint8)
+        self._tensor[GUARD + offset : GUARD + offset + len(data)] = part.cuda()
+        torch.cuda.synchronize()
+
+    def canaries_intact(self) -> bool:
+        whole = self._tensor.cpu().numpy().tobytes()
+        return whole[:GUARD] == CANARY and whole[-GUARD:] == CANARY
 
 
 class TestRealMooncakeConformance(DriverConformance):
     """The shared driver checks over the real pool, one fresh client per check, with the scenarios
-    a real master can stage: a key another client is writing, and a get held inside the SDK."""
+    a real master can stage: a key another client is writing, and a get held inside the SDK. The
+    driver registers device memory, and the checks' device rows lie in GPU memory."""
 
     timeout = 30.0
 
@@ -194,7 +234,14 @@ class TestRealMooncakeConformance(DriverConformance):
         self.master = pool
 
     def make_driver(self) -> MooncakeDriver:
-        return MooncakeDriver(open_sdk(client_config(self.master)))
+        return MooncakeDriver(
+            open_sdk(client_config(self.master)), allocation_range=allocation_range
+        )
+
+    def allocate(self, nbytes: int, fill: int, memory_kind: MemoryKind):
+        if memory_kind is MemoryKind.DEVICE:
+            return DeviceBuffer(nbytes, fill), None
+        return HostBuffer(nbytes, fill), None
 
     def make_held_key(self):
         key = f"held{secrets.token_hex(4)}/v1/H"  # the pool outlives each check
@@ -212,7 +259,12 @@ class TestRealMooncakeConformance(DriverConformance):
     def make_blocked_get(self):
         key = f"blocked{secrets.token_hex(4)}/v1/S"
         sdk = GetsOfKeyWait(open_sdk(client_config(self.master)), key)
-        return MooncakeDriver(sdk), key, sdk.entered, sdk.release.set
+        return (
+            MooncakeDriver(sdk, allocation_range=allocation_range),
+            key,
+            sdk.entered,
+            sdk.release.set,
+        )
 
 
 def test_real_four_workers_round_trip_2000_rows_without_crossed_bytes(clients, request) -> None:

@@ -145,7 +145,8 @@ class CpuRegion:
 
 
 class Rows(_Sealable):
-    """One group of a view: a ``LayerGroupRows``. ``rows`` overrides ``len`` for malformed views."""
+    """One group of a view: a ``LayerGroupRows``, placed by address or, with ``slots`` and
+    ``region_indices``, by slot. ``rows`` overrides ``len`` for malformed views."""
 
     def __init__(
         self,
@@ -154,17 +155,23 @@ class Rows(_Sealable):
         addresses: np.ndarray | None,
         region_index: int | None,
         rows: int | None = None,
+        *,
+        slots: np.ndarray | None = None,
+        region_indices: tuple[int, ...] | None = None,
     ) -> None:
         self.layer_group_index = layer_group_index
         self.object_keys = object_keys
         self.addresses = addresses
         self.region_index = region_index
         self.rows = rows
+        self.slots = slots
+        self.region_indices = region_indices
 
     def __len__(self) -> int:
         if self.rows is not None:
             return self.rows
-        return 0 if self.addresses is None else len(self.addresses)
+        placed = self.addresses if self.addresses is not None else self.slots
+        return 0 if placed is None else len(placed)
 
 
 class CpuView(_Sealable):

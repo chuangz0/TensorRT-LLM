@@ -153,7 +153,9 @@ def test_batches_respect_rows_bytes_and_driver_limits(store: MemoryStore, limit:
 def test_capabilities_are_the_driver_directions(store: MemoryStore) -> None:
     driver = MemoryDriver(store, capabilities=replace(DEFAULT_CAPABILITIES, get=False))
     writer = Endpoint(driver, ["A"])
-    assert writer.backend.capabilities == Capabilities(fetch=False, publish=True, cancel=True)
+    assert writer.backend.capabilities == Capabilities(
+        fetch=False, publish=True, cancel=True, slot_rows=True
+    )
     with pytest.raises(InvalidSubmission, match="cannot get"):
         writer.backend.fetch(writer.view("A"), None)
     assert store_calls(writer) == []
@@ -595,6 +597,47 @@ def test_invalid_submissions_are_rejected_before_the_driver(store: MemoryStore, 
     assert store_calls(reader) == []
     assert reader.backend.stats()["attempts_active"] == 0
     reader.close()
+
+
+def test_rows_placed_by_slot_store_the_bytes_a_staging_slot_holds(store: MemoryStore) -> None:
+    """A row placed by slot is that slot of each listed region, back to back: the bytes a staging
+    slot of the pool group holds. A block published in place reads back staged, and the reverse."""
+    names = ["A", "B", "C"]
+    # Two pools of different widths stand in for a pool group's device pools.
+    pools = [
+        CpuRegion(SLOT_BYTES, 3, memory_kind=MemoryKind.DEVICE),
+        CpuRegion(SLOT_BYTES // 2, 3, memory_kind=MemoryKind.DEVICE),
+    ]
+    for slot in range(3):
+        pools[0].write(slot, bytes([0x41 + slot]) * SLOT_BYTES)
+        pools[1].write(slot, bytes([0x61 + slot]) * (SLOT_BYTES // 2))
+    in_place = Endpoint(MemoryDriver(store), ["unused"], others=pools)
+    keys = np.stack([object_key(name) for name in names])
+
+    def by_slot(*slots: int) -> CpuView:
+        return CpuView([Rows(0, keys, None, None, slots=np.array(slots), region_indices=(1, 2))])
+
+    attempt = in_place.backend.publish(by_slot(2, 0, 1), None)
+    assert masks(in_place.wait_outcome(attempt)) == [[True] * 3]
+    in_place.wait_quiesced(attempt)
+
+    staged = Endpoint(MemoryDriver(store), names, slot_bytes=SLOT_BYTES * 3 // 2, fill=0x2D)
+    attempt = staged.backend.fetch(staged.view(*names), None)
+    assert masks(staged.wait_outcome(attempt)) == [[True] * 3]
+    staged.wait_quiesced(attempt)
+    for name, slot in zip(names, (2, 0, 1)):
+        assert staged.read(name) == pools[0].read(slot) + pools[1].read(slot)
+
+    # Back in place, each span lands in its own pool.
+    published = [pool.buffer.read() for pool in pools]
+    for pool in pools:
+        pool.buffer.write(b"-" * pool.nbytes)
+    attempt = in_place.backend.fetch(by_slot(2, 0, 1), None)
+    assert masks(in_place.wait_outcome(attempt)) == [[True] * 3]
+    in_place.wait_quiesced(attempt)
+    assert [pool.buffer.read() for pool in pools] == published
+    in_place.close()
+    staged.close()
 
 
 def test_a_publish_may_read_one_slot_twice(store: MemoryStore) -> None:
