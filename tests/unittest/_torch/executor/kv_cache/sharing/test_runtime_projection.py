@@ -130,6 +130,30 @@ def test_real_lender_projection_partial_delivery(
         manager.free_resources(request)
 
 
+def test_a_device_domain_takes_rows_lent_in_place_and_refuses_staged_rows(
+    real_manager: Callable[..., AbstractContextManager[KVCacheManagerV2]], kit: SimpleNamespace
+) -> None:
+    """GPU Direct operations take the device pools' rows placed by slot, never staged rows."""
+    with real_manager(dtype=DataType.BF16) as manager:
+        domain = attach_domain(manager, _profile(), memory_kind=MemoryKind.DEVICE)
+        assert domain.namespace.memory_kind is MemoryKind.DEVICE
+        fetched = kit.admitted(manager, 1, list(range(1000, 1097)))
+        lease = domain.lender.lend_write(
+            fetched, 0, 96, memory_kind=MemoryKind.DEVICE, rows=RowSelection.NAMED, ready_event=None
+        )
+        check_view_compatibility(kit.ready_view(lease, manager), domain.namespace)
+        lease.release()
+        computed = kit.published(manager, 2, list(range(2000, 2097)))
+        staged = domain.lender.lend_read(
+            computed, 0, 96, memory_kind=MemoryKind.HOST, rows=RowSelection.NAMED, ready_event=None
+        )
+        with pytest.raises(ValueError, match="rows placed in DEVICE memory"):
+            check_view_compatibility(kit.ready_view(staged, manager), domain.namespace)
+        staged.release()
+        for request in (fetched, computed):
+            manager.free_resources(request)
+
+
 def test_real_lender_attachment_is_unique_and_scope_fixed(
     real_manager: Callable[..., AbstractContextManager[KVCacheManagerV2]],
 ) -> None:

@@ -14,10 +14,11 @@
 # limitations under the License.
 """Private runtime assembly shared by transfer and Store integrations.
 
-The initial profile consumes HOST/NAMED leases from the lender's complete mixed
-memory namespace. Model provenance and writer facts derive its canonical scope;
-public layout and region facts validate the serving profile. Neither
-a provider name nor a caller-supplied hint establishes compatibility or isolation.
+The initial profile consumes NAMED leases of one memory kind, HOST (staged) or
+DEVICE (in place), from the lender's complete mixed memory namespace. Model
+provenance and writer facts derive its canonical scope; public layout and region
+facts validate the serving profile. Neither a provider name nor a caller-supplied
+hint establishes compatibility or isolation.
 """
 
 from __future__ import annotations
@@ -313,8 +314,7 @@ class RegionNamespace:
 
     Preserve every HOST and DEVICE region and its original lender index. Factories
     register only supported regions; an operation may reference only its selected
-    kind. This profile supports HOST/NAMED operations, not DEVICE activation.
-    A provider owns any registration hold, not this immutable descriptor.
+    kind. A provider owns any registration hold, not this immutable descriptor.
 
     Attributes:
         regions: Complete namespace in the lender's original index order.
@@ -334,8 +334,6 @@ class RegionNamespace:
         """Check namespace overlap and selection; canonical regions validate their own geometry."""
         if not isinstance(self.memory_kind, MemoryKind):
             raise TypeError("selected memory kind must be MemoryKind")
-        if self.memory_kind is not MemoryKind.HOST:
-            raise ValueError("initial profile supports HOST operations only")
         regions = tuple(self.regions)
         intervals: dict[MemoryKind, list[tuple[int, int]]] = {}
         for region in regions:
@@ -386,7 +384,7 @@ class DomainBinding:
 
 
 def _validate_layout(profile: ProfileSpec, layout: PageLayout, namespace: RegionNamespace) -> None:
-    """Check the selected profile against public manager layout and HOST capability."""
+    """Check the selected profile against public manager layout and the selected kind's regions."""
     if not isinstance(layout, PageLayout):
         raise TypeError("lender page_layout must be PageLayout")
     topology = layout.topology
@@ -406,6 +404,18 @@ def _validate_layout(profile: ProfileSpec, layout: PageLayout, namespace: Region
         raise ValueError("initial profile excludes attention sinks")
     if len(layout.pool_slot_bytes) != profile.pool_count:
         raise ValueError("lender pool groups do not match the selected profile")
+    if namespace.memory_kind is MemoryKind.HOST:
+        _validate_staging_regions(layout, namespace)
+    else:
+        _validate_device_regions(layout, namespace)
+
+
+def _layer_groups_of(layout: PageLayout, pool_group: int) -> tuple[int, ...]:
+    return tuple(i for i, group in enumerate(layout.layer_groups) if group.pool_group == pool_group)
+
+
+def _validate_staging_regions(layout: PageLayout, namespace: RegionNamespace) -> None:
+    """A staging region per pool group, holding the pool group's slots back to back."""
     if not layout.staging_region_index or set(layout.staging_region_index) != set(
         layout.pool_slot_bytes
     ):
@@ -414,24 +424,41 @@ def _validate_layout(profile: ProfileSpec, layout: PageLayout, namespace: Region
         if not 0 <= index < len(namespace.regions):
             raise ValueError("staging region is outside the lender namespace")
         region = namespace.regions[index]
-        groups = tuple(
-            i for i, group in enumerate(layout.layer_groups) if group.pool_group == pool_group
-        )
         if (
-            region.memory_kind is not namespace.memory_kind
-            or region.layer_group_indices != groups
+            region.memory_kind is not MemoryKind.HOST
+            or region.layer_group_indices != _layer_groups_of(layout, pool_group)
             or region.slot_bytes != sum(layout.pool_slot_bytes[pool_group])
         ):
             raise ValueError("staging region does not match the public HOST layout")
 
 
-def attach_domain(manager: KVCacheManagerV2, profile: ProfileSpec) -> DomainBinding:
+def _validate_device_regions(layout: PageLayout, namespace: RegionNamespace) -> None:
+    """A device region per pool of every pool group, slots of the pool's width."""
+    for pool_group, widths in layout.pool_slot_bytes.items():
+        for pool, width in enumerate(widths):
+            index = layout.device_region_index.get((pool_group, pool))
+            if index is None or not 0 <= index < len(namespace.regions):
+                raise ValueError("lender has no complete DEVICE/NAMED capability for this profile")
+            region = namespace.regions[index]
+            if (
+                region.memory_kind is not MemoryKind.DEVICE
+                or region.layer_group_indices != _layer_groups_of(layout, pool_group)
+                or region.slot_bytes != width
+            ):
+                raise ValueError("device region does not match the public DEVICE layout")
+
+
+def attach_domain(
+    manager: KVCacheManagerV2, profile: ProfileSpec, *, memory_kind: MemoryKind = MemoryKind.HOST
+) -> DomainBinding:
     """Attach the canonical lender without duplicating manager policy checks.
 
     The caller supplies facts derived from its actual writer/serving-manager
     assembly. The lender validates attachment and exposes available memory kinds;
-    this helper checks its public layout and HOST/NAMED capability. Backend-specific
-    pinning requirements belong to its factory.
+    this helper checks its public layout and the NAMED capability of ``memory_kind``:
+    staging regions for HOST, a region per device pool for DEVICE. The scope does
+    not depend on the kind. Backend-specific pinning requirements belong to its
+    factory.
     This helper neither activates a backend nor certifies provider qualification.
     Unexpected attach failures retain the canonical lender's safety meaning.
     The caller retains the manager through cleanup and shuts it down last.
@@ -441,9 +468,11 @@ def attach_domain(manager: KVCacheManagerV2, profile: ProfileSpec) -> DomainBind
     Args:
         manager: Serving manager, never a sizing probe.
         profile: Trusted compatibility facts and canonical byte scope.
+        memory_kind: The kind every operation of the domain lends.
 
     Returns:
-        An orchestration-owned association and full namespace for HOST operations.
+        An orchestration-owned association and full namespace for ``memory_kind``
+        operations.
 
     Raises:
         TypeError: Profile is not ProfileSpec.
@@ -453,7 +482,7 @@ def attach_domain(manager: KVCacheManagerV2, profile: ProfileSpec) -> DomainBind
     if not isinstance(profile, ProfileSpec):
         raise TypeError("profile must be ProfileSpec")
     lender = attach_lender(manager, scope=profile.scope, staging=profile.staging)
-    namespace = RegionNamespace(lender.regions, memory_kind=MemoryKind.HOST)
+    namespace = RegionNamespace(lender.regions, memory_kind=memory_kind)
     _validate_layout(profile, lender.page_layout, namespace)
     return DomainBinding(lender, profile, namespace)
 
@@ -462,8 +491,9 @@ def check_view_compatibility(lease_view: LeaseView, namespace: RegionNamespace) 
     """Check operation placement against the profile's permitted regions.
 
     Canonical LeaseView already implements View. The lender guarantees array
-    shape, immutability, group mapping and valid addresses. Check only placement
-    selection per group; do not inspect rows or create a replacement View.
+    shape, immutability, group mapping and valid placement. Check only placement
+    selection per group, addresses for HOST and slots for DEVICE; do not inspect
+    rows or create a replacement View.
     Orchestration must pair the lease with its lender's binding. Region indices
     alone do not prove lease origin, and this check grants no memory access.
 
@@ -474,8 +504,13 @@ def check_view_compatibility(lease_view: LeaseView, namespace: RegionNamespace) 
     Raises:
         ValueError: The view uses unsupported memory or row placement.
     """
+    kind = namespace.memory_kind
     for blocks in lease_view.groups:
-        if blocks.object_keys is None or blocks.addresses is None or blocks.region_index is None:
-            raise ValueError("initial profile requires keys, addresses and a region")
-        if blocks.region_index not in namespace.allowed_region_indices:
-            raise ValueError("row region is not permitted by the selected HOST profile")
+        if kind is MemoryKind.HOST:
+            regions = None if blocks.addresses is None else (blocks.region_index,)
+        else:
+            regions = None if blocks.slots is None else blocks.region_indices
+        if blocks.object_keys is None or regions is None:
+            raise ValueError(f"initial profile requires keys and rows placed in {kind.name} memory")
+        if not namespace.allowed_region_indices.issuperset(regions):
+            raise ValueError(f"row region is not permitted by the selected {kind.name} profile")

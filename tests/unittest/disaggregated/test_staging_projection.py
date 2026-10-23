@@ -551,11 +551,14 @@ def test_profile_does_not_infer_containment_from_host_memory(profile_id: str) ->
 
 
 def test_namespace_requires_explicit_known_memory_kind() -> None:
-    """Operation selection uses the canonical enum and does not enable DEVICE access."""
+    """Operation selection uses the canonical enum: a DEVICE namespace allows its DEVICE regions."""
     with pytest.raises(TypeError, match="MemoryKind"):
         RegionNamespace((), "HOST")
-    with pytest.raises(ValueError, match="HOST operations"):
-        RegionNamespace((), MemoryKind.DEVICE)
+    regions = (
+        MemoryRegion("host", 0x1000, 128, 64, 2, (3,), MemoryKind.HOST),
+        MemoryRegion("device", 0x1000, 128, 64, 2, (3,), MemoryKind.DEVICE),
+    )
+    assert RegionNamespace(regions, MemoryKind.DEVICE).allowed_region_indices == frozenset({1})
 
 
 @pytest.mark.parametrize("reusable", [False, True])
