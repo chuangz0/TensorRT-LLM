@@ -49,8 +49,10 @@ def test_minimal_kv_sharing_config_is_accepted(store_config: str) -> None:
         {"data_path": "gpu_direct"},
         cache_transceiver_config={"backend": "NIXL"},
     )
-    # Tensor parallelism shares through the store.
+    # Tensor parallelism, attention DP and an FP8 KV cache share through the store.
     assert llm_args(store_config, tensor_parallel_size=2).kv_sharing is not None
+    llm_args(store_config, tensor_parallel_size=2, enable_attention_dp=True)
+    llm_args(store_config, kv_cache_config={"dtype": "fp8"})
 
 
 UNSUPPORTED = {
@@ -66,15 +68,11 @@ UNSUPPORTED = {
     ),
     "block reuse off": ({"kv_cache_config": {"enable_block_reuse": False}}, "block reuse off"),
     "PP2": ({"pipeline_parallel_size": 2}, "pipeline or context parallelism"),
-    "attention DP": (
-        {"tensor_parallel_size": 2, "enable_attention_dp": True},
-        "attention DP, for now (it comes later)",
-    ),
     "TP2 with a cache transceiver": (
         {"tensor_parallel_size": 2, "cache_transceiver_config": {"backend": "NIXL"}},
         "disaggregated serving with more than one GPU per server",
     ),
-    "an FP8 KV cache": ({"kv_cache_config": {"dtype": "fp8"}}, "BF16 KV caches only for now (FP8"),
+    "an NVFP4 KV cache": ({"kv_cache_config": {"dtype": "nvfp4"}}, "BF16 or FP8 KV caches only"),
     "speculative decoding": (
         {"speculative_config": {"decoding_type": "NGram", "max_draft_len": 1}},
         "speculative decoding",

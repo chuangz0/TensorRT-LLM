@@ -26,6 +26,7 @@ from tensorrt_llm.math_utils import ceil_div
 from ...disaggregation.transfer_manager import Accepted, Direction, TransferIntent, TransferManager
 from ..kv_cache.sharing import Lender, MemoryKind, RowSelection
 from ..llm_request import LlmRequestState, rewind_context_after_cache_drop
+from .replicas import ReplicaSet
 from .store_ops import Action, Decision, OpKind, OpState, StoreOp, decide, report, table_hash
 
 if TYPE_CHECKING:
@@ -106,6 +107,9 @@ class SharingPolicy:
             hold, whole blocks: staging less one fetch, so publications never keep a fetch
             waiting for staging. Unused under GPU Direct (None).
         max_util_for_resume: The KV cache manager's own page budget for resumes.
+        max_parked_fetches: Under attention DP, the most requests parked for a fetch at once:
+            ``max_num_active_requests - 1``, so a rank whose requests all wait for the store
+            keeps a seat for the padding request its peers' forwards need. None elsewhere.
     """
 
     memory_kind: MemoryKind
@@ -116,6 +120,7 @@ class SharingPolicy:
     fetch_timeout_s: float
     publication_tokens: Optional[int]
     max_util_for_resume: float
+    max_parked_fetches: Optional[int] = None
 
 
 class SharedKvOrchestrator:
@@ -128,7 +133,8 @@ class SharedKvOrchestrator:
     ``resolve_store_operations``, at the start of each scheduling pass, closes them: there every
     lease goes back and every parked request resumes or computes its prompt, by ``decide``. Under
     tensor parallelism the round covers the entries rank 0 announced with the request count, and
-    every rank enters its one collective exactly when that count is not zero.
+    every rank enters its one collective exactly when that count is not zero. Under attention DP
+    each rank's table holds its own requests' operations, and it closes them alone.
 
     Args:
         policy: What the server does with the store.
@@ -140,7 +146,10 @@ class SharedKvOrchestrator:
         watchdog: The watchdog of the transfer manager's store accesses, stopped at shutdown.
         probe: Rank 0's probe service, or None where this server does not fetch.
         min_over_ranks: The elementwise minimum of a report over the tensor-parallel ranks, a
-            collective every rank enters; None where this rank decides alone (one rank).
+            collective every rank enters; None where this rank decides alone (one rank, or
+            attention DP, where each rank serves requests of its own).
+        replicas: The ranks holding this rank's KV cache bytes, which share its publications'
+            puts.
         trace: Where each round and the exit are written, one line each, for tests to compare
             across ranks; None writes nothing.
     """
@@ -157,6 +166,7 @@ class SharedKvOrchestrator:
         watchdog: RetirementWatchdog,
         probe: Optional[ProbeService],
         min_over_ranks: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        replicas: ReplicaSet = ReplicaSet(),
         trace: Optional[TextIO] = None,
     ) -> None:
         self.counters: collections.Counter[str] = collections.Counter()
@@ -170,6 +180,7 @@ class SharedKvOrchestrator:
         self._watchdog = watchdog
         self._probe = probe
         self._min_over_ranks = min_over_ranks
+        self._replicas = replicas
         self._trace = trace
         # The entries the next round covers, as rank 0 announced them; read once.
         self._announced = 0
@@ -212,7 +223,7 @@ class SharedKvOrchestrator:
         """How long rank 0 may wait on an empty request queue: not at all while store operations
         are open, since scheduling passes close them; 1 ms while requests wait for their probe;
         otherwise ``timeout`` (None waits for the next request)."""
-        if self._ops or self._transfers.pending():
+        if self.open_operations():
             return NO_WAIT
         if self._probe is not None and self._probe.holds_requests():
             return HELD_REQUEST_POLL if timeout is None else min(timeout, HELD_REQUEST_POLL)
@@ -232,6 +243,12 @@ class SharedKvOrchestrator:
         """Rank 0, before the request broadcast: how many open entries the next round covers.
         Every one with peers; alone, 0, as a rank's own rounds need no announcement."""
         return len(self._ops) if self._with_peers else 0
+
+    def open_operations(self) -> int:
+        """Nonzero while this rank has store work that needs executor passes: open entries, or
+        transfer manager work left after their decisions (counted as one). Under attention DP it
+        keeps rank 0 from sleeping on an empty request queue while another rank has some."""
+        return len(self._ops) + int(self._transfers.pending())
 
     # Every rank, around the request broadcast.
 
@@ -467,17 +484,32 @@ class SharedKvOrchestrator:
 
     def _return_none(self, op: StoreOp) -> None:
         """The lease goes back with nothing delivered; the entry closes."""
-        if op.kind is OpKind.PUBLISH:
-            delivered = op.operation_id is not None and self._transfers.ready(op.operation_id)
-            if delivered:
-                self.counters["published_blocks"] += (op.end - op.start) // self._tokens_per_block
-            else:
-                self.counters["publications_failed"] += 1
+        if op.kind is OpKind.PUBLISH and op.blocks_put:
+            self._count_puts(op)
         if op.operation_id is not None:
             self._transfers.return_now(op.operation_id, deliver=False)
         elif op.lease is not None:
             op.lease.release()  # a lease the transfer manager did not take is still ours
         op.closed = True
+
+    def _count_puts(self, op: StoreOp) -> None:
+        """Counts this rank's puts of a publication whose access ended: the blocks the store took,
+        and a failure where the store or the transfer failed. A block the store left alone without
+        a fault is skipped, not failed: another server was still putting the same object (it
+        normally completes it; two servers computing one prefix at once is normal traffic), the
+        store was full, or this client's own put session of the key was open or the master refused
+        the object's size. The outcome does not say which; the store driver's warning and stats
+        do (all but the first are warned)."""
+        masks = None
+        if op.operation_id is not None:
+            masks = self._transfers.delivered_masks(op.operation_id)
+        if masks is None:
+            self.counters["publications_failed"] += 1
+            return
+        stored = int(np.logical_and.reduce(masks).sum())  # every layer group's row of the block
+        self.counters["published_blocks"] += stored
+        if stored < op.blocks_put:
+            self.counters["publication_blocks_skipped"] += op.blocks_put - stored
 
     def _resume(self, op: StoreOp) -> None:
         """The request computes on from the fetch's end, which every rank holds; the entry
@@ -542,6 +574,8 @@ class SharedKvOrchestrator:
         request and appends a parked fetch, whatever the lend or submit did on this rank."""
         if request.state != LlmRequestState.CONTEXT_INIT or not request.is_first_context_chunk:
             return False
+        if self._parked_fetches_at_cap():
+            return False
         matched = self._kv_cache_manager.probe_context_reuse(request)
         if matched is None:  # it holds a cache already
             return False
@@ -580,6 +614,15 @@ class SharedKvOrchestrator:
         self._ops.append(op)
         self.counters["fetches_started"] += 1
         return True
+
+    def _parked_fetches_at_cap(self) -> bool:
+        """Under attention DP, whether parked fetches take every seat the padding request does
+        not need."""
+        cap = self._policy.max_parked_fetches
+        if cap is None:
+            return False
+        parked = sum(op.kind is OpKind.FETCH and op.state is not OpState.OPEN for op in self._ops)
+        return parked >= cap
 
     def _pages_allow_fetch(self, request: LlmRequest) -> bool:
         """Whether the request's whole prompt plus one step fits in free pages, and the pages
@@ -661,6 +704,8 @@ class SharedKvOrchestrator:
 
     def _staging_fits(self, tokens: int) -> bool:
         """Host staging: whether the range fits in what open publications leave of the budget."""
+        # Every open publication counts, also a replica's that lent nothing here: all ranks gate
+        # alike, so their tables stay equal.
         open_tokens = sum(op.end - op.start for op in self._ops if op.kind is OpKind.PUBLISH)
         return tokens <= self._policy.publication_tokens - open_tokens
 
@@ -697,18 +742,23 @@ class SharedKvOrchestrator:
         return start, committed_end, committed_end
 
     def _publish(self, request: LlmRequest, start: int, end: int, ready: torch.cuda.Event) -> None:
+        tpb, memory_kind = self._tokens_per_block, self._policy.memory_kind
         op = StoreOp(
             seq=next(self._seq),
             kind=OpKind.PUBLISH,
             request=request,
-            memory_kind=self._policy.memory_kind,
+            memory_kind=memory_kind,
             state=OpState.OPEN,
             start=start,
             end=end,
+            blocks_put=self._replicas.blocks_put(start // tpb, end // tpb, memory_kind),
         )
         request.py_published_end = end
+        # Under GPU Direct every replica lends the range, so its pages lock alike on every rank;
+        # under host staging a replica that puts nothing lends nothing (a host lease locks no page).
+        lends = op.blocks_put > 0 or memory_kind is MemoryKind.DEVICE
         # A range that does not start (a lend refused) closes like one that put nothing.
-        if not self._start(op, ready):
+        if lends and not self._start(op, ready):
             self.counters["publications_not_started"] += 1
         self._ops.append(op)
         self.counters["publications_started"] += 1
@@ -717,8 +767,9 @@ class SharedKvOrchestrator:
 
     def _start(self, op: StoreOp, ready: torch.cuda.Event) -> bool:
         """Lends the operation's rows by name, in place or in host staging, and hands the lease
-        to the transfer manager. Returns whether the store access started; where it did not, the
-        entry reports nothing delivered and a decision returns any lease it holds."""
+        to the transfer manager, which puts this rank's stripe of a publication's rows. Returns
+        False where the lend or the submit was refused: the entry reports nothing delivered and a
+        decision returns any lease it holds."""
         if self._stopped is not None:
             return False
         fetch = op.kind is OpKind.FETCH
@@ -743,8 +794,17 @@ class SharedKvOrchestrator:
                 key=re.sub(r"\d+", "#", lease.failure),
             )
             return False
+        if not fetch and op.blocks_put == 0:
+            # Other replicas put these blocks; this rank holds its pages' lock like theirs until
+            # a round returns the lease, after every rank's access ended.
+            op.lease = lease
+            return True
         intent = TransferIntent(
-            BINDING_ID, PROFILE_ID, Direction.FETCH if fetch else Direction.PUBLISH, op.memory_kind
+            BINDING_ID,
+            PROFILE_ID,
+            Direction.FETCH if fetch else Direction.PUBLISH,
+            op.memory_kind,
+            put_stripe=None if fetch else self._replicas.put_stripe(op.memory_kind),
         )
         result = self._transfers.submit(lease, intent)
         if not isinstance(result, Accepted):

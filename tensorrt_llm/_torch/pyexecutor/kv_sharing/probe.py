@@ -83,8 +83,8 @@ class ProbeService:
         tokens_per_block: The KV cache's block size.
         min_fetch_tokens: Shorter stored prefixes are not fetched; a prompt must exceed it to be
             probed, as a fetch leaves the last prompt token to compute.
-        shares_per_group: How many shares, one per rank holding its own, each layer group's
-            content is split into.
+        shares_per_group: How many distinct shares each layer group's content is split into
+            (one per tensor-parallel rank with KV heads of its own; 1 for MLA and attention DP).
         hold_s: Longest a request waits for its answer.
         clock: Monotonic seconds.
     """

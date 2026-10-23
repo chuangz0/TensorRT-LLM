@@ -56,6 +56,7 @@ from .orchestrator import (
     SharingPolicy,
 )
 from .probe import ProbeService
+from .replicas import ReplicaSet, replica_set
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -72,15 +73,17 @@ _Shared = TypeVar("_Shared")
 STORE_ACCESS_DEADLINE_S = 120.0
 # Pinned host memory each rank stages fetches and publications through, at most.
 HOST_STAGING_BYTES = 8 << 30
-# The attention writer layout of the TRTLLM backend, which stored blocks carry.
+# The attention writer layouts of the TRTLLM backend, which stored blocks carry.
 MHA_LAYOUT = "mha-trtllm-hnd"
+MLA_LAYOUT = "mla-trtllm-latent"
+# The cache dtypes stored blocks carry, by the KV cache manager's dtype.
+_CACHE_DTYPES = {DataType.BF16: "bfloat16", DataType.FP8: "fp8"}
 # What kv_sharing serves at this milestone, said before the reason a model is refused.
 SUPPORTED_MODELS = (
-    "kv_sharing serves, for now, one GPU or tensor parallelism with a BF16 KV cache (FP8 comes "
-    "later), multi-head attention with full attention in every layer (no sliding window, "
-    "recurrent state or attention sinks; MLA comes later) and KV heads each held by one rank, "
-    "and under host staging one fetch of max(max_fetch_tokens, max_num_tokens) tokens within "
-    f"{HOST_STAGING_BYTES >> 30} GiB"
+    "kv_sharing serves, for now, one GPU, tensor parallelism or attention DP, with multi-head "
+    "attention (BF16 or FP8 KV cache) or MLA (BF16) and full attention in every layer (no sliding "
+    "window, recurrent state or attention sinks), and under host staging one fetch of "
+    f"max(max_fetch_tokens, max_num_tokens) tokens within {HOST_STAGING_BYTES >> 30} GiB"
 )
 # Where each rank writes its round trace (rank<r>.txt), for multi-GPU tests to compare.
 TRACE_DIR_ENV = "TRTLLM_KV_SHARING_TRACE_DIR"
@@ -149,12 +152,19 @@ def start_kv_sharing(
     attached, facts_by_rank = _agree(dist, attach)
     if len({facts.scope for facts in facts_by_rank}) > 1:
         raise ValueError("kv_sharing: the ranks would name blocks differently")
-    _refuse_shares_held_twice([facts.shards for facts in facts_by_rank])
     publication_tokens = None
     if memory_kind is MemoryKind.HOST:  # every rank gates ranges within the smallest budget
         publication_tokens = min(facts.publication_tokens for facts in facts_by_rank)
+    attention_dp = py_executor.enable_attention_dp
+    # Attention DP needs no replica set: each rank serves requests of its own with every KV head,
+    # so two ranks put one block only as two servers can, and the master refuses the later put.
+    replicas = ReplicaSet()
     min_over_ranks = None
-    if dist.tp_size > 1:
+    if dist.tp_size > 1 and not attention_dp:  # tensor parallelism: one table, closed together
+        try:
+            replicas = replica_set([facts.shards for facts in facts_by_rank], dist.rank)
+        except ValueError as error:  # alike on every rank: the shards are gathered
+            raise ValueError(f"{SUPPORTED_MODELS}; this server is refused: {error}") from error
         # Creating the TP communicator is itself a collective (MPI Create_group): do it here,
         # where every rank is, not lazily inside the first round.
         dist.tp_comm  # noqa: B018
@@ -171,7 +181,13 @@ def start_kv_sharing(
         fetch_timeout_s=config.fetch_timeout_s,
         publication_tokens=publication_tokens,
         max_util_for_resume=llm_args.kv_cache_config.max_util_for_resume,
+        max_parked_fetches=py_executor.max_num_active_requests - 1 if attention_dp else None,
     )
+    if policy.fetch and policy.max_parked_fetches == 0 and dist.rank == 0:
+        logger.warning(
+            "kv_sharing: under attention DP with max_num_active_requests 1 no request fetches "
+            "from the store: its one seat stays free for the padding request"
+        )
     probe = None
     if policy.fetch and dist.rank == 0:
         probe = ProbeService(
@@ -194,6 +210,7 @@ def start_kv_sharing(
         watchdog=attached.watchdog,
         probe=probe,
         min_over_ranks=min_over_ranks,
+        replicas=replicas,
         trace=attached.trace,
     )
     py_executor.kv_sharing = orchestrator
@@ -345,21 +362,6 @@ def _attach(
     return attached, _RankFacts(profile.scope, shards, publication_tokens)
 
 
-def _refuse_shares_held_twice(shards_by_rank: list[tuple[tuple[int, int], ...]]) -> None:
-    """Refuses a server where two ranks hold the same share of a layer group (KV heads fewer than
-    the ranks): both would put the same objects.
-
-    Raises:
-        ValueError: Some share is held by more than one rank.
-    """
-    for group, shares in enumerate(zip(*shards_by_rank)):
-        if len(set(shares)) < len(shares):
-            raise ValueError(
-                f"{SUPPORTED_MODELS}; this server is refused: layer group {group} has "
-                f"{shares[0][0]} shares over {len(shares)} ranks, so ranks hold the same KV heads"
-            )
-
-
 def _open_trace(rank: int) -> Optional[TextIO]:
     """This rank's round trace, line-buffered, where TRACE_DIR_ENV names a directory."""
     directory = os.environ.get(TRACE_DIR_ENV)
@@ -401,6 +403,7 @@ def _profile(
     manager = py_executor.kv_cache_manager
     model_config = py_executor.model_engine.model.model_config
     mapping = model_config.mapping
+    dp_size = mapping.tp_size if mapping.enable_attention_dp else 1
     major, minor = torch.cuda.get_device_capability()
     compatibility = (
         f"trtllm-{tensorrt_llm.__version__}/tp{mapping.tp_size}-pp{mapping.pp_size}"
@@ -413,9 +416,10 @@ def _profile(
             model_config, artifact_identity=artifact_identity
         ),
         compatibility_id=compatibility,
-        model_layout="mla" if is_mla(model_config.pretrained_config) else MHA_LAYOUT,
-        dtype="bfloat16" if manager.dtype == DataType.BF16 else str(manager.dtype),
-        topology=(mapping.tp_size, 1, mapping.pp_size, mapping.cp_size),
+        model_layout=MLA_LAYOUT if is_mla(model_config.pretrained_config) else MHA_LAYOUT,
+        dtype=_CACHE_DTYPES.get(manager.dtype, str(manager.dtype)),
+        # Under attention DP each tensor-parallel rank is a data-parallel rank of its own.
+        topology=(mapping.tp_size, dp_size, mapping.pp_size, mapping.cp_size),
         state_kinds=(CacheKind.PAGED,) * manager.num_pools,
         full_attention=True,
         sparse_attention=llm_args.sparse_attention_config is not None,

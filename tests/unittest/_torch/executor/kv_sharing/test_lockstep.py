@@ -18,7 +18,8 @@ the same script of arrivals, cancels, finishes and a shutdown, as the request br
 only their stores differ (when each access ends, and whether it delivers every row) and their
 clocks. The announced round must keep their tables, decisions, locks, pages and request states
 equal in every pass, release no lease before every rank's access ended, and drop a fetch on every
-rank in the first round some rank finds it late."""
+rank in the first round some rank finds it late. Ranks holding the same bytes (MLA) put each
+published block once between them."""
 
 import io
 import math
@@ -54,6 +55,7 @@ from tensorrt_llm._torch.pyexecutor.kv_sharing.orchestrator import (
     SharedKvOrchestrator,
     SharingPolicy,
 )
+from tensorrt_llm._torch.pyexecutor.kv_sharing.replicas import ReplicaSet, replica_set
 from tensorrt_llm._torch.pyexecutor.kv_sharing.store_ops import OpKind, OpState, StoreOp
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 
@@ -106,10 +108,19 @@ class Group:
         return self._exchange(rank, "broadcast", value)[0]
 
 
+def lease_key(view: LeaseView) -> tuple[int, int, int]:
+    """``(request id, kind, start)`` of the lease whose rows ``view`` holds, all or some of them.
+    The transfer manager hands the store a striped copy of a lease's view, so the key rides in
+    the rows' object keys, not in the view's identity."""
+    return tuple(int(v) for v in np.frombuffer(view.groups[0].object_keys[0, :24], np.int64))
+
+
 class Lease:
     def __init__(self, lender: "Lender", request, start: int, end: int, memory_kind, kind) -> None:
-        ordinals = np.arange((end - start) // TPB, dtype=np.int64)
+        ordinals = np.arange(start // TPB, end // TPB, dtype=np.int64)  # page b is block b
+        self.key = (request.py_request_id, kind.value, start)
         keys = np.zeros((len(ordinals), 54), dtype=np.uint8)
+        keys[:, :24] = np.frombuffer(np.array(self.key, dtype=np.int64).tobytes(), np.uint8)
         if memory_kind is MemoryKind.HOST:
             addresses = REGION.address + REGION.slot_bytes * ordinals
             group = LentLayerGroupRows(0, ordinals, keys, addresses, 0)
@@ -117,8 +128,7 @@ class Lease:
             group = LentLayerGroupRows(0, ordinals, keys, slots=ordinals, region_indices=(1,))
         self.view = LeaseView((group,))
         self.failure = None
-        self.key = (request.py_request_id, kind, start)
-        lender.keys[id(self.view)] = self.key
+        lender.lent[self.key] = ordinals.tolist()
         self._lender, self._request_id, self._end = lender, request.py_request_id, end
         self._locks = memory_kind is MemoryKind.DEVICE  # a host lease takes no page lock
         self.released = False
@@ -155,7 +165,7 @@ class Lender:
         self.locks: Counter[int] = Counter()
         self.settling: dict[int, tuple[int, int]] = {}  # request id -> (end, progress calls left)
         self.released: dict[tuple, int] = {}  # lease key -> iteration
-        self.keys: dict[int, tuple] = {}  # id of a lease's view -> the lease's key
+        self.lent: dict[tuple, list[int]] = {}  # lease key -> the blocks it lent
         self.iteration = 0
 
     def lend_write(self, request, start, end, *, memory_kind, rows, ready_event) -> Lease:
@@ -235,20 +245,22 @@ class Store:
 
     capabilities = Capabilities(fetch=True, publish=True, slot_rows=True)
 
-    def __init__(self, rng: random.Random, keys: dict[int, tuple]) -> None:
+    def __init__(self, rng: random.Random) -> None:
         self.rng = rng
-        self.keys = keys
         self.running: list[SimpleNamespace] = []
         self.ended: dict[tuple, int] = {}  # lease key -> iteration
+        self.put: dict[tuple, list[int]] = {}  # lease key -> the blocks a publication put
 
-    def _submit(self, view, hint):
+    def fetch(self, view, hint):
         attempt = SimpleNamespace(view=view, outcome=None, ended=False, left=self.rng.randint(0, 4))
         attempt.poll = lambda: attempt.outcome
         attempt.quiesced = lambda: attempt.ended
         self.running.append(attempt)
         return attempt
 
-    fetch = publish = _submit
+    def publish(self, view, hint):
+        self.put[lease_key(view)] = view.groups[0].page_ordinals.tolist()
+        return self.fetch(view, hint)
 
     def tick(self, iteration: int) -> None:
         for attempt in list(self.running):
@@ -262,7 +274,7 @@ class Store:
             elif draw < 0.3:
                 masks[0][-1] = False
             attempt.outcome, attempt.ended = Outcome.for_view(attempt.view, masks, fault), True
-            self.ended[self.keys[id(attempt.view)]] = iteration
+            self.ended[lease_key(attempt.view)] = iteration
             self.running.remove(attempt)
 
     def shutdown(self, timeout: float) -> frozenset:
@@ -305,6 +317,8 @@ class RankRecord:
     appended: dict[int, int] = field(default_factory=dict)  # fetch seq -> iteration
     released: dict[tuple, int] = field(default_factory=dict)
     ended: dict[tuple, int] = field(default_factory=dict)
+    lent: dict[tuple, list[int]] = field(default_factory=dict)
+    put: dict[tuple, list[int]] = field(default_factory=dict)
     drained: bool = False
 
 
@@ -340,12 +354,13 @@ def run_rank(
     seed: int,
     trace: _Trace,
     diverge_at: Optional[int],
+    replicas: ReplicaSet,
 ) -> RankRecord:
     """One rank's run. With ``diverge_at``, rank 1 adds an entry of its own at the head of its
     table in the first pass from then on that has entries."""
     rng = random.Random(seed * 1000 + rank)  # this rank's store and clock
     lender = Lender(rng)
-    store = Store(rng, lender.keys)
+    store = Store(rng)
     manager = Manager(lender)
     transfers = TransferManager(wake=lambda: None, hold_returns=True)
     transfers.assemble(
@@ -377,6 +392,7 @@ def run_rank(
         watchdog=SimpleNamespace(stop=lambda: None),
         probe=None,
         min_over_ranks=lambda report: group.min(rank, report),
+        replicas=replicas,
         trace=trace,
     )
     requests: dict[int, SimpleNamespace] = {}
@@ -448,6 +464,7 @@ def run_rank(
             )
         )
     record.released, record.ended = dict(lender.released), dict(store.ended)
+    record.lent, record.put = dict(lender.lent), dict(store.put)
     _clock.now = None  # the drain runs on real time
     transfers.begin_shutdown(_real_monotonic() + 5)
     orchestrator.shutdown()
@@ -460,17 +477,22 @@ def run_rank(
 
 
 def run_ranks(
-    memory_kind: MemoryKind, seed: int, diverge_at: Optional[int] = None
+    memory_kind: MemoryKind,
+    seed: int,
+    diverge_at: Optional[int] = None,
+    replicated: bool = False,
 ) -> tuple[list[RankRecord | BaseException], list[_Trace]]:
-    """Every rank's record, or what it raised, and its trace."""
+    """Every rank's record, or what it raised, and its trace. ``replicated``: every rank holds
+    the same bytes, as under MLA."""
     group, script = Group(RANKS), Script.of(seed)
     traces = [_Trace() for _ in range(RANKS)]
     outcomes: list = [None] * RANKS
 
     def worker(rank: int) -> None:
+        replicas = ReplicaSet(rank, RANKS) if replicated else ReplicaSet()
         try:
             outcomes[rank] = run_rank(
-                rank, group, script, memory_kind, seed, traces[rank], diverge_at
+                rank, group, script, memory_kind, seed, traces[rank], diverge_at, replicas
             )
         except BaseException as error:  # handed to the test's thread; peers left waiting
             outcomes[rank] = error  # in a collective break out at the barrier's timeout
@@ -490,15 +512,17 @@ def rank_clocks(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(orchestrator_module, "time", SimpleNamespace(monotonic=rank_clock))
 
 
-@pytest.mark.parametrize("seed", range(10))
-@pytest.mark.parametrize("memory_kind", [MemoryKind.HOST, MemoryKind.DEVICE], ids=["host", "gpu"])
-def test_ranks_whose_stores_differ_agree_in_every_round(memory_kind: MemoryKind, seed: int) -> None:
-    outcomes, _ = run_ranks(memory_kind, seed)
+def records_of(outcomes: list[RankRecord | BaseException]) -> list[RankRecord]:
+    """The ranks' records; raises the first rank's own error (its peers then time out in the
+    collective it left)."""
     errors = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
-    # A rank's own error first: its peers then time out in the collective it left.
     for error in sorted(errors, key=lambda error: isinstance(error, threading.BrokenBarrierError)):
         raise error
-    records = outcomes
+    return outcomes
+
+
+def assert_lockstep(records: list[RankRecord]) -> None:
+    """The ranks agreed in every pass and released no lease before every rank's access ended."""
     first = records[0]
     assert first.trace.count("round") > 10, first.trace  # the script exercises rounds
     for record in records[1:]:
@@ -512,6 +536,14 @@ def test_ranks_whose_stores_differ_agree_in_every_round(memory_kind: MemoryKind,
         for key, released in record.released.items():
             ends = [other.ended[key] for other in records if key in other.ended]
             assert all(released > end for end in ends), (key, released, ends)
+
+
+@pytest.mark.parametrize("seed", range(10))
+@pytest.mark.parametrize("memory_kind", [MemoryKind.HOST, MemoryKind.DEVICE], ids=["host", "gpu"])
+def test_ranks_whose_stores_differ_agree_in_every_round(memory_kind: MemoryKind, seed: int) -> None:
+    records = records_of(run_ranks(memory_kind, seed)[0])
+    assert_lockstep(records)
+    first = records[0]
     # A fetch leaves PARKED on every rank in the first round some rank finds it late, once that
     # round covers it (announced the pass after it was appended).
     for seq in {seq for record in records for seq in record.late_from}:
@@ -532,3 +564,31 @@ def test_a_table_that_differs_on_one_rank_ends_every_rank_in_the_same_round() ->
     last_rounds = [trace.getvalue().splitlines()[-1].split()[1:] for trace in traces]
     fields = [dict(field.split("=", 1) for field in line) for line in last_rounds]
     assert {(f["pass"], f["decisions"]) for f in fields} == {(fields[0]["pass"], "fatal")}
+
+
+def test_replicas_under_gpu_direct_put_each_published_block_once_between_them() -> None:
+    """Ranks holding the same bytes: each lends every publication's range, which locks its pages
+    alike, and puts the blocks of its stripe; a rank with nothing to put holds its lock until the
+    round that follows the others' puts."""
+    records = records_of(run_ranks(MemoryKind.DEVICE, seed=0, replicated=True)[0])
+    assert_lockstep(records)
+    publications = {key for key in records[0].lent if key[1] == OpKind.PUBLISH.value}
+    assert len(publications) > 5, publications
+    for key in publications:
+        assert all(record.lent[key] == records[0].lent[key] for record in records), key
+        put = sorted(block for record in records for block in record.put.get(key, []))
+        assert put == records[0].lent[key], (key, [record.put.get(key) for record in records])
+
+
+def test_ranks_holding_the_same_share_of_every_layer_group_form_one_replica_set() -> None:
+    mla = [((1, 0),)] * 4  # every rank holds the latent cache
+    assert [replica_set(mla, rank) for rank in range(4)] == [ReplicaSet(r, 4) for r in range(4)]
+    own_heads = [((4, rank),) for rank in range(4)]
+    assert replica_set(own_heads, 2) == ReplicaSet()
+    pairs = [((2, rank // 2),) for rank in range(4)]  # two KV heads over four ranks
+    halves = [ReplicaSet(0, 2), ReplicaSet(1, 2)] * 2
+    assert [replica_set(pairs, rank) for rank in range(4)] == halves
+    # Layer groups shared by different sets of ranks: no one rank could put each block.
+    mixed = [((2, rank // 2), (2, rank % 2)) for rank in range(4)]
+    with pytest.raises(ValueError, match="different sets of ranks"):
+        replica_set(mixed, 0)

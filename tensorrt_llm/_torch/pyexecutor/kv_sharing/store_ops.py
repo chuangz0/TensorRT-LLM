@@ -63,9 +63,12 @@ class StoreOp:
     # The prompt range [start, end): a fetch's local prefix and stored end, a publication's range.
     start: int
     end: int
+    # A publication's blocks this rank puts: all of them, or its share among replicas.
+    blocks_put: int = 0
     # The transfer manager's operation, or None where it took no lease.
     operation_id: Optional[int] = None
-    # A lease the transfer manager did not take: refused by the lender or by the submit.
+    # A lease the transfer manager did not take: refused by the lender or by the submit, or held
+    # by a replica that puts none of the publication's blocks.
     lease: Optional[Lease] = None
     # A fetch is late on this rank from this monotonic time on.
     deadline: float = math.inf

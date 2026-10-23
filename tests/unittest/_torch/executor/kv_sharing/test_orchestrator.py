@@ -391,6 +391,36 @@ def test_a_publication_that_does_not_fit_waits_for_the_open_one(server):
     assert server.counters["published_blocks"] == 6
 
 
+def test_blocks_another_server_is_still_putting_are_skipped_not_failed(server):
+    """The store took 1 of the 3 blocks: the other 2 were another server's open puts (Mooncake:
+    exists, uncommitted), which that server completes."""
+    server.manager.kv_cache_map[1] = object()
+    server.orchestrator.publish_committed_blocks(computed(1))
+    server.iterate()  # the store starts writing
+    attempt = server.store.attempts[0]
+    attempt.outcome = Outcome.for_view(attempt.view, (np.array([True, False, False]),))
+    attempt.ended = True
+    server.iterate()
+    assert server.lender.leases[0].released
+    assert server.counters["published_blocks"] == 1
+    assert server.counters["publication_blocks_skipped"] == 2
+    assert server.counters["publications_failed"] == 0
+
+
+def test_a_publication_the_store_faulted_counts_as_failed(server):
+    server.manager.kv_cache_map[1] = object()
+    server.orchestrator.publish_committed_blocks(computed(1))
+    server.iterate()  # the store starts writing
+    attempt = server.store.attempts[0]
+    delivered = (np.array([True, False, False]),)
+    attempt.outcome = Outcome.for_view(attempt.view, delivered, "the store failed")
+    attempt.ended = True
+    server.iterate()
+    assert server.lender.leases[0].released
+    assert server.counters["publications_failed"] == 1
+    assert server.counters["published_blocks"] == server.counters["publication_blocks_skipped"] == 0
+
+
 def test_a_gpu_direct_publication_waits_while_its_locked_pages_would_crowd_out_resumes(
     gpu_direct_server,
 ):

@@ -2856,6 +2856,20 @@ def test_pad_dummy_added_when_overshoot_has_no_schedulable_requests():
     assert len(stub.active_requests) == 3
 
 
+def test_pad_dummy_added_when_every_request_waits_for_a_store_fetch():
+    # Aggregated attention DP with kv_sharing: a request parked for a store
+    # fetch waits in the transmission state and takes no batch slot, so a rank
+    # holding only parked requests needs a padding request like an idle rank.
+    stub = _StubADPExecutor(kv_cache_transceiver=None)
+    stub.active_requests = [_make_adp_request(_STATE_DISAGG_GENERATION_TRANS_IN_PROGRESS)]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert len(stub.active_requests) == 2
+
+
 def test_pad_dummy_added_when_only_wait_scheduler_requests_disagg():
     # Gen-first mode on the context server: DISAGG_CONTEXT_WAIT_SCHEDULER
     # sits BELOW the scheduler's window [CONTEXT_INIT, GENERATION_TO_COMPLETE)

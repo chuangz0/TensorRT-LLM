@@ -6869,6 +6869,9 @@ class PyExecutor:
                     "totalKvBlocks"]
                 iter_stats_payload.kv_load_timestamp_ns = load_sample[
                     "timestampUnixNanos"]
+            # kv_sharing: this rank's open store work keeps rank 0 awake.
+            store_operations = (self.kv_sharing.open_operations()
+                                if self.kv_sharing is not None else 0)
             if getattr(self, "_enable_remote_tail_adp", False):
                 context_ids, generation_ids = self._snapshot_remote_tail_phase_work(
                     active_requests)
@@ -6876,14 +6879,16 @@ class PyExecutor:
                     active_requests,
                     iter_stats_payload=iter_stats_payload,
                     forward_work=(len(context_ids), len(generation_ids)),
-                    include_kv_cache_load=self._kv_load_tracker.enabled)
+                    include_kv_cache_load=self._kv_load_tracker.enabled,
+                    store_operations=store_operations)
                 self._select_remote_tail_phase(all_rank_states, context_ids,
                                                generation_ids)
             else:
                 all_rank_states = self.adp_router.gather_all_rank_states(
                     active_requests,
                     iter_stats_payload=iter_stats_payload,
-                    include_kv_cache_load=self._kv_load_tracker.enabled)
+                    include_kv_cache_load=self._kv_load_tracker.enabled,
+                    store_operations=store_operations)
             if self._kv_load_tracker.enabled and self.dist.rank == 0:
                 self._kv_load_tracker.record_rank_states(all_rank_states)
             if self.enable_iter_perf_stats:
@@ -7792,7 +7797,13 @@ class PyExecutor:
         if (not self._enable_scheduler_aware_adp_dummy
                 or self.kv_cache_transceiver is None):
             if self.kv_cache_transceiver is None:
-                return len(self.active_requests)
+                # Without a transceiver only a request parked for a kv_sharing
+                # store fetch is in transmission (KV connectors refuse attention
+                # DP in py_executor_creator); it waits, so the rank still needs a
+                # padding request.
+                return sum(
+                    1 for req in self.active_requests
+                    if not req.is_disagg_generation_transmission_in_progress)
 
             # PP intentionally preserves its established ADP padding behavior
             # until its dummy lifecycle is generalized. Keep this fallback on

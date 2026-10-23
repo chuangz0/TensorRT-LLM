@@ -12,16 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""KV sharing through a real Mooncake store under tensor parallelism (Llama-3.1-8B, TP2 and TP4).
+"""KV sharing through a real Mooncake store on several GPUs of one node: Llama-3.1-8B at TP2 and
+TP4; one case per other model class and layout: DeepSeek-V3-Lite (MLA) at TP2 and under attention
+DP, Qwen3-8B with an FP8 KV cache at TP2.
 
-Each rank publishes its own share of every prompt block, once; a fresh reader of the same layout
-fetches every rank's share and serves the tokens of a server that reused the blocks locally, also
-when part of the prefix is in its own cache already. A fetch running late drops on every rank and
-the request computes its prompt; a cancel or a shutdown with a fetch in flight ends cleanly. Two
-instances of one service share system prompts and follow-up turns under concurrent load. Every
-rank writes a trace of its rounds (``TRTLLM_KV_SHARING_TRACE_DIR``): the ranks of a server must
-write the same one, which proves they entered the same store collectives with the same tables and
-page counts.
+Each stored object is put once: each rank puts its own share of every prompt block, and ranks
+holding the same bytes (MLA's latent cache) put one stripe each, or under host staging the first
+of them all. A fresh reader of the same layout fetches the blocks and serves the tokens of a server
+that reused them locally, also when part of the prefix is in its own cache already. A fetch
+running late drops on every rank and the request computes its prompt; a cancel or a shutdown with
+a fetch in flight ends cleanly. Two instances of one service share system prompts and follow-up
+turns under concurrent load. Every rank writes a trace of its rounds
+(``TRTLLM_KV_SHARING_TRACE_DIR``): under tensor parallelism the ranks of a server must write the
+same one, which proves they entered the same store collectives with the same tables and page
+counts; under attention DP each rank closes its own store work before it exits.
 
 Needs four GPUs, ``mooncake_master`` on the path, the ``mooncake.store`` SDK and, for the native
 driver, the built ``tensorrt_llm.mooncake_store_worker``; fails without them. The store and its
@@ -40,14 +44,21 @@ from pathlib import Path
 
 import pytest
 import torch
-from conftest import Store, decisions, rank_traces, run_two_turn_workload, wait_until
+from conftest import (
+    TOKENS_PER_BLOCK,
+    Store,
+    decisions,
+    puts_since,
+    rank_traces,
+    run_two_turn_workload,
+)
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.pyexecutor.kv_sharing.startup import TRACE_DIR_ENV
 from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.scheduling_params import SchedulingParams
 
-TOKENS_PER_BLOCK = 32
 NEW_TOKENS = 32
 _tokens = random.Random(20261023)
 P = [1000] + [_tokens.randrange(1000, 30000) for _ in range(999)]  # 31 whole blocks
@@ -68,27 +79,39 @@ T = {
 # another server computed), then a question of its own.
 SYSTEM, FIRST_TURN = 512, 256
 FOLLOW_UP = P[: SYSTEM + FIRST_TURN] + [_tokens.randrange(1000, 30000) for _ in range(200)]
+# The sibling every other model class's reader fetches.
+SIBLING = P[:FETCHED] + [_tokens.randrange(1000, 30000) for _ in range(200)]
 GREEDY = SamplingParams(max_tokens=NEW_TOKENS, temperature=0.0)
-# The master's count of keys a put asked for, and of those it refused.
-PUT_KEYS = "master_batch_put_start_items_total"
-PUT_KEYS_REFUSED = "master_batch_put_start_failed_items_total"
 
 
-def model_path() -> str:
-    return str(llm_models_root(check=True) / "llama-3.1-model" / "Llama-3.1-8B-Instruct")
+LLAMA = "llama-3.1-model/Llama-3.1-8B-Instruct"
+DEEPSEEK = "DeepSeek-V3-Lite/bf16"
+QWEN3 = "Qwen3/Qwen3-8B"
 
 
-def llama(
-    monkeypatch: pytest.MonkeyPatch, tp: int, trace_dir: Path, *, max_batch_size: int = 8, **kwargs
+def model_path(model: str = LLAMA) -> str:
+    return str(llm_models_root(check=True) / model)
+
+
+def server(
+    monkeypatch: pytest.MonkeyPatch,
+    tp: int,
+    trace_dir: Path,
+    *,
+    model: str = LLAMA,
+    max_batch_size: int = 8,
+    kv_dtype: str = "auto",
+    **kwargs,
 ) -> LLM:
-    """A Llama-3.1-8B server over ``tp`` GPUs whose ranks trace their rounds into ``trace_dir``."""
+    """A server of ``model`` (Llama-3.1-8B by default) over ``tp`` GPUs whose ranks trace their
+    rounds into ``trace_dir``."""
     monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
     monkeypatch.setenv(TRACE_DIR_ENV, str(trace_dir))
     return LLM(
-        model=model_path(),
+        model=model_path(model),
         tensor_parallel_size=tp,
         kv_cache_config=KvCacheConfig(
-            tokens_per_block=TOKENS_PER_BLOCK, free_gpu_memory_fraction=0.1
+            tokens_per_block=TOKENS_PER_BLOCK, free_gpu_memory_fraction=0.1, dtype=kv_dtype
         ),
         cuda_graph_config=None,
         max_batch_size=max_batch_size,
@@ -122,14 +145,6 @@ def shut_down(llm: LLM) -> None:
     torch.cuda.empty_cache()
 
 
-def puts_during(store: Store, action: Callable[[], None]) -> tuple[float, float]:
-    """Keys the master was asked to put while ``action`` ran, and how many it refused."""
-    before = store.master_metrics()
-    action()
-    after = store.master_metrics()
-    return after[PUT_KEYS] - before[PUT_KEYS], after[PUT_KEYS_REFUSED] - before[PUT_KEYS_REFUSED]
-
-
 def gpus_by_process() -> dict[int, set[str]]:
     """The GPUs each process holds a CUDA context on."""
     listing = subprocess.run(
@@ -160,18 +175,14 @@ def publish_and_reference(store: Store, tp: int, trace_dir: Path) -> Written:
     siblings with P's blocks reused locally, and computed whole."""
     key_prefix = f"tp{tp}"
     with pytest.MonkeyPatch.context() as monkeypatch:
-        llm = llama(monkeypatch, tp, trace_dir, kv_sharing=sharing(store, key_prefix))
+        llm = server(monkeypatch, tp, trace_dir, kv_sharing=sharing(store, key_prefix))
     stored = tp * P_BLOCKS
     references = {}
     try:
-
-        def publish_p() -> None:
-            references["P"] = tokens(complete(llm, P))
-            assert wait_until(lambda: store.readable_objects(key_prefix) == (stored, stored)), (
-                f"the store holds {store.readable_objects(key_prefix)}; expected {stored}"
-            )
-
-        assert puts_during(store, publish_p) == (stored, 0)
+        before = store.master_metrics()
+        references["P"] = tokens(complete(llm, P))
+        store.assert_readable(key_prefix, stored)
+        assert puts_since(store, before) == (stored, 0)
         complete(llm, P, cache_salt="reused")
         for name in EXACT:
             reused = complete(llm, T[name], cache_salt="reused")
@@ -207,32 +218,26 @@ def test_a_tensor_parallel_reader_fetches_exactly_and_each_object_is_put_once(
 ) -> None:
     writer = written(tp)
     name = f"exact-tp{tp}-{data_path}"
-    llm = llama(
+    llm = server(
         monkeypatch, tp, tmp_path, kv_sharing=sharing(store, writer.key_prefix, data_path=data_path)
     )
+    # Each rank puts its share of the blocks past the fetched ones.
+    new_objects = tp * (T_BLOCKS - FETCHED_BLOCKS)
     try:
-        before, _ = store.readable_objects(writer.key_prefix)
-        fetched = []
-
-        def fetch_and_publish() -> None:
-            fetched.append(complete(llm, T[name]))
-            # Each rank puts its share of the blocks past the fetched ones.
-            published = before + tp * (T_BLOCKS - FETCHED_BLOCKS)
-            assert wait_until(
-                lambda: store.readable_objects(writer.key_prefix) == (published, published)
-            ), f"the store holds {store.readable_objects(writer.key_prefix)}; expected {published}"
-
-        puts = puts_during(store, fetch_and_publish)
+        held, _ = store.readable_objects(writer.key_prefix)
+        before = store.master_metrics()
+        output = complete(llm, T[name])
+        store.assert_readable(writer.key_prefix, held + new_objects)
+        puts = puts_since(store, before)
         if tp == 4:
             # Every rank's store threads use its own GPU only.
             ranks = {pid: gpus for pid, gpus in gpus_by_process().items() if pid != os.getpid()}
             assert len(ranks) >= tp and all(len(gpus) == 1 for gpus in ranks.values()), ranks
     finally:
         shut_down(llm)
-    (output,) = fetched
     assert tokens(output) == writer.references[name]
     assert output.cached_tokens == FETCHED
-    assert puts == (tp * (T_BLOCKS - FETCHED_BLOCKS), 0)
+    assert puts == (new_objects, 0)
     trace = rank_traces(tmp_path, tp)
     if data_path == "auto":  # GPU Direct resumes in the round that returns the lease
         assert len(decisions(trace, "resume")) == 1, trace
@@ -244,7 +249,7 @@ def test_a_fetch_past_its_deadline_drops_on_every_rank_and_serving_goes_on(
     writer = written(2)
     # Past by the first round that covers the fetch, on every rank's clock.
     timeout = sharing(store, writer.key_prefix, fetch_timeout_s=1e-6)
-    llm = llama(monkeypatch, 2, tmp_path, kv_sharing=timeout)
+    llm = server(monkeypatch, 2, tmp_path, kv_sharing=timeout)
     try:
         late = complete(llm, T["late"])
         again = complete(llm, P)
@@ -260,7 +265,7 @@ def test_cancel_and_shutdown_with_a_fetch_in_flight_end_cleanly(
     store: Store, written, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     writer = written(2)
-    llm = llama(monkeypatch, 2, tmp_path, kv_sharing=sharing(store, writer.key_prefix))
+    llm = server(monkeypatch, 2, tmp_path, kv_sharing=sharing(store, writer.key_prefix))
     try:
         cancelled = llm.generate_async(T["late"], GREEDY)
         cancelled.abort()
@@ -277,26 +282,19 @@ def test_a_prefix_partly_in_the_local_cache_reads_the_rest_from_the_store_exactl
     the store. The request reuses both, and the store gains only the new question's blocks."""
     writer = written(2)
     new_blocks = len(FOLLOW_UP) // TOKENS_PER_BLOCK - (SYSTEM + FIRST_TURN) // TOKENS_PER_BLOCK
-    llm = llama(monkeypatch, 2, tmp_path, kv_sharing=sharing(store, writer.key_prefix))
+    llm = server(monkeypatch, 2, tmp_path, kv_sharing=sharing(store, writer.key_prefix))
     try:
         # The system prompt and one token: all 16 of its blocks are read from the store, so the
         # reader's own cache holds them as the other server computed them in one pass (a block
         # computed here over a cached prefix can differ from that in the last bits).
         complete(llm, P[: SYSTEM + 1])
-        before, _ = store.readable_objects(writer.key_prefix)
-        followed = []
-
-        def follow_up() -> None:
-            followed.append(complete(llm, FOLLOW_UP))
-            published = before + 2 * new_blocks
-            assert wait_until(
-                lambda: store.readable_objects(writer.key_prefix) == (published, published)
-            ), f"the store holds {store.readable_objects(writer.key_prefix)}; expected {published}"
-
-        puts = puts_during(store, follow_up)
+        held, _ = store.readable_objects(writer.key_prefix)
+        before = store.master_metrics()
+        output = complete(llm, FOLLOW_UP)
+        store.assert_readable(writer.key_prefix, held + 2 * new_blocks)
+        puts = puts_since(store, before)
     finally:
         shut_down(llm)
-    (output,) = followed
     assert tokens(output) == writer.references["follow-up"]
     assert output.cached_tokens == SYSTEM + FIRST_TURN
     assert puts == (2 * new_blocks, 0)
@@ -308,3 +306,101 @@ def test_two_instances_of_one_service_share_system_prompts_and_follow_up_turns(
 ) -> None:
     """Two TP2 instances, with CUDA graphs as served by default, on the node's four GPUs."""
     run_two_turn_workload(store, model_path(), tp=2, gpu_groups=("0,1", "2,3"), run_dir=tmp_path)
+
+
+@dataclass(frozen=True)
+class Cell:
+    """A model class on a layout of CELL_TP GPUs: a writer publishes P over ``writer_path``, then
+    a fresh reader of the same layout fetches the sibling over 'auto' (GPU Direct here).
+
+    Attributes:
+        objects_per_block: Objects the store holds per prompt block: one per share of the KV
+            heads, one for MLA's latent cache, which every rank holds alike.
+    """
+
+    model: str
+    objects_per_block: int
+    writer_path: str = "auto"
+    attention_dp: bool = False
+    kv_dtype: str = "auto"
+
+
+CELL_TP = 2
+CELLS = {
+    "deepseek-tp2-gpu-direct-writer": Cell(DEEPSEEK, 1, writer_path="gpu_direct"),
+    "deepseek-tp2-host-staging-writer": Cell(DEEPSEEK, 1, writer_path="host_staging"),
+    "qwen3-fp8-tp2": Cell(QWEN3, 2, kv_dtype="fp8"),
+    "deepseek-attention-dp2": Cell(DEEPSEEK, 1, attention_dp=True),
+}
+# Under attention DP every request goes to rank 1, never to rank 0 (which probes): rank 0 keeps
+# stepping only because rank 1 reports open store work, and rank 1, whose one request is parked,
+# still gets a padding request.
+ON_RANK_1 = SchedulingParams(attention_dp_rank=1, attention_dp_relax=False)
+
+
+def cell_server(
+    monkeypatch: pytest.MonkeyPatch, cell: Cell, trace_dir: Path, kv_sharing: dict
+) -> LLM:
+    return server(
+        monkeypatch,
+        CELL_TP,
+        trace_dir,
+        model=cell.model,
+        kv_dtype=cell.kv_dtype,
+        enable_attention_dp=cell.attention_dp,
+        # The kernels the autotuner picks differ from one server process to the next, and with
+        # them the last bits of MoE outputs: fixed kernels let a reader match its writer exactly.
+        enable_autotuner=False,
+        kv_sharing=kv_sharing,
+    )
+
+
+def cell_trace(trace_dir: Path, cell: Cell) -> str:
+    """The trace of the rank that served the requests: under tensor parallelism every rank's,
+    which must agree; under attention DP rank 1's, after every rank ended with nothing open."""
+    if not cell.attention_dp:
+        return rank_traces(trace_dir, CELL_TP)
+    traces = [(trace_dir / f"rank{rank}.txt").read_text() for rank in range(CELL_TP)]
+    for rank, trace in enumerate(traces):
+        assert trace.splitlines()[-1].endswith(" open=0"), f"rank {rank}: {trace[-500:]}"
+    return traces[1]
+
+
+@pytest.mark.parametrize("name", CELLS)
+def test_a_reader_of_each_model_class_and_layout_fetches_exactly_and_each_object_is_put_once(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    cell = CELLS[name]
+    pinned = {"scheduling_params": ON_RANK_1} if cell.attention_dp else {}
+    with pytest.MonkeyPatch.context() as writer_env:
+        writer = cell_server(
+            writer_env, cell, tmp_path / "writer", sharing(store, name, data_path=cell.writer_path)
+        )
+    stored = cell.objects_per_block * P_BLOCKS
+    try:
+        before = store.master_metrics()
+        complete(writer, P, **pinned)
+        store.assert_readable(name, stored)
+        assert puts_since(store, before) == (stored, 0)
+        complete(writer, P, cache_salt="reused", **pinned)
+        reference = complete(writer, SIBLING, cache_salt="reused", **pinned)
+        assert reference.cached_tokens == FETCHED
+    finally:
+        shut_down(writer)
+    cell_trace(tmp_path / "writer", cell)
+
+    new_objects = cell.objects_per_block * (T_BLOCKS - FETCHED_BLOCKS)
+    reader = cell_server(monkeypatch, cell, tmp_path / "reader", sharing(store, name))
+    try:
+        held, _ = store.readable_objects(name)  # the writer's salted prompts too
+        before = store.master_metrics()
+        output = complete(reader, SIBLING, **pinned)
+        store.assert_readable(name, held + new_objects)
+        puts = puts_since(store, before)
+    finally:
+        shut_down(reader)
+    assert tokens(output) == tokens(reference)
+    assert output.cached_tokens == FETCHED
+    assert puts == (new_objects, 0)
+    trace = cell_trace(tmp_path / "reader", cell)
+    assert len(decisions(trace, "resume")) == 1, trace
