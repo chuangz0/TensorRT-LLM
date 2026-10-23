@@ -380,7 +380,7 @@ def test_view_rejects_unsupported_row_placement() -> None:
         ("staging", object(), TypeError),
         ("lifecycle_profile_id", "", ValueError),
         ("model_layout", "mha-token-major", ValueError),
-        ("topology", (2, 1, 1, 1), ValueError),
+        ("topology", (0, 1, 1, 1), ValueError),
         ("topology", (1, 2, 1, 1), ValueError),
         ("topology", (1, 1, 2, 1), ValueError),
         ("topology", (1, 1, 1, 2), ValueError),
@@ -433,6 +433,11 @@ def test_profile_rejects_unsupported_inputs(
     """No backend name can bypass the initial compatibility and containment gates."""
     with pytest.raises(error):
         replace(_profile(), **{field: value})
+
+
+def test_profile_accepts_tensor_parallelism() -> None:
+    """Each tensor-parallel rank lends its own share of the cache."""
+    assert replace(_profile(), topology=(4, 1, 1, 1)).topology == (4, 1, 1, 1)
 
 
 def test_profile_preserves_scope_and_opaque_provider_config() -> None:

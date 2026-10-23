@@ -147,7 +147,8 @@ class ProfileSpec:
         scope: Derived immutable byte identity; callers cannot supply a raw scope.
         model_layout: Actual attention-writer layout identifier.
         dtype: Actual cache dtype supplied by model assembly.
-        topology: Tensor, data, pipeline and context parallel sizes.
+        topology: Tensor, data, pipeline and context parallel sizes; any tensor
+            parallel size, no data, pipeline or context parallelism.
         state_kinds: Canonical cache kinds from the layout's layer groups.
         full_attention: Whether every group uses full attention.
         sparse_attention: Whether runtime sparse attention is enabled; must be false.
@@ -201,8 +202,8 @@ class ProfileSpec:
             isinstance(size, bool) or not isinstance(size, numbers.Integral) for size in topology
         ):
             raise TypeError("topology sizes must be integers")
-        if topology != (1, 1, 1, 1):
-            raise ValueError("initial profile requires TP1/DP1/PP1/CP1")
+        if topology[0] < 1 or topology[1:] != (1, 1, 1):
+            raise ValueError("initial profile requires TPn/DP1/PP1/CP1")
         kinds = tuple(self.state_kinds)
         if not kinds or any(not isinstance(kind, CacheKind) for kind in kinds):
             raise TypeError("state kinds must contain canonical CacheKind values")
