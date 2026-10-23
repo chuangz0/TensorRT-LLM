@@ -127,9 +127,17 @@ class FactoryRejected(RuntimeError):
     """Construction certifies no remaining access, registration or region hold."""
 
 
+# The tested cells: an attention writer layout with the dtype of its cache.
+_TESTED_CELLS = frozenset(
+    {("mha-trtllm-hnd", "bfloat16"), ("mha-trtllm-hnd", "fp8"), ("mla-trtllm-latent", "bfloat16")}
+)
+# The public layout's dtype and quantization of each cell dtype.
+_LAYOUT_DTYPES = {"bfloat16": ("BF16", None), "fp8": ("FP8", "fp8")}
+
+
 @dataclass(frozen=True)
 class ProfileSpec:
-    """Trusted immutable facts for the initial BF16 MHA compatibility cell.
+    """Trusted immutable facts for one of the tested compatibility cells.
 
     The model/executor assembly supplies facts for the actual writer and serving
     manager. Attachment checks the manager facts against its public page layout.
@@ -145,10 +153,13 @@ class ProfileSpec:
         source_identity: Immutable loaded-checkpoint and effective-config provenance.
         compatibility_id: Qualified KV semantics ABI, changed for incompatible releases.
         scope: Derived immutable byte identity; callers cannot supply a raw scope.
-        model_layout: Actual attention-writer layout identifier.
-        dtype: Actual cache dtype supplied by model assembly.
+        model_layout: Actual attention-writer layout identifier: ``mha-trtllm-hnd``
+            or ``mla-trtllm-latent``.
+        dtype: Actual cache dtype supplied by model assembly: ``bfloat16``, or
+            ``fp8`` for the MHA layout.
         topology: Tensor, data, pipeline and context parallel sizes; any tensor
-            parallel size, no data, pipeline or context parallelism.
+            parallel size, data parallelism 1 or equal to it (attention DP), no
+            pipeline or context parallelism.
         state_kinds: Canonical cache kinds from the layout's layer groups.
         full_attention: Whether every group uses full attention.
         sparse_attention: Whether runtime sparse attention is enabled; must be false.
@@ -195,15 +206,19 @@ class ProfileSpec:
                 raise ValueError(f"{name} must be a nonempty string")
         if not isinstance(self.staging, StagingOptions):
             raise TypeError("profile staging must be StagingOptions")
-        if self.model_layout != "mha-trtllm-hnd" or self.dtype != "bfloat16":
-            raise ValueError("initial profile requires BF16 MHA with the HND writer layout")
+        if (self.model_layout, self.dtype) not in _TESTED_CELLS:
+            raise ValueError(
+                f"profile cell {self.model_layout}/{self.dtype} is not one of the tested cells "
+                f"{sorted(_TESTED_CELLS)}"
+            )
         topology = tuple(self.topology)
         if any(
             isinstance(size, bool) or not isinstance(size, numbers.Integral) for size in topology
         ):
             raise TypeError("topology sizes must be integers")
-        if topology[0] < 1 or topology[1:] != (1, 1, 1):
-            raise ValueError("initial profile requires TPn/DP1/PP1/CP1")
+        tp, dp, pp, cp = topology
+        if tp < 1 or dp not in (1, tp) or (pp, cp) != (1, 1):
+            raise ValueError("profile requires TPn with DP1 or DPn (attention DP), PP1 and CP1")
         kinds = tuple(self.state_kinds)
         if not kinds or any(not isinstance(kind, CacheKind) for kind in kinds):
             raise TypeError("state kinds must contain canonical CacheKind values")
@@ -391,8 +406,11 @@ def _validate_layout(profile: ProfileSpec, layout: PageLayout, namespace: Region
     topology = layout.topology
     if (topology.tp_size, topology.dp_size, topology.pp_size, topology.cp_size) != profile.topology:
         raise ValueError("lender topology does not match the selected profile")
-    if layout.dtype != "BF16" or layout.quant_mode is not None:
-        raise ValueError("initial profile requires public BF16 unquantized layout")
+    if (layout.dtype, layout.quant_mode) != _LAYOUT_DTYPES[profile.dtype]:
+        raise ValueError(
+            f"lender layout {layout.dtype} (quantization {layout.quant_mode}) does not match the "
+            f"profile's {profile.dtype} cache"
+        )
     kinds = {"attention": CacheKind.PAGED, "state": CacheKind.STATE}
     if tuple(kinds.get(group.kind) for group in layout.layer_groups) != profile.state_kinds:
         raise ValueError("lender layer kinds do not match the selected profile")

@@ -220,8 +220,8 @@ def test_attachment_uses_public_layout_and_complete_namespace(
 @pytest.mark.parametrize(
     "layout, message",
     [
-        (replace(_layout(), dtype="HALF"), "BF16"),
-        (replace(_layout(), quant_mode="fp8"), "unquantized"),
+        (replace(_layout(), dtype="HALF"), "bfloat16 cache"),
+        (replace(_layout(), dtype="FP8", quant_mode="fp8"), "bfloat16 cache"),
         (replace(_layout(), topology=RankTopology(tp_size=2)), "topology"),
         (
             replace(_layout(), layer_groups=(LayerGroupDesc("state", None, 0, 0, (0,)),)),
@@ -242,7 +242,7 @@ def test_attachment_uses_public_layout_and_complete_namespace(
     ],
     ids=[
         "dtype",
-        "quantized",
+        "fp8",
         "topology",
         "state",
         "window",
@@ -435,9 +435,23 @@ def test_profile_rejects_unsupported_inputs(
         replace(_profile(), **{field: value})
 
 
-def test_profile_accepts_tensor_parallelism() -> None:
-    """Each tensor-parallel rank lends its own share of the cache."""
-    assert replace(_profile(), topology=(4, 1, 1, 1)).topology == (4, 1, 1, 1)
+def test_profile_accepts_the_tested_cells_and_parallel_layouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FP8 multi-head attention, BF16 MLA and both parallel layouts are accepted.
+
+    Tensor-parallel ranks lend shares of one cache, attention-DP ranks caches of their own.
+    """
+    fp8 = replace(_profile(), dtype="fp8")
+    mla = replace(_profile(), model_layout="mla-trtllm-latent")
+    assert len({_profile().scope, fp8.scope, mla.scope}) == 3
+    with pytest.raises(ValueError, match="tested cells"):
+        replace(mla, dtype="fp8")
+    lender = _lender(replace(_layout(), dtype="FP8", quant_mode="fp8"))
+    monkeypatch.setattr(_assembly, "attach_lender", lambda *args, **kwargs: lender)
+    assert attach_domain(object(), fp8).lender is lender
+    for topology in ((4, 1, 1, 1), (2, 2, 1, 1)):
+        assert replace(_profile(), topology=topology).topology == topology
 
 
 def test_profile_preserves_scope_and_opaque_provider_config() -> None:
