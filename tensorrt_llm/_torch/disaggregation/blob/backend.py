@@ -7,6 +7,12 @@ sequence; worker threads hand the batches to the driver, and one progress thread
 whose results or access end were still open when they returned, and after shutdown drains the
 driver and unregisters the regions. An attempt quiesces only once every batch it started has proven
 its access ended.
+
+A queued driver (``capabilities.queued``) runs, orders and cuts its own store calls: the backend
+starts no worker thread, hands it each layer group of a submission as one batch on the submitting
+thread, and records the operations the driver finished whenever an attempt is polled. While
+operations are out, the progress thread looks once per ``UNCOLLECTED_GRACE_S`` for finished ones an
+executor left untaken that long, and takes them itself; it also reports stuck calls and shuts down.
 """
 
 from __future__ import annotations
@@ -15,7 +21,7 @@ import itertools
 import threading
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple, NoReturn, Protocol
 
@@ -42,13 +48,12 @@ from .store import (
     RegionHandle,
     RegionLayout,
     RegistrationError,
+    RowArrays,
     RowIO,
-    RowResult,
     RowStatus,
     Span,
     StoreDriver,
     concluded,
-    faulted,
 )
 
 __all__ = [
@@ -69,10 +74,14 @@ PROGRESS_MAX_DELAY_S = 0.1
 # physically, and a get up to about 60 s for the transfers it submitted. A call past this is logged
 # once; its submission keeps holding its slots meanwhile.
 STUCK_CALL_WARNING_S = 60.0
+# An executor iteration polls well within this; past it the progress thread takes a queued driver's
+# finished operations itself. It looks this often while operations are out, each look a GIL handoff.
+UNCOLLECTED_GRACE_S = 0.05
 SHUTDOWN_FAULT = "blob backend shut down"
 
 _instance_ids = itertools.count()  # names each backend and binding in thread names and logs
-_Results = Sequence[RowResult] | None  # None: not concluded yet, or no new evidence
+# A batch's rows: which landed READY, and the fault text of each FAULT row.
+_Results = tuple[np.ndarray, Mapping[int, str]] | None  # None: not concluded, or no new evidence
 
 
 @dataclass(frozen=True)
@@ -81,12 +90,12 @@ class BlobConfig:
 
     Attributes:
         key_prefix: The deployment's key namespace; matches ``[A-Za-z0-9_-]{1,64}``.
-        workers: Driver calls at once, each on a backend thread of its own. Publishes take at most
-            ``max(1, workers - 1)`` of them, so unless there is one worker, one is always left for
-            fetches. One Mooncake put does not fill the links, and each running get busy-polls a
-            core.
-        rows_per_batch: Most rows in one driver call. A call prepares and maps its rows in Python
-            for a few microseconds each, holding the GIL, so this bounds that stretch too.
+        workers: Store calls at once: the backend's threads, or a queued driver's own. Publishes
+            take at most ``publish_workers`` of them. One Mooncake put does not fill the links,
+            and each running get busy-polls a core.
+        rows_per_batch: Most rows in one driver call; a queued driver cuts its calls by the same
+            limits. A call prepares and maps its rows in Python for a few microseconds each,
+            holding the GIL, so this bounds that stretch too.
         bytes_per_batch: Most payload bytes in one driver call. Larger calls return into Python
             fewer times per byte, and a busy executor thread makes each return wait for the GIL;
             but one call must end well inside the store's read lease (Mooncake: 10 s), and its
@@ -107,6 +116,11 @@ class BlobConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be an int of at least 1, got {value!r}")
+
+    @property
+    def publish_workers(self) -> int:
+        """Store calls publishes may take at once: all but one, so a fetch always finds one."""
+        return max(1, self.workers - 1)
 
 
 class ConstructionRejected(RuntimeError):
@@ -274,8 +288,9 @@ class _Batch:
 class BlobAttempt:
     """The handle of one submission: a ``base.backend.Attempt``.
 
-    Its state changes only under the backend's lock; ``poll`` and ``quiesced`` read one reference
-    without it, so they never block.
+    Its state changes only under the backend's lock; ``quiesced`` reads one reference without it,
+    so it never blocks. ``poll`` does too, except that with a queued driver it first records the
+    operations the driver finished (a short hold of the lock, never a store call).
     """
 
     def __init__(
@@ -287,7 +302,9 @@ class BlobAttempt:
         self._backend = backend
         self._groups: list[_GroupRows] | None = groups
         self._masks = [np.zeros(len(rows.object_keys), dtype=bool) for rows in groups]
-        self._queued_batches = 0  # zeroed by a stop; the deque keeps the batches, _take skips them
+        # Not yet handed to a worker or the queued driver (which takes them all in _submit);
+        # zeroed by a stop, after which _take skips the batches the deque keeps.
+        self._queued_batches = 0
         self._results_pending = 0
         self._access_open = 0  # an unprovable batch stays in it for good
         self._fault: str | None = None  # the first fault, which also stops the attempt
@@ -296,28 +313,26 @@ class BlobAttempt:
         self._quiesced = False
 
     def poll(self) -> Outcome | None:
+        if self._outcome is None and self._backend._queued:
+            self._backend._collect()
         return self._outcome
 
     def quiesced(self) -> bool:
         return self._quiesced
 
     def cancel(self) -> None:
-        """Stops dispatching the attempt's queued batches; started ones run on.
-
-        Not forwarded to the driver: the contract's cancel is advisory, and the store this backend
-        serves has no cancel to forward it to.
-        """
+        """Stops dispatching the attempt's queued batches; started ones run on. Forwarded to a
+        queued driver, which drops the store calls it has not started."""
         self._backend._cancel(self)
 
-    def _apply(self, batch: _Batch, results: Sequence[RowResult]) -> None:
-        self._masks[batch.group][batch.start : batch.stop] = [
-            result.status is RowStatus.READY for result in results
-        ]
-        for row, result in enumerate(results, batch.start):
-            if result.fault is not None:
-                self._fault = self._fault or f"group {batch.group} row {row}: {result.fault}"
-                self._stop()
-                return
+    def _apply(self, batch: _Batch, ready: np.ndarray, faults: Mapping[int, str]) -> None:
+        self._masks[batch.group][batch.start : batch.stop] = ready
+        if faults:
+            row = min(faults)
+            self._fault = (
+                self._fault or f"group {batch.group} row {batch.start + row}: {faults[row]}"
+            )
+            self._stop()
 
     def _stop(self) -> None:
         self._stopped = True
@@ -391,12 +406,16 @@ class BlobBackend:
             slot_rows=capabilities.multi_span,
         )
         self._unprovable_batches = 0
-        self._workers_alive = config.workers
-        self._publish_limit = max(1, config.workers - 1)
+        # A queued driver runs its own calls: no worker thread, and batches handed over by handle.
+        self._queued = capabilities.queued
+        self._batch_of: dict[OpHandle, _Batch] = {}
+        workers = 0 if self._queued else config.workers
+        self._workers_alive = workers
+        self._publish_limit = config.publish_workers
         self._publishes_running = 0
         self._workers = [
             threading.Thread(target=self._worker_loop, name=f"{name}-worker-{i}", daemon=True)
-            for i in range(config.workers)
+            for i in range(workers)
         ]
         self._progress = threading.Thread(
             target=self._progress_loop, name=f"{name}-progress", daemon=True
@@ -460,9 +479,13 @@ class BlobBackend:
                 raise SubmissionRejected("the blob backend is shut down")
             self._attempts.add(attempt)
             attempt._queued_batches = len(batches)
-            (self._fetch_queue if is_fetch else self._publish_queue).extend(batches)
-            self._work_ready.notify(len(batches))
-            wake_due = self._conclude_or_quiesce(attempt)
+            wake_due = False
+            if self._queued:
+                wake_due = self._dispatch(attempt, batches)
+            else:
+                (self._fetch_queue if is_fetch else self._publish_queue).extend(batches)
+                self._work_ready.notify(len(batches))
+            wake_due |= self._conclude_or_quiesce(attempt)
         if wake_due:
             self._call_wake()
         return attempt
@@ -528,8 +551,11 @@ class BlobBackend:
     def _cut(self, attempt: BlobAttempt, groups: list[_GroupRows]) -> list[_Batch]:
         batches = []
         for group, group_rows in enumerate(groups):
-            step = self._rows_per_batch(sum(group_rows.span_bytes))
             count = len(group_rows.object_keys)
+            if self._queued:  # a queued driver cuts its own store calls: one batch per group
+                batches += [_Batch(attempt, group, 0, count)] if count else []
+                continue
+            step = self._rows_per_batch(sum(group_rows.span_bytes))
             batches += [
                 _Batch(attempt, group, start, min(start + step, count))
                 for start in range(0, count, step)
@@ -547,9 +573,72 @@ class BlobBackend:
             if attempt._outcome is not None:
                 return
             attempt._stop()
+            self._cancel_queued_calls(attempt)
             wake_due = self._conclude_or_quiesce(attempt)
         if wake_due:
             self._call_wake()
+
+    # A queued driver: batches handed over on the submitting thread, results taken at each poll.
+
+    def _dispatch(self, attempt: BlobAttempt, batches: list[_Batch]) -> bool:
+        """Hands each batch to the queued driver, under the lock: the driver only queues, and a
+        batch is in ``_batch_of`` before any thread can take its finish. True when a refused batch
+        landed the attempt's outcome."""
+        submit = self._driver.get_rows if attempt.is_fetch else self._driver.put_rows
+        wake_due = False
+        if not self._in_driver:  # the progress thread may sleep long while nothing is out
+            self._progress_due.notify()
+        for batch in batches:
+            _count_started(batch)
+            try:
+                batch.op = submit(self._row_arrays(batch))
+            except Exception as error:  # DriverRejected certifies nothing escaped; others may have
+                refused = isinstance(error, DriverRejected)
+                wake_due = self._record(
+                    batch, _faults(batch, _refusal(error, refused)), refused, not refused
+                )
+                # The fault stopped the attempt (its queued count is 0) and cancelled the groups
+                # handed over before this one; the groups after it are never handed over.
+                break
+            self._batch_of[batch.op] = batch
+            # Stuck-call warnings count from submission: only the driver knows when a call starts,
+            # and a call queued that long behind others means a stuck store as well.
+            self._in_driver[batch] = time.monotonic()
+        return wake_due
+
+    def _row_arrays(self, batch: _Batch) -> RowArrays:
+        group_rows = batch.attempt._groups[batch.group]
+        names = group_rows.object_keys[batch.start : batch.stop]
+        starts = group_rows.starts[batch.start : batch.stop]
+        return RowArrays(self._key_stem, names, starts, group_rows.span_bytes)
+
+    def _collect(self, older_than_s: float = 0.0) -> None:
+        """Records the operations the queued driver finished, once the oldest has waited at least
+        ``older_than_s``: any age on the executor thread at each poll; ``UNCOLLECTED_GRACE_S`` on
+        the progress thread, which takes only what an executor left."""
+        waited = self._driver.finished_waiting_s()
+        if waited == 0.0 or waited < older_than_s:  # 0.0: nothing finished
+            return
+        finished = self._driver.take_finished()
+        with self._lock:
+            wake_due = False
+            for done in finished:
+                batch = self._batch_of.pop(done.op, None)
+                if batch is None:
+                    continue
+                del self._in_driver[batch]
+                wake_due |= self._record(
+                    batch, (done.ready, done.faults), done.access_ended, not done.access_ended
+                )
+        if wake_due:
+            self._call_wake()
+
+    def _cancel_queued_calls(self, attempt: BlobAttempt) -> None:
+        """Under the lock: a queued driver drops the attempt's store calls not started yet.
+        Nothing to do without a queued driver: ``_batch_of`` stays empty."""
+        for op, batch in self._batch_of.items():
+            if batch.attempt is attempt:
+                self._driver.cancel(op)
 
     # Workers: up to ``config.workers`` driver calls at once, each on a thread of its own.
 
@@ -577,11 +666,7 @@ class BlobBackend:
                 if not attempt.is_fetch:
                     self._publishes_running += 1
                 self._fetches_in_a_row = self._fetches_in_a_row + 1 if attempt.is_fetch else 0
-                # Counted as started before the driver call: while the call runs, this count alone
-                # keeps the attempt from quiescing once a cancel or a fault has cleared its queue.
-                attempt._queued_batches -= 1
-                attempt._results_pending += 1
-                attempt._access_open += 1
+                _count_started(batch)
                 self._in_driver[batch] = time.monotonic()
                 return batch
 
@@ -605,8 +690,8 @@ class BlobBackend:
             # DriverRejected certifies nothing escaped; any other raise from the driver is outside
             # its protocol: the rows may be accessed for good.
             refused = not driver_called or isinstance(error, DriverRejected)
-            reason = f"refused: {error}" if refused else f"the store driver raised {error!r}"
-            self._finish(batch, _faults(batch, reason), ended=refused, unprovable=not refused)
+            results = _faults(batch, _refusal(error, refused))
+            self._finish(batch, results, ended=refused, unprovable=not refused)
             return
         batch.op = op
         self._finish(batch, *self._observe(batch))
@@ -641,7 +726,11 @@ class BlobBackend:
         if count != len(batch):  # outside the driver protocol: no later answer proves an access end
             reason = f"the store driver gave {count} results for {len(batch)} rows"
             return _faults(batch, reason), False, not batch.access_recorded
-        return (results if done else None), ended, unprovable
+        if not done:
+            return None, ended, unprovable
+        ready = np.fromiter((r.status is RowStatus.READY for r in results), bool, len(results))
+        faults = {row: r.fault for row, r in enumerate(results) if r.fault is not None}
+        return (ready, faults), ended, unprovable
 
     def _finish(self, batch: _Batch, results: _Results, ended: bool, unprovable: bool) -> None:
         with self._lock:
@@ -664,7 +753,10 @@ class BlobBackend:
         if results is not None and not batch.results_recorded:
             batch.results_recorded = True
             attempt._results_pending -= 1
-            attempt._apply(batch, results)
+            ready, faults = results
+            attempt._apply(batch, ready, faults)
+            if faults:  # the fault stopped the attempt: a queued driver drops its calls not started
+                self._cancel_queued_calls(attempt)
         if ended and not batch.access_recorded:
             batch.access_recorded = True
             attempt._access_open -= 1
@@ -697,15 +789,23 @@ class BlobBackend:
         while True:
             try:
                 self._observe_watched()
+                if self._queued:
+                    self._collect(0.0 if self._closing else UNCOLLECTED_GRACE_S)
                 self._report_stuck_calls()
+            except Exception as error:  # the thread must live on, or the labels never clear
+                self._warn_progress_raised(error)
+            try:  # even when the round above raised: shutdown must still finish
                 if self._closing and self._finish_shutdown():
                     return
-            except Exception as error:  # the thread must live on, or the labels never clear
-                logger.warning_once(
-                    f"blob backend: a progress round raised {error!r}",
-                    key=(self._name, "progress", type(error)),
-                )
+            except Exception as error:
+                self._warn_progress_raised(error)
             delay = self._sleep(delay)
+
+    def _warn_progress_raised(self, error: Exception) -> None:
+        logger.warning_once(
+            f"blob backend: a progress round raised {error!r}",
+            key=(self._name, "progress", type(error)),
+        )
 
     def _observe_watched(self) -> None:
         with self._lock:
@@ -726,7 +826,7 @@ class BlobBackend:
             ]
         for batch in stuck:
             logger.warning_once(
-                f"blob backend: a store call of {batch.attempt.label} has run for over "
+                f"blob backend: a store call of {batch.attempt.label} has been out for over "
                 f"{STUCK_CALL_WARNING_S:g} s; its slots stay held until it returns",
                 key=(self._name, "stuck", batch.attempt.label, batch.group, batch.start),
             )
@@ -734,9 +834,12 @@ class BlobBackend:
     def _sleep(self, delay: float) -> float:
         with self._lock:
             if not self._progress_poked:
+                if self._queued:  # looks for operations an executor left untaken, at a fixed pace
+                    busy, wait_s = bool(self._in_driver or self._closing), UNCOLLECTED_GRACE_S
+                else:
+                    busy, wait_s = bool(self._watched or self._closing), delay
                 # Idle, the thread wakes only as often as stuck driver calls need reporting.
-                busy = self._watched or self._closing
-                self._progress_due.wait(delay if busy else STUCK_CALL_WARNING_S)
+                self._progress_due.wait(wait_s if busy else STUCK_CALL_WARNING_S)
             poked, self._progress_poked = self._progress_poked, False
         return PROGRESS_MIN_DELAY_S if poked else min(2 * delay, PROGRESS_MAX_DELAY_S)
 
@@ -762,6 +865,8 @@ class BlobBackend:
             for attempt in forced:
                 attempt._force_outcome(SHUTDOWN_FAULT)
                 self._conclude_or_quiesce(attempt)
+            for op in self._batch_of:  # a shutdown starts no more store calls
+                self._driver.cancel(op)
             self._work_ready.notify_all()
             self._poke_progress()
         return bool(forced)
@@ -793,10 +898,25 @@ def _refuse_shared_destinations(groups: list[_GroupRows]) -> None:
     """Two fetched rows in one slot would let one report READY over the other's bytes. A publish
     only reads its slots, so only a fetch is checked. Rows on one slot share their first span,
     and the spans of rows in different slots never meet."""
-    firsts = np.concatenate([rows.starts[:, 0] for rows in groups]) if groups else np.empty(0)
-    if np.unique(firsts).size != firsts.size:
+    firsts = np.sort(np.concatenate([rows.starts[:, 0] for rows in groups]) if groups else [])
+    if np.any(firsts[1:] == firsts[:-1]):
         raise InvalidSubmission("two rows of a fetch write the same slot")
 
 
-def _faults(batch: _Batch, reason: str) -> tuple[RowResult, ...]:
-    return (faulted(reason),) * len(batch)
+def _faults(batch: _Batch, reason: str) -> _Results:
+    """No row of ``batch`` READY, and its first row faulted for ``reason``: the attempt reports the
+    lowest faulted row."""
+    return np.zeros(len(batch), dtype=bool), {0: reason}
+
+
+def _refusal(error: Exception, refused: bool) -> str:
+    return f"refused: {error}" if refused else f"the store driver raised {error!r}"
+
+
+def _count_started(batch: _Batch) -> None:
+    """Counted as started before the driver call: while the call runs, this count alone keeps the
+    attempt from quiescing once a cancel or a fault has cleared its queue."""
+    attempt = batch.attempt
+    attempt._queued_batches -= 1
+    attempt._results_pending += 1
+    attempt._access_open += 1

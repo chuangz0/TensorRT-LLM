@@ -193,6 +193,7 @@ else:
         'libs/nvshmem/nvshmem_bootstrap_uid.so.3',
         'libs/nvshmem/nvshmem_transport_ibgda.so.103',
         'bindings.*.so',
+        'mooncake_store_worker.*.so',
         'deep_ep/LICENSE',
         'deep_ep/*.py',
         'deep_ep_cpp_tllm.*.so',

@@ -1020,6 +1020,8 @@ def main(*,
         "tensorrt_llm", "th_common", "bindings", "deep_ep", "deep_gemm",
         "pg_utils", "flash_mla"
     ]
+    if not on_windows:
+        targets.append("mooncake_store_worker")
     build_nccl_extensions_enabled = has_sm90_or_newer(cuda_architectures)
     if build_nccl_extensions_enabled:
         targets.append("nccl_extensions_wheel")
@@ -1434,6 +1436,10 @@ def main(*,
     binding_lib_dir = get_binding_lib("nanobind", "bindings")
     binding_lib_file_name = binding_lib_dir.name
     install_file(binding_lib_dir, pkg_dir)
+    if not on_windows:
+        install_file(
+            get_binding_lib("mooncake_store_worker", "mooncake_store_worker"),
+            pkg_dir)
 
     with (build_dir / "tensorrt_llm" / "deep_ep" /
           "cuda_architectures.txt").open() as f:

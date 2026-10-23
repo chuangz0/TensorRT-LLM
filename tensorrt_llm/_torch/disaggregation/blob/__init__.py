@@ -13,10 +13,14 @@ Read top down; a fetch or publish flows ``BlobBackend`` -> ``StoreDriver`` -> st
 - ``mooncake``: ``MooncakeDriver``, a ``StoreDriver`` over a set-up Mooncake SDK client.
   ``BlobBackend`` has no probe: a caller asking which objects exist calls the driver's ``probe``
   directly.
-- ``mooncake_setup``: reads a store config and opens the SDK client; ``open_mooncake_driver``
-  returns the driver and the config's ``blob`` section, from which ``BlobConfig`` is built.
+- ``mooncake_native``: ``NativeMooncakeDriver``, the same driver with its store calls on the C++
+  store worker's threads (``tensorrt_llm.mooncake_store_worker``), which never hold the GIL.
+- ``mooncake_setup``: reads a store config, opens the SDK client and picks the driver
+  (``make_store_driver``); ``open_mooncake_driver`` returns the driver and the config's ``blob``
+  section, from which ``BlobConfig`` is built.
 
 No module imports torch, ``tensorrt_llm._torch.pyexecutor`` or a store SDK at import time; only
-``mooncake_setup.open_sdk`` imports ``mooncake.store``, when called. Each module's imports are
-checked by ``test_mooncake_setup.py::test_blob_modules_import_only_their_layer``.
+``mooncake_setup.open_sdk`` imports ``mooncake.store``, and ``mooncake_setup`` the store worker,
+when called. Each module's imports are checked by
+``test_mooncake_setup.py::test_blob_modules_import_only_their_layer``.
 """

@@ -9,7 +9,9 @@ the other process's segment and every transfer goes through the transfer engine;
 transport is ``TRTLLM_MOONCAKE_PROTOCOL`` (default rdma) over ``TRTLLM_MOONCAKE_DEVICES`` (default:
 the host's fastest active InfiniBand devices). The shared ``driver_conformance`` checks run here
 too, each over a fresh client and under a key prefix of its own, with a driver that registers
-device memory: over RDMA, rows of several spans move into and out of GPU memory in place.
+device memory: over RDMA, rows of several spans move into and out of GPU memory in place. They and
+the backend-level tests run on both drivers, the Python one and the native one whose store worker
+calls the same client from C++ threads, and must give the same results.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import os
 import secrets
 import shutil
 import threading
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -29,8 +32,14 @@ from fake_mooncake import GetsOfKeyWait
 
 from tensorrt_llm._torch.disaggregation.base.backend import Outcome
 from tensorrt_llm._torch.disaggregation.base.memory import MemoryKind
+from tensorrt_llm._torch.disaggregation.blob.backend import BlobConfig
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
-from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import MooncakeConfig, open_sdk
+from tensorrt_llm._torch.disaggregation.blob.mooncake_native import NativeMooncakeDriver
+from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
+    MooncakeConfig,
+    make_store_driver,
+    open_sdk,
+)
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import SLOT as CHECK_SLOT
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import DriverConformance
 from tensorrt_llm._torch.disaggregation.testing.host_memory import CANARY, GUARD, HostBuffer
@@ -48,6 +57,7 @@ PROTOCOL = os.environ.get("TRTLLM_MOONCAKE_PROTOCOL", "rdma")
 DEVICES = os.environ.get("TRTLLM_MOONCAKE_DEVICES", "")
 POOL_BYTES = 1 << 30
 SLOT_BYTES = 64 << 10
+DRIVERS = ("python", "native")
 
 
 def _require_mooncake() -> None:
@@ -108,10 +118,24 @@ class Clients:
         self.opened.append(open_sdk(client_config(self.master)))
         return self.opened[-1]
 
-    def endpoint(self, names, *, workers: int = 2, **options) -> Endpoint:
+    def endpoint(
+        self,
+        names,
+        *,
+        driver: str = "python",
+        workers: int = 2,
+        rows_per_batch: int = 64,
+        **options,
+    ) -> Endpoint:
+        """An endpoint over a fresh client and the ``driver`` asked for; a native driver's worker
+        cuts its calls as the endpoint's backend would."""
+        blob = BlobConfig(workers=workers, rows_per_batch=rows_per_batch)
+        mooncake = replace(client_config(self.master), driver=driver)
+        store_driver = make_store_driver(self.open_client(), mooncake, blob)
         options = {"slot_bytes": SLOT_BYTES, **options}
-        driver = MooncakeDriver(self.open_client())
-        return self.add(Endpoint(driver, names, workers=workers, **options))
+        return self.add(
+            Endpoint(store_driver, names, workers=workers, rows_per_batch=rows_per_batch, **options)
+        )
 
     def add(self, endpoint: Endpoint) -> Endpoint:
         self.endpoints.append(endpoint)
@@ -150,7 +174,15 @@ def finish(endpoint: Endpoint, submit, *names: str) -> Outcome:
     return outcome
 
 
-def test_real_store_full_is_declined(tmp_path, request) -> None:
+def test_real_auto_runs_the_native_driver_where_the_slot_check_passes(clients) -> None:
+    config = client_config(clients.master)
+    assert config.driver == "auto"
+    driver = make_store_driver(clients.open_client(), config, BlobConfig())
+    assert isinstance(driver, NativeMooncakeDriver)
+
+
+@pytest.mark.parametrize("driver", DRIVERS)
+def test_real_store_full_is_declined(tmp_path, request, driver) -> None:
     _require_mooncake()
     # A pool of its own that one publish overfills: a 16 MiB segment (the smallest a TCP client
     # may give, one allocator slab) holds at most 256 of the 512 rows. A PutStart that finds no room
@@ -160,7 +192,7 @@ def test_real_store_full_is_declined(tmp_path, request) -> None:
     clients = Clients(master)
     with stack:
         names = [f"{request.node.name}-{i}" for i in range(512)]
-        writer = clients.endpoint(names, workers=1)
+        writer = clients.endpoint(names, driver=driver, workers=1)
         random_rows(writer, seed=4)
         outcome = finish(writer, writer.backend.publish, *names)
         delivered = int(outcome.delivered_masks[0].sum())
@@ -173,17 +205,20 @@ def test_real_store_full_is_declined(tmp_path, request) -> None:
 
 # The reader's backend keeps polling the get whose access is unproven, as it would in production.
 @pytest.mark.threadleak(enabled=False)
-def test_real_get_refuses_an_object_of_another_size_before_moving_a_byte(clients, request) -> None:
+@pytest.mark.parametrize("driver", DRIVERS)
+def test_real_get_refuses_an_object_of_another_size_before_moving_a_byte(
+    clients, request, driver
+) -> None:
     # batch_get_into_multi_buffers refuses an object longer than its buffers (INVALID_PARAMS),
     # and its transfer submission one shorter (TRANSFER_FAIL, which proves no access end).
     short, long = f"{request.node.name}-short", f"{request.node.name}-long"
-    half = clients.endpoint([short], slot_bytes=SLOT_BYTES // 2)
-    double = clients.endpoint([long], slot_bytes=2 * SLOT_BYTES)
+    half = clients.endpoint([short], driver=driver, slot_bytes=SLOT_BYTES // 2)
+    double = clients.endpoint([long], driver=driver, slot_bytes=2 * SLOT_BYTES)
     random_rows(half, seed=9)
     random_rows(double, seed=10)
     assert masks(finish(half, half.backend.publish, short)) == [[True]]
     assert masks(finish(double, double.backend.publish, long)) == [[True]]
-    reader = clients.endpoint([short, long], fill=0x2D, rows_per_batch=1)
+    reader = clients.endpoint([short, long], driver=driver, fill=0x2D, rows_per_batch=1)
     outcome = finish(reader, reader.backend.fetch, long)
     assert masks(outcome) == [[False]] and "INVALID_PARAMS(-600)" in outcome.fault
     assert reader.read(long) == b"-" * SLOT_BYTES
@@ -267,10 +302,29 @@ class TestRealMooncakeConformance(DriverConformance):
         )
 
 
-def test_real_four_workers_round_trip_2000_rows_without_crossed_bytes(clients, request) -> None:
+class TestRealNativeConformance(TestRealMooncakeConformance):
+    """The same checks on the native driver, which must refuse to start rather than fall back.
+    Its store calls bypass the Python client a test could hold, so a get blocked inside the store
+    is staged only over the fake SDK (``test_mooncake_driver.py``)."""
+
+    handles_before_completion = True
+
+    def make_driver(self) -> NativeMooncakeDriver:
+        config = replace(client_config(self.master), driver="native")
+        store = open_sdk(config)
+        return make_store_driver(store, config, BlobConfig(), allocation_range=allocation_range)
+
+    def make_blocked_get(self):
+        return None
+
+
+@pytest.mark.parametrize("driver", DRIVERS)
+def test_real_four_workers_round_trip_2000_rows_without_crossed_bytes(
+    clients, request, driver
+) -> None:
     names = [f"{request.node.name}-{i}" for i in range(2000)]
-    writer = clients.endpoint(names, workers=4, rows_per_batch=64)
-    reader = clients.endpoint(names, workers=4, rows_per_batch=64, fill=0x2D)
+    writer = clients.endpoint(names, driver=driver, workers=4, rows_per_batch=64)
+    reader = clients.endpoint(names, driver=driver, workers=4, rows_per_batch=64, fill=0x2D)
     rows = random_rows(writer, seed=6)
     outcome = finish(writer, writer.backend.publish, *names)
     assert outcome.fault is None and all(masks(outcome)[0])
@@ -278,7 +332,8 @@ def test_real_four_workers_round_trip_2000_rows_without_crossed_bytes(clients, r
     assert outcome.fault is None and all(masks(outcome)[0])
     crossed = [name for name in names if reader.read(name) != rows[name]]
     assert crossed == []
-    assert writer.driver.peak_in_flight >= 2 and reader.driver.peak_in_flight >= 2
+    if driver == "python":  # the backend's threads; a native driver runs its calls itself
+        assert writer.driver.peak_in_flight >= 2 and reader.driver.peak_in_flight >= 2
     writer.close()
     reader.close()
 

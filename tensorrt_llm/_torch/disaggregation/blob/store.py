@@ -12,9 +12,11 @@ other. Nothing here belongs to the public backend contract in ``base/``, from wh
 from __future__ import annotations
 
 import enum
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
+
+import numpy as np
 
 from ..base.memory import MemoryKind
 
@@ -241,6 +243,10 @@ class DriverCapabilities:
             every region handed to it is host memory and it rejects a DEVICE one.
         multi_span: ``put`` and ``get`` take rows of more than one span; without it every row
             handed to it has exactly one.
+        queued: ``put`` and ``get`` only queue the operation and return its handle; the driver
+            runs, orders and cuts its own store calls, takes rows as arrays through ``put_rows``
+            and ``get_rows``, and hands operations back through ``take_finished``
+            (:class:`QueuedStoreDriver`).
     """
 
     get: bool
@@ -252,6 +258,7 @@ class DriverCapabilities:
     absent_is_miss: bool = False
     device_memory: bool = False
     multi_span: bool = False
+    queued: bool = False
 
     def __post_init__(self) -> None:
         if not (self.get or self.put):
@@ -409,4 +416,49 @@ class StoreDriver(Protocol):
         Allowed only after ``drain`` returned True and every registration is unregistered;
         otherwise raises :class:`DriverRejected` and changes nothing. Idempotent.
         """
+        ...
+
+
+@dataclass(frozen=True)
+class RowArrays:
+    """The rows of one queued operation. Row ``i`` is the object ``stem + names[i].hex()``; its
+    bytes are the spans ``(starts[i, j], span_bytes[j])`` back to back, in column order. Names are
+    distinct, every span lies in one registered region, and the arrays are C-contiguous and stay
+    unchanged while the driver may read them."""
+
+    stem: str
+    names: np.ndarray  # uint8 [rows, width]
+    starts: np.ndarray  # int64 [rows, spans]
+    span_bytes: tuple[int, ...]  # positive, one per span
+
+
+@dataclass(frozen=True, eq=False)
+class FinishedOp:
+    """A queued operation whose rows all concluded and whose access ended, or never will."""
+
+    op: OpHandle
+    ready: np.ndarray  # bool [rows]
+    faults: Mapping[int, str]  # row -> fault text, FAULT rows only
+    access_ended: bool  # False: access_unprovable
+
+
+@runtime_checkable
+class QueuedStoreDriver(StoreDriver, Protocol):
+    """A driver that declares ``queued``. Every method it adds returns in microseconds."""
+
+    def put_rows(self, rows: RowArrays) -> OpHandle:
+        """Queues a put of ``rows``; raises as ``put``."""
+        ...
+
+    def get_rows(self, rows: RowArrays) -> OpHandle:
+        """Queues a get of ``rows``; raises as ``get``."""
+        ...
+
+    def take_finished(self) -> Sequence[FinishedOp]:
+        """Every operation finished since the last call, each once, whoever polled it meanwhile."""
+        ...
+
+    def finished_waiting_s(self) -> float:
+        """How long the oldest finished operation has waited for ``take_finished``, in seconds;
+        0.0 when none waits."""
         ...

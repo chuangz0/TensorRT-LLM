@@ -29,11 +29,13 @@ from tensorrt_llm._torch.disaggregation.blob.backend import (
 from tensorrt_llm._torch.disaggregation.blob.keys import encode_key
 from tensorrt_llm._torch.disaggregation.blob.store import (
     DriverCapabilities,
+    FinishedOp,
     Hint,
     OpHandle,
     RegionHandle,
     RegionLayout,
     RegistrationError,
+    RowArrays,
     RowIO,
     RowResult,
     StoreDriver,
@@ -360,6 +362,24 @@ class DriverSpy:
         with self._counted():
             op = self.inner.get(rows) if hint is None else self.inner.get(rows, hint)
             return self._started(rows, op)
+
+    def put_rows(self, rows: RowArrays) -> OpHandle:
+        self._enter("put_rows")
+        with self._counted():
+            return self.inner.put_rows(rows)
+
+    def get_rows(self, rows: RowArrays) -> OpHandle:
+        self._enter("get_rows")
+        with self._counted():
+            return self.inner.get_rows(rows)
+
+    # A queued driver's collection, forwarded unrecorded: the backend calls it at every poll.
+
+    def take_finished(self) -> Sequence[FinishedOp]:
+        return self.inner.take_finished()
+
+    def finished_waiting_s(self) -> float:
+        return self.inner.finished_waiting_s()
 
     def poll(self, op: OpHandle) -> tuple[RowResult, ...]:
         self._enter("poll", op=op)

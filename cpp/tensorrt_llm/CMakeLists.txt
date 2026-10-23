@@ -345,6 +345,10 @@ endif()
 
 add_subdirectory(nanobind)
 
+if(NOT WIN32)
+  add_subdirectory(mooncake_store_worker)
+endif()
+
 if(BUILD_DEEP_EP)
   add_subdirectory(deep_ep)
 endif()

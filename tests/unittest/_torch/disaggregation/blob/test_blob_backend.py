@@ -331,7 +331,7 @@ def test_a_stuck_driver_call_is_reported_once(monkeypatch: pytest.MonkeyPatch) -
     attempt = reader.backend.fetch(reader.view("A"), None)
 
     def stuck() -> list[str]:
-        return [line for line in warnings if "has run for over" in line]
+        return [line for line in warnings if "has been out for over" in line]
 
     try:
         store.wait_for_waiting(1)

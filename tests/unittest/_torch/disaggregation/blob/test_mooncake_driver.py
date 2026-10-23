@@ -1,13 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The Mooncake driver over a fake SDK that moves real bytes.
+"""Both Mooncake drivers over a fake SDK that moves real bytes: the Python driver, and the native
+one whose store worker reaches the fake through its test client.
 
 Pins the mapping of SDK 0.3.13 answers to row results, the put session bookkeeping (every session
 the driver starts is ended, revoked or left open; only rows written whole are ended), the access-end
 rules (a put scatter that returns ends access, whatever it answers; a get ends it unless a row
 answers TRANSFER_FAIL; a call that raises or miscounts does not, and its access is unprovable),
 registration (device memory one piece per CUDA allocation), drain and close, and a backend round
-trip over the fake SDK. The shared ``driver_conformance`` checks run over the fake SDK too.
+trip over the fake SDK. Each scenario runs on both drivers and must give the same results. The
+shared ``driver_conformance`` checks run over the fake SDK too.
 """
 
 from __future__ import annotations
@@ -18,16 +20,18 @@ from collections import Counter
 from dataclasses import replace
 
 import pytest
-from cpu_fixtures import PROMPT_S, WAIT_S, Endpoint, store_key
+from cpu_fixtures import PROMPT_S, WAIT_S, Endpoint, store_key, wait_until
 from fake_mooncake import FakeMooncakeStore, FakePool, GetsOfKeyWait
 
 from tensorrt_llm._torch.disaggregation.base.backend import Attempt, Backend, Capabilities
 from tensorrt_llm._torch.disaggregation.base.memory import MemoryKind
 from tensorrt_llm._torch.disaggregation.blob import mooncake as mooncake_module
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
+from tensorrt_llm._torch.disaggregation.blob.mooncake_native import NativeMooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.store import (
     DriverCapabilities,
     DriverRejected,
+    QueuedStoreDriver,
     RegionLayout,
     RegistrationError,
     RowIO,
@@ -35,6 +39,7 @@ from tensorrt_llm._torch.disaggregation.blob.store import (
     Span,
     StoreDriver,
     StoreError,
+    concluded,
 )
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import DriverConformance
 from tensorrt_llm._torch.disaggregation.testing.host_memory import HostBuffer
@@ -56,12 +61,49 @@ def key(name: str) -> str:
     return f"t/v1/{name}"
 
 
-class Bench:
-    """A ``MooncakeDriver`` over a fake SDK, with ``slots`` registered host slots."""
+def python_driver(sdk, allocation_range=None) -> MooncakeDriver:
+    return MooncakeDriver(sdk, allocation_range=allocation_range)
 
-    def __init__(self, slots: int = 4, pool: FakePool | None = None) -> None:
+
+def native_driver(sdk, allocation_range=None, **overrides) -> NativeMooncakeDriver:
+    """The native driver over a fake SDK: the worker's store calls go to ``sdk``'s methods."""
+    from tensorrt_llm.mooncake_store_worker import StoreWorker
+
+    options = {
+        "threads": 4,
+        "put_threads": 3,
+        "gets_per_put": 4,
+        "rows_per_call": 256,
+        "bytes_per_call": 1 << 30,
+        **overrides,
+    }
+    worker = StoreWorker.over_sdk_object(sdk, **options)
+    return NativeMooncakeDriver(sdk, worker, allocation_range=allocation_range)
+
+
+DRIVERS = {"python": python_driver, "native": native_driver}
+
+
+@pytest.fixture(params=DRIVERS)
+def make_driver(request):
+    """Builds a driver over a fake SDK: each scenario taking it runs on both drivers."""
+    return DRIVERS[request.param]
+
+
+def settled(driver: StoreDriver, op) -> tuple:
+    """The results of ``op`` once every row concluded: at once for the Python driver, whose calls
+    return only after the store answered; a native operation's results and access end land
+    together."""
+    wait_until(lambda: concluded(driver.poll(op)), "the operation to conclude")
+    return driver.poll(op)
+
+
+class Bench:
+    """A driver (``make_driver``) over a fake SDK, with ``slots`` registered host slots."""
+
+    def __init__(self, make_driver, slots: int = 4, pool: FakePool | None = None) -> None:
         self.fake = FakeMooncakeStore(pool)
-        self.driver = MooncakeDriver(self.fake)
+        self.driver = make_driver(self.fake)
         self.buffer = HostBuffer(SLOT * slots, fill=0x2D)
         layout = RegionLayout(SLOT, slots)
         self.handle = self.driver.register(self.buffer.address, self.buffer.nbytes, layout)
@@ -80,10 +122,11 @@ class Bench:
         return self.buffer.read(slot * SLOT, SLOT)
 
     def run(self, direction: str, *names: str):
-        """The results and access end of a put or get of ``names``; ``last`` is its handle."""
+        """The results and access end of a put or get of ``names``, once concluded; ``last`` is
+        its handle."""
         rows = self.rows(*names)
         self.last = self.driver.put(rows) if direction == "put" else self.driver.get(rows)
-        return self.driver.poll(self.last), self.driver.access_ended(self.last)
+        return settled(self.driver, self.last), self.driver.access_ended(self.last)
 
     def fill_sources(self, direction: str, *names: str) -> None:
         """Gives a put of ``names`` its slots' bytes, or a get its objects in the pool."""
@@ -99,10 +142,12 @@ def summary(results) -> list[tuple[str, str | None]]:
     return [(result.status.value, result.fault) for result in results]
 
 
-def test_the_driver_follows_the_driver_protocol() -> None:
-    bench = Bench()
-    assert isinstance(bench.driver, StoreDriver)
-    assert bench.driver.capabilities == DriverCapabilities(
+def test_the_drivers_follow_the_driver_protocol() -> None:
+    python = Bench(python_driver).driver
+    native = Bench(native_driver).driver
+    assert isinstance(python, StoreDriver) and not isinstance(python, QueuedStoreDriver)
+    assert isinstance(native, QueuedStoreDriver)
+    assert python.capabilities == DriverCapabilities(
         get=True,
         put=True,
         cancel=False,
@@ -113,21 +158,25 @@ def test_the_driver_follows_the_driver_protocol() -> None:
         device_memory=False,
         multi_span=True,
     )
-    assert MooncakeDriver(bench.fake, allocation_range=lambda address: None).capabilities == (
-        replace(bench.driver.capabilities, device_memory=True)
-    )
+    # The native driver cancels the calls it has not started and runs its own queue.
+    assert native.capabilities == replace(python.capabilities, cancel=True, queued=True)
+    for make_driver in DRIVERS.values():
+        device = make_driver(FakeMooncakeStore(), allocation_range=lambda address: None)
+        assert device.capabilities.device_memory
 
 
 class TestMooncakeDriverConformance(DriverConformance):
     """The shared driver checks over the fake SDK, with every scenario it can stage. A probe
     cannot be blocked past its budget: the SDK's existence check takes no deadline."""
 
+    driver_of = staticmethod(python_driver)
+
     def make_driver(self) -> StoreDriver:
-        return MooncakeDriver(FakeMooncakeStore())
+        return self.driver_of(FakeMooncakeStore())
 
     def make_blocked_get(self):
         sdk = GetsOfKeyWait(FakeMooncakeStore(), key("blocked"))
-        return MooncakeDriver(sdk), key("blocked"), sdk.entered, sdk.release.set
+        return self.driver_of(sdk), key("blocked"), sdk.entered, sdk.release.set
 
     def make_held_key(self):
         pool = FakePool()
@@ -137,34 +186,42 @@ class TestMooncakeDriverConformance(DriverConformance):
         def release() -> None:
             writer.batch_put_session_revoke([key("held")])
 
-        return MooncakeDriver(FakeMooncakeStore(pool)), key("held"), release
+        return self.driver_of(FakeMooncakeStore(pool)), key("held"), release
 
     def make_full_store(self):
         fake = FakeMooncakeStore()
         # Room for one more object as the check uses it: its one two-row put finds room for the
         # first only.
         fake.script(PUT_START, [None, -200])
-        return MooncakeDriver(fake)
+        return self.driver_of(fake)
 
     def make_crash_after_record(self):
         fake = FakeMooncakeStore()
         fake.script(PUT_START, RuntimeError("the SDK crashed"))
-        return MooncakeDriver(fake)
+        return self.driver_of(fake)
 
     def make_failing_presence(self):
         fake = FakeMooncakeStore()
         fake.script(IS_EXIST, [-900])  # the existence check fails with RPC_FAIL
-        return MooncakeDriver(fake), key("failing")
+        return self.driver_of(fake), key("failing")
 
     def make_failing_get(self):
         fake = FakeMooncakeStore()
         fake.script(GET, [-900])  # the next read fails with RPC_FAIL; the check reads the key once
-        return MooncakeDriver(fake), key("failing")
+        return self.driver_of(fake), key("failing")
 
     def make_unprovable_get(self):
         fake = FakeMooncakeStore()
         fake.script(GET, [-800])  # a transfer future gave up while its transfer may still run
-        return MooncakeDriver(fake), lambda op: None  # the get concluded before it returned
+        return self.driver_of(fake), lambda op: None  # the get concluded on its own
+
+
+class TestNativeMooncakeDriverConformance(TestMooncakeDriverConformance):
+    """The same checks on the native driver. Its put and get return the handle before the store
+    answers, so the checks of a get blocked inside the store and cancelled there run too."""
+
+    driver_of = staticmethod(native_driver)
+    handles_before_completion = True
 
 
 # Answers to row results.
@@ -189,9 +246,9 @@ GET_ANSWERS = {
 
 
 @pytest.mark.parametrize("case", GET_ANSWERS)
-def test_get_answers_map_to_row_statuses(case: str) -> None:
+def test_get_answers_map_to_row_statuses(make_driver, case: str) -> None:
     answer, status, fault, counted = GET_ANSWERS[case]
-    bench = Bench()
+    bench = Bench(make_driver)
     bench.store(A=b"aaaaaaaa")
     bench.fake.script(GET, [answer])
     results, access_ended = bench.run("get", "A")
@@ -213,9 +270,9 @@ PUT_START_ANSWERS = {
 
 
 @pytest.mark.parametrize("case", PUT_START_ANSWERS)
-def test_put_session_start_answers_map_to_row_statuses(case: str) -> None:
+def test_put_session_start_answers_map_to_row_statuses(make_driver, case: str) -> None:
     answer, status, fault, counted = PUT_START_ANSWERS[case]
-    bench = Bench()
+    bench = Bench(make_driver)
     bench.fake.script(PUT_START, [answer])
     results, access_ended = bench.run("put", "A")
     assert summary(results) == [(status, fault)]
@@ -239,9 +296,9 @@ PUT_WRITE_ANSWERS = {
 
 
 @pytest.mark.parametrize("case", PUT_WRITE_ANSWERS)
-def test_put_ranges_and_end_answers_map_to_row_statuses(case: str) -> None:
+def test_put_ranges_and_end_answers_map_to_row_statuses(make_driver, case: str) -> None:
     ranges, end, status, fault = PUT_WRITE_ANSWERS[case]
-    bench = Bench()
+    bench = Bench(make_driver)
     bench.write(0, b"aaaaaaaa")
     bench.fake.script(PUT_RANGES, [ranges])
     bench.fake.script(PUT_END, [end])
@@ -262,9 +319,9 @@ EXISTENCE_ANSWERS = {
 
 
 @pytest.mark.parametrize("case", EXISTENCE_ANSWERS)
-def test_only_rows_that_already_exist_are_checked_for_existence(case: str) -> None:
+def test_only_rows_that_already_exist_are_checked_for_existence(make_driver, case: str) -> None:
     exist, expected = EXISTENCE_ANSWERS[case]
-    bench = Bench()
+    bench = Bench(make_driver)
     # A starts, B and C exist (OBJECT_ALREADY_EXISTS), D finds the pool full.
     bench.fake.script(PUT_START, [None, -705, -705, -200])
     bench.fake.script("batch_is_exist", exist)
@@ -299,9 +356,11 @@ SESSION_SCENARIOS = {
 
 
 @pytest.mark.parametrize("scenario", SESSION_SCENARIOS)
-def test_every_started_put_session_is_ended_revoked_or_left_open(scenario: str) -> None:
+def test_every_started_put_session_is_ended_revoked_or_left_open(
+    make_driver, scenario: str
+) -> None:
     steps, statuses, ends_access = SESSION_SCENARIOS[scenario]
-    bench = Bench()
+    bench = Bench(make_driver)
     for slot, data in enumerate((b"aaaaaaaa", b"bbbbbbbb", b"cccccccc")):
         bench.write(slot, data)
     for method, method_steps in steps.items():
@@ -326,8 +385,8 @@ def test_every_started_put_session_is_ended_revoked_or_left_open(scenario: str) 
     assert set(ready) == set(bench.fake.keys_answered(PUT_END, 0))
 
 
-def test_sessions_left_open_are_revoked_only_in_drain() -> None:
-    bench = Bench()
+def test_sessions_left_open_are_revoked_only_in_drain(make_driver) -> None:
+    bench = Bench(make_driver)
     bench.write(0, b"aaaaaaaa")
     bench.fake.script(PUT_END, [-704])
     bench.fake.script(PUT_REVOKE, [-900])
@@ -348,8 +407,8 @@ def test_sessions_left_open_are_revoked_only_in_drain() -> None:
     assert bench.fake.put_sessions == set()
 
 
-def test_drain_leaves_sessions_alone_while_access_is_unproven() -> None:
-    bench = Bench()
+def test_drain_leaves_sessions_alone_while_access_is_unproven(make_driver) -> None:
+    bench = Bench(make_driver)
     bench.fake.script(PUT_RANGES, RuntimeError("bad pointer"))
     _, access_ended = bench.run("put", "A")
     assert not access_ended
@@ -372,9 +431,11 @@ LEASE_EXPIRED_CASES = {
 
 
 @pytest.mark.parametrize("case", LEASE_EXPIRED_CASES)
-def test_rows_whose_lease_expired_are_reread_once_and_both_reads_must_end_access(case: str) -> None:
+def test_rows_whose_lease_expired_are_reread_once_and_both_reads_must_end_access(
+    make_driver, case: str
+) -> None:
     first, reread, statuses, ended = LEASE_EXPIRED_CASES[case]
-    bench = Bench()
+    bench = Bench(make_driver)
     bench.fill_sources("get", "A", "B", "C")
     bench.fake.script(GET, first)
     bench.fake.script(GET, reread)
@@ -386,13 +447,13 @@ def test_rows_whose_lease_expired_are_reread_once_and_both_reads_must_end_access
     assert bench.driver.drain(0.0) is ended
 
 
-def test_an_object_being_written_is_not_ready_for_put_and_get(monkeypatch) -> None:
+def test_an_object_being_written_is_not_ready_for_put_and_get(make_driver, monkeypatch) -> None:
     warnings: list[str] = []
     monkeypatch.setattr(mooncake_module.logger, "warning", warnings.append)
     pool = FakePool()
     writer = FakeMooncakeStore(pool)
     assert writer.batch_put_session_start([key("K")], [SLOT]) == [0]  # another client is writing
-    bench = Bench(pool=pool)
+    bench = Bench(make_driver, pool=pool)
     results, access_ended = bench.run("get", "K")
     assert summary(results) == [("not_ready", None)] and access_ended
     results, access_ended = bench.run("put", "K")
@@ -417,8 +478,10 @@ FAILURES = {
 
 @pytest.mark.parametrize("failure", FAILURES)
 @pytest.mark.parametrize("call", ["put", "get", "get_reread"])
-def test_access_stays_open_when_a_data_call_raises_or_miscounts(call: str, failure: str) -> None:
-    bench = Bench()
+def test_access_stays_open_when_a_data_call_raises_or_miscounts(
+    make_driver, call: str, failure: str
+) -> None:
+    bench = Bench(make_driver)
     direction = "put" if call == "put" else "get"
     bench.fill_sources(direction, "A", "B")
     if call == "get_reread":
@@ -436,10 +499,12 @@ def test_access_stays_open_when_a_data_call_raises_or_miscounts(call: str, failu
 
 @pytest.mark.parametrize("direction", ["put", "get"])
 def test_a_fault_past_the_sdk_calls_keeps_access_open(direction: str, monkeypatch) -> None:
+    """The Python driver's own bug path; the native one's is its worker's catch-all."""
+
     def broken(*_):
         raise ValueError("mapping bug")
 
-    bench = Bench()
+    bench = Bench(python_driver)
     if direction == "get":
         monkeypatch.setattr(mooncake_module, "_get_result", broken)
         bench.fake.script(GET, [5])  # a row read short goes past the all-whole shortcut
@@ -454,8 +519,8 @@ def test_a_fault_past_the_sdk_calls_keeps_access_open(direction: str, monkeypatc
 # Admission, registration, concurrency.
 
 
-def test_bad_rows_are_rejected_before_the_sdk() -> None:
-    bench = Bench()
+def test_bad_rows_are_rejected_before_the_sdk(make_driver) -> None:
+    bench = Bench(make_driver)
     with pytest.raises(DriverRejected, match="at least one"):
         bench.driver.get([])
     with pytest.raises(DriverRejected, match="at most"):
@@ -463,19 +528,19 @@ def test_bad_rows_are_rejected_before_the_sdk() -> None:
     assert [c for c in bench.fake.calls if c.method.startswith("batch_")] == []
 
 
-def test_rows_in_two_registrations_are_admitted_row_by_row() -> None:
-    bench = Bench()
+def test_rows_in_two_registrations_are_admitted_row_by_row(make_driver) -> None:
+    bench = Bench(make_driver)
     other = HostBuffer(SLOT)  # a second registration, apart from the first
     bench.driver.register(other.address, SLOT, RegionLayout(SLOT, 1))
     first, _ = bench.rows("A", "B")
     op = bench.driver.get([first, RowIO(key("C"), (other.span(),))])  # the gap is no row's
-    assert summary(bench.driver.poll(op)) == [("miss", None), ("miss", None)]
+    assert summary(settled(bench.driver, op)) == [("miss", None), ("miss", None)]
     assert bench.driver.access_ended(op)
 
 
-def test_register_and_unregister_follow_the_protocol() -> None:
+def test_register_and_unregister_follow_the_protocol(make_driver) -> None:
     fake = FakeMooncakeStore()
-    driver = MooncakeDriver(fake)
+    driver = make_driver(fake)
     region, other = HostBuffer(64), HostBuffer(64)
     handle = driver.register(region.address, 64, RegionLayout(SLOT, 8))
     with pytest.raises(DriverRejected, match="layout needs"):
@@ -521,10 +586,12 @@ class Allocations:
         return self.buffer.address + offset // SLOT * SLOT, SLOT
 
 
-def test_a_device_region_registers_one_piece_per_allocation_and_rolls_back_a_failed_piece() -> None:
+def test_a_device_region_registers_one_piece_per_allocation_and_rolls_back_a_failed_piece(
+    make_driver,
+) -> None:
     fake = FakeMooncakeStore()
     region = HostBuffer(3 * SLOT)  # stands in for device memory of three allocations
-    driver = MooncakeDriver(fake, allocation_range=Allocations(region))
+    driver = make_driver(fake, allocation_range=Allocations(region))
     layout = RegionLayout(SLOT, 3, "kv", MemoryKind.DEVICE)
     pieces = [(region.address + i * SLOT, SLOT) for i in range(3)]
     for answer in (None, None, -1):  # the third piece fails
@@ -539,14 +606,16 @@ def test_a_device_region_registers_one_piece_per_allocation_and_rolls_back_a_fai
     assert fake.registered == {}
 
 
-def test_a_span_across_allocations_reaches_the_sdk_as_one_buffer_per_allocation() -> None:
+def test_a_span_across_allocations_reaches_the_sdk_as_one_buffer_per_allocation(
+    make_driver,
+) -> None:
     fake = FakeMooncakeStore()
     region = HostBuffer(3 * SLOT, fill=0x2D)
-    driver = MooncakeDriver(fake, allocation_range=Allocations(region))
+    driver = make_driver(fake, allocation_range=Allocations(region))
     driver.register(region.address, region.nbytes, RegionLayout(SLOT, 3, "kv", MemoryKind.DEVICE))
     region.write(b"0123456789abcdef", SLOT // 2)  # bytes 4 to 20: across both inner boundaries
     row = RowIO(key("A"), (region.span(SLOT // 2, 2 * SLOT), region.span(0, SLOT // 2)))
-    assert summary(driver.poll(driver.put([row]))) == [("ready", None)]
+    assert summary(settled(driver, driver.put([row]))) == [("ready", None)]
     (scatter,) = fake.calls_to(PUT_RANGES)
     _, buffers, lengths, offsets = scatter.args
     assert lengths == [[4, 8, 4, 4]] and offsets == [[0, 4, 12, 16]]
@@ -554,7 +623,7 @@ def test_a_span_across_allocations_reaches_the_sdk_as_one_buffer_per_allocation(
     assert fake.pool.objects[key("A")] == b"0123456789abcdef----"
 
     region.write(b"-" * 3 * SLOT)
-    assert summary(driver.poll(driver.get([row]))) == [("ready", None)]
+    assert summary(settled(driver, driver.get([row]))) == [("ready", None)]
     (get,) = fake.calls_to(GET)
     assert get.args[2] == [[4, 8, 4, 4]]
     assert region.read() == b"----0123456789abcdef----"
@@ -573,8 +642,8 @@ def wait_until_draining(driver: MooncakeDriver) -> None:
     pytest.fail("no drain started")
 
 
-def test_unregister_is_refused_and_drain_waits_while_a_put_runs() -> None:
-    bench = Bench()
+def test_unregister_is_refused_and_drain_waits_while_a_put_runs(make_driver) -> None:
+    bench = Bench(make_driver)
     bench.fill_sources("put", "A")
     gate = bench.fake.block(PUT_RANGES)
     putter = threading.Thread(target=lambda: bench.run("put", "A"))
@@ -599,13 +668,16 @@ def test_unregister_is_refused_and_drain_waits_while_a_put_runs() -> None:
     assert len(bench.fake.calls_to("unregister_buffer")) == 1
 
 
-def test_an_unprovable_operation_pins_its_region_and_fails_drain_at_once() -> None:
-    bench = Bench()
+def test_an_unprovable_operation_pins_its_region_and_fails_drain_at_once(make_driver) -> None:
+    bench = Bench(make_driver)
     bench.fill_sources("get", "A", "B")
     bench.fake.script(GET, [-800])
     bench.run("get", "A")
     gate = bench.fake.block(GET)
-    blocked = threading.Thread(target=lambda: bench.driver.get(bench.rows("A", "B")[1:]))
+    ops = []
+    blocked = threading.Thread(
+        target=lambda: ops.append(bench.driver.get(bench.rows("A", "B")[1:]))
+    )
     blocked.start()
     try:
         assert gate.entered.wait(WAIT_S)  # another get is still running
@@ -615,6 +687,9 @@ def test_an_unprovable_operation_pins_its_region_and_fails_drain_at_once() -> No
     finally:
         gate.release.set()
         blocked.join(WAIT_S)
+    # The second get ended: only the unprovable first one pins the region, and the worker no
+    # longer writes into bench.buffer.
+    settled(bench.driver, ops[0])
     with pytest.raises(DriverRejected, match="may still access"):
         bench.driver.unregister(bench.handle)
     with pytest.raises(DriverRejected, match="drain"):
@@ -622,8 +697,10 @@ def test_an_unprovable_operation_pins_its_region_and_fails_drain_at_once() -> No
     assert bench.fake.calls_to("close") == []
 
 
-def test_close_needs_a_drain_closes_the_sdk_client_once_and_then_queries_raise() -> None:
-    bench = Bench()
+def test_close_needs_a_drain_closes_the_sdk_client_once_and_then_queries_raise(
+    make_driver,
+) -> None:
+    bench = Bench(make_driver)
     bench.fill_sources("put", "A")
     bench.run("put", "A")
     with pytest.raises(DriverRejected, match="drain"):
@@ -639,8 +716,8 @@ def test_close_needs_a_drain_closes_the_sdk_client_once_and_then_queries_raise()
         bench.driver.drain(0.0)
 
 
-def test_hints_and_foreign_handles_are_programming_errors() -> None:
-    bench, other = Bench(), Bench()
+def test_hints_and_foreign_handles_are_programming_errors(make_driver) -> None:
+    bench, other = Bench(make_driver), Bench(make_driver)
     with pytest.raises(DriverRejected, match="hints"):
         bench.driver.get(bench.rows("A"), "a peer")
     other.fill_sources("put", "A")
@@ -653,10 +730,12 @@ def test_hints_and_foreign_handles_are_programming_errors() -> None:
     assert [c for c in bench.fake.calls if c.method.startswith("batch_")] == []
 
 
-def test_backend_round_trip_over_the_fake_store() -> None:
+def test_backend_round_trip_over_the_fake_store(make_driver) -> None:
+    """With the native driver, the backend's queued path: no worker threads, batches handed over on
+    the submitting thread, finished operations taken at each poll."""
     pool = FakePool()  # two clients of one master
-    writer = Endpoint(MooncakeDriver(FakeMooncakeStore(pool)), ["A", "B"])
-    reader = Endpoint(MooncakeDriver(FakeMooncakeStore(pool)), ["A", "B", "C", "D"], fill=0x2D)
+    writer = Endpoint(make_driver(FakeMooncakeStore(pool)), ["A", "B"])
+    reader = Endpoint(make_driver(FakeMooncakeStore(pool)), ["A", "B", "C", "D"], fill=0x2D)
     assert isinstance(writer.backend, Backend)
     assert writer.backend.capabilities == Capabilities(
         fetch=True, publish=True, cancel=True, slot_rows=True

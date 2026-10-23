@@ -3,9 +3,12 @@
 """Opening Mooncake from a store config: the deployment glue around the driver.
 
 A store config has two sections: ``blob``, handed back untouched for the backend to read, and
-``mooncake``, read here. Mooncake reads its own environment variables, some once per process
-(``MOONCAKE_STORE_CHECKSUM``), some per client (``MC_STORE_MEMCPY``) and ``MC_TCP_PROTO`` on every
-transfer; this module logs them before setup and sets only the two RPC timeouts, from the config.
+``mooncake``, read here. ``make_store_driver`` picks the driver: the native one, whose store calls
+run on C++ threads that never hold the GIL, wherever it can run, or the Python one.
+
+Mooncake reads its own environment variables, some once per process (``MOONCAKE_STORE_CHECKSUM``),
+some per client (``MC_STORE_MEMCPY``) and ``MC_TCP_PROTO`` on every transfer; this module logs them
+before setup and sets only the two RPC timeouts, from the config.
 
 Over RDMA, a process that used ibverbs before its first Mooncake client (importing
 ``tensorrt_llm`` does) logs ``RDMA context setup failed: fork compatibility: Invalid argument``
@@ -28,9 +31,17 @@ import yaml
 
 from tensorrt_llm.logger import logger
 
-from .mooncake import MooncakeDriver
+from .backend import FETCH_BATCHES_PER_PUBLISH_BATCH, BlobConfig
+from .mooncake import AllocationRange, MooncakeDriver
+from .mooncake_native import NativeMooncakeDriver
 
-__all__ = ["MooncakeConfig", "load_store_config", "open_mooncake_driver", "open_sdk"]
+__all__ = [
+    "MooncakeConfig",
+    "load_store_config",
+    "make_store_driver",
+    "open_mooncake_driver",
+    "open_sdk",
+]
 
 SDK_DISTRIBUTION = "mooncake-transfer-engine-cuda13"
 SDK_VERSION = "0.3.13"
@@ -38,6 +49,10 @@ IB_SYSFS_ROOT = "/sys/class/infiniband"
 MASTER_WAIT_S = 60.0
 MASTER_RETRY_S = 0.5
 SECTIONS = ("blob", "mooncake")
+DRIVERS = ("auto", "native", "python")
+# The tensorrt_llm.mooncake_store_worker API this code speaks (its API_VERSION, bindings.cpp
+# kApiVersion): a module built from other sources is refused at startup.
+STORE_WORKER_API_VERSION = 3
 
 # Logged before setup, as Mooncake will read them.
 _LOGGED_ENVIRONMENT = (
@@ -75,6 +90,9 @@ class MooncakeConfig:
         rpc_timeout_ms: How long one call to the master may take. It bounds the store calls
             that take no deadline of their own, an existence check say.
         rpc_connect_timeout_ms: How long connecting to the master may take.
+        driver: ``native``: store calls run on C++ threads that never hold the GIL, and the server
+            refuses to start where they cannot; ``python``: on the blob backend's Python threads,
+            where each call's return waits for the GIL; ``auto``: native where it can run.
     """
 
     master_server_address: str
@@ -86,11 +104,14 @@ class MooncakeConfig:
     local_buffer_size: int = 16 << 20
     rpc_timeout_ms: int = 10_000
     rpc_connect_timeout_ms: int = 5_000
+    driver: str = "auto"
 
     def __post_init__(self) -> None:
         for name in ("master_server_address", "device_name", "local_hostname", "metadata_server"):
             if not isinstance(getattr(self, name), str):
                 raise ValueError(f"{name} must be a str, got {getattr(self, name)!r}")
+        if self.driver not in DRIVERS:
+            raise ValueError(f"driver must be one of {DRIVERS}, got {self.driver!r}")
         if self.protocol not in ("rdma", "tcp"):
             raise ValueError(f"protocol must be rdma or tcp, got {self.protocol!r}")
         for name, least in (
@@ -155,7 +176,12 @@ def open_sdk(config: MooncakeConfig) -> Any:
         from mooncake.store import MooncakeDistributedStore
     except ImportError as error:
         raise ImportError(_sdk_missing(error)) from error
-    _warn_unless_pinned_version()
+    version = _installed_sdk_version()
+    if version != SDK_VERSION:
+        logger.warning(
+            f"mooncake: {SDK_DISTRIBUTION} is {version}; the driver's code mapping and access-end "
+            f"rule follow {SDK_VERSION}"
+        )
     _wait_for_master(config.master_server_address)
     store = MooncakeDistributedStore()
     code = store.setup(
@@ -180,8 +206,76 @@ def open_mooncake_driver(config: object) -> tuple[MooncakeDriver, Mapping[str, o
     """Opens the Mooncake driver a store config describes: the driver, and the config's ``blob``
     section as given, from which the backend's ``BlobConfig`` is built."""
     blob_section, mooncake_config = load_store_config(config)
+    try:
+        blob_config = BlobConfig(**blob_section)
+    except TypeError as error:  # an unknown key
+        raise ValueError(f"store config section 'blob': {error}") from error
     store = open_sdk(mooncake_config)
-    return MooncakeDriver(store), blob_section
+    return make_store_driver(store, mooncake_config, blob_config), blob_section
+
+
+class _NativeDriverUnavailable(Exception):
+    """Why the native store driver cannot run here."""
+
+
+def make_store_driver(
+    store: Any,
+    config: MooncakeConfig,
+    blob: BlobConfig,
+    *,
+    allocation_range: AllocationRange | None = None,
+) -> MooncakeDriver:
+    """The serving driver over a set-up ``store``, as ``config.driver`` asks: the native driver
+    with ``blob.workers`` store threads where it can run, else the Python driver.
+
+    Raises:
+        RuntimeError: The driver ``native`` was asked for and cannot run here.
+    """
+    if config.driver == "python":
+        logger.info("mooncake: store calls run on Python threads (driver: python)")
+        return MooncakeDriver(store, allocation_range=allocation_range)
+    try:
+        worker = _start_store_worker(store, blob)
+    except Exception as error:  # the one fallback boundary: whatever stops the worker, say why
+        reason = str(error) if isinstance(error, _NativeDriverUnavailable) else repr(error)
+        if config.driver == "native":
+            raise RuntimeError(f"mooncake: driver 'native' cannot run here: {reason}") from error
+        logger.warning(
+            "mooncake: store calls run on Python threads, where each call's return waits for the "
+            f"GIL, as the native store worker cannot run here: {reason}"
+        )
+        return MooncakeDriver(store, allocation_range=allocation_range)
+    logger.info(f"mooncake: store calls run on {blob.workers} C++ threads that never hold the GIL")
+    return NativeMooncakeDriver(store, worker, allocation_range=allocation_range)
+
+
+def _start_store_worker(store: Any, blob: BlobConfig) -> Any:
+    """A store worker over ``store``'s client; raises saying why not."""
+    version = _installed_sdk_version()
+    if version != SDK_VERSION:
+        raise _NativeDriverUnavailable(
+            f"the store worker mirrors the client of {SDK_DISTRIBUTION} {SDK_VERSION}; this is "
+            f"{version}"
+        )
+    try:
+        import tensorrt_llm.mooncake_store_worker as store_worker
+    except ImportError as error:
+        raise _NativeDriverUnavailable(f"the store worker is not built: {error}") from error
+    api_version = getattr(store_worker, "API_VERSION", None)
+    if api_version != STORE_WORKER_API_VERSION:
+        raise _NativeDriverUnavailable(
+            f"the store worker module has API version {api_version}, this code needs "
+            f"{STORE_WORKER_API_VERSION}: it was built from other sources"
+        )
+    # Raises where the store has no client or a client the worker does not mirror (by slot).
+    return store_worker.StoreWorker(
+        store,
+        threads=blob.workers,
+        put_threads=blob.publish_workers,
+        gets_per_put=FETCH_BATCHES_PER_PUBLISH_BATCH,
+        rows_per_call=blob.rows_per_batch,
+        bytes_per_call=blob.bytes_per_batch,
+    )
 
 
 def _refuse_legacy_tcp_framing(protocol: str) -> None:
@@ -215,16 +309,11 @@ def _sdk_missing(error: ImportError) -> str:
     return f"cannot import mooncake.store ({error}). {hint}"
 
 
-def _warn_unless_pinned_version() -> None:
+def _installed_sdk_version() -> str:
     try:
-        version = importlib.metadata.version(SDK_DISTRIBUTION)
+        return importlib.metadata.version(SDK_DISTRIBUTION)
     except importlib.metadata.PackageNotFoundError:
-        version = "not an installed distribution"
-    if version != SDK_VERSION:
-        logger.warning(
-            f"mooncake: {SDK_DISTRIBUTION} is {version}; the driver's code mapping and access-end "
-            f"rule follow {SDK_VERSION}"
-        )
+        return "not an installed distribution"
 
 
 # Three deployment helpers, with the same rules as the Mooncake connector's

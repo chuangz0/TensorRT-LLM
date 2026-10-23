@@ -47,7 +47,7 @@ import operator
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Optional
@@ -95,7 +95,8 @@ class _Code(IntEnum):
     TRANSFER_FAIL = -800
     RPC_FAIL = -900
     RPC_TIMEOUT = -901
-    CALL_FAILED = -100_000  # not an SDK code: a metadata call raised or miscounted (logged)
+    # Not an SDK code: a call raised or miscounted; storeWorker.h kCallFailed has the same value.
+    CALL_FAILED = -100_000
 
 
 OBJECT_EXISTS, OBJECT_ABSENT = 1, 0  # batch_is_exist answers
@@ -373,27 +374,13 @@ class MooncakeDriver:
             self._require_open()
             self._draining = True
             self._lock.wait_for(lambda: self._unprovable or not self._in_flight, budget_s)
-            quiet = not (self._in_flight or self._unprovable)
-            left_open = sorted(self._sessions_left_open) if quiet else []
-        if left_open:
-            codes = self._metadata_call(self._store.batch_put_session_revoke, left_open)
-            with self._lock:
-                gone = (k for k, code in zip(left_open, codes) if _gone(code))
-                self._sessions_left_open.difference_update(gone)
-        return quiet
+        return self._end_drain()
 
     def close(self) -> None:
         """Closes the SDK client once a drain returned True and every region is unregistered.
         Never called in production: it holds the GIL through unmount RPCs; process exit frees it."""
-        with self._lock:
-            if self._closed:
-                return
-            if not self._draining or self._in_flight or self._unprovable:
-                raise DriverRejected("close needs a drain that returned True")
-            if any(r.pieces for r in self._registrations):
-                raise DriverRejected("close needs every registration unregistered")
-            self._closed = True
-        self._store.close()
+        if self._mark_closed():
+            self._store.close()
 
     def stats(self) -> dict[str, int]:
         """A snapshot for logs and tests; not part of the driver protocol."""
@@ -421,7 +408,7 @@ class MooncakeDriver:
             elif code in _PUT_START_SKIPS:
                 batch.skip(row, _PUT_START_SKIPS[code])
             else:
-                batch.fault([row], f"put session start: {_describe(code)}")
+                batch.fault([row], _put_start_fault(code))
         ended = self._write_and_finish_sessions(batch, started) if started else True
         if existing:
             self._confirm_existing(batch, existing)
@@ -451,7 +438,7 @@ class MooncakeDriver:
                     written.append(i)
                 else:  # its object must never be marked complete
                     unwritten.append(i)
-                    batch.fault([i], f"put ranges: {_moved(answer, size)}")
+                    batch.fault([i], _put_ranges_fault(answer, size))
         not_ended = self._end_put_sessions(batch, written)
         self._revoke_put_sessions([batch.keys[i] for i in unwritten + not_ended])
         return True
@@ -470,9 +457,7 @@ class MooncakeDriver:
             again = dict(zip(retry, self._metadata_call(end, retry)))
             codes = [again.get(key, code) for key, code in zip(keys, codes)]
         for i, code in zip(written, codes):
-            batch.results[i] = (
-                _READY if code == _Code.OK else faulted(f"put session end: {_describe(code)}")
-            )
+            batch.results[i] = _READY if code == _Code.OK else faulted(_put_end_fault(code))
         return [i for i, code in zip(written, codes) if code != _Code.OK]
 
     def _revoke_put_sessions(self, keys: list[str]) -> None:
@@ -495,7 +480,7 @@ class MooncakeDriver:
             elif answer == OBJECT_ABSENT:
                 batch.skip(i, "uncommitted")
             else:
-                batch.fault([i], f"existence check: {_describe(answer)}")
+                batch.fault([i], _existence_fault(answer))
 
     # Get: one batch_get_into_multi_buffers; rows whose read lease expired mid-read are read once
     # more.
@@ -517,9 +502,7 @@ class MooncakeDriver:
             return True
         for i, answer in zip(indices, answers):
             if not may_reread and answer in (_Code.OBJECT_NOT_FOUND, _Code.REPLICA_IS_NOT_READY):
-                # A reread: the first read already wrote this slot, and MISS or NOT_READY would
-                # claim that nothing landed there.
-                batch.results[i] = faulted(f"reread after LEASE_EXPIRED: {_describe(answer)}")
+                batch.results[i] = faulted(_reread_fault(answer))
             elif answer == _Code.OBJECT_NOT_FOUND:
                 batch.results[i] = _MISS
             elif answer == _Code.REPLICA_IS_NOT_READY:
@@ -537,7 +520,7 @@ class MooncakeDriver:
             ended = ended and reread_ended  # a TRANSFER_FAIL of the first read stays
         return ended
 
-    # Bookkeeping.
+    # Bookkeeping, shared with the native driver.
 
     def _admit(self, rows: Sequence[RowIO]) -> _Batch:
         """Checks ``rows`` and records the operation, or raises ``DriverRejected`` having done
@@ -553,21 +536,69 @@ class MooncakeDriver:
             row = next(row for row in rows if row.nbytes > MAX_ROW_BYTES)
             raise DriverRejected(f"a row holds at most {MAX_ROW_BYTES} bytes, got {row}")
         spans = [span for row in rows for span in row.spans]
+        holders = self._reserve(spans)
+        # Busy, the registrations keep their pieces.
+        buffers, lengths = _buffers(rows, holders)
+        regions = list(dict.fromkeys(holders))
+        return _Batch(keys, buffers, lengths, sizes, regions, [_PENDING] * len(rows), {})
+
+    def _reserve(self, spans: Sequence[Span]) -> list[_Registration]:
+        """The live registration each span lies in, all of them marked busy for one more
+        operation; raises ``DriverRejected`` having done nothing."""
         low, high = min(span.address for span in spans), max(span.end for span in spans)
         with self._lock:
             self._require_open(DriverRejected)
             if self._draining:
                 raise DriverRejected("the driver is draining")
             live = [r for r in self._registrations if r.live]
-            # Usually one registration holds every row: one check instead of one per span.
+            # Usually one registration holds every span: one check instead of one per span.
             covering = next((r for r in live if r.span.address <= low and high <= r.span.end), None)
             holders = [covering] * len(spans) if covering is not None else _holders(spans, live)
-            regions = list(dict.fromkeys(holders))
             self._in_flight += 1
-            self._busy.update(regions)
-        # Busy, the registrations keep their pieces.
-        buffers, lengths = _buffers(rows, holders)
-        return _Batch(keys, buffers, lengths, sizes, regions, [_PENDING] * len(rows), {})
+            self._busy.update(set(holders))
+        return holders
+
+    def _release(
+        self, regions: Sequence[_Registration], ended: bool, skip_reasons: Iterable[str]
+    ) -> None:
+        """Ends an operation ``_reserve`` admitted: its regions go free if its access ended, and
+        are held for good otherwise."""
+        with self._lock:
+            self._skipped_rows.update(skip_reasons)
+            self._in_flight -= 1
+            if ended:
+                self._busy.subtract(regions)
+            else:
+                self._unprovable += 1
+            self._lock.notify_all()
+
+    def _end_drain(self) -> bool:
+        """Whether nothing runs and nothing is unprovable. When so, it also revokes the put
+        sessions left open: no put runs any more, so none is in use. They hold no lender memory,
+        so they never change the answer, and one whose revocation fails stays open until the
+        master discards it."""
+        with self._lock:
+            quiet = not (self._in_flight or self._unprovable)
+            left_open = sorted(self._sessions_left_open) if quiet else []
+        if left_open:
+            codes = self._metadata_call(self._store.batch_put_session_revoke, left_open)
+            with self._lock:
+                gone = (k for k, code in zip(left_open, codes) if _gone(code))
+                self._sessions_left_open.difference_update(gone)
+        return quiet
+
+    def _mark_closed(self) -> bool:
+        """True the first time, once a drain returned True and every region is unregistered;
+        raises ``DriverRejected`` otherwise."""
+        with self._lock:
+            if self._closed:
+                return False
+            if not self._draining or self._in_flight or self._unprovable:
+                raise DriverRejected("close needs a drain that returned True")
+            if any(r.pieces for r in self._registrations):
+                raise DriverRejected("close needs every registration unregistered")
+            self._closed = True
+            return True
 
     def _metadata_call(self, call: Callable, keys: list[str], *args) -> list[int]:
         """A session or existence call. It touches no row memory, so a raise or a wrong answer
@@ -579,15 +610,22 @@ class MooncakeDriver:
             return [_Code.CALL_FAILED] * len(keys)
 
     def _conclude(self, direction: str, batch: _Batch, ended: bool, seconds: float) -> _Op:
-        with self._lock:
-            self._skipped_rows.update(batch.skip_reasons.values())
-            self._in_flight -= 1
-            if ended:
-                self._busy.subtract(batch.regions)
-            else:  # holds its regions for good
-                self._unprovable += 1
-            self._lock.notify_all()
-        _report(direction, batch, ended, seconds)
+        self._release(batch.regions, ended, batch.skip_reasons.values())
+        expected = (RowStatus.READY, RowStatus.MISS)
+        failed = [i for i, r in enumerate(batch.results) if r.status not in expected]
+        first = None
+        if failed:
+            result = batch.results[failed[0]]
+            why = result.fault or f"{result.status.value} ({batch.skip_reasons[failed[0]]})"
+            first = f"{batch.keys[failed[0]]}: {why}"
+        _report(
+            direction,
+            rows=len(batch.keys),
+            failed=len(failed),
+            first=first,
+            ended=ended,
+            seconds=seconds,
+        )
         return _Op(tuple(batch.results), ended, self)
 
     def _add(self, registration: _Registration) -> None:
@@ -685,11 +723,38 @@ def _buffers(
 
 def _get_result(answer: int, size: int) -> RowResult:
     """A read answers the object's size, which must be the row's."""
-    if answer == size:
-        return _READY
+    return _READY if answer == size else faulted(_get_fault(answer, size))
+
+
+# The fault texts of both Mooncake drivers, one per store call that can fault a row.
+
+
+def _get_fault(answer: int, size: int) -> str:
     if answer >= 0:
-        return faulted(f"object is {answer} bytes, expected {size}")
-    return faulted(f"batch_get_into_multi_buffers: {_describe(answer)}")
+        return f"object is {answer} bytes, expected {size}"
+    return f"batch_get_into_multi_buffers: {_describe(answer)}"
+
+
+def _reread_fault(answer: int) -> str:
+    """A reread that found no object or an unfinished one: the first read already wrote the slot,
+    so MISS or NOT_READY would claim that nothing landed there."""
+    return f"reread after LEASE_EXPIRED: {_describe(answer)}"
+
+
+def _put_start_fault(code: int) -> str:
+    return f"put session start: {_describe(code)}"
+
+
+def _put_ranges_fault(answer: int, size: int) -> str:
+    return f"put ranges: {_moved(answer, size)}"
+
+
+def _put_end_fault(code: int) -> str:
+    return f"put session end: {_describe(code)}"
+
+
+def _existence_fault(code: int) -> str:
+    return f"existence check: {_describe(code)}"
 
 
 def _gone(revoke_answer: int) -> bool:
@@ -725,20 +790,16 @@ def _describe(code: int) -> str:
         return f"code({code})"
 
 
-def _report(direction: str, batch: _Batch, ended: bool, seconds: float) -> None:
-    """One warning per call that failed or skipped a row or left access open; none otherwise."""
-    expected = (RowStatus.READY, RowStatus.MISS)
-    failed_or_skipped = [i for i, r in enumerate(batch.results) if r.status not in expected]
-    if ended and not failed_or_skipped:
+def _report(
+    direction: str, *, rows: int, failed: int, first: str | None, ended: bool, seconds: float
+) -> None:
+    """One warning per operation that failed or skipped a row (``first`` names the first, with
+    why) or left access open; none otherwise. Cancelled rows count as neither."""
+    if ended and not failed:
         return
-    first = ""
-    if failed_or_skipped:
-        row = failed_or_skipped[0]
-        result = batch.results[row]
-        why = result.fault or f"{result.status.value} ({batch.skip_reasons[row]})"
-        first = f"; first {batch.keys[row]}: {why}"
+    detail = f"; first {first}" if first else ""
     access = "ended" if ended else "may still be in progress"
     logger.warning(
-        f"mooncake {direction}: {len(failed_or_skipped)} of {len(batch.keys)} rows failed or "
-        f"skipped in {seconds:.3f} s{first}; access {access}"
+        f"mooncake {direction}: {failed} of {rows} rows failed or skipped in {seconds:.3f} s"
+        f"{detail}; access {access}"
     )

@@ -3,8 +3,9 @@
 """Store config, opening the Mooncake SDK and driver, and the blob package's layering.
 
 The SDK is a fake module put into ``sys.modules``, the master probe and the route probe are
-replaced, and the InfiniBand sysfs tree is a temporary directory, so nothing here needs a network,
-a Mooncake install or a GPU.
+replaced, and the InfiniBand sysfs tree is a temporary directory, so nothing here needs a network
+or a GPU. The store worker tests need the built store worker, and the slot check the installed
+Mooncake wheel, without a server.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import ast
 import os
 import pathlib
+import re
 import sys
 import types
 
@@ -26,6 +28,7 @@ from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
     MooncakeConfig,
     load_store_config,
+    make_store_driver,
     open_mooncake_driver,
     open_sdk,
 )
@@ -119,6 +122,7 @@ BAD_VALUES = {
     "mooncake.master_server_address=5": ("mooncake", "master_server_address", 5),
     "mooncake.device_name=None": ("mooncake", "device_name", None),
     "mooncake.rpc_timeout_ms=0": ("mooncake", "rpc_timeout_ms", 0),
+    "mooncake.driver=fast": ("mooncake", "driver", "fast"),
 }
 
 
@@ -231,6 +235,40 @@ def test_local_hot_cache_is_refused(sdk: Sdk, monkeypatch: pytest.MonkeyPatch) -
     assert len(sdk.stores) == 1
 
 
+def test_a_client_the_store_worker_does_not_mirror_is_refused_by_slot_and_auto_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mooncake.store import MooncakeDistributedStore
+
+    store = MooncakeDistributedStore()
+    # Without a server the setup fails, but the store keeps its DummyClient, whose method table
+    # holds DummyClient's methods where the worker calls RealClient's.
+    assert store.setup_dummy(0, 0, "127.0.0.1:1") != 0
+    refused = r"slot \d+ holds mooncake::DummyClient::batch_get_into_multi_buffers"
+    with pytest.raises(RuntimeError, match=refused):
+        make_store_driver(store, MooncakeConfig(MASTER, 0, driver="native"), BlobConfig())
+    warnings: list[str] = []
+    monkeypatch.setattr(mooncake_setup.logger, "warning", warnings.append)
+    driver = make_store_driver(store, MooncakeConfig(MASTER, 0), BlobConfig())
+    assert type(driver) is MooncakeDriver
+    (warning,) = warnings
+    assert "store calls run on Python threads" in warning and re.search(refused, warning)
+
+
+def test_a_store_worker_built_from_other_sources_is_refused_before_it_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm import mooncake_store_worker
+
+    monkeypatch.setattr(
+        mooncake_setup, "_installed_sdk_version", lambda: mooncake_setup.SDK_VERSION
+    )
+    needed = mooncake_setup.STORE_WORKER_API_VERSION
+    monkeypatch.setattr(mooncake_store_worker, "API_VERSION", needed - 1)
+    with pytest.raises(RuntimeError, match=f"API version {needed - 1}, this code needs {needed}"):
+        make_store_driver(object(), MooncakeConfig(MASTER, 0, driver="native"), BlobConfig())
+
+
 def test_setup_failure_closes_the_half_open_client(sdk: Sdk) -> None:
     sdk.setup_answer = -1
     with pytest.raises(RuntimeError, match="setup failed with -1"):
@@ -245,6 +283,7 @@ def test_setup_failure_closes_the_half_open_client(sdk: Sdk) -> None:
 BLOB_PACKAGE = blob_package.__name__
 DISAGGREGATION = BLOB_PACKAGE.rsplit(".", 1)[0]
 THIRD_PARTY_ALLOWED = {"numpy", "yaml"}
+STORE_WORKER = "tensorrt_llm.mooncake_store_worker"
 
 
 def _imports(path: pathlib.Path) -> list[tuple[str, str | None]]:
@@ -276,8 +315,10 @@ def _imports(path: pathlib.Path) -> list[tuple[str, str | None]]:
 def test_blob_modules_import_only_their_layer() -> None:
     root = pathlib.Path(blob_package.__file__).parent
     modules = {path.stem: _imports(path) for path in sorted(root.glob("*.py"))}
-    assert {"backend", "mooncake", "mooncake_setup", "store", "keys"} <= set(modules)
-    sdk_imports = []
+    assert {"backend", "mooncake", "mooncake_native", "mooncake_setup", "store", "keys"} <= set(
+        modules
+    )
+    sdk_imports, worker_imports = [], []
     for name, imports in modules.items():
         for module, function in imports:
             top = module.split(".")[0]
@@ -285,19 +326,30 @@ def test_blob_modules_import_only_their_layer() -> None:
             if top == "mooncake":
                 sdk_imports.append((name, function))
                 continue
+            if module == STORE_WORKER:
+                worker_imports.append((name, function))
+                continue
             assert top != "torch" and not module.startswith("tensorrt_llm._torch.pyexecutor"), where
             if top == "tensorrt_llm":
                 assert module == "tensorrt_llm.logger" or module.startswith(DISAGGREGATION), where
             else:
                 assert top in sys.stdlib_module_names or top in THIRD_PARTY_ALLOWED, where
     assert sdk_imports == [("mooncake_setup", "open_sdk")]
+    assert worker_imports == [("mooncake_setup", "_start_store_worker")]
 
     def package_imports(name: str) -> set[str]:
         return {m for m, _ in modules[name] if m.startswith(BLOB_PACKAGE + ".")}
 
     assert package_imports("mooncake") == {f"{BLOB_PACKAGE}.store"}
-    assert package_imports("mooncake_setup") == {f"{BLOB_PACKAGE}.mooncake"}
-    memory_kind = f"{DISAGGREGATION}.base.memory"  # all the boundary shares with the contract
+    assert package_imports("mooncake_native") == {
+        f"{BLOB_PACKAGE}.{m}" for m in ("mooncake", "store")
+    }
+    assert package_imports("mooncake_setup") == {
+        f"{BLOB_PACKAGE}.{m}" for m in ("backend", "mooncake", "mooncake_native")
+    }
+    # All the boundary shares with the contract; rows cross it as numpy arrays.
+    memory_kind = f"{DISAGGREGATION}.base.memory"
     for name in ("store", "keys"):
         for module, _ in modules[name]:
-            assert module.split(".")[0] in sys.stdlib_module_names or module == memory_kind, name
+            top = module.split(".")[0]
+            assert top in sys.stdlib_module_names or module in (memory_kind, "numpy"), name
