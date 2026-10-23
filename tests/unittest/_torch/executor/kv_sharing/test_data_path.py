@@ -23,6 +23,7 @@ import pytest
 from _torch.disaggregation.blob.fake_mooncake import FakeMooncakeStore
 
 from tensorrt_llm._torch.disaggregation.base.memory import MemoryKind
+from tensorrt_llm._torch.disaggregation.blob.backend import BlobConfig
 from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import MooncakeConfig
 from tensorrt_llm._torch.pyexecutor.kv_sharing import data_path
 from tensorrt_llm._torch.pyexecutor.kv_sharing.data_path import (
@@ -82,7 +83,8 @@ def store(monkeypatch: pytest.MonkeyPatch) -> FakeMooncakeStore:
     return fake
 
 
-CONFIG = MooncakeConfig("127.0.0.1:50051", 0)
+# The fake client hands out no C++ client: the serving driver is the Python one.
+CONFIG = MooncakeConfig("127.0.0.1:50051", 0, driver="python")
 
 
 def check_thread_ended() -> bool:
@@ -99,7 +101,7 @@ def test_auto_takes_host_staging_when_the_device_round_trip_fails(store, monkeyp
     monkeypatch.setattr(data_path.logger, "warning", warnings.append)
     store.script(GET, [None])  # the host get reads
     store.script(GET, [-600])  # the get into device memory fails
-    memory_kind, driver = data_path.open_store("auto", CONFIG)
+    memory_kind, driver = data_path.open_store("auto", CONFIG, BlobConfig())
     assert memory_kind is MemoryKind.HOST and not driver.capabilities.device_memory
     (fallback,) = [warning for warning in warnings if "through host staging" in warning]
     assert "a round trip through device memory" in fallback and "INVALID_PARAMS" in fallback
@@ -108,7 +110,7 @@ def test_auto_takes_host_staging_when_the_device_round_trip_fails(store, monkeyp
 def test_a_store_failing_the_host_round_trip_refuses_the_server(store) -> None:
     store.script(GET, [-900])  # RPC_FAIL
     with pytest.raises(ValueError, match="on rank 0: a round trip through host memory"):
-        data_path.open_store("auto", CONFIG)
+        data_path.open_store("auto", CONFIG, BlobConfig())
 
 
 @pytest.mark.parametrize("half", ["host", "device"])

@@ -26,6 +26,7 @@ from ...disaggregation.blob.backend import (
 )
 from ...disaggregation.blob.keys import key_stem
 from ...disaggregation.blob.mooncake import MooncakeDriver
+from ...disaggregation.blob.mooncake_native import NativeMooncakeDriver
 from ...disaggregation.blob.mooncake_setup import load_store_config
 from ...disaggregation.lifecycle.retirement import QuiescenceFatalEvent, RetirementWatchdog
 from ...disaggregation.transfer_manager import LifecycleBinding, TransferManager
@@ -116,7 +117,7 @@ def start_kv_sharing(
     except TypeError as error:  # an unknown key
         raise ValueError(f"store config {backend.config}, section 'blob': {error}") from error
     # Before the lender pins its staging memory: an unreachable master fails here, within a minute.
-    memory_kind, driver = open_store(config.data_path, mooncake)
+    memory_kind, driver = open_store(config.data_path, mooncake, blob_config)
 
     tokens_per_block = manager.tokens_per_block
     fetch_tokens = max(config.max_fetch_tokens, max_num_tokens)
@@ -200,9 +201,10 @@ def start_kv_sharing(
     )
     py_executor.kv_sharing = orchestrator
     py_executor.scheduler.store_fetches = orchestrator
+    store_calls = "native" if isinstance(driver, NativeMooncakeDriver) else "python"
     logger.info(
         f"kv_sharing: store master {mooncake.master_server_address} over {mooncake.protocol}, "
-        f"roles {backend.roles}, {path}"
+        f"roles {backend.roles}, {store_calls} store driver, {path}"
     )
     return orchestrator
 

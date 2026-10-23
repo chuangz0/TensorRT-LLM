@@ -247,7 +247,8 @@ class SharedKvOrchestrator:
             # Readers name a prompt by its tokens alone, which multimodal prompts are not.
             if not request.is_dummy and request.py_multimodal_data is None:
                 self._unpublished[request.py_request_id] = request
-        self._publish_waiting()
+        if self._unpublished:
+            self._publish_waiting()
 
     def cancel_fetch(self, request: LlmRequest) -> None:
         """Lets a request being cancelled go: its fetch is abandoned, and it no longer reads as

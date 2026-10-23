@@ -20,11 +20,14 @@ generates, and serves the same tokens as a server without the store. A fresh ser
 stored prefix of a prompt instead of computing it, and its tokens equal those of a server that
 reused the same blocks locally; a fetch that cannot deliver every block, or runs late, leaves the
 request to compute its prompt. Servers move blocks over GPU Direct, which 'auto' picks here, or
-through host staging, and a block either path stores reads exactly on the other.
+through host staging, and a block either path stores reads exactly on the other. Every server makes
+its store calls through the driver ``TRTLLM_MOONCAKE_E2E_DRIVER`` names: ``native`` (the default,
+the C++ store worker; a server refuses to start without it) or ``python``.
 
-Needs a GPU (three for the disaggregated test), ``mooncake_master`` on the path and the
-``mooncake.store`` SDK, and fails without them. ``TRTLLM_MOONCAKE_PROTOCOL`` (default rdma) and
-``TRTLLM_MOONCAKE_DEVICES`` (default: the fastest InfiniBand devices) pick the transport.
+Needs a GPU (three for the disaggregated test), ``mooncake_master`` on the path, the
+``mooncake.store`` SDK and, for the native driver, the built ``tensorrt_llm.mooncake_store_worker``,
+and fails without them. ``TRTLLM_MOONCAKE_PROTOCOL`` (default rdma) and ``TRTLLM_MOONCAKE_DEVICES``
+(default: the fastest InfiniBand devices) pick the transport.
 """
 
 from __future__ import annotations
@@ -50,11 +53,15 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
+from tensorrt_llm._torch.disaggregation.blob.mooncake_native import NativeMooncakeDriver
+from tensorrt_llm._torch.disaggregation.blob.store import ProbeStatus
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import MemoryKind
 from tensorrt_llm._torch.pyexecutor.kv_sharing import data_path
 from tensorrt_llm.llmapi import KvCacheConfig
 
 PROTOCOL = os.environ.get("TRTLLM_MOONCAKE_PROTOCOL", "rdma")
+DRIVER = os.environ.get("TRTLLM_MOONCAKE_E2E_DRIVER", "native")
+assert DRIVER in ("native", "python"), f"TRTLLM_MOONCAKE_E2E_DRIVER={DRIVER!r}"
 DEVICES = os.environ.get("TRTLLM_MOONCAKE_DEVICES", "")
 TOKENS_PER_BLOCK = 32
 PROVIDER_BYTES = 4 << 30
@@ -101,6 +108,7 @@ class Store:
             "global_segment_size": 0,
             "protocol": PROTOCOL,
             "device_name": DEVICES,
+            "driver": DRIVER,
         }
         path = self.run_dir / f"{key_prefix}.yaml"
         path.write_text(yaml.safe_dump({"mooncake": mooncake, "blob": {"key_prefix": key_prefix}}))
@@ -350,14 +358,34 @@ def settled(executor) -> bool:
 
 
 def slow_store_reads(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
-    """Every store read in this process takes ``seconds`` longer."""
-    get = MooncakeDriver.get
+    """Every store read in this process ends ``seconds`` after it was queued, as far as the
+    server can tell; the executor runs on meanwhile. The Python driver's read sleeps on its
+    backend thread; the native driver hands the backend no finished read younger than that."""
+    if DRIVER == "python":
+        get = MooncakeDriver.get
 
-    def slow_get(self, rows, hint=None):
-        time.sleep(seconds)
-        return get(self, rows, hint)
+        def slow_get(self, rows, hint=None):
+            time.sleep(seconds)
+            return get(self, rows, hint)
 
-    monkeypatch.setattr(MooncakeDriver, "get", slow_get)
+        monkeypatch.setattr(MooncakeDriver, "get", slow_get)
+        return
+    take, waiting = NativeMooncakeDriver.take_finished, NativeMooncakeDriver.finished_waiting_s
+    held: dict[NativeMooncakeDriver, list] = {}  # by driver: finished reads not handed out yet
+
+    def take_when_old(self):
+        mine = held.setdefault(self, [])
+        mine += take(self)
+        now = time.monotonic()
+        due = [done for done in mine if done.op.is_put or now - done.op.submitted >= seconds]
+        mine[:] = [done for done in mine if done not in due]
+        return due
+
+    def waiting_while_held(self):  # the backend asks this before it takes
+        return float("inf") if held.get(self) else waiting(self)
+
+    monkeypatch.setattr(NativeMooncakeDriver, "take_finished", take_when_old)
+    monkeypatch.setattr(NativeMooncakeDriver, "finished_waiting_s", waiting_while_held)
 
 
 @pytest.fixture(scope="module")
@@ -462,6 +490,37 @@ def test_an_object_lost_after_the_probe_drops_the_fetch_and_computes_the_prompt(
     counters = executor.kv_sharing.counters
     assert counters["fetches_started"] == counters["fetches_dropped_short"] == 1
     assert counters["fetches_resumed"] == 0
+
+
+def test_a_prompt_of_whole_blocks_fetches_all_but_its_last_block_and_puts_none_again(
+    store: Store, published_p: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prompt that ends on a block boundary: the probe names every one of its blocks, the fetch
+    stops one block short (the last prompt token is computed), and the reader puts none of its
+    blocks again, as the store held them all."""
+    aligned = P[:FETCHED]  # 16 whole blocks, all published by the writer of P
+    probe = MooncakeDriver.probe
+    probed: list[tuple[ProbeStatus, ...]] = []
+
+    def recording_probe(self, keys, budget_s, hint=None):
+        probed.append(probe(self, keys, budget_s, hint))
+        return probed[-1]
+
+    monkeypatch.setattr(MooncakeDriver, "probe", recording_probe)
+    llm = reader(monkeypatch, store)
+    executor = llm._executor.engine
+    before = store.readable_objects(FETCH_PREFIX)
+    try:
+        output = complete(llm, aligned)
+        assert wait_until(lambda: settled(executor))
+    finally:
+        shut_down(llm)
+    assert probed == [(ProbeStatus.HIT,) * FETCHED_BLOCKS]
+    assert output.cached_tokens == FETCHED - TOKENS_PER_BLOCK
+    counters = executor.kv_sharing.counters
+    assert counters["fetches_resumed"] == 1 and counters["fetched_blocks"] == FETCHED_BLOCKS - 1
+    assert counters["publications_started"] == 0
+    assert store.readable_objects(FETCH_PREFIX) == before
 
 
 def test_a_fetch_past_its_timeout_is_dropped_and_the_request_completes(

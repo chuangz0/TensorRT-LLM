@@ -27,8 +27,9 @@ import torch
 from tensorrt_llm.logger import logger
 
 from ...disaggregation.base.memory import MemoryKind
+from ...disaggregation.blob.backend import BlobConfig
 from ...disaggregation.blob.mooncake import MooncakeDriver
-from ...disaggregation.blob.mooncake_setup import MooncakeConfig, open_sdk
+from ...disaggregation.blob.mooncake_setup import MooncakeConfig, make_store_driver, open_sdk
 from ...disaggregation.blob.store import RegionLayout, RowIO, RowStatus, Span
 from ..connectors.mooncake_store.gpudirect import (
     PEERMEM_ENV,
@@ -65,28 +66,35 @@ class PathCheck:
     gpu_direct_error: Optional[str]
 
 
-def open_store(requested: str, mooncake: MooncakeConfig) -> tuple[MemoryKind, MooncakeDriver]:
+def open_store(
+    requested: str, mooncake: MooncakeConfig, blob: BlobConfig
+) -> tuple[MemoryKind, MooncakeDriver]:
     """Opens the store client, checks it with one round trip and picks the data path.
 
     Run it before any other Mooncake client of the process opens: the first one fixes how the
     process registers device memory.
 
     Returns:
-        DEVICE for GPU Direct or HOST for host staging, and a driver over the client that
-        registers device memory exactly under GPU Direct.
+        DEVICE for GPU Direct or HOST for host staging, and the serving driver over the client
+        (``mooncake.driver`` picks native or Python), which registers device memory exactly under
+        GPU Direct.
 
     Raises:
         ValueError: The store failed the check, or 'gpu_direct' was asked for and is not possible.
+        RuntimeError: The driver 'native' was asked for and cannot run here.
     """
     if requested == HOST_STAGING:
         gpu_direct_error = "host staging was asked for"
     else:
         gpu_direct_error = prepare_gpu_direct(mooncake.protocol)
     store = open_sdk(mooncake)
+    # The check runs on its own Python driver, before any store worker thread exists.
     path = choose_data_path(requested, [check_store(store, gpu_direct_error)])
     if path == HOST_STAGING:
-        return MemoryKind.HOST, MooncakeDriver(store)
-    return MemoryKind.DEVICE, MooncakeDriver(store, allocation_range=allocation_range)
+        return MemoryKind.HOST, make_store_driver(store, mooncake, blob)
+    return MemoryKind.DEVICE, make_store_driver(
+        store, mooncake, blob, allocation_range=allocation_range
+    )
 
 
 def prepare_gpu_direct(protocol: str) -> Optional[str]:
