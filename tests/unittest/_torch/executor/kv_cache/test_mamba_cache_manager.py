@@ -4498,6 +4498,24 @@ def test_v2_kda_replay_refuses_a_suspend_before_the_host_drafter_acceptance(
     assert not mgr.kv_cache_map[1].is_active
 
 
+@pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
+def test_v2_kda_replay_refuses_a_suspend_while_a_lender_locks_the_cache(manager_cls):
+    """A lender reading the cache's recurrent state refuses the suspend before the KDA commit
+    writes the slot's V2 states: nothing is committed and the request keeps its slot."""
+    mgr = _v2_kda_replay_stub(manager_cls=manager_cls)
+    request = SimpleNamespace(py_request_id=1, is_dummy=False)
+    mgr.kv_cache_map[1] = cache = _SlotCache(0)
+    cache.id = 1
+    mgr._setup_state_indices([request], num_contexts=0)
+    _write_kda_replay_slot(mgr, 0, accepted=2, value=1.0)
+    mgr._sharing = SimpleNamespace(_is_locked=lambda *args: True)
+
+    with pytest.raises(RuntimeError, match="lender locks"):
+        mgr.suspend_request(request)
+    assert mgr.committed_slots == []
+    assert mgr._request_id_to_state_index[1] == 0 and cache.is_active
+
+
 @pytest.mark.parametrize("seeded", [False, True], ids=["before_seeding", "after_seeding"])
 @pytest.mark.parametrize("manager_cls", [KimiK3HybridCacheManager, Glm5NextCacheManager])
 def test_v2_kda_replay_disagg_generation_request_suspends_its_transferred_state(
