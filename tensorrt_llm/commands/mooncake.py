@@ -26,6 +26,7 @@ lends the memory its own config asks for. Servers that share KV cache through
 
 import contextlib
 import dataclasses
+import os
 import pathlib
 import signal
 import tempfile
@@ -38,6 +39,9 @@ import tensorrt_llm.usage as usage
 from tensorrt_llm.commands import _telemetry as _command_telemetry
 from tensorrt_llm.logger import logger
 from tensorrt_llm.usage.config import UsageContext
+
+#: The longest handshake message a provider accepts from a server.
+PROVIDER_HANDSHAKE_BYTES = 64 << 20
 
 #: Both commands sit in the telemetry-aware `trtllm-serve` group, so they offer
 #: the same opt-out the group documents.
@@ -280,6 +284,11 @@ def mooncake_provider(config: str, segment_size: int, ready_file: Optional[str],
     from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import load_store_config, open_sdk
 
     _, mooncake = load_store_config(config)
+    # A server's first transfer with this provider sends it the server's transfer descriptor,
+    # which lists every registered piece of KV cache memory under GPU Direct: thousands for a
+    # large pool. The provider drops a longer message than MC_HANDSHAKE_MAX_LENGTH (1 MiB unless
+    # set; Mooncake accepts up to 128 MiB).
+    os.environ.setdefault("MC_HANDSHAKE_MAX_LENGTH", str(PROVIDER_HANDSHAKE_BYTES))
     with _signal_handoff():
         store = open_sdk(dataclasses.replace(mooncake, global_segment_size=segment_size))
         try:

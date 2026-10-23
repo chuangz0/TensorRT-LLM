@@ -140,8 +140,9 @@ class ProbeService:
         tokens = request.input_token_ids
         if len(tokens) < self._min_prompt_tokens:
             return None
-        # A fetch ends at the whole blocks before the last prompt token.
-        num_blocks = (len(tokens) - 1) // self._tokens_per_block
+        # Every whole block: a fetch still stops before the last prompt token, and a publication
+        # starts past every block the store holds, the one ending the prompt included.
+        num_blocks = len(tokens) // self._tokens_per_block
         return _Prompt(item.id, tokens, request.cache_salt, num_blocks)
 
     def _leaves(self, item: RequestQueueItem, now: float, release: bool) -> bool:

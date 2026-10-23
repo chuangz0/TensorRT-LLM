@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The orchestrator over a fake lender, a fake store and the real transfer manager holding leases:
-what the rounds do with fetches and publications, and what a cancel, a stopped lender and the
-shutdown leave behind."""
+what the rounds do with fetches and publications, what a cancel, a stopped lender and the shutdown
+leave behind, and what bounds publications on each data path."""
 
 import time
 from types import SimpleNamespace
@@ -34,9 +34,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     MemoryRegion,
     ResumeBounds,
 )
+from tensorrt_llm._torch.pyexecutor.kv_sharing import orchestrator as orchestrator_module
 from tensorrt_llm._torch.pyexecutor.kv_sharing.orchestrator import (
     BINDING_ID,
     DOMAIN_ID,
+    MAX_OPEN_PUBLICATIONS,
     PARKED_STATE,
     PROFILE_ID,
     SharedKvOrchestrator,
@@ -48,16 +50,24 @@ pytestmark = pytest.mark.cpu_only
 
 TPB = 4
 REGION = MemoryRegion("layout", 4096, 64, 16, 4, (0,), MemoryKind.HOST)  # four one-block slots
+POOL = MemoryRegion("pool", 1 << 20, 1024, 16, 64, (0,), MemoryKind.DEVICE)  # the KV cache's
 PROMPT = 13  # three whole blocks before the last token
+PROMPT_PAGES = 5  # the prompt's four pages and one step
 
 
 class Lease:
-    def __init__(self, rows: int, failure: str | None) -> None:
-        addresses = REGION.address + REGION.slot_bytes * np.arange(rows, dtype=np.int64)
-        keys = np.zeros((rows, 54), dtype=np.uint8)
-        group = LentLayerGroupRows(0, np.arange(rows, dtype=np.int64), keys, addresses, 0)
+    def __init__(
+        self, rows: int, memory_kind: MemoryKind, failure: str | None, ready_event
+    ) -> None:
+        ordinals, keys = np.arange(rows, dtype=np.int64), np.zeros((rows, 54), dtype=np.uint8)
+        if memory_kind is MemoryKind.HOST:
+            addresses = REGION.address + REGION.slot_bytes * ordinals
+            group = LentLayerGroupRows(0, ordinals, keys, addresses, 0)
+        else:
+            group = LentLayerGroupRows(0, ordinals, keys, slots=ordinals, region_indices=(1,))
         self.view = LeaseView((group,))
         self.failure = failure
+        self.ready_event = ready_event
         self.released = False
 
     def poll(self):
@@ -70,7 +80,7 @@ class Lease:
 class Lender:
     """Lends every range at once, or refuses it; a returned fetch settles when ``settle`` says."""
 
-    regions = (REGION,)
+    regions = (REGION, POOL)
 
     def __init__(self) -> None:
         self.stopped = False
@@ -82,7 +92,7 @@ class Lender:
     def _lend(self, request, start, end, *, memory_kind, rows, ready_event) -> Lease:
         if self.lend_error is not None:
             raise self.lend_error
-        self.leases.append(Lease((end - start) // TPB, self.refusal))
+        self.leases.append(Lease((end - start) // TPB, memory_kind, self.refusal, ready_event))
         return self.leases[-1]
 
     lend_read = lend_write = _lend
@@ -107,7 +117,7 @@ class Lender:
 class Store:
     """The backend: each operation ends when the test says, delivering every row or none."""
 
-    capabilities = Capabilities(fetch=True, publish=True)
+    capabilities = Capabilities(fetch=True, publish=True, slot_rows=True)
 
     def __init__(self) -> None:
         self.attempts: list[SimpleNamespace] = []
@@ -144,6 +154,7 @@ class Manager:
     def __init__(self) -> None:
         self.kv_cache_map: dict[int, object] = {}
         self.resumed: dict[int, int] = {}
+        self.total_pages = 1000
 
     def probe_context_reuse(self, request) -> int:
         return 0
@@ -156,16 +167,23 @@ class Manager:
         del self.kv_cache_map[request.py_request_id]
 
     def get_primary_block_counts(self) -> tuple[int, int]:
-        return 0, 1000
+        return 0, self.total_pages
 
     def resume_served_prefix(self, request, position: int) -> None:
         request.state = LlmRequestState.CONTEXT_INIT
         self.resumed[request.py_request_id] = position
 
 
+# The pages the largest request's resume needs, which the room for pinned pages leaves aside.
+RESUME_PAGES = Manager.max_seq_len // TPB + 1
+
+
 class Event:
+    def __init__(self) -> None:
+        self.records = 0
+
     def record(self, stream) -> None:
-        pass
+        self.records += 1
 
 
 def request(request_id: int, stored: int = 8, computed: int = 0) -> SimpleNamespace:
@@ -176,6 +194,7 @@ def request(request_id: int, stored: int = 8, computed: int = 0) -> SimpleNamesp
         is_first_context_chunk=True,
         is_finished=False,
         is_dummy=False,
+        is_context_only_request=False,
         py_multimodal_data=None,
         prompt_len=PROMPT,
         py_store_hit_tokens=stored,
@@ -189,13 +208,13 @@ def request(request_id: int, stored: int = 8, computed: int = 0) -> SimpleNamesp
 class Server:
     """One rank: the orchestrator, the transfer manager in hold mode, and an iteration."""
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch):
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, memory_kind: MemoryKind = MemoryKind.HOST):
         monkeypatch.setattr(torch.cuda, "Event", Event)
         self.lender, self.store, self.manager = Lender(), Store(), Manager()
         self.transfers = TransferManager(wake=lambda: None, hold_returns=True)
         self.transfers.assemble(
             BINDING_ID,
-            RegionNamespace((REGION,), MemoryKind.HOST),
+            RegionNamespace((REGION, POOL), memory_kind),
             PROFILE_ID,
             lambda regions, wake, config, post: self.store,
             domain_id=DOMAIN_ID,
@@ -207,12 +226,13 @@ class Server:
             take_shared_domain_failures=self.transfers.take_domain_failures
         )
         policy = SharingPolicy(
+            memory_kind=memory_kind,
             fetch=True,
             publish=True,
             min_fetch_tokens=TPB,
             max_fetch_tokens=16 * TPB,
             fetch_timeout_s=60.0,
-            publication_tokens=3 * TPB,
+            publication_tokens=3 * TPB if memory_kind is MemoryKind.HOST else None,
             max_util_for_resume=1.0,
         )
         self.orchestrator = SharedKvOrchestrator(
@@ -254,6 +274,18 @@ def server(monkeypatch: pytest.MonkeyPatch):
     server = Server(monkeypatch)
     yield server
     server.shut_down()
+
+
+@pytest.fixture
+def gpu_direct_server(monkeypatch: pytest.MonkeyPatch):
+    server = Server(monkeypatch, MemoryKind.DEVICE)
+    yield server
+    server.shut_down()
+
+
+def computed(*request_ids: int) -> list[SimpleNamespace]:
+    """Requests that computed their whole prompts, none of which the store held."""
+    return [request(request_id, stored=0, computed=PROMPT) for request_id in request_ids]
 
 
 def test_a_fetch_whose_every_row_arrived_resumes_once_its_copy_settled(server):
@@ -340,7 +372,7 @@ def test_a_publication_that_does_not_fit_waits_for_the_open_one(server):
     server.manager.kv_cache_map.update({1: object(), 2: object()})
     server.orchestrator.publish_committed_blocks([first, second])
     assert len(server.lender.leases) == 1 and second.py_published_end is None
-    assert server.counters["publications_waited"] == 1
+    assert server.counters["publication_waits"] == 1
     server.iterate()  # the store starts writing the first
     server.store.end(0)
     server.iterate()  # the first closes; the second takes its room
@@ -349,3 +381,82 @@ def test_a_publication_that_does_not_fit_waits_for_the_open_one(server):
     server.store.end(1)
     server.iterate()
     assert server.counters["published_blocks"] == 6
+
+
+def test_a_gpu_direct_publication_waits_while_its_locked_pages_would_crowd_out_resumes(
+    gpu_direct_server,
+):
+    server = gpu_direct_server
+    # Room for two requests' locked pages beside the largest request's resume.
+    server.manager.total_pages = RESUME_PAGES + 2 * PROMPT_PAGES
+    requests = computed(1, 2, 3)
+    server.manager.kv_cache_map.update({r.py_request_id: object() for r in requests})
+    server.orchestrator.publish_committed_blocks(requests)
+    assert len(server.lender.leases) == 2 and requests[2].py_published_end is None
+    # A fetch would pin pages too: it waits as well.
+    server.orchestrator.add_fetch_candidates([request(4)])
+    assert server.orchestrator.start_fetches() == set()
+    assert server.counters["fetches_skipped_for_pages"] == 1
+    server.iterate()
+    server.store.end(1)
+    server.iterate()  # the second request's pages are free to go again
+    assert len(server.lender.leases) == 3 and requests[2].py_published_end == 3 * TPB
+
+
+def test_no_later_lending_phase_records_the_event_a_lease_waits_for(server):
+    """A lease in place asks its event's latest record: phases of later iterations record other
+    events, so no later forward holds back an earlier lease."""
+    for request_id in (1, 2, 3):
+        server.manager.kv_cache_map[request_id] = object()
+        server.orchestrator.publish_committed_blocks([request(request_id, stored=0, computed=TPB)])
+        server.iterate()
+    events = [lease.ready_event for lease in server.lender.leases]
+    assert len({id(event) for event in events}) == 3
+    assert [event.records for event in events] == [1, 1, 1]
+
+
+def test_gpu_direct_publications_wait_at_the_cap_unless_they_end_a_context_only_request(
+    gpu_direct_server,
+):
+    """A context-only request is freed soon after its context: its last range cannot wait for
+    the cap. Under GPU Direct a waiting range holds back no range behind it, and a chunked
+    context-only request's earlier range waits until it merges into the last."""
+    server = gpu_direct_server
+    full = computed(*range(1, MAX_OPEN_PUBLICATIONS + 1))
+    waiting = request(MAX_OPEN_PUBLICATIONS + 1, stored=0, computed=PROMPT)
+    chunked = request(MAX_OPEN_PUBLICATIONS + 2, stored=0, computed=TPB)  # its first chunk
+    chunked.is_context_only_request = True
+    for each in (*full, waiting, chunked):
+        server.manager.kv_cache_map[each.py_request_id] = object()
+    server.orchestrator.publish_committed_blocks([*full, waiting, chunked])
+    assert len(server.lender.leases) == MAX_OPEN_PUBLICATIONS
+    assert waiting.py_published_end is None and chunked.py_published_end is None
+    chunked.context_current_position = PROMPT  # its last chunk
+    server.orchestrator.publish_committed_blocks([chunked])
+    assert len(server.lender.leases) == MAX_OPEN_PUBLICATIONS + 1
+    assert chunked.py_published_end == 3 * TPB and waiting.py_published_end is None
+    server.iterate()  # the store starts writing
+    server.store.end(0)
+    server.store.end(1)
+    server.iterate()  # two locks go back: below the cap again
+    assert waiting.py_published_end == 3 * TPB
+
+
+def test_a_gpu_direct_publication_that_can_never_fit_is_dropped_once_and_logged(
+    gpu_direct_server, monkeypatch
+):
+    server = gpu_direct_server
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        orchestrator_module.logger, "warning_once", lambda message, key: warnings.append(message)
+    )
+    server.manager.total_pages = RESUME_PAGES  # no room at all beside the largest resume
+    dropped = request(1, stored=0, computed=TPB)
+    server.manager.kv_cache_map[1] = object()
+    server.orchestrator.publish_committed_blocks([dropped])
+    dropped.context_current_position = PROMPT  # a later chunk publishes nothing either
+    server.orchestrator.publish_committed_blocks([dropped])
+    server.iterate()
+    assert not server.lender.leases and dropped.py_published_end == PROMPT
+    assert server.counters["publications_dropped_for_pages"] == 1
+    assert len(warnings) == 1 and "does not fit the 0 pages left" in warnings[0]

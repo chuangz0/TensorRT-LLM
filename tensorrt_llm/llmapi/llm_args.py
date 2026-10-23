@@ -2800,9 +2800,10 @@ class KvSharingConfig(StrictBaseModel):
     data_path: Literal["auto", "gpu_direct", "host_staging"] = Field(
         default="auto",
         description="How blocks move between the store and the KV cache: "
-        "'gpu_direct' reads and writes KV cache pages in place, "
-        "'host_staging' copies them through pinned host memory. 'auto' "
-        "chooses host staging for now.")
+        "'gpu_direct' reads and writes KV cache pages in place over GPUDirect "
+        "RDMA, 'host_staging' copies them through pinned host memory. 'auto' "
+        "picks GPU Direct when a startup check passes, else host staging. "
+        "Both store the same blocks.")
     min_fetch_tokens: PositiveInt = Field(
         default=2048,
         description="Shortest stored prompt prefix worth fetching; a request "
@@ -2810,11 +2811,11 @@ class KvSharingConfig(StrictBaseModel):
         "it instead.")
     max_fetch_tokens: PositiveInt = Field(
         default=32768,
-        description="Longest prompt prefix one fetch reads. Each rank pins at "
-        "most 8 GiB of host memory: one fetch of max(max_fetch_tokens, "
-        "max_num_tokens) tokens of KV cache, and up to as much again for "
-        "publications; the server refuses to start when one fetch does not "
-        "fit.")
+        description="Longest prompt prefix one fetch reads. Under host "
+        "staging each rank pins at most 8 GiB of host memory: one fetch of "
+        "max(max_fetch_tokens, max_num_tokens) tokens of KV cache, and up to "
+        "as much again for publications; the server refuses to start when one "
+        "fetch does not fit.")
     probe_hold_ms: NonNegativeFloat = Field(
         default=50.0,
         description="Longest a new request waits for the store to say how "
@@ -8034,8 +8035,6 @@ class TorchLlmArgs(BaseLlmArgs):
              != LoadFormat.AUTO),
             (f"attn_backend={self.attn_backend!r}: stored blocks have the "
              "TRTLLM backend's layout", self.attn_backend != "TRTLLM"),
-            ("data_path='gpu_direct' for now; use 'auto' or 'host_staging'",
-             self.kv_sharing.data_path == "gpu_direct"),
         )
         reasons = [reason for reason, applies in checks if applies]
         if reasons:

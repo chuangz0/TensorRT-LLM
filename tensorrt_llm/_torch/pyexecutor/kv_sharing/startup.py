@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Wires KV sharing into a built executor, on its construction thread before its worker starts:
-the store client, the KV cache manager's lender, the transfer manager and the orchestrator."""
+the store client and its data path, the KV cache manager's lender, the transfer manager and the
+orchestrator."""
 
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ from ...disaggregation.blob.backend import (
 )
 from ...disaggregation.blob.keys import key_stem
 from ...disaggregation.blob.mooncake import MooncakeDriver
-from ...disaggregation.blob.mooncake_setup import load_store_config, open_sdk
+from ...disaggregation.blob.mooncake_setup import load_store_config
 from ...disaggregation.lifecycle.retirement import QuiescenceFatalEvent, RetirementWatchdog
 from ...disaggregation.transfer_manager import LifecycleBinding, TransferManager
 from ...weight_sharing.source_identity import SourceIdentity
@@ -34,7 +35,15 @@ from ..hang_detector import propagate_hard_kill
 from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ..kv_cache.sharing import Lender, MemoryKind, StagingOptions
 from ..scheduler.scheduler_v2 import KVCacheV2Scheduler
-from .orchestrator import BINDING_ID, DOMAIN_ID, PROFILE_ID, SharedKvOrchestrator, SharingPolicy
+from .data_path import open_store
+from .orchestrator import (
+    BINDING_ID,
+    DOMAIN_ID,
+    MAX_OPEN_PUBLICATIONS,
+    PROFILE_ID,
+    SharedKvOrchestrator,
+    SharingPolicy,
+)
 from .probe import ProbeService
 
 if TYPE_CHECKING:
@@ -54,8 +63,8 @@ MHA_LAYOUT = "mha-trtllm-hnd"
 SUPPORTED_MODELS = (
     "kv_sharing serves, for now, one GPU per server with a BF16 KV cache, multi-head attention "
     "with full attention in every layer (no sliding window, MLA, recurrent state or attention "
-    "sinks), and one fetch of max(max_fetch_tokens, max_num_tokens) tokens within "
-    f"{HOST_STAGING_BYTES >> 30} GiB of host staging"
+    "sinks), and under host staging one fetch of max(max_fetch_tokens, max_num_tokens) tokens "
+    f"within {HOST_STAGING_BYTES >> 30} GiB"
 )
 # The watchdog's names for the two directions of a store call.
 _STORE_CALLS = {"send": "store publication", "receive": "store fetch"}
@@ -107,19 +116,38 @@ def start_kv_sharing(
     except TypeError as error:  # an unknown key
         raise ValueError(f"store config {backend.config}, section 'blob': {error}") from error
     # Before the lender pins its staging memory: an unreachable master fails here, within a minute.
-    driver = MooncakeDriver(open_sdk(mooncake))
+    memory_kind, driver = open_store(config.data_path, mooncake)
 
-    # Host staging holds one fetch, and publications the rest of two fetches within the cap.
+    tokens_per_block = manager.tokens_per_block
     fetch_tokens = max(config.max_fetch_tokens, max_num_tokens)
-    staging = StagingOptions(
-        guaranteed_fetch_tokens=fetch_tokens, capacity_in_fetches=2, max_bytes=HOST_STAGING_BYTES
-    )
+    if memory_kind is MemoryKind.DEVICE:
+        # Nothing is staged; the lender still sets one block aside per pool group.
+        staging = StagingOptions(guaranteed_fetch_tokens=tokens_per_block)
+    else:
+        # Host staging holds one fetch, and publications the rest of two fetches within the cap.
+        staging = StagingOptions(
+            guaranteed_fetch_tokens=fetch_tokens,
+            capacity_in_fetches=2,
+            max_bytes=HOST_STAGING_BYTES,
+        )
     try:
-        domain = attach_domain(manager, _profile(py_executor, llm_args, checkpoint, staging))
+        profile = _profile(py_executor, llm_args, checkpoint, staging)
+        domain = attach_domain(manager, profile, memory_kind=memory_kind)
     except (TypeError, ValueError) as error:
         # The lender may stay attached; startup fails, so nothing lends through it.
         raise ValueError(f"{SUPPORTED_MODELS}; this server is refused: {error}") from error
-    publication_tokens = _publication_tokens(domain.lender, fetch_tokens, manager.tokens_per_block)
+    if memory_kind is MemoryKind.DEVICE:
+        publication_tokens = None
+        path = f"GPU Direct, at most {MAX_OPEN_PUBLICATIONS} publications locking pages at once"
+    else:
+        publication_tokens = _publication_tokens(domain.lender, fetch_tokens, tokens_per_block)
+        staging_bytes = sum(
+            r.nbytes for r in domain.lender.regions if r.memory_kind is MemoryKind.HOST
+        )
+        path = (
+            f"host staging of {staging_bytes >> 20} MiB: one fetch of {fetch_tokens} tokens and "
+            f"{publication_tokens} tokens for publications"
+        )
 
     transfers = TransferManager(wake=_nothing_to_wake, hold_returns=True)
     watchdog = RetirementWatchdog(_end_process)
@@ -138,8 +166,8 @@ def start_kv_sharing(
     watchdog.start()
     py_executor.disagg.attach_shared_transfer_manager(transfers)
 
-    tokens_per_block = manager.tokens_per_block
     policy = SharingPolicy(
+        memory_kind=memory_kind,
         fetch="fetch" in backend.roles,
         publish="publish" in backend.roles,
         min_fetch_tokens=config.min_fetch_tokens,
@@ -172,13 +200,9 @@ def start_kv_sharing(
     )
     py_executor.kv_sharing = orchestrator
     py_executor.scheduler.store_fetches = orchestrator
-    staging_bytes = sum(
-        region.nbytes for region in domain.lender.regions if region.memory_kind is MemoryKind.HOST
-    )
     logger.info(
         f"kv_sharing: store master {mooncake.master_server_address} over {mooncake.protocol}, "
-        f"roles {backend.roles}, host staging of {staging_bytes >> 20} MiB: one fetch of "
-        f"{fetch_tokens} tokens and {publication_tokens} tokens for publications"
+        f"roles {backend.roles}, {path}"
     )
     return orchestrator
 

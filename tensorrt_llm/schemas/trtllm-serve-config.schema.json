@@ -3359,7 +3359,7 @@
         },
         "data_path": {
           "default": "auto",
-          "description": "How blocks move between the store and the KV cache: 'gpu_direct' reads and writes KV cache pages in place, 'host_staging' copies them through pinned host memory. 'auto' chooses host staging for now.",
+          "description": "How blocks move between the store and the KV cache: 'gpu_direct' reads and writes KV cache pages in place over GPUDirect RDMA, 'host_staging' copies them through pinned host memory. 'auto' picks GPU Direct when a startup check passes, else host staging. Both store the same blocks.",
           "enum": [
             "auto",
             "gpu_direct",
@@ -3377,7 +3377,7 @@
         },
         "max_fetch_tokens": {
           "default": 32768,
-          "description": "Longest prompt prefix one fetch reads. Each rank pins at most 8 GiB of host memory: one fetch of max(max_fetch_tokens, max_num_tokens) tokens of KV cache, and up to as much again for publications; the server refuses to start when one fetch does not fit.",
+          "description": "Longest prompt prefix one fetch reads. Under host staging each rank pins at most 8 GiB of host memory: one fetch of max(max_fetch_tokens, max_num_tokens) tokens of KV cache, and up to as much again for publications; the server refuses to start when one fetch does not fit.",
           "exclusiveMinimum": 0,
           "title": "Max Fetch Tokens",
           "type": "integer"

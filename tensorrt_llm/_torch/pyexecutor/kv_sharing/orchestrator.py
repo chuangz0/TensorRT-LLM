@@ -45,6 +45,48 @@ PARKED_STATE = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
 # Rank 0's longest wait on an empty request queue while requests wait for their store probe.
 HELD_REQUEST_POLL = datetime.timedelta(milliseconds=1)
 NO_WAIT = datetime.timedelta(0)
+# Under GPU Direct, publications open at once at most: each locks its request's pages, which can
+# then be neither evicted nor suspended, until a round returns its lease. A context-only request's
+# last range is exempt: its request is freed soon after, and the range is then lost.
+MAX_OPEN_PUBLICATIONS = 8
+# Events lends wait for, recorded on the execution stream. A lease in place asks its event's latest
+# record, so one event recorded every iteration would keep a waiting lease behind each newer
+# forward: each lending phase takes the next event of a ring instead. Three phases may take one
+# per iteration (the round's retried publications, fetch admission, the step's publications), so
+# an event comes round after 2.7 iterations at the earliest; a lease still holding it then only
+# waits for a later forward on the same stream.
+READY_EVENTS = 8
+
+
+@dataclass
+class _PublicationLocks:
+    """Under GPU Direct, what one publishing pass may still lock: open publications against
+    MAX_OPEN_PUBLICATIONS, and pages kept from eviction against the room the manager's resumes
+    leave.
+
+    Attributes:
+        room: Pages that may be pinned at all.
+        pinned: Pages pinned now.
+        open: Open publications.
+        locked: The requests whose pages an open publication pins already.
+    """
+
+    room: int
+    pinned: int
+    open: int
+    locked: set[int]
+
+    def take(self, request_id: int, pages: int, past_cap: bool) -> bool:
+        """Locks the request's ``pages`` if they fit, past the open-publication cap when
+        ``past_cap``; whether they did."""
+        pages = 0 if request_id in self.locked else pages
+        at_cap = self.open >= MAX_OPEN_PUBLICATIONS and not past_cap
+        if at_cap or self.pinned + pages > self.room:
+            return False
+        self.open += 1
+        self.pinned += pages
+        self.locked.add(request_id)
+        return True
 
 
 @dataclass(frozen=True)
@@ -52,22 +94,26 @@ class SharingPolicy:
     """What a server does with the store, and its limits.
 
     Attributes:
+        memory_kind: DEVICE under GPU Direct, the store reading and writing KV cache pages in
+            place; HOST under host staging.
         fetch: Whether requests read stored prompt prefixes.
         publish: Whether the server stores the prompt blocks it computes.
         min_fetch_tokens: Shorter stored prefixes are computed.
         max_fetch_tokens: Longest prefix one fetch reads.
         fetch_timeout_s: A fetch still running this long after admission is abandoned.
-        publication_tokens: Most prompt tokens open publications may hold, whole blocks: host
-            staging less one fetch, so publications never keep a fetch waiting for staging.
+        publication_tokens: Under host staging, the most prompt tokens open publications may
+            hold, whole blocks: staging less one fetch, so publications never keep a fetch
+            waiting for staging. Unused under GPU Direct (None).
         max_util_for_resume: The KV cache manager's own page budget for resumes.
     """
 
+    memory_kind: MemoryKind
     fetch: bool
     publish: bool
     min_fetch_tokens: int
     max_fetch_tokens: int
     fetch_timeout_s: float
-    publication_tokens: int
+    publication_tokens: Optional[int]
     max_util_for_resume: float
 
 
@@ -114,9 +160,8 @@ class SharedKvOrchestrator:
         self._execution_stream = execution_stream
         self._watchdog = watchdog
         self._probe = probe
-        # Recorded on the execution stream before lends and handed to each: one reused event,
-        # since constructing one drops the GIL.
-        self._ready = torch.cuda.Event()
+        # Made once: freeing an event lets go of the GIL.
+        self._ready_events = itertools.cycle([torch.cuda.Event() for _ in range(READY_EVENTS)])
         self._ops: list[StoreOp] = []
         self._seq = itertools.count(1)
         # Requests with a stored prefix, until the scheduler's next pass decides on each.
@@ -134,6 +179,11 @@ class SharedKvOrchestrator:
         # resume window and its next step.
         self._resume_window_pages = ceil_div(kv_cache_manager.max_seq_len, self._tokens_per_block)
         self._resume_window_pages += 1
+
+    @property
+    def memory_kind(self) -> MemoryKind:
+        """DEVICE under GPU Direct, HOST under host staging."""
+        return self._policy.memory_kind
 
     # Rank 0, around the request queue.
 
@@ -178,9 +228,12 @@ class SharedKvOrchestrator:
     def start_fetches(self) -> set[int]:
         """The scheduler's admission hook: parks each candidate that fetches, and returns their
         ids. A parked request takes no batch slot and no token budget."""
+        if not self._candidates:
+            return set()
+        ready = next(self._ready_events)  # the pass's fetches share one
         parked = set()
         for request in self._candidates.values():
-            if self._park_for_fetch(request):
+            if self._park_for_fetch(request, ready):
                 parked.add(request.py_request_id)
         self._candidates.clear()
         return parked
@@ -198,8 +251,9 @@ class SharedKvOrchestrator:
 
     def cancel_fetch(self, request: LlmRequest) -> None:
         """Lets a request being cancelled go: its fetch is abandoned, and it no longer reads as
-        in transfer. Its cache may be freed at once: the store writes into staging only, until
-        a decision returns the lease."""
+        in transfer. Its cache may be freed at once: under host staging the store writes into
+        staging only, and under GPU Direct the lease's lock keeps the pages from reuse, until a
+        decision returns the lease."""
         self._candidates.pop(request.py_request_id, None)
         for op in self._ops:
             if op.kind is OpKind.FETCH and op.state is not OpState.OPEN and op.request is request:
@@ -374,7 +428,7 @@ class SharedKvOrchestrator:
 
     # Fetch admission.
 
-    def _park_for_fetch(self, request: LlmRequest) -> bool:
+    def _park_for_fetch(self, request: LlmRequest, ready: torch.cuda.Event) -> bool:
         """Claims the local prefix, lends the rows up to the stored end for writing, parks the
         request and appends a parked fetch, whatever the lend or submit did on this rank."""
         if request.state != LlmRequestState.CONTEXT_INIT or not request.is_first_context_chunk:
@@ -399,18 +453,19 @@ class SharedKvOrchestrator:
             self._free_cache(request)
             self.counters["fetches_skipped_for_claim"] += 1
             return False
-        self._ready.record(self._execution_stream)  # after the claim's own work
+        # After the claim's own work; the lender adds its grow's under GPU Direct.
+        ready.record(self._execution_stream)
         op = StoreOp(
             seq=next(self._seq),
             kind=OpKind.FETCH,
             request=request,
-            memory_kind=MemoryKind.HOST,
+            memory_kind=self._policy.memory_kind,
             state=OpState.PARKED,
             start=claim,
             end=end,
             deadline=time.monotonic() + self._policy.fetch_timeout_s,
         )
-        if not self._start(op):
+        if not self._start(op, ready):
             self.counters["fetches_not_started"] += 1
         request.state = PARKED_STATE
         self._ops.append(op)
@@ -418,72 +473,132 @@ class SharedKvOrchestrator:
         return True
 
     def _pages_allow_fetch(self, request: LlmRequest) -> bool:
-        """Whether the request's whole prompt plus one step fits in free pages, and pages that
-        parked fetches and deferred closes hold stay within the manager's resume budget."""
-        tpb = self._tokens_per_block
+        """Whether the request's whole prompt plus one step fits in free pages, and the pages
+        nothing may evict stay within the manager's resume budget with it."""
         used, total = self._kv_cache_manager.get_primary_block_counts()
-        need = ceil_div(request.prompt_len, tpb) + 1
-        parked = sum(
+        need = self._pages_of(request)
+        return need <= total - used and self._pinned_pages() + need <= self._resume_room(total)
+
+    def _pinned_pages(self) -> int:
+        """Pages no eviction or suspension may take now: what parked fetches lent up to their
+        ends; under GPU Direct the prompt and one step of each request an open publication locks,
+        once each (one freed meanwhile counts among the deferred closes); and the pages of caches
+        whose close waits for a lease."""
+        tpb = self._tokens_per_block
+        pinned = sum(
             ceil_div(op.end, tpb)
             for op in self._ops
             if op.kind is OpKind.FETCH and op.state is not OpState.OPEN
         )
-        held = parked + sum(self._lender.deferred_close_page_counts().values())
-        room = int(self._policy.max_util_for_resume * total) - self._resume_window_pages
-        return need <= total - used and held + need <= room
+        if self._policy.memory_kind is MemoryKind.DEVICE:
+            holders = self._kv_cache_manager.kv_cache_map
+            locked = {
+                op.request_id: op.request
+                for op in self._ops
+                if op.kind is OpKind.PUBLISH and op.request_id in holders
+            }
+            pinned += sum(self._pages_of(request) for request in locked.values())
+        return pinned + sum(self._lender.deferred_close_page_counts().values())
+
+    def _pages_of(self, request: LlmRequest) -> int:
+        """The request's whole prompt and one step."""
+        return ceil_div(request.prompt_len, self._tokens_per_block) + 1
+
+    def _resume_room(self, total_pages: int) -> int:
+        """The pages the manager may hold pinned and still resume its largest request."""
+        return int(self._policy.max_util_for_resume * total_pages) - self._resume_window_pages
 
     # Publication.
 
     def _publish_waiting(self) -> None:
-        """Lends and submits the waiting ranges in arrival order while they fit next to the open
-        publications; a range that does not fit waits, and the ones behind it too."""
-        room = self._policy.publication_tokens - sum(
-            op.end - op.start for op in self._ops if op.kind is OpKind.PUBLISH
-        )
-        cache_holders = self._kv_cache_manager.kv_cache_map
-        recorded = False
-        while self._unpublished:
-            request = next(iter(self._unpublished.values()))
+        """Lends and submits the waiting ranges in arrival order while they fit beside the open
+        publications."""
+        holders = self._kv_cache_manager.kv_cache_map
+        locks = None if self._policy.memory_kind is MemoryKind.HOST else self._publication_locks()
+        ready = None
+        for request in list(self._unpublished.values()):
             start, end, committed_end = self._publication_range(request)
             # A request freed meanwhile has nothing left to read.
-            if request.py_request_id not in cache_holders or end <= start:
+            if request.py_request_id not in holders or end <= start:
                 del self._unpublished[request.py_request_id]
                 continue
-            if end - start > room:
-                self.counters["publications_waited"] += 1
-                return
-            if not recorded:
-                self._ready.record(self._execution_stream)  # after the forward and the commits
-                recorded = True
-            room -= end - start
+            if locks is None:
+                if not self._staging_fits(end - start):
+                    self.counters["publication_waits"] += 1
+                    return  # staging frees in order: the ranges behind wait too
+            else:
+                pages = self._pages_of(request)
+                if pages > locks.room:  # even with nothing else pinned
+                    request.py_published_end = request.prompt_len  # its later chunks too
+                    del self._unpublished[request.py_request_id]
+                    self.counters["publications_dropped_for_pages"] += 1
+                    logger.warning_once(
+                        f"kv_sharing: a request of {pages} KV cache pages does not fit the "
+                        f"{locks.room} pages left beside the largest request's resume, so GPU "
+                        "Direct publishes nothing of it; give the KV cache more memory or "
+                        "max_util_for_resume, or use data_path 'host_staging'",
+                        key="kv_sharing: a publication never fits",
+                    )
+                    continue  # under GPU Direct a range waits on its own
+                if not locks.take(request.py_request_id, pages, self._ends_context(request, end)):
+                    self.counters["publication_waits"] += 1
+                    continue  # under GPU Direct a range waits on its own
+            if ready is None:
+                ready = next(self._ready_events)
+                ready.record(self._execution_stream)  # after the forward and the commits
             if end == committed_end:
                 del self._unpublished[request.py_request_id]
-            self._publish(request, start, end)
+            self._publish(request, start, end, ready)
+
+    def _staging_fits(self, tokens: int) -> bool:
+        """Host staging: whether the range fits in what open publications leave of the budget."""
+        open_tokens = sum(op.end - op.start for op in self._ops if op.kind is OpKind.PUBLISH)
+        return tokens <= self._policy.publication_tokens - open_tokens
+
+    def _publication_locks(self) -> _PublicationLocks:
+        """GPU Direct: what one publishing pass may still lock."""
+        _, total_pages = self._kv_cache_manager.get_primary_block_counts()
+        publications = [op for op in self._ops if op.kind is OpKind.PUBLISH]
+        return _PublicationLocks(
+            room=self._resume_room(total_pages),
+            pinned=self._pinned_pages(),
+            open=len(publications),
+            locked={op.request_id for op in publications},
+        )
+
+    def _ends_context(self, request: LlmRequest, end: int) -> bool:
+        """Whether the range is a context-only request's last: its request is freed soon after."""
+        tpb = self._tokens_per_block
+        prompt_blocks_end = request.prompt_len // tpb * tpb
+        return request.is_context_only_request and end == prompt_blocks_end
 
     def _publication_range(self, request: LlmRequest) -> tuple[int, int, int]:
         """``(start, end, committed_end)``: the request's committed whole prompt blocks from where
-        publication stopped, ``[start, end)`` at most the publication budget long."""
+        publication stopped, past what the store held at the probe, ``[start, end)`` at most the
+        host staging budget long."""
         tpb = self._tokens_per_block
         committed_end = min(request.context_current_position, request.prompt_len) // tpb * tpb
-        start = request.py_published_end
-        if start is None:
-            # Blocks reused locally, or that the store held at the probe, are not put again.
-            stored = min(request.py_store_hit_tokens or 0, committed_end)
-            start = max(request.prepopulated_prompt_len // tpb * tpb, stored)
-        return start, min(committed_end, start + self._policy.publication_tokens), committed_end
+        published = request.py_published_end
+        if published is None:  # blocks reused locally are not put again
+            published = request.prepopulated_prompt_len // tpb * tpb
+        # Nor those the store held at the probe, a resumed fetch's past its end included.
+        start = max(published, min(request.py_store_hit_tokens or 0, committed_end))
+        if self._policy.memory_kind is MemoryKind.HOST:
+            return start, min(committed_end, start + self._policy.publication_tokens), committed_end
+        return start, committed_end, committed_end
 
-    def _publish(self, request: LlmRequest, start: int, end: int) -> None:
+    def _publish(self, request: LlmRequest, start: int, end: int, ready: torch.cuda.Event) -> None:
         op = StoreOp(
             seq=next(self._seq),
             kind=OpKind.PUBLISH,
             request=request,
-            memory_kind=MemoryKind.HOST,
+            memory_kind=self._policy.memory_kind,
             state=OpState.OPEN,
             start=start,
             end=end,
         )
         request.py_published_end = end
-        if not self._start(op):
+        if not self._start(op, ready):
             self.counters["publications_not_started"] += 1
             if op.lease is not None and op.lease.failure is not None:
                 # The lender refused the range by the request's own state, which every rank
@@ -495,10 +610,10 @@ class SharedKvOrchestrator:
 
     # Helpers.
 
-    def _start(self, op: StoreOp) -> bool:
-        """Lends the operation's rows by name in host staging and hands the lease to the
-        transfer manager. Returns whether the store access started; where it did not, the entry
-        reports nothing delivered and a decision returns any lease it holds."""
+    def _start(self, op: StoreOp, ready: torch.cuda.Event) -> bool:
+        """Lends the operation's rows by name, in place or in host staging, and hands the lease
+        to the transfer manager. Returns whether the store access started; where it did not, the
+        entry reports nothing delivered and a decision returns any lease it holds."""
         if not self._lender_ok:
             return False
         fetch = op.kind is OpKind.FETCH
@@ -508,9 +623,9 @@ class SharedKvOrchestrator:
                 op.request,
                 op.start,
                 op.end,
-                memory_kind=MemoryKind.HOST,
+                memory_kind=op.memory_kind,
                 rows=RowSelection.NAMED,
-                ready_event=self._ready,
+                ready_event=ready,
             )
         except RuntimeError as error:  # the lender lends no more
             self._lender_failed(f"a lend failed: {error}")
@@ -524,7 +639,7 @@ class SharedKvOrchestrator:
             )
             return False
         intent = TransferIntent(
-            BINDING_ID, PROFILE_ID, Direction.FETCH if fetch else Direction.PUBLISH, MemoryKind.HOST
+            BINDING_ID, PROFILE_ID, Direction.FETCH if fetch else Direction.PUBLISH, op.memory_kind
         )
         result = self._transfers.submit(lease, intent)
         if not isinstance(result, Accepted):

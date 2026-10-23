@@ -19,7 +19,8 @@ store no memory. A server publishes the whole blocks of every prompt it computes
 generates, and serves the same tokens as a server without the store. A fresh server fetches the
 stored prefix of a prompt instead of computing it, and its tokens equal those of a server that
 reused the same blocks locally; a fetch that cannot deliver every block, or runs late, leaves the
-request to compute its prompt.
+request to compute its prompt. Servers move blocks over GPU Direct, which 'auto' picks here, or
+through host staging, and a block either path stores reads exactly on the other.
 
 Needs a GPU (three for the disaggregated test), ``mooncake_master`` on the path and the
 ``mooncake.store`` SDK, and fails without them. ``TRTLLM_MOONCAKE_PROTOCOL`` (default rdma) and
@@ -49,6 +50,8 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
+from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import MemoryKind
+from tensorrt_llm._torch.pyexecutor.kv_sharing import data_path
 from tensorrt_llm.llmapi import KvCacheConfig
 
 PROTOCOL = os.environ.get("TRTLLM_MOONCAKE_PROTOCOL", "rdma")
@@ -59,6 +62,7 @@ WAIT_S = 60.0
 # Fills the last partial block of P and of Q: whole blocks then hold generated tokens.
 NEW_TOKENS = 32
 CHUNKED_PREFILL = {"enable_chunked_prefill": True, "max_num_tokens": 256}
+DATA_PATHS = {"gpu_direct": MemoryKind.DEVICE, "host_staging": MemoryKind.HOST}
 
 _tokens = random.Random(20261022)
 # Token ids; P and Q start differently, so they share no block.
@@ -182,7 +186,13 @@ def store(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Store]:
     from test_common.mooncake_utils import running_master_on_free_ports, running_segment_provider
 
     from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import MooncakeConfig, open_sdk
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.gpudirect import (
+        select_registration_path,
+    )
 
+    # The first Mooncake client of the process fixes how it registers device memory, and the
+    # servers in this process register theirs after the test's own client.
+    select_registration_path(PROTOCOL, registers_device_memory=True)
     run_dir = tmp_path_factory.mktemp("mooncake")
     with ExitStack() as stack:
         master = stack.enter_context(
@@ -218,9 +228,13 @@ def references() -> Iterator[dict[str, list[int]]]:
 def test_publication_stores_whole_prompt_blocks_and_keeps_output(
     store: Store, references: dict[str, list[int]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    warnings: list[str] = []
+    monkeypatch.setattr(data_path.logger, "warning", warnings.append)
     llm = server(monkeypatch, in_process=True, kv_sharing=sharing(store, "overlap"))
     executor = llm._executor.engine
     try:
+        # 'auto' picks GPU Direct here.
+        assert executor.kv_sharing.memory_kind is MemoryKind.DEVICE, warnings
         tokens = {"P": generate(llm, P), "Q": generate(llm, Q)}
         stored = P_BLOCKS + Q_BLOCKS
         assert wait_until(lambda: store.readable_objects("overlap") == (stored, stored)), (
@@ -267,13 +281,10 @@ def test_chunked_prefill_publishes_each_chunk_and_keeps_output(
         reference = generate(llm, P)
     finally:
         shut_down(llm)
-    # Room for one chunk's publication: each later chunk's range waits for the one before it.
-    chunk = CHUNKED_PREFILL["max_num_tokens"]
+    # Each chunk's range is published once its commit lands, its pages locked while later chunks
+    # compute.
     llm = server(
-        monkeypatch,
-        in_process=True,
-        kv_sharing=sharing(store, "chunked", max_fetch_tokens=chunk),
-        **CHUNKED_PREFILL,
+        monkeypatch, in_process=True, kv_sharing=sharing(store, "chunked"), **CHUNKED_PREFILL
     )
     executor = llm._executor.engine
     try:
@@ -305,15 +316,25 @@ def block_bytes() -> int:
     return per_token * TOKENS_PER_BLOCK * 2
 
 
-def publish_p(store: Store, key_prefix: str) -> None:
-    """A writer server, shut down once done, publishes P's whole blocks under ``key_prefix``."""
+def publish_p(store: Store, key_prefix: str, *, gpu_direct_fails: bool = False) -> MemoryKind:
+    """A writer server, shut down once done, publishes P's whole blocks under ``key_prefix``; its
+    memory kind. With ``gpu_direct_fails`` its GPU Direct preparation fails, and 'auto' falls back
+    to host staging, logging why."""
+    warnings: list[str] = []
     with pytest.MonkeyPatch.context() as monkeypatch:
+        if gpu_direct_fails:
+            monkeypatch.setattr(data_path, "prepare_gpu_direct", lambda _: "forced by the test")
+            monkeypatch.setattr(data_path.logger, "warning", warnings.append)
         llm = server(monkeypatch, in_process=True, kv_sharing=sharing(store, key_prefix))
+    executor = llm._executor.engine
     try:
         generate(llm, P)
         assert wait_until(lambda: store.readable_objects(key_prefix) == (P_BLOCKS, P_BLOCKS))
     finally:
         shut_down(llm)
+    fell_back = [w for w in warnings if "host staging" in w and "forced by the test" in w]
+    assert len(fell_back) == gpu_direct_fails, warnings
+    return executor.kv_sharing.memory_kind
 
 
 def reader(monkeypatch: pytest.MonkeyPatch, store: Store, key_prefix=FETCH_PREFIX, **knobs) -> LLM:
@@ -362,27 +383,44 @@ def sibling_references() -> dict[str, dict[str, list[int]]]:
 
 @pytest.fixture(scope="module")
 def published_p(store: Store) -> None:
-    publish_p(store, FETCH_PREFIX)
+    """P published under FETCH_PREFIX by a writer over GPU Direct, which 'auto' picks here."""
+    assert publish_p(store, FETCH_PREFIX) is MemoryKind.DEVICE
 
 
-def test_fresh_server_fetches_a_published_prefix_exactly(
-    store: Store, published_p: None, sibling_references: dict, monkeypatch: pytest.MonkeyPatch
+@pytest.fixture(scope="module")
+def staged_p(store: Store) -> str:
+    """The key prefix under which a writer that fell back to host staging published P."""
+    assert publish_p(store, "fetch-staged", gpu_direct_fails=True) is MemoryKind.HOST
+    return "fetch-staged"
+
+
+@pytest.mark.parametrize("read_on", ["host_staging", "gpu_direct"])
+def test_a_fresh_server_fetches_a_prefix_published_on_the_other_data_path_exactly(
+    store: Store,
+    published_p: None,
+    staged_p: str,
+    sibling_references: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    read_on: str,
 ) -> None:
-    llm = reader(monkeypatch, store)
+    # Read through host staging what GPU Direct wrote, and the reverse.
+    key_prefix = FETCH_PREFIX if read_on == "host_staging" else staged_p
+    llm = reader(monkeypatch, store, key_prefix=key_prefix, data_path=read_on)
     executor = llm._executor.engine
-    before, _ = store.readable_objects(FETCH_PREFIX)
+    before, _ = store.readable_objects(key_prefix)
     try:
         fetched = complete(llm, T["exact"])
         # It publishes the blocks it computed past the fetched ones, and only those.
         published = before + T_BLOCKS - FETCHED_BLOCKS
-        assert wait_until(lambda: store.readable_objects(FETCH_PREFIX) == (published, published)), (
-            f"the store holds {store.readable_objects(FETCH_PREFIX)}; expected {published}"
+        assert wait_until(lambda: store.readable_objects(key_prefix) == (published, published)), (
+            f"the store holds {store.readable_objects(key_prefix)}; expected {published}"
         )
         # Another salt names other blocks, which the store does not hold.
         salted = complete(llm, T["exact"], cache_salt="other-tenant")
         assert wait_until(lambda: settled(executor))
     finally:
         shut_down(llm)
+    assert executor.kv_sharing.memory_kind is DATA_PATHS[read_on]
     assert list(fetched.outputs[0].token_ids) == sibling_references["reused"]["exact"]
     # A fresh server holds no block: the cached tokens came from the store.
     assert fetched.cached_tokens == FETCHED
