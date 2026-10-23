@@ -1052,6 +1052,9 @@ def test_a_held_lease_goes_back_only_by_return_now(path: str) -> None:
         assert not lease.released and not lease.marks and not h.fatals
         ready = h.manager.ready(operation)
         assert ready is (path == "delivered")
+        # A short delivery failed nothing; every other path but "delivered" did.
+        failed = h.manager.delivered_masks(operation) is None
+        assert failed is (path not in ("delivered", "short"))
         h.manager.return_now(operation, deliver=ready)
         assert lease.released and bool(lease.marks) is ready
         h.tick_until(lambda: operation not in h.manager.operations)
@@ -1086,3 +1089,26 @@ def test_shutdown_leaves_a_held_lease_ready_for_its_return() -> None:
         assert h.manager.ready(operation) and "abandoned" not in h.manager.counters
         h.manager.return_now(operation, deliver=True)
         assert lease.released and lease.marks[0][0].all()
+
+
+def test_a_publication_puts_only_its_stripe_and_a_striped_fetch_is_refused() -> None:
+    """Ranks holding the same bytes each put a stripe of a publication's rows: the backend sees
+    the rows whose page ordinal modulo the stripe's size is its position, and the outcome answers
+    for those rows alone."""
+    with _Harness(hold_returns=True) as h:
+        striped_fetch = replace(h.intent, put_stripe=(1, 2))
+        assert isinstance(h.manager.submit(_Lease(h.view), striped_fetch), Rejected)
+        lease = _Lease(h.view)
+        publication = replace(h.intent, direction=Direction.PUBLISH, put_stripe=(1, 2))
+        result = h.manager.submit(lease, publication)
+        assert isinstance(result, Accepted)
+        h.tick()
+        ((view, _, direction),) = h.backend.submissions
+        # h.view lends ordinals 2 and 3; stripe (1, 2) keeps 3.
+        assert direction == "publish" and view.groups[0].page_ordinals.tolist() == [3]
+        h.backend.attempts[0].outcome = Outcome.for_view(view, view.row_masks(True))
+        h.backend.attempts[0].ended = True
+        h.tick_until(lambda: h.manager.ended(result.operation_id))
+        assert h.manager.ready(result.operation_id)
+        h.manager.return_now(result.operation_id, deliver=False)
+        assert lease.released

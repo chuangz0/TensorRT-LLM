@@ -9,7 +9,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -35,6 +35,8 @@ from .base.backend import (
 from .lifecycle.retirement import RetirementDeadline, RetirementWatchdog
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from ..pyexecutor.kv_cache.sharing import Lease, LeaseView, Lender
 
 
@@ -50,7 +52,10 @@ class TransferIntent:
     """Immutable operation input; the caller must also freeze its opaque hint.
 
     Direction comes from the lending call, not introspection of the Lease. Memory
-    kind must match independently verified assembly metadata.
+    kind must match independently verified assembly metadata. A publication with
+    ``put_stripe=(position, size)`` puts only the rows whose page ordinal modulo
+    ``size`` is ``position``; the others stay lent, unread. Ranks holding the same
+    bytes each put one stripe, so every object is put once.
     """
 
     binding_id: str
@@ -58,6 +63,7 @@ class TransferIntent:
     direction: Direction
     memory_kind: MemoryKind
     hint: Hint = None
+    put_stripe: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -260,6 +266,7 @@ class OperationRecord:
     intent: TransferIntent
     lease: Lease
     accepted_at: float
+    # The rows the backend reads or writes: the lease's whole view, or a publication's stripe.
     lease_view: LeaseView | None = None
     attempt: Attempt | None = None
     submission: Submission = Submission.NOT_CALLED
@@ -318,6 +325,18 @@ class _ShutdownAttempt:
     access_ended: bool
     cancel_sent: bool
     fault: str | None = None
+
+
+def _backend_rows(view: LeaseView, stripe: tuple[int, int] | None) -> LeaseView:
+    """The rows of ``view`` an operation with ``stripe`` (``TransferIntent.put_stripe``) hands its
+    backend: every row without one."""
+    if stripe is None:
+        return view
+    position, size = stripe
+    return replace(
+        view,
+        groups=tuple(rows.select(rows.page_ordinals % size == position) for rows in view.groups),
+    )
 
 
 class TransferManager:
@@ -492,6 +511,8 @@ class TransferManager:
             return Rejected("intent does not match verified assembly metadata")
         if intent.direction not in (Direction.FETCH, Direction.PUBLISH):
             return Rejected("unsupported transfer direction")
+        if intent.direction is Direction.FETCH and intent.put_stripe is not None:
+            return Rejected("only a publication puts a stripe of its rows")
         if any(record.lease is lease for record in self.operations.values()):
             return Rejected("lease ownership already transferred")
         watchdog = binding.lifecycle_binding.watchdog
@@ -685,7 +706,7 @@ class TransferManager:
             self.stop_lender_domain(binding.domain_id, f"lease poll failed: {error}")
             return
         if view is not None:
-            record.lease_view = view
+            record.lease_view = _backend_rows(view, record.intent.put_stripe)
         if failure is not None:
             self._abandon(record, failure)
 
@@ -800,18 +821,26 @@ class TransferManager:
     def ready(self, operation_id: int) -> bool:
         """Whether the operation's Outcome delivered every row of its view without a fault,
         and neither it, its lender domain nor its lender stopped."""
+        masks = self.delivered_masks(operation_id)
+        return masks is not None and all(bool(mask.all()) for mask in masks)
+
+    def delivered_masks(self, operation_id: int) -> tuple[np.ndarray, ...] | None:
+        """The rows of its view the operation's Outcome delivered, one mask per group; None where
+        it failed: no Outcome yet, a fault, or it, its lender domain or its lender stopped. A row
+        not delivered without a failure is one the backend left alone, such as a store's put of
+        an object another writer is still putting."""
         record = self.operations[operation_id]
         binding = self.bindings[record.intent.binding_id]
         outcome = record.outcome
-        return (
-            outcome is not None
-            and outcome.fault is None
-            and record.fault is None
-            and not record.abandoned
-            and binding.domain_id not in self._domain_faults
-            and not binding.lender.stopped
-            and all(bool(mask.all()) for mask in outcome.delivered_masks)
+        failed = (
+            outcome is None
+            or outcome.fault is not None
+            or record.fault is not None
+            or record.abandoned
+            or binding.domain_id in self._domain_faults
+            or binding.lender.stopped
         )
+        return None if failed else outcome.delivered_masks
 
     def return_now(self, operation_id: int, deliver: bool) -> None:
         """Return a held lease: a fetch's with the rows its Outcome delivered when ``deliver``
