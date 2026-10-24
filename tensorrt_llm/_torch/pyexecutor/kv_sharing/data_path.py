@@ -11,6 +11,9 @@ sets ``MC_HANDSHAKE_MAX_LENGTH`` as that command does, since a GPU Direct server
 sends it a descriptor of every registered piece of KV cache memory. Where a peer-memory module is
 loaded but the KV cache pools could not be allocated GPUDirect-capable, the check (on an ordinary
 device buffer) passes and registering the pools fails: the server is refused, also under 'auto'.
+A provider that stops while a server reads from it can end that server about two minutes later
+(a store access it cannot prove ended); restart providers while their servers are idle or stopped.
+A provider restarted while no server reads from it only empties the store of its objects.
 """
 
 from __future__ import annotations

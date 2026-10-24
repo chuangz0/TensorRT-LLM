@@ -35,6 +35,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     MemoryRegion,
     ResumeBounds,
 )
+from tensorrt_llm._torch.pyexecutor.kv_sharing import breaker as breaker_module
 from tensorrt_llm._torch.pyexecutor.kv_sharing import orchestrator as orchestrator_module
 from tensorrt_llm._torch.pyexecutor.kv_sharing.orchestrator import (
     BINDING_ID,
@@ -241,6 +242,7 @@ class Server:
         min_over_ranks=None,
         windowed: bool = False,
         max_fetch_tokens: int = 16 * TPB,
+        probe=None,
     ):
         monkeypatch.setattr(torch.cuda, "Event", Event)
         self.lender, self.store, self.manager = Lender(windowed), Store(), Manager()
@@ -276,7 +278,8 @@ class Server:
             coordinator=coordinator,
             execution_stream=None,
             watchdog=SimpleNamespace(stop=lambda: None),
-            probe=None,
+            driver=None,
+            probe=probe,
             min_over_ranks=min_over_ranks,
         )
 
@@ -473,6 +476,143 @@ def test_a_publication_the_store_faulted_counts_as_failed(server):
     assert server.counters["publication_objects_skipped"] == 0
 
 
+def test_faulted_publications_in_a_row_pause_publishing_and_a_refused_lend_is_no_failure(
+    server, monkeypatch
+):
+    """Alone, a server pauses its publications after failures in a row and publishes again once
+    the pause passed; a lend the lender refused never reached the store, so it counts no
+    failure."""
+    monkeypatch.setattr(breaker_module, "FAILURES_TO_PAUSE", 2)
+    monkeypatch.setattr(breaker_module, "PAUSE_S", 0.2)
+    server.lender.refusal = "no room"
+    server.manager.kv_cache_map[1] = object()
+    server.orchestrator.publish_committed_blocks(computed(1))
+    server.iterate()
+    assert server.counters["publications_not_started"] == 1
+    assert server.counters["publications_failed"] == 0
+    server.lender.refusal = None
+    for request_id, attempt in ((2, 0), (3, 1)):
+        server.manager.kv_cache_map[request_id] = object()
+        server.orchestrator.publish_committed_blocks(computed(request_id))
+        server.iterate()  # the store starts writing
+        view = server.store.attempts[attempt].view
+        server.store.attempts[attempt].outcome = Outcome.for_view(view, fault="the store failed")
+        server.store.attempts[attempt].ended = True
+        server.iterate()
+    assert server.counters["publications_failed"] == 2
+    assert server.counters["publication_pauses"] == 1
+    leases = len(server.lender.leases)
+    server.manager.kv_cache_map[4] = object()
+    server.orchestrator.publish_committed_blocks(computed(4))
+    assert len(server.lender.leases) == leases  # paused: nothing lent
+    time.sleep(0.25)
+    server.orchestrator.publish_committed_blocks(computed(4))
+    assert len(server.lender.leases) == leases + 1
+
+
+class Probe:
+    """Records what the round tells rank 0's probe about settled fetches."""
+
+    def __init__(self) -> None:
+        self.fetches: list[tuple[bool, str]] = []
+
+    def record_fetch(self, failed: bool, why: str = "") -> None:
+        self.fetches.append((failed, why))
+
+    def stop(self, wait_s: float = 0.0) -> None:
+        pass
+
+    def stop_and_wait(self) -> None:
+        pass
+
+    counters: dict = {}
+
+
+@pytest.mark.parametrize(
+    "end,recorded",
+    [
+        ("resumed", [(False, "")]),
+        ("evicted", []),  # rows missing without a fault: no store failure
+        ("faulted", [(True, "a fetch failed in the store")]),
+        # Late with no fetch resumed within fetch_timeout_s: a slow data plane.
+        ("late", [(True, "fetches went late and none resumed in 60.0 s")]),
+    ],
+)
+def test_each_round_tells_rank_0s_probe_whether_the_store_failed_a_fetch(
+    monkeypatch, end, recorded
+):
+    probe = Probe()
+    server = Server(monkeypatch, MemoryKind.DEVICE, probe=probe)
+    try:
+        server.park(request(1))
+        server.iterate()  # the store starts reading
+        attempt = server.store.attempts[0]
+        if end == "late":
+            server.orchestrator._ops[0].deadline = 0.0  # as if fetch_timeout_s passed
+        else:
+            delivered = attempt.view.row_masks(end == "resumed")
+            fault = "the store failed" if end == "faulted" else None
+            attempt.outcome, attempt.ended = Outcome.for_view(attempt.view, delivered, fault), True
+        server.lender.settled.add(1)  # in place: its rows are the cache's
+        server.iterate()
+        assert probe.fetches == recorded
+    finally:
+        server.shut_down()
+
+
+def test_a_late_fetch_is_a_store_failure_only_when_no_fetch_resumed_within_the_timeout(monkeypatch):
+    """A long queue on a healthy store makes the tail of a burst late while its head resumes: no
+    failure. Fetches that go late with nothing resumed for ``fetch_timeout_s`` (60 s here) are a
+    slow data plane: a failure."""
+    clock = [0.0]
+    probe = Probe()
+    server = Server(monkeypatch, MemoryKind.DEVICE, probe=probe)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock[0], perf_counter=time.perf_counter),
+    )
+    try:
+        server.park(request(1), request(2))  # one burst, deadline 60
+        server.iterate()  # the store starts reading both
+        clock[0] = 30.0
+        server.store.end(0)
+        server.lender.settled.update({1, 2})
+        server.iterate()  # 1 resumes
+        clock[0] = 61.0
+        server.iterate()  # 2 goes late, 31 s after a resume
+        assert probe.fetches == [(False, "")]
+        server.park(request(3))  # deadline 121
+        server.iterate()
+        clock[0] = 122.0
+        server.iterate()  # 3 goes late, 92 s after the last resume
+        assert probe.fetches == [
+            (False, ""),
+            (True, "fetches went late and none resumed in 60.0 s"),
+        ]
+        assert server.counters["fetches_dropped_late"] == 2
+    finally:
+        monkeypatch.setattr(orchestrator_module, "time", time)  # the drain runs on real time
+        server.shut_down()
+
+
+def test_only_a_gpu_direct_operation_of_this_pass_asks_for_the_mid_pass_start(
+    gpu_direct_server, server
+):
+    """The executor waits for its input copy before ``start_store_transfers`` only when that call
+    has work: an operation lent in this pass under GPU Direct. Host staging starts at the loop
+    head."""
+    gpu_direct_server.iterate()
+    assert not gpu_direct_server.orchestrator.has_store_transfers_to_start()
+    gpu_direct_server.park(request(1))
+    assert gpu_direct_server.orchestrator.has_store_transfers_to_start()
+    gpu_direct_server.orchestrator.start_store_transfers()
+    assert len(gpu_direct_server.store.attempts) == 1  # the store reads during the forward
+    assert not gpu_direct_server.orchestrator.has_store_transfers_to_start()
+    server.park(request(1))
+    assert not server.orchestrator.has_store_transfers_to_start()
+
+
 def test_a_gpu_direct_publication_waits_while_its_locked_pages_would_crowd_out_resumes(
     gpu_direct_server,
 ):
@@ -575,7 +715,7 @@ def test_under_tensor_parallelism_a_stopped_store_binding_ends_the_server_before
 
 def test_refreshed_hits_update_only_waiting_requests(server):
     waiting = [SimpleNamespace(id=1, store_hit_tokens=8), SimpleNamespace(id=2, store_hit_tokens=8)]
-    server.orchestrator.apply_refreshed_hits(waiting, ((1, 16), (9, 4)))  # 9 no longer waits
+    server.orchestrator.apply_store_update(waiting, ((1, 16), (9, 4)), None)  # 9 no longer waits
     assert [item.store_hit_tokens for item in waiting] == [16, 8]
     assert server.counters["hits_refreshed"] == 1
 

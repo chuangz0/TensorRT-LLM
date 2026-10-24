@@ -21,8 +21,11 @@ locally, also when part of the prefix is in its own cache already; a request who
 store while it waited computes it, and one cancelled while a stuck store holds its fetch ends at
 once. Servers move blocks over GPU Direct, which 'auto' picks here, or through host staging, and a
 block either path stores reads exactly on the other. Two instances of one service share system
-prompts and follow-up turns under concurrent load. The store and its drivers are the module's
-(``conftest.py``).
+prompts and follow-up turns under concurrent load. When the store fails, requests compute their
+prompts with the same tokens: slow gets still serve hits, stuck ones pause fetching, a stalled
+master pauses probing and publishing, a full store declines puts without a pause, and a restarted
+provider only empties the store. The store and its drivers are the module's (``conftest.py``),
+except where a test needs a store of its own.
 
 Needs a GPU (four for the disaggregated test, two for the service), ``mooncake_master`` on the
 path, the ``mooncake.store`` SDK and, for the native driver, the built
@@ -35,15 +38,26 @@ import gc
 import json
 import os
 import random
+import signal
 import subprocess
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
 import torch
-from conftest import DRIVER, WAIT_S, Store, rank_traces, run_two_turn_workload, wait_until
+from conftest import (
+    DRIVER,
+    WAIT_S,
+    Store,
+    rank_traces,
+    run_two_turn_workload,
+    running_provider,
+    running_store,
+    wait_until,
+)
 from llmapi.apps.openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
 from utils.llm_data import llm_models_root
 
@@ -51,7 +65,7 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.store import ProbeStatus
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import MemoryKind
-from tensorrt_llm._torch.pyexecutor.kv_sharing import data_path, probe
+from tensorrt_llm._torch.pyexecutor.kv_sharing import breaker, data_path, probe
 from tensorrt_llm.llmapi import KvCacheConfig
 
 TOKENS_PER_BLOCK = 32
@@ -591,3 +605,262 @@ def test_disaggregated_context_server_fetches_computes_the_rest_and_publishes(
     assert shared.choices[0].text == reference.choices[0].text
     assert reference.usage.prompt_tokens_details.cached_tokens == FETCHED
     assert shared.usage.prompt_tokens_details.cached_tokens == FETCHED
+
+
+# Failures of the store. Each prompt F[i] has a sibling S[i]: F[i]'s first 16 blocks, then 200
+# tokens of its own; a server holding F[i] reuses exactly the 16 blocks.
+
+_failure_tokens = random.Random(20261024)
+F = [[2000 + i] + [_failure_tokens.randrange(1000, 30000) for _ in range(999)] for i in range(9)]
+S = [f[:FETCHED] + [_failure_tokens.randrange(1000, 30000) for _ in range(200)] for f in F]
+F_BLOCKS = len(F[0]) // TOKENS_PER_BLOCK  # 31, as P
+# The breakers' limits in these tests.
+FAILURES_TO_PAUSE, PAUSE_S = 3, 5.0
+
+
+@pytest.fixture(scope="module")
+def failure_references() -> dict[str, list[list[int]]]:
+    """Greedy tokens from a server without the store: each F[i] computed whole ("prompt"), each
+    S[i] computed whole ("whole") and with F[i]'s 16 blocks reused ("reused")."""
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        llm = server(monkeypatch, in_process=True)
+    references: dict[str, list[list[int]]] = {"prompt": [], "whole": [], "reused": []}
+    try:
+        for f, s in zip(F, S):
+            # A salt of its own leaves the request nothing to reuse.
+            whole = complete(llm, s, cache_salt=f"whole-{f[0]}")
+            references["prompt"].append(generate(llm, f))
+            reused = complete(llm, s)
+            assert whole.cached_tokens == 0 and reused.cached_tokens == FETCHED
+            references["whole"].append(list(whole.outputs[0].token_ids))
+            references["reused"].append(list(reused.outputs[0].token_ids))
+    finally:
+        shut_down(llm)
+    return references
+
+
+def short_breakers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(breaker, "FAILURES_TO_PAUSE", FAILURES_TO_PAUSE)
+    monkeypatch.setattr(breaker, "PAUSE_S", PAUSE_S)
+
+
+def publish(store: Store, key_prefix: str, prompts: list[list[int]]) -> None:
+    """A writer server, shut down once done, publishes the whole blocks of ``prompts``."""
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        llm = server(monkeypatch, in_process=True, kv_sharing=sharing(store, key_prefix))
+    try:
+        for prompt in prompts:
+            generate(llm, prompt)
+        store.assert_readable(key_prefix, len(prompts) * F_BLOCKS)
+    finally:
+        shut_down(llm)
+
+
+def test_slow_gets_serve_hits_and_stuck_or_failing_ones_pause_fetches(
+    store: Store, failure_references: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gets that take 0.3 s still resume their requests. A get that never answers goes late at
+    ``fetch_timeout_s`` and its request computes; with no fetch resumed within that time it is a
+    store failure (a slow data plane), as are gets the store fails, whose requests drop and
+    compute. After FAILURES_TO_PAUSE such rounds in a row the next request is not even probed.
+    Once the pause passed, a request fetches again. (The stuck get returns well within the access
+    watchdog's grace.)"""
+    short_breakers(monkeypatch)
+    publish(store, "slow", F[:8])
+    slow, stuck, failing = range(2), 2, range(3, 3 + FAILURES_TO_PAUSE - 1)
+    unprobed, after_pause = failing.stop, failing.stop + 1
+    store_answers = threading.Event()
+    gets = ["slow"]
+    get_rows = MooncakeDriver._get_rows
+
+    def misbehaving_get_rows(self, batch, indices, may_reread):
+        if gets[0] == "failing":  # the store answers an error: access ended, rows faulted
+            batch.fault(indices, "batch_get_into_multi_buffers: RPC_FAIL(-900)")
+            return True
+        if gets[0] == "stuck":
+            store_answers.wait()
+        time.sleep(0.3)
+        return get_rows(self, batch, indices, may_reread)
+
+    monkeypatch.setenv("TRTLLM_KV_SHARING_TRACE_DIR", str(tmp_path))
+    llm = reader(monkeypatch, store, key_prefix="slow", driver="python", fetch_timeout_s=1.0)
+    monkeypatch.setattr(MooncakeDriver, "_get_rows", misbehaving_get_rows)
+    executor = llm._executor.engine
+    counters = executor.kv_sharing.counters  # the probe's counts join it at shutdown
+    outputs = {}
+    try:
+        for i in slow:
+            outputs[i] = complete(llm, S[i])
+        assert counters["fetches_resumed"] == len(slow)
+        gets[0] = "stuck"
+        outputs[stuck] = complete(llm, S[stuck])
+        assert counters["fetches_dropped_late"] == 1
+        gets[0] = "failing"
+        for i in failing:
+            outputs[i] = complete(llm, S[i])
+        assert counters["fetches_dropped_short"] == FAILURES_TO_PAUSE - 1
+        started = counters["fetches_started"]
+        outputs[unprobed] = complete(llm, S[unprobed])  # probing paused
+        assert counters["fetches_started"] == started
+        gets[0] = "slow"
+        store_answers.set()
+        assert wait_until(lambda: settled(executor))
+        time.sleep(PAUSE_S)
+        outputs[after_pause] = complete(llm, S[after_pause])
+    finally:
+        store_answers.set()
+        shut_down(llm)
+    for i, output in outputs.items():
+        fetched = i in (*slow, after_pause)
+        kind = "reused" if fetched else "whole"
+        assert list(output.outputs[0].token_ids) == failure_references[kind][i], i
+        assert output.cached_tokens == (FETCHED if fetched else 0), i
+    assert counters["fetches_resumed"] == len(slow) + 1 and counters["fetch_pauses"] == 1
+    assert counters["probe_pauses"] == 0
+    assert rank_traces(tmp_path, 1).splitlines()[-1].endswith(" open=0")
+
+
+# The stalled-master test: below the master's 10 s client TTL, so no client remounts; requests
+# a little more than one RPC timeout apart, so each one's probe is a store call of its own.
+MASTER_STALL_S = 6.5
+STALL_RPC_TIMEOUT_MS = 1000
+STALL_REQUEST_GAP_S = STALL_RPC_TIMEOUT_MS / 1000 + 0.6
+
+
+def test_a_stalled_master_pauses_probes_and_publications_and_serving_goes_on(
+    failure_references: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The master stops answering (``SIGSTOP``). New requests' probe calls and their publications'
+    put starts time out (the store config's 1 s RPC timeout): after FAILURES_TO_PAUSE of each,
+    probing and publishing pause, the next request leaves unprobed, and every request completes
+    with its reference's tokens. Once the master answers and the pauses passed, a publication
+    stores its objects and a request fetches."""
+    short_breakers(monkeypatch)
+    with running_store(tmp_path / "store") as own:
+        publish(own, "stall", [F[8]])
+        trace_dir = tmp_path / "trace"
+        monkeypatch.setenv("TRTLLM_KV_SHARING_TRACE_DIR", str(trace_dir))
+        config = sharing(own, "stall", **READER)
+        config["backends"][0]["config"] = own.config("stall", rpc_timeout_ms=STALL_RPC_TIMEOUT_MS)
+        llm = server(monkeypatch, in_process=True, kv_sharing=config)
+        executor = llm._executor.engine
+        counters = executor.kv_sharing.counters  # the probe's counts join it at shutdown
+        stalled = []
+        try:
+            os.kill(own.master_pid, signal.SIGSTOP)
+            stopped_at = time.monotonic()
+            try:
+                for i, prompt in enumerate(F[: FAILURES_TO_PAUSE + 1]):  # the last one unprobed
+                    time.sleep(max(0.0, stopped_at + i * STALL_REQUEST_GAP_S - time.monotonic()))
+                    stalled.append(complete(llm, prompt))
+            finally:
+                time.sleep(max(0.0, stopped_at + MASTER_STALL_S - time.monotonic()))
+                os.kill(own.master_pid, signal.SIGCONT)
+            assert wait_until(lambda: settled(executor))
+            time.sleep(PAUSE_S)
+            computed = complete(llm, F[6])
+            own.assert_readable("stall", 2 * F_BLOCKS)  # F[8]'s blocks and F[6]'s
+            fetched = complete(llm, S[8])
+        finally:
+            os.kill(own.master_pid, signal.SIGCONT)
+            shut_down(llm)
+    for i, output in enumerate(stalled):
+        assert list(output.outputs[0].token_ids) == failure_references["prompt"][i], i
+    assert list(computed.outputs[0].token_ids) == failure_references["prompt"][6]
+    assert list(fetched.outputs[0].token_ids) == failure_references["reused"][8]
+    assert fetched.cached_tokens == FETCHED and counters["fetches_resumed"] == 1
+    assert counters["probe_pauses"] == counters["publication_pauses"] == 1
+    # Each probed request outlasted the hold; the last one went unprobed.
+    assert counters["held_past_limit"] == FAILURES_TO_PAUSE
+    assert counters["publications_failed"] >= FAILURES_TO_PAUSE
+    assert rank_traces(trace_dir, 1).splitlines()[-1].endswith(" open=0")
+
+
+def test_a_full_store_declines_puts_without_pausing(
+    failure_references: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store of about 70 of this model's objects, which evicts as Mooncake does by default,
+    takes eight prompts of 31 blocks each: puts the full store declines are skipped, not failed,
+    and publishing never pauses. A fresh reader of the last prompt fetches the leading blocks the
+    store kept of it, as the store answered its probe."""
+    short_breakers(monkeypatch)
+    probe = MooncakeDriver.probe
+    probed: list[tuple[ProbeStatus, ...]] = []
+
+    def recording_probe(self, keys, budget_s, hint=None):
+        probed.append(probe(self, keys, budget_s, hint))
+        return probed[-1]
+
+    with running_store(tmp_path / "store", eviction_ratio=0.05, provider_bytes=256 << 20) as own:
+        llm = server(monkeypatch, in_process=True, kv_sharing=sharing(own, "full"))
+        executor = llm._executor.engine
+        try:
+            computed = [generate(llm, prompt) for prompt in F[:8]]
+            assert wait_until(lambda: settled(executor))
+        finally:
+            shut_down(llm)
+        counters = executor.kv_sharing.counters  # the driver's counts join it at shutdown
+        llm = reader(monkeypatch, own, key_prefix="full")
+        reader_counters = llm._executor.engine.kv_sharing.counters
+        monkeypatch.setattr(MooncakeDriver, "probe", recording_probe)
+        try:
+            last = complete(llm, F[7])
+        finally:
+            shut_down(llm)
+    assert computed == failure_references["prompt"][:8]
+    assert counters["driver_rows_declined_pool_full"] > 0
+    assert counters["publication_pauses"] == counters["publications_failed"] == 0
+    # The master kept a leading run of the last prompt's blocks; the reader fetched exactly it, up
+    # to the whole blocks before the last prompt token.
+    (answer,) = probed
+    kept = next((b for b, status in enumerate(answer) if status is not ProbeStatus.HIT), F_BLOCKS)
+    assert kept * TOKENS_PER_BLOCK >= READER["min_fetch_tokens"], f"the store kept {kept} blocks"
+    fetchable = (len(F[7]) - 1) // TOKENS_PER_BLOCK
+    assert last.cached_tokens == min(kept, fetchable) * TOKENS_PER_BLOCK
+    assert reader_counters["fetches_resumed"] == 1
+    assert list(last.outputs[0].token_ids) == failure_references["prompt"][7]
+
+
+def test_a_restarted_provider_empties_the_store_and_serving_goes_on(
+    failure_references: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store's only provider stops while servers are idle and a new one starts: a request
+    served meanwhile has its puts declined, a sibling of what the old provider held misses and
+    computes, and what is published afterwards reads back exactly. Nothing pauses and the server
+    serves throughout."""
+    short_breakers(monkeypatch)
+    run_dir = tmp_path / "store"
+    with running_store(run_dir, provider_bytes=0) as own, ExitStack() as providers:
+        old = providers.enter_context(running_provider(own.master, run_dir, 1 << 30))
+        llm = server(monkeypatch, in_process=True, kv_sharing=sharing(own, "restart", **READER))
+        executor = llm._executor.engine
+        try:
+            computed = [generate(llm, F[0])]
+            own.assert_readable("restart", F_BLOCKS)
+            assert wait_until(lambda: settled(executor))
+            providers.close()  # the old provider stops (nothing in flight)
+            assert old.returncode is not None
+            computed.append(generate(llm, F[1]))  # no segment: its puts are declined
+            assert wait_until(lambda: settled(executor))
+            # A directory of its own: the old provider's readiness marker stays in run_dir.
+            providers.enter_context(running_provider(own.master, run_dir / "new", 1 << 30))
+            computed.append(generate(llm, F[2]))
+            assert wait_until(lambda: settled(executor))
+        finally:
+            shut_down(llm)
+        counters = executor.kv_sharing.counters
+        # F[2]'s blocks only: F[0]'s are gone.
+        assert own.readable_objects("restart") == (F_BLOCKS, F_BLOCKS), dict(counters)
+        llm = reader(monkeypatch, own, key_prefix="restart")
+        try:
+            missed = complete(llm, S[0])
+            fetched = complete(llm, S[2])
+        finally:
+            shut_down(llm)
+    assert computed == failure_references["prompt"][:3]
+    assert counters["driver_rows_declined_pool_full"] >= F_BLOCKS
+    assert counters["publication_pauses"] == counters["publications_failed"] == 0
+    assert list(missed.outputs[0].token_ids) == failure_references["whole"][0]
+    assert missed.cached_tokens == 0
+    assert list(fetched.outputs[0].token_ids) == failure_references["reused"][2]
+    assert fetched.cached_tokens == FETCHED

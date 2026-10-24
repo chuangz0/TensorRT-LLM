@@ -13,9 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """What kv_sharing sends with the executor's request broadcast reaches every tensor-parallel rank:
-rank 0's round size, and the store hits it measured again for waiting requests, applied to every
-rank's waiting queue before any request is activated. Two ranks run the executor's own fetch and
-broadcast path over a fake communicator."""
+rank 0's round size, and its store update (the store hits it measured again for waiting requests
+and a publishing switch), applied on every rank before any request is activated. Two ranks run the
+executor's own fetch and broadcast path over a fake communicator."""
 
 import collections
 from contextlib import nullcontext
@@ -39,13 +39,16 @@ ROUND_SIZE = 3
 
 
 class Sharing:
-    """The executor's kv_sharing hooks on one rank: rank 0 announces a round and has measured the
-    waiting request's hit again; applying it is the orchestrator's own code."""
+    """The executor's kv_sharing hooks on one rank: rank 0 announces a round, has measured the
+    waiting request's hit again and pauses publishing; applying the update is the orchestrator's
+    own code."""
 
     def __init__(self, rank: int) -> None:
         self.rank = rank
         self.counters = collections.Counter()
         self.announced = None
+        self._publishing = True
+        self._unpublished = {7: object()}  # a range waiting for room, dropped at the pause
 
     def request_queue_wait(self, timeout):
         return timeout
@@ -57,13 +60,17 @@ class Sharing:
         assert self.rank == 0, "only rank 0 measures hits"
         return ((WAITING_ID, 64),)
 
+    def take_publishing_switch(self):
+        assert self.rank == 0, "only rank 0 switches publishing"
+        return False
+
     def round_to_announce(self) -> int:
         return ROUND_SIZE if self.rank == 0 else 0
 
     def round_announced(self, entries: int) -> None:
         self.announced = entries
 
-    apply_refreshed_hits = SharedKvOrchestrator.apply_refreshed_hits
+    apply_store_update = SharedKvOrchestrator.apply_store_update
 
 
 def rank(index: int, wire: dict) -> PyExecutor:
@@ -103,7 +110,7 @@ def rank(index: int, wire: dict) -> PyExecutor:
     return executor
 
 
-def test_the_round_size_and_refreshed_hits_reach_every_rank_before_activation() -> None:
+def test_the_round_size_and_the_store_update_reach_every_rank_before_activation() -> None:
     wire: dict = {}
     executors = [rank(index, wire) for index in range(2)]
     for executor in executors:  # rank 0 broadcasts first, as the root does
@@ -113,3 +120,4 @@ def test_the_round_size_and_refreshed_hits_reach_every_rank_before_activation() 
         (waiting,) = executor.waiting_queue
         assert waiting.store_hit_tokens == 64
         assert executor.kv_sharing.counters["hits_refreshed"] == 1
+        assert executor.kv_sharing._publishing is False and not executor.kv_sharing._unpublished

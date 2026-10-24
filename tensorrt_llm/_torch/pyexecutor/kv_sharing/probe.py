@@ -5,6 +5,7 @@ and asks again for requests that still wait."""
 
 from __future__ import annotations
 
+import atexit
 import collections
 import threading
 import time
@@ -19,6 +20,7 @@ from tensorrt_llm.logger import logger
 
 from ...disaggregation.blob.mooncake import PROBE_KEYS_PER_CALL
 from ...disaggregation.blob.store import ProbeStatus
+from .breaker import Breaker
 
 if TYPE_CHECKING:
     from ...disaggregation.blob.store import StoreDriver
@@ -31,9 +33,13 @@ if TYPE_CHECKING:
 REFRESH_AFTER_S = 4.0
 # How often rank 0 looks for waiting hits due for a refresh.
 REFRESH_SCAN_S = 1.0
-# A refresh round stops adding prompts once it reached this many keys, one store call's worth, so a
-# probe of new requests that carries a refresh makes about one store call more.
+# A refresh round stops adding prompts once it reached this many keys, one store call's worth; the
+# refreshes then fill what room new requests leave in the thread's calls, or take calls of their own.
 REFRESH_KEYS_PER_ROUND = PROBE_KEYS_PER_CALL
+# A request waits for its answer one hold from when its own store call starts; queued behind other
+# requests' calls, it waits at most this many holds for that start (a burst of long prompts on a
+# healthy store drains within it).
+HOLDS_WHILE_QUEUED = 10
 # TODO(mooncake): a refresh asks about every share of every block. Puts that carried each block's
 # shares as one group (0.3.13's ReplicateConfig.group_ids) would let one key's existence check
 # renew every share's read lease, but 0.3.13 does not answer whether the group's other members
@@ -80,6 +86,17 @@ class ProbeService:
     that left with a hit worth fetching are probed again every REFRESH_AFTER_S while they wait, and
     ``take_refreshed_hits`` reports the hits that changed.
 
+    The thread asks the store one call at a time (at most PROBE_KEYS_PER_CALL keys: new requests
+    in arrival order, then refreshes) and answers each request as soon as its call returns. A
+    request's hold runs from its own call's start (queued, at most HOLDS_WHILE_QUEUED holds); a
+    call that runs longer than one hold releases every held request, so a slow store costs each
+    request one hold.
+
+    Probing pauses (a ``Breaker``) after failures in a row of store calls (an error, or a key the
+    store did not answer in time) or of fetches (``record_fetch``): new requests then leave
+    unprobed, so no rank admits a fetch, and nothing is refreshed. A request held past the limit
+    is no failure: a burst of long prompts outlasts the hold on a healthy store.
+
     Args:
         lender: Names the blocks as a publication names them.
         driver: The store driver; only this service's thread calls its ``probe``.
@@ -91,6 +108,10 @@ class ProbeService:
             (one per tensor-parallel rank with KV heads of its own; 1 for MLA and attention DP).
         windowed: Whether a layer group keeps a sliding window.
         hold_s: Longest a request waits for its answer.
+        exit_wait_s: How long the interpreter's exit waits for a store call in progress: the
+            store's RPC timeout and a little more. The thread stops between store calls; only a
+            prompt of more than PROBE_KEYS_PER_CALL keys takes several calls in one, which a stalled
+            master at exit can make outlast the wait.
         clock: Monotonic seconds.
     """
 
@@ -105,6 +126,7 @@ class ProbeService:
         shares_per_group: Sequence[int],
         windowed: bool,
         hold_s: float,
+        exit_wait_s: float = 1.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.counters: collections.Counter[str] = collections.Counter()
@@ -119,8 +141,9 @@ class ProbeService:
         self._group_rows = np.cumsum((0, *self._shares_per_group[:-1]))
         self._windowed = windowed
         self._hold_s = hold_s
+        self._exit_wait_s = exit_wait_s
         self._clock = clock
-        # Guards the six fields below and wakes the probe thread.
+        # Guards the nine fields below and wakes the probe thread.
         self._cond = threading.Condition()
         self._work: list[_Prompt] = []
         self._deadlines: dict[int, float] = {}  # by request id, while held and unanswered
@@ -129,6 +152,9 @@ class ProbeService:
         self._refresh_work: list[_Prompt] = []
         # By request id: a refresh's hit (None: the store call failed) and when the store gave it.
         self._refreshed: dict[int, tuple[Optional[int], float]] = {}
+        self._call_started_at: Optional[float] = None  # of the store call in flight
+        self._probe_breaker = Breaker("probes")
+        self._fetch_breaker = Breaker("fetches")
         self._stopped = False
         # Executor thread only.
         self._held: list[RequestQueueItem] = []
@@ -136,6 +162,9 @@ class ProbeService:
         self._next_scan = 0.0
         self._thread = threading.Thread(target=self._run, name="kv-sharing-probe", daemon=True)
         self._thread.start()
+        # Python ends a daemon thread still inside a store call at its exit, which aborts the
+        # process; exit hooks run before that.
+        atexit.register(self.stop_and_wait)
 
     def submit(self, item: RequestQueueItem) -> None:
         """Queues the request for a probe if it may fetch. Runs on the enqueuing thread."""
@@ -143,9 +172,9 @@ class ProbeService:
         if prompt is None:
             return
         with self._cond:
-            if self._stopped:
+            if self._stopped or self._paused(self._clock()):
                 return
-            self._deadlines[item.id] = self._clock() + self._hold_s
+            self._deadlines[item.id] = self._clock() + HOLDS_WHILE_QUEUED * self._hold_s
             self._work.append(prompt)
             self._cond.notify()
 
@@ -201,6 +230,12 @@ class ProbeService:
             self._queue_refreshes(waiting, now)
         return tuple(changed)
 
+    def record_fetch(self, failed: bool, why: str = "") -> None:
+        """Counts how the store served a round's fetches: ``failed`` where it failed one."""
+        with self._cond:
+            if self._fetch_breaker.record(failed, self._clock(), why):
+                self.counters["fetch_pauses"] += 1
+
     def stop(self, wait_s: float = 0.0) -> None:
         """Probes nothing more; held requests leave at the next call, unanswered. Waits up to
         ``wait_s`` for the probe thread, which may be inside a store call, to end."""
@@ -212,6 +247,16 @@ class ProbeService:
             self._cond.notify()
         if wait_s > 0:
             self._thread.join(wait_s)
+            if not self._thread.is_alive():
+                atexit.unregister(self.stop_and_wait)
+
+    def stop_and_wait(self) -> None:
+        """Stops and waits for a store call in progress, up to the store's RPC timeout."""
+        self.stop(self._exit_wait_s)
+
+    def _paused(self, now: float) -> bool:
+        """Under ``_cond``: whether probing pauses."""
+        return not (self._probe_breaker.allows(now) and self._fetch_breaker.allows(now))
 
     def _prompt_to_probe(self, item: RequestQueueItem) -> Optional[_Prompt]:
         """The prompt of a request that may fetch: one text prompt, no LoRA, no output computed
@@ -254,7 +299,9 @@ class ProbeService:
         deadline = self._deadlines.get(item.id)
         if deadline is None:  # not probed
             return True
-        if release or now >= deadline:
+        started = self._call_started_at
+        slow_store = started is not None and now - started >= self._hold_s
+        if release or now >= deadline or slow_store:
             del self._deadlines[item.id]
             if not release:
                 self.counters["held_past_limit"] += 1
@@ -262,17 +309,18 @@ class ProbeService:
         return False
 
     def _queue_refreshes(self, waiting: Iterable[RequestQueueItem], now: float) -> None:
-        """Forgets kept hits no longer waiting and hands the thread those due for a refresh."""
+        """Forgets kept hits no longer waiting and hands the thread those due for a refresh,
+        unless probing pauses."""
+        with self._cond:
+            paused = self._paused(now)
         waiting_ids, due, keys = set(), [], 0
         for item in waiting:
             waiting_ids.add(item.id)
             kept = self._waiting_hits.get(item.id)
-            if (
-                kept is None
-                or kept.refreshing
-                or now - kept.probed_at < REFRESH_AFTER_S
-                or keys >= REFRESH_KEYS_PER_ROUND
-            ):
+            if paused or kept is None or kept.refreshing or now - kept.probed_at < REFRESH_AFTER_S:
+                continue
+            if keys >= REFRESH_KEYS_PER_ROUND:
+                self.counters["refreshes_deferred"] += 1
                 continue
             kept.refreshing = True
             due.append(kept.prompt)
@@ -290,16 +338,17 @@ class ProbeService:
                 self._cond.wait_for(lambda: self._work or self._refresh_work or self._stopped)
                 if self._stopped:
                     return
-                # A request released meanwhile needs no answer. Refreshes ride the same store
-                # call, so steady arrivals never starve them.
-                first = [p for p in self._work if p.request_id in self._deadlines]
-                refresh = self._refresh_work
-                self._work, self._refresh_work = [], []
+                first, refresh = self._take_store_call()
+                probed_at = self._call_started_at  # the store's read leases run from the call
             if not first and not refresh:
                 continue
-            probed_at = self._clock()  # the store's read leases run from the call
-            answers = self._probe(first + refresh)
+            answers, answered = self._probe(first + refresh)
             with self._cond:
+                self._call_started_at = None
+                # At the call's return: a pause then lasts PAUSE_S whatever the call took.
+                why = "a store probe failed or timed out"
+                if self._probe_breaker.record(not answered, self._clock(), why):
+                    self.counters["probe_pauses"] += 1
                 for prompt, answer in zip(first, answers):
                     if prompt.request_id in self._deadlines:
                         del self._deadlines[prompt.request_id]
@@ -307,10 +356,45 @@ class ProbeService:
                 for prompt, answer in zip(refresh, answers[len(first) :]):
                     self._refreshed[prompt.request_id] = (answer, probed_at)
 
-    def _probe(self, batch: list[_Prompt]) -> list[Optional[int]]:
-        """Each prompt's usable end; ``None`` for every one where naming, the store call or the
-        lender's rule failed. One driver call for the batch; the driver asks PROBE_KEYS_PER_CALL
-        keys per store call."""
+    def _take_store_call(self) -> tuple[list[_Prompt], list[_Prompt]]:
+        """Under ``_cond``: the new requests and the refreshes of the next store call, at most
+        PROBE_KEYS_PER_CALL keys (one prompt at least), and the call's start; each new request's
+        hold now runs one hold from it. A request released meanwhile needs no answer. Refreshes
+        fill the room new requests leave: under a steady stream of long new prompts they wait, and
+        a hit whose read lease lapsed meanwhile fetches short and drops."""
+        self._work = [p for p in self._work if p.request_id in self._deadlines]
+        first = self._take_prompts(self._work, PROBE_KEYS_PER_CALL, at_least_one=True)
+        room = PROBE_KEYS_PER_CALL - sum(self._keys_of(p) for p in first)
+        refresh = self._take_prompts(self._refresh_work, room, at_least_one=not first)
+        if first or refresh:
+            self._call_started_at = now = self._clock()
+            for prompt in first:
+                self._deadlines[prompt.request_id] = now + self._hold_s
+        keys = sum(self._keys_of(p) for p in first + refresh)
+        self.counters["probe_batch_keys_max"] = max(self.counters["probe_batch_keys_max"], keys)
+        return first, refresh
+
+    def _take_prompts(self, queue: list[_Prompt], keys: int, at_least_one: bool) -> list[_Prompt]:
+        """Removes and returns the head of ``queue`` whose keys fit in ``keys``; with
+        ``at_least_one``, its first prompt whatever its size."""
+        count, taken = 0, 0
+        for prompt in queue:
+            taken += self._keys_of(prompt)
+            if taken > keys and not (at_least_one and count == 0):
+                break
+            count += 1
+        head = queue[:count]
+        del queue[:count]
+        return head
+
+    def _keys_of(self, prompt: _Prompt) -> int:
+        return prompt.num_blocks * self._keys_per_block
+
+    def _probe(self, batch: list[_Prompt]) -> tuple[list[Optional[int]], bool]:
+        """Each prompt's usable end (None for each where naming, the store call or the lender's
+        rule failed), and whether the store answered every key in time. The driver asks
+        PROBE_KEYS_PER_CALL keys per store call."""
+        started = time.perf_counter()
         try:
             names = np.concatenate(
                 [
@@ -327,15 +411,19 @@ class ProbeService:
             )
             hexed, width = names.tobytes().hex(), 2 * names.shape[1]  # one pass for the batch
             keys = [self._key_stem + hexed[i : i + width] for i in range(0, len(hexed), width)]
+            called = time.perf_counter()
             statuses = self._driver.probe(keys, self._hold_s)
+            self.counters["probe_call_seconds"] += time.perf_counter() - called
             held = np.fromiter((status is ProbeStatus.HIT for status in statuses), dtype=bool)
             answers = self._usable_ends(batch, held)
         except Exception as error:  # the requests compute their prompts
             self.counters["probe_errors"] += 1
             logger.warning_once(f"kv_sharing: a store probe failed: {error!r}", key="probe")
-            return [None] * len(batch)
+            return [None] * len(batch), False
         self.counters["probes"] += 1
-        return answers
+        self.counters["probe_seconds"] += time.perf_counter() - started
+        # A key the store did not answer in time (RPC timeout) counts as not held.
+        return answers, ProbeStatus.UNKNOWN not in statuses
 
     def _usable_ends(self, batch: list[_Prompt], held: np.ndarray) -> list[int]:
         """Each prompt's usable end by the lender's rule, given ``held``, whether the store holds

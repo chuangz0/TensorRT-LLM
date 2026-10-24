@@ -16,6 +16,10 @@ Prints one JSON line per cell, then, for the native driver, PASS or FAIL against
 (medians over the repeats): busy bandwidth at least 90% of idle for gets and for puts, and the busy
 thread keeping at least 99% of the loop rate it has alone.
 
+The rows live in host memory (the lender's staging slots) or, with ``--memory device``, in one CUDA
+allocation the driver registers as GPU Direct does (the KV cache pages); ``--row-kib`` sets a row's
+size (a serving row is one block of one layer group: 4096 KiB for Llama-3.1-8B at TP1).
+
 Needs a running ``mooncake_master``, a client giving the pool its memory, and a store config whose
 ``mooncake`` section points at the master::
 
@@ -34,6 +38,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import numpy as np
+import torch
 
 from tensorrt_llm._torch.disaggregation.base.memory import MemoryKind
 from tensorrt_llm._torch.disaggregation.blob.backend import BlobBackend, BlobConfig, RegionBinding
@@ -42,7 +47,12 @@ from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
     make_store_driver,
     open_sdk,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.gpudirect import (
+    allocation_range,
+    select_registration_path,
+)
 
+KIB = 1 << 10
 MIB = 1 << 20
 GIB = 1 << 30
 ATTEMPTS_IN_FLIGHT = 2
@@ -54,15 +64,15 @@ FIRST_PUT_NAME = 1 << 40  # put cells name their objects from here on, apart fro
 
 
 @dataclass(frozen=True)
-class HostRegion:
-    """Host memory the backend registers: the lender's ``SlotRegion``."""
+class SlotRegion:
+    """Memory the backend registers, as the lender's ``SlotRegion``."""
 
     address: int
     nbytes: int
     slot_bytes: int
     slot_count: int
+    memory_kind: MemoryKind
     layout_label: str = "bench"
-    memory_kind: MemoryKind = MemoryKind.HOST
 
 
 @dataclass
@@ -153,24 +163,33 @@ def loop_rate_alone(cpu: int | None, poll_interval_s: float) -> float:
 
 
 class Bench:
-    """A blob backend over one store driver and two attempts' worth of registered host slots."""
+    """A blob backend over one store driver and two attempts' worth of registered slots."""
 
     def __init__(
         self,
         store,
         mooncake,
         blob: BlobConfig,
+        memory_kind: MemoryKind,
         row_bytes: int,
         attempt_rows: int,
         cpu: int | None,
         poll_interval_s: float,
     ):
-        self.driver = make_store_driver(store, mooncake, blob)
+        device = memory_kind is MemoryKind.DEVICE
+        lookup = allocation_range if device else None
+        self.driver = make_store_driver(store, mooncake, blob, allocation_range=lookup)
         self.cpu, self.poll_interval_s = cpu, poll_interval_s
         self.row_bytes, self.attempt_rows = row_bytes, attempt_rows
         slot_count = ATTEMPTS_IN_FLIGHT * attempt_rows
-        self.memory = np.zeros(slot_count * row_bytes, dtype=np.uint8)  # zeroed: pages touched
-        region = HostRegion(self.memory.ctypes.data, self.memory.nbytes, row_bytes, slot_count)
+        nbytes = slot_count * row_bytes
+        if device:
+            self.memory = torch.zeros(nbytes, dtype=torch.uint8, device="cuda")
+            address = self.memory.data_ptr()
+        else:
+            self.memory = np.zeros(nbytes, dtype=np.uint8)  # zeroed: pages touched
+            address = self.memory.ctypes.data
+        region = SlotRegion(address, nbytes, row_bytes, slot_count, memory_kind)
         self.slots = region.address + np.arange(slot_count, dtype=np.int64) * row_bytes
         binding = RegionBinding([region], self.driver, Hold())
         binding.register()
@@ -241,11 +260,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--store-config", required=True)
     parser.add_argument("--driver", choices=("python", "native", "both"), default="both")
-    parser.add_argument("--row-mib", type=float, default=1.0)
+    parser.add_argument("--memory", choices=("host", "device"), default="host")
+    parser.add_argument("--row-kib", type=int, default=1024)
     parser.add_argument("--attempt-gib", type=float, default=1.0)
     parser.add_argument("--volume-gib", type=int, default=128, help="each cell moves this much")
     parser.add_argument("--objects-gib", type=int, default=4, help="the objects gets cycle over")
     parser.add_argument("--repeats", type=int, default=3, help="of each busy cell")
+    parser.add_argument("--workers", type=int, help="the blob section's workers, if given")
+    parser.add_argument(
+        "--batch-mib", type=int, help="the blob section's bytes_per_batch in MiB, if given"
+    )
     parser.add_argument(
         "--poll-ms", type=float, default=5.0, help="the executor's iteration: one poll each"
     )
@@ -261,16 +285,25 @@ def main() -> None:
 
     blob_section, mooncake = load_store_config(args.store_config)
     blob = BlobConfig(**blob_section)
-    row_bytes = int(args.row_mib * MIB)
+    if args.workers is not None:
+        blob = replace(blob, workers=args.workers)
+    if args.batch_mib is not None:
+        blob = replace(blob, bytes_per_batch=args.batch_mib * MIB)
+    memory_kind = MemoryKind.DEVICE if args.memory == "device" else MemoryKind.HOST
+    if memory_kind is MemoryKind.DEVICE:  # before the first client, as GPU Direct serving does
+        select_registration_path(mooncake.protocol, registers_device_memory=True)
+    row_bytes = args.row_kib * KIB
     attempt_rows = int(args.attempt_gib * GIB) // row_bytes
     attempt_bytes = attempt_rows * row_bytes
     object_attempts = args.objects_gib * GIB // attempt_bytes
     cell_attempts = args.volume_gib * GIB // attempt_bytes
     store = open_sdk(mooncake)
     shape = {
-        "row_mib": args.row_mib,
+        "memory": args.memory,
+        "row_kib": args.row_kib,
         "attempt_gib": args.attempt_gib,
         "workers": blob.workers,
+        "batch_mib": blob.bytes_per_batch // MIB,
         "pinned": args.pin_executor,
         "poll_ms": args.poll_ms,
     }
@@ -282,12 +315,16 @@ def main() -> None:
             store,
             replace(mooncake, driver=driver),
             blob,
+            memory_kind,
             row_bytes,
             attempt_rows,
             cpu,
             poll_interval_s,
         )
         bench.cell("put", False, object_attempts, first_name=0)  # the objects the gets read
+        # Discarded: a process's first busy cell runs slower than the same cell later (GB200, a
+        # 0.95-0.97 loop rate against 0.985).
+        bench.cell("get", True, object_attempts, 0, cycle=object_attempts)
 
         def cell(direction: str, busy: bool) -> dict:
             if direction == "get":

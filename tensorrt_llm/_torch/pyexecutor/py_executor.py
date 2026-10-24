@@ -87,7 +87,7 @@ from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
-                                     STORE_HITS_REQUEST_ID,
+                                     STORE_UPDATE_REQUEST_ID,
                                      ExecutorRequestQueue,
                                      RequestAdmissionState, RequestQueueItem)
 from .gpu_keepalive import GpuKeepalive
@@ -5125,6 +5125,15 @@ class PyExecutor:
                                 sample_state = self._sample_async(
                                     scheduled_batch, batch_outputs)
 
+                    if (self.kv_sharing is not None
+                            and self.kv_sharing.has_store_transfers_to_start()):
+                        # A fetch admitted in this pass starts while the
+                        # forward runs. Starting may fail a lease, which
+                        # rewrites host page-index entries the input copy
+                        # reads: wait for the copy first.
+                        self._wait_for_model_engine_input_copy()
+                        self.kv_sharing.start_store_transfers()
+
                     if batch_outputs is not None:
                         if self.perf_manager.enabled:
                             self.perf_manager.save_timing_to_requests(
@@ -6162,6 +6171,10 @@ class PyExecutor:
                     # host page-index entries with BAD_PAGE_INDEX. Wait until
                     # the current input preparation has consumed those buffers.
                     self._wait_for_model_engine_input_copy()
+                    if self.kv_sharing is not None:
+                        # A fetch admitted in this pass starts while the
+                        # forward runs.
+                        self.kv_sharing.start_store_transfers()
                     self._update_request_states(scheduled_batch)
 
                     # Update context requests' KV cache so that sliding-window
@@ -6650,19 +6663,23 @@ class PyExecutor:
             with self.hang_detector.pause():
                 fetched = self.executor_request_queue.get_from_request_queue(
                     timeout)
-            hits = ()
+            hits, publishing = (), None
             if kv_sharing is not None:
                 # Before the hold: a request it releases joins the waiting
                 # queue only after the broadcast, and a refresh scan forgets
                 # hits not in the waiting queue.
                 hits = kv_sharing.take_refreshed_hits(waiting_queue)
+                publishing = kv_sharing.take_publishing_switch()
                 fetched = kv_sharing.hold_until_probed(fetched)
             new_requests.extend(fetched)
-            if hits:
+            if hits or publishing is not None:
                 # First, so a shutdown or control item ending the envelope
                 # does not cut it off.
                 new_requests.insert(
-                    0, RequestQueueItem(STORE_HITS_REQUEST_ID, store_hits=hits))
+                    0,
+                    RequestQueueItem(STORE_UPDATE_REQUEST_ID,
+                                     store_hits=hits,
+                                     store_publishing=publishing))
 
         if connector is not None and self.dist.rank == 0:
             completed = connector.take_finished_prefix_loads()
@@ -6993,9 +7010,10 @@ class PyExecutor:
             if req_item.is_prefix_load_completion_request:
                 finished_prefix_load_ids.extend(
                     req_item.finished_prefix_load_ids)
-            elif req_item.is_store_hits_request:
-                self.kv_sharing.apply_refreshed_hits(self.waiting_queue,
-                                                     req_item.store_hits)
+            elif req_item.is_store_update_request:
+                self.kv_sharing.apply_store_update(self.waiting_queue,
+                                                   req_item.store_hits,
+                                                   req_item.store_publishing)
             elif req_item.is_shutdown_request:
                 self.is_shutdown = True
                 if self.kv_sharing is not None:

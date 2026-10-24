@@ -62,15 +62,18 @@ class Store:
     metrics_url: str
     run_dir: Path
     client: object  # mooncake.store.MooncakeDistributedStore
+    master_pid: int
 
-    def config(self, key_prefix: str, driver: str = DRIVER) -> str:
-        """Writes a server's store config whose keys start with ``key_prefix``."""
+    def config(self, key_prefix: str, driver: str = DRIVER, **mooncake_options) -> str:
+        """Writes a server's store config whose keys start with ``key_prefix``; its ``mooncake``
+        section takes ``mooncake_options`` too."""
         mooncake = {
             "master_server_address": self.master,
             "global_segment_size": 0,
             "protocol": PROTOCOL,
             "device_name": DEVICES,
             "driver": driver,
+            **mooncake_options,
         }
         path = self.run_dir / f"{key_prefix}-{driver}.yaml"
         path.write_text(yaml.safe_dump({"mooncake": mooncake, "blob": {"key_prefix": key_prefix}}))
@@ -134,9 +137,12 @@ def store(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Store]:
 
 
 @contextlib.contextmanager
-def running_store(run_dir: Path) -> Iterator[Store]:
-    """A master and one provider on this host, with servers' store configs in ``run_dir``."""
-    from test_common.mooncake_utils import running_master_on_free_ports, running_segment_provider
+def running_store(
+    run_dir: Path, *, eviction_ratio: float = 0.0, provider_bytes: int = PROVIDER_BYTES
+) -> Iterator[Store]:
+    """A master and one provider of ``provider_bytes`` (none for 0) on this host, with servers'
+    store configs in ``run_dir``. The module's store evicts nothing (``eviction_ratio`` 0)."""
+    from test_common.mooncake_utils import running_master_on_free_ports
 
     from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import MooncakeConfig, open_sdk
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.gpudirect import (
@@ -148,22 +154,28 @@ def running_store(run_dir: Path) -> Iterator[Store]:
     select_registration_path(PROTOCOL, registers_device_memory=True)
     with ExitStack() as stack:
         master = stack.enter_context(
-            running_master_on_free_ports(str(run_dir), protocol=PROTOCOL, eviction_ratio=0.0)
-        )
-        stack.enter_context(
-            running_segment_provider(
-                master.address,
-                str(run_dir),
-                segment_size=PROVIDER_BYTES,
-                protocol=PROTOCOL,
-                device_name=DEVICES,
+            running_master_on_free_ports(
+                str(run_dir), protocol=PROTOCOL, eviction_ratio=eviction_ratio
             )
         )
+        if provider_bytes:
+            stack.enter_context(running_provider(master.address, run_dir, provider_bytes))
         metrics_port = json.loads((run_dir / "pool.json").read_text())["metrics_port"]
         host = master.address.rsplit(":", 1)[0]
         client = open_sdk(MooncakeConfig(master.address, 0, PROTOCOL, DEVICES, local_buffer_size=0))
         stack.callback(client.close)
-        yield Store(master.address, f"http://{host}:{metrics_port}", run_dir, client)
+        metrics_url = f"http://{host}:{metrics_port}"
+        yield Store(master.address, metrics_url, run_dir, client, master.process.pid)
+
+
+def running_provider(master: str, run_dir: Path, segment_bytes: int):
+    """A provider (``trtllm-serve mooncake_provider``) of the store whose master is ``master``,
+    for the body's duration."""
+    from test_common.mooncake_utils import running_segment_provider
+
+    return running_segment_provider(
+        master, str(run_dir), segment_size=segment_bytes, protocol=PROTOCOL, device_name=DEVICES
+    )
 
 
 # The two-turn workload: system prompts of 16 blocks, each shared by several users whose first

@@ -11,6 +11,7 @@ from __future__ import annotations
 import collections
 import datetime
 import itertools
+import math
 import re
 import sys
 import time
@@ -27,10 +28,12 @@ from tensorrt_llm.math_utils import ceil_div
 from ...disaggregation.transfer_manager import Accepted, Direction, TransferIntent, TransferManager
 from ..kv_cache.sharing import Lender, MemoryKind, RowSelection
 from ..llm_request import LlmRequestState, rewind_context_after_cache_drop
+from .breaker import Breaker
 from .replicas import ReplicaSet
 from .store_ops import Action, Decision, OpKind, OpState, StoreOp, decide, report, table_hash
 
 if TYPE_CHECKING:
+    from ...disaggregation.blob.mooncake import MooncakeDriver
     from ...disaggregation.lifecycle.retirement import RetirementWatchdog
     from ...disaggregation.orchestration.coordinator import DisaggTransferCoordinator
     from ..executor_request_queue import RequestQueueItem
@@ -172,6 +175,10 @@ class SharedKvOrchestrator:
     """Fetches stored prompt prefixes for new requests and publishes the whole prompt blocks each
     context step commits.
 
+    Publishing pauses after failed publications in a row (a ``Breaker``): alone, each rank by its
+    own; with peers, rank 0 decides and every rank applies its switch from the store-update item
+    before activation, so all ranks stop and start appending publications in the same pass.
+
     Every store operation is an entry of one table (``store_ops``). Entries are appended where
     every rank runs the same code with the same inputs: a fetch's admission inside the scheduler
     and a publication after the context commit, whatever this rank's own lend or submit did. Only
@@ -189,12 +196,15 @@ class SharedKvOrchestrator:
         coordinator: The executor's coordinator, which advances the transfer manager.
         execution_stream: The stream the forward passes run on.
         watchdog: The watchdog of the transfer manager's store accesses, stopped at shutdown.
+        driver: The store driver, whose stats join the counters at shutdown.
         probe: Rank 0's probe service, or None where this server does not fetch.
         min_over_ranks: The elementwise minimum of a report over the tensor-parallel ranks, a
             collective every rank enters; None where this rank decides alone (one rank, or
             attention DP, where each rank serves requests of its own).
         replicas: The ranks holding this rank's KV cache bytes, which share its publications'
             puts.
+        decides_publishing: Whether this rank's publication breaker decides when publishing
+            pauses: alone, or rank 0 with peers.
         trace: Where each round and the exit are written, one line each, for tests to compare
             across ranks; None writes nothing.
     """
@@ -209,9 +219,11 @@ class SharedKvOrchestrator:
         coordinator: DisaggTransferCoordinator,
         execution_stream: torch.cuda.Stream,
         watchdog: RetirementWatchdog,
+        driver: Optional[MooncakeDriver],
         probe: Optional[ProbeService],
         min_over_ranks: Optional[Callable[[np.ndarray], np.ndarray]] = None,
         replicas: ReplicaSet = ReplicaSet(),
+        decides_publishing: bool = True,
         trace: Optional[TextIO] = None,
     ) -> None:
         self.counters: collections.Counter[str] = collections.Counter()
@@ -223,6 +235,7 @@ class SharedKvOrchestrator:
         self._coordinator = coordinator
         self._execution_stream = execution_stream
         self._watchdog = watchdog
+        self._driver = driver
         self._probe = probe
         self._min_over_ranks = min_over_ranks
         self._replicas = replicas
@@ -240,6 +253,15 @@ class SharedKvOrchestrator:
         self._unpublished: dict[int, LlmRequest] = {}
         # Whether new store operations are admitted; alike on every rank.
         self._admitting = True
+        self._publication_breaker = Breaker("publications") if decides_publishing else None
+        # With peers: whether publications are appended, as rank 0 last switched it; alike on
+        # every rank.
+        self._publishing = True
+        # Whether the transfer manager took an operation since this pass's round: the loop head
+        # handed the store everything accepted before it.
+        self._submitted_this_pass = False
+        # Rank 0: when a fetch last resumed (monotonic).
+        self._last_resume_at = -math.inf
         # Why this rank's lender or store binding stopped; None while they serve. Reported in each
         # round. With peers it stays None: a failure ends the server instead.
         self._stopped: Optional[str] = None
@@ -301,6 +323,15 @@ class SharedKvOrchestrator:
             return ()
         return self._probe.take_refreshed_hits(waiting)
 
+    def take_publishing_switch(self) -> Optional[bool]:
+        """Rank 0 with peers: whether publications are appended from now on, where that changed
+        (a pause began or ended); rank 0 broadcasts it for every rank to apply before activation.
+        None otherwise."""
+        if not self._with_peers or self._publication_breaker is None:
+            return None
+        publishing = self._publication_breaker.allows(time.monotonic())
+        return None if publishing == self._publishing else publishing
+
     def round_to_announce(self) -> int:
         """Rank 0, before the request broadcast: how many open entries the next round covers.
         Every one with peers; alone, 0, as a rank's own rounds need no announcement."""
@@ -320,17 +351,25 @@ class SharedKvOrchestrator:
         so every rank makes these two calls once per pass, in this order."""
         self._announced = entries
 
-    def apply_refreshed_hits(
-        self, waiting: Iterable[RequestQueueItem], hits: tuple[tuple[int, int], ...]
+    def apply_store_update(
+        self,
+        waiting: Iterable[RequestQueueItem],
+        hits: tuple[tuple[int, int], ...],
+        publishing: Optional[bool],
     ) -> None:
-        """Sets the store hit of each waiting request rank 0 measured again. Runs at the
-        store-hits item, before any request of the broadcast is activated, so every rank admits
-        from the same hit."""
+        """Sets the store hit of each waiting request rank 0 measured again, and switches
+        publishing as rank 0 decided (None: unchanged). Runs at the store-update item, before any
+        request of the broadcast is activated, so every rank admits from the same hit and appends
+        the same publications."""
         by_id = dict(hits)
         for item in waiting:
             if item.id in by_id:
                 item.store_hit_tokens = by_id[item.id]
                 self.counters["hits_refreshed"] += 1
+        if publishing is not None:
+            self._publishing = publishing
+            if not publishing:  # the ranges waiting to be published are dropped
+                self._unpublished.clear()
 
     # Each scheduling pass.
 
@@ -344,7 +383,9 @@ class SharedKvOrchestrator:
                 stopped or the ranks' tables differ; on any server, a lender or store binding
                 stopped with GPU Direct leases out.
         """
+        started = time.perf_counter()
         self._passes += 1
+        self._submitted_this_pass = False
         failure = self._store_failure()
         if failure is not None:
             self._store_failed(failure)
@@ -354,8 +395,10 @@ class SharedKvOrchestrator:
         round_size = announced if self._with_peers else len(self._ops)
         if round_size:
             self._close_ops(round_size)
-        if self._unpublished:
+        if self._unpublished and not self._publications_paused():
             self._publish_waiting()
+        # Under tensor parallelism this includes the round's wait for the slowest rank.
+        self.counters["round_seconds"] += time.perf_counter() - started
 
     def add_fetch_candidates(self, new_requests: list[LlmRequest]) -> None:
         """Remembers the new requests whose prompt prefix the store holds."""
@@ -379,20 +422,44 @@ class SharedKvOrchestrator:
         tried = [r for r in candidates if r.state != waiting]
         if not tried:
             return set()
+        started = time.perf_counter()
         ready = next(self._ready_events)  # the pass's fetches share one
-        return {r.py_request_id for r in tried if self._park_for_fetch(r, ready)}
+        parked = {r.py_request_id for r in tried if self._park_for_fetch(r, ready)}
+        self.counters["admission_seconds"] += time.perf_counter() - started
+        return parked
+
+    def has_store_transfers_to_start(self) -> bool:
+        """Whether ``start_store_transfers`` has work: operations this pass handed the transfer
+        manager under GPU Direct, while the lender serves. Host staging leases need the lender's
+        progress for their slots, so they start at the next pass's loop head."""
+        return (
+            self._submitted_this_pass
+            and self._policy.memory_kind is MemoryKind.DEVICE
+            and self._stopped is None
+        )
+
+    def start_store_transfers(self) -> None:
+        """Hands the store the operations this pass lent whose pages are ready, so a fetch
+        admitted in this pass starts while the forward runs. Call it after the iteration's
+        input-copy wait: a lease that failed unlocks its pages, which rewrites the host
+        page-index entries the input copy reads."""
+        if self.has_store_transfers_to_start():
+            self._submitted_this_pass = False
+            self._transfers.start_submitted()
 
     def publish_committed_blocks(self, context_requests: list[LlmRequest]) -> None:
         """Hands the store the prompt blocks this step's context requests committed. Call it after
         the forward launch and the context commits, before anything can free these requests."""
-        if not (self._policy.publish and self._admitting):
+        if not (self._policy.publish and self._admitting) or self._publications_paused():
             return
+        started = time.perf_counter()
         for request in context_requests:
             # Readers name a prompt by its tokens alone, which multimodal prompts are not.
             if not request.is_dummy and request.py_multimodal_data is None:
                 self._unpublished[request.py_request_id] = request
         if self._unpublished:
             self._publish_waiting()
+        self.counters["publication_seconds"] += time.perf_counter() - started
 
     def cancel_fetch(self, request: LlmRequest) -> bool:
         """Lets a request being cancelled go: its fetch is abandoned, and it no longer reads as
@@ -424,9 +491,10 @@ class SharedKvOrchestrator:
 
     def shutdown(self) -> None:
         """Returns every lease once its store access ended, within the transfer manager's
-        shutdown deadline, logs the counters and stops the access watchdog. Call it when the
-        executor loop ended, after the transfer manager's shutdown began: no rank schedules any
-        more, so each returns its leases on its own."""
+        shutdown deadline, adds the probe's, the transfer manager's and the store driver's counts
+        to the counters, logs them and stops the access watchdog. Call it when the executor loop
+        ended, after the transfer manager's shutdown began: no rank schedules any more, so each
+        returns its leases on its own."""
         if self._trace is not None:
             self._trace.write(f"exit passes={self._passes} open={len(self._ops)}\n")
             self._trace.close()
@@ -443,12 +511,14 @@ class SharedKvOrchestrator:
         while not self._transfers.shutdown_status().complete and time.monotonic() < deadline:
             self._transfers.advance(time.monotonic())
             self._transfers.wait_for_progress(0.001)
-        probe = {}
         if self._probe is not None:
-            self._probe.stop(wait_s=1.0)
-            probe = self._probe.counters
-        transfers = {f"transfers_{name}": count for name, count in self._transfers.counters.items()}
-        logger.info(f"kv_sharing counters: {dict(self.counters, **probe, **transfers)}")
+            self._probe.stop_and_wait()
+            self.counters.update(self._probe.counters)
+        self.counters.update({f"transfers_{n}": c for n, c in self._transfers.counters.items()})
+        if self._driver is not None:
+            self.counters.update({f"driver_{n}": c for n, c in self._driver.stats().items()})
+        counters = {n: round(c, 3) if isinstance(c, float) else c for n, c in self.counters.items()}
+        logger.info(f"kv_sharing counters: {counters}")
         # The watchdog refuses to stop while a store access may still touch KV cache memory.
         if self._transfers.shutdown_status().complete:
             self._watchdog.stop()
@@ -459,6 +529,13 @@ class SharedKvOrchestrator:
     def _with_peers(self) -> bool:
         """The tensor-parallel ranks keep one table and close it together."""
         return self._min_over_ranks is not None
+
+    def _publications_paused(self) -> bool:
+        """Whether publishing pauses now: with peers as rank 0 last switched it, alone by this
+        rank's breaker."""
+        if self._with_peers:
+            return not self._publishing
+        return not self._publication_breaker.allows(time.monotonic())
 
     def _store_failure(self) -> Optional[str]:
         """Why this rank's lender, its transfer-manager domain or its store binding stopped, or
@@ -490,6 +567,8 @@ class SharedKvOrchestrator:
             self._trace_round(round_size, entries, decisions)
         for decision in decisions:
             self._apply(decision)
+        if self._probe is not None:
+            self._tell_probe_about_fetches(decisions)
         self._ops = [op for op in self._ops if not op.closed]
 
     def _trace_round(
@@ -555,6 +634,34 @@ class SharedKvOrchestrator:
                 cause = "" if self._stopped is None else f" ({self._stopped})"
                 raise RuntimeError(f"kv_sharing: {decision.reason}{cause}")
 
+    def _tell_probe_about_fetches(self, decisions: list[Decision]) -> None:
+        """Rank 0 tells its probe how the store served this round's fetches: well where one
+        resumed; badly where one came back short with a fault on this rank (a failed store call;
+        short without a fault is an evicted object), or where one went late and none resumed
+        within ``fetch_timeout_s`` (a slow data plane: a degraded link, a fallback to TCP). A long
+        queue on a healthy store also makes fetches late, but others keep resuming meanwhile. A
+        transfer that never ends is caught by the access watchdog, which ends the process."""
+        now = time.monotonic()
+        resumed = faulted = late = False
+        for decision in decisions:
+            op = decision.op
+            if decision.action is Action.RESUME:
+                resumed = True
+            elif decision.action is Action.DROP and decision.reason == "late":
+                late = True
+            elif decision.action is Action.DROP and decision.reason == "short":
+                started_here = op.operation_id is not None  # a refused lend is no store failure
+                if started_here and self._transfers.delivered_masks(op.operation_id) is None:
+                    faulted = True
+        if resumed:
+            self._last_resume_at = now
+            self._probe.record_fetch(failed=False)
+        elif faulted:
+            self._probe.record_fetch(failed=True, why="a fetch failed in the store")
+        elif late and now - self._last_resume_at > self._policy.fetch_timeout_s:
+            why = f"fetches went late and none resumed in {self._policy.fetch_timeout_s} s"
+            self._probe.record_fetch(failed=True, why=why)
+
     def _return_none(self, op: StoreOp) -> None:
         """The lease goes back with nothing delivered; the entry closes."""
         if op.kind is OpKind.PUBLISH and self._replicas.lends(op.memory_kind):
@@ -566,16 +673,20 @@ class SharedKvOrchestrator:
         op.closed = True
 
     def _count_puts(self, op: StoreOp) -> None:
-        """Counts this rank's puts of a publication whose access ended: the objects the store took
-        (one per lent row: a layer group's share of a block), and a failure where the store or the
-        transfer failed. An object the store left alone without a fault is skipped, not failed:
-        another server was still putting the same object (it normally completes it; two servers
-        computing one prefix at once is normal traffic), the store was full, or this client's own
-        put session of the key was open or the master refused the object's size. The outcome does
-        not say which; the store driver's warning and stats do (all but the first are warned)."""
-        masks = None
-        if op.operation_id is not None:
-            masks = self._transfers.delivered_masks(op.operation_id)
+        """Counts this rank's puts of a publication whose access ended: objects stored, objects
+        skipped (another writer, a full store; the driver's stats say which), and a failure where
+        the store or transfer failed, which feeds the publication breaker. A refused lend counts
+        nothing here (``publications_not_started``)."""
+        if op.operation_id is None:  # a refused lend, counted as not started
+            return
+        masks = self._transfers.delivered_masks(op.operation_id)
+        if self._publication_breaker is not None:
+            paused = self._publication_breaker.record(
+                masks is None, time.monotonic(), "a publication failed"
+            )
+            self.counters["publication_pauses"] += int(paused)
+            if paused and not self._with_peers:  # with peers, at rank 0's broadcast switch
+                self._unpublished.clear()
         if masks is None:
             self.counters["publications_failed"] += 1
             return
@@ -896,6 +1007,7 @@ class SharedKvOrchestrator:
             self._store_failed(f"the transfer manager refused an operation: {result.reason}")
             return False
         op.operation_id = result.operation_id
+        self._submitted_this_pass = True
         return True
 
     def _read_start(self, start: int) -> int | list[int]:

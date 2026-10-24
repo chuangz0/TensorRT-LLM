@@ -98,6 +98,7 @@ def running_segment_provider(
     protocol: str = "tcp",
     device_name: str = "",
     timeout: float = SEGMENT_PROVIDER_TIMEOUT,
+    launcher: tuple[str, ...] = (),
 ) -> Iterator[subprocess.Popen]:
     """Give the pool a `segment_size`-byte segment for the body's duration.
 
@@ -113,6 +114,7 @@ def running_segment_provider(
         protocol: `rdma` or `tcp`.
         device_name: RDMA devices; empty picks the host's fastest InfiniBand ones.
         timeout: Seconds to wait for the provider to join the pool.
+        launcher: A command the provider runs under, e.g. `numactl` binding it to a socket.
     """
     os.makedirs(run_dir, exist_ok=True)
     config = os.path.join(run_dir, "segment_provider.yaml")
@@ -126,7 +128,7 @@ def running_segment_provider(
     }
     with open(config, "w") as file:
         yaml.safe_dump({"mooncake": mooncake}, file)
-    command = [sys.executable, "-m", "tensorrt_llm.commands.serve", "mooncake_provider"]
+    command = [*launcher, sys.executable, "-m", "tensorrt_llm.commands.serve", "mooncake_provider"]
     command += ["--no-telemetry", "--config", config, "--segment_size", str(segment_size)]
     command += ["--ready_file", ready]
     with open(log_path, "wb") as log:

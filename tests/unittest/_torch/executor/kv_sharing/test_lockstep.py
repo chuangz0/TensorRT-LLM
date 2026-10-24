@@ -19,7 +19,8 @@ only their stores differ (when each access ends, and whether it delivers every r
 clocks. The announced round must keep their tables, decisions, locks, pages and request states
 equal in every pass, release no lease before every rank's access ended, and drop a fetch on every
 rank in the first round some rank finds it late. Ranks holding the same bytes (MLA) put each
-published block once between them."""
+published block once between them. A publication pause rank 0 decides reaches every rank before
+activation, as the store-update item carries it."""
 
 import io
 import math
@@ -46,6 +47,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     MemoryRegion,
     ResumeBounds,
 )
+from tensorrt_llm._torch.pyexecutor.kv_sharing import breaker as breaker_module
 from tensorrt_llm._torch.pyexecutor.kv_sharing import orchestrator as orchestrator_module
 from tensorrt_llm._torch.pyexecutor.kv_sharing.orchestrator import (
     BINDING_ID,
@@ -330,6 +332,7 @@ class RankRecord:
     lent: dict[tuple, list[int]] = field(default_factory=dict)
     put: dict[tuple, list[int]] = field(default_factory=dict)
     drained: bool = False
+    publication_pauses: int = 0
 
 
 class _Trace(io.StringIO):
@@ -400,9 +403,11 @@ def run_rank(
         coordinator=SimpleNamespace(take_shared_domain_failures=transfers.take_domain_failures),
         execution_stream=None,
         watchdog=SimpleNamespace(stop=lambda: None),
+        driver=None,
         probe=None,
         min_over_ranks=lambda report: group.min(rank, report),
         replicas=replicas,
+        decides_publishing=rank == 0,
         trace=trace,
     )
     requests: dict[int, SimpleNamespace] = {}
@@ -417,6 +422,8 @@ def run_rank(
         orchestrator.resolve_store_operations()
         record.parked.append({op.seq for op in orchestrator._ops if op.state is OpState.PARKED})
         orchestrator.round_announced(group.broadcast(rank, orchestrator.round_to_announce()))
+        publishing = group.broadcast(rank, orchestrator.take_publishing_switch())
+        orchestrator.apply_store_update([], (), publishing)
         if rank == 1 and diverge_at is not None and iteration >= diverge_at and orchestrator._ops:
             head = orchestrator._ops[0]
             extra = StoreOp(0, OpKind.PUBLISH, head.request, memory_kind, OpState.OPEN, 0, TPB)
@@ -475,6 +482,7 @@ def run_rank(
         )
     record.released, record.ended = dict(lender.released), dict(store.ended)
     record.lent, record.put = dict(lender.lent), dict(store.put)
+    record.publication_pauses = orchestrator.counters["publication_pauses"]
     _clock.now = None  # the drain runs on real time
     transfers.begin_shutdown(_real_monotonic() + 5)
     orchestrator.shutdown()
@@ -519,7 +527,8 @@ def run_ranks(
 def rank_clocks(monkeypatch: pytest.MonkeyPatch) -> None:
     """No CUDA events; the orchestrator reads its rank thread's clock."""
     monkeypatch.setattr(torch.cuda, "Event", lambda: SimpleNamespace(record=lambda stream: None))
-    monkeypatch.setattr(orchestrator_module, "time", SimpleNamespace(monotonic=rank_clock))
+    clock = SimpleNamespace(monotonic=rank_clock, perf_counter=time.perf_counter)
+    monkeypatch.setattr(orchestrator_module, "time", clock)
 
 
 def records_of(outcomes: list[RankRecord | BaseException]) -> list[RankRecord]:
@@ -565,6 +574,22 @@ def test_ranks_whose_stores_differ_agree_in_every_round(memory_kind: MemoryKind,
     # The shutdown left no request parked.
     *_, last_states = first.passes[-1]
     assert all(state != PARKED_STATE for _, state, _, _ in last_states)
+
+
+def test_a_publication_pause_rank_0_decides_keeps_every_rank_in_lockstep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rank 0's breaker sees only rank 0's failed publications (here each one pauses); every rank
+    stops and starts appending publications in the pass its switch arrives."""
+    monkeypatch.setattr(breaker_module, "FAILURES_TO_PAUSE", 1)
+    monkeypatch.setattr(breaker_module, "PAUSE_S", 3 * STEP_S)
+    pauses = 0
+    for seed in range(4):
+        records = records_of(run_ranks(MemoryKind.DEVICE, seed)[0])
+        assert_lockstep(records)
+        assert all(record.publication_pauses == 0 for record in records[1:])
+        pauses += records[0].publication_pauses
+    assert pauses, "no seed paused publishing"
 
 
 def test_a_table_that_differs_on_one_rank_ends_every_rank_in_the_same_round() -> None:

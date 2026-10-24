@@ -207,6 +207,7 @@ def start_kv_sharing(
                 group.kept_window is not None for group in attached.lender.page_layout.layer_groups
             ),
             hold_s=config.probe_hold_ms / 1000,
+            exit_wait_s=mooncake.rpc_timeout_ms / 1000 + 1,
         )
         py_executor.executor_request_queue.probe_on_enqueue = probe.submit
     orchestrator = SharedKvOrchestrator(
@@ -217,9 +218,11 @@ def start_kv_sharing(
         coordinator=py_executor.disagg,
         execution_stream=py_executor.execution_stream,
         watchdog=attached.watchdog,
+        driver=attached.driver,
         probe=probe,
         min_over_ranks=min_over_ranks,
         replicas=replicas,
+        decides_publishing=min_over_ranks is None or dist.rank == 0,
         trace=attached.trace,
     )
     py_executor.kv_sharing = orchestrator
