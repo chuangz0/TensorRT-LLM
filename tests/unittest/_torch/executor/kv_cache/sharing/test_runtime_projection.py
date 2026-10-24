@@ -68,7 +68,7 @@ def _profile() -> ProfileSpec:
         dtype="bfloat16",
         topology=(1, 1, 1, 1),
         state_kinds=(CacheKind.PAGED,),
-        full_attention=True,
+        attention_windows=(),
         sparse_attention=False,
         sink_token_length=0,
         lora_enabled=False,

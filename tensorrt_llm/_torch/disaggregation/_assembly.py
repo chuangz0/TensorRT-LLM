@@ -161,7 +161,9 @@ class ProfileSpec:
             parallel size, data parallelism 1 or equal to it (attention DP), no
             pipeline or context parallelism.
         state_kinds: Canonical cache kinds from the layout's layer groups.
-        full_attention: Whether every group uses full attention.
+        attention_windows: ``(global layer id, tokens)`` of each layer whose attention reads a
+            sliding window, sorted; ``()`` when every layer reads its whole context. Windowed
+            MLA is not a tested cell.
         sparse_attention: Whether runtime sparse attention is enabled; must be false.
         sink_token_length: Runtime sink length; this cell requires zero.
         lora_enabled: Whether adapters are enabled; this cell excludes LoRA.
@@ -186,7 +188,7 @@ class ProfileSpec:
     dtype: str
     topology: tuple[int, int, int, int]
     state_kinds: tuple[CacheKind, ...]
-    full_attention: bool
+    attention_windows: tuple[tuple[int, int], ...]
     sparse_attention: bool
     sink_token_length: int
     lora_enabled: bool
@@ -224,8 +226,20 @@ class ProfileSpec:
             raise TypeError("state kinds must contain canonical CacheKind values")
         if any(kind != CacheKind.PAGED for kind in kinds):
             raise ValueError("initial profile supports paged attention state only")
-        if self.full_attention is not True:
-            raise ValueError("initial profile requires full attention")
+        windows = [tuple(pair) for pair in self.attention_windows]
+        if any(
+            len(pair) != 2
+            or any(isinstance(v, bool) or not isinstance(v, numbers.Integral) for v in pair)
+            for pair in windows
+        ):
+            raise TypeError("attention windows must be (layer, tokens) integer pairs")
+        windows = tuple(sorted((int(layer), int(window)) for layer, window in windows))
+        if any(layer < 0 or window <= 0 for layer, window in windows):
+            raise ValueError("attention windows need a nonnegative layer and a positive window")
+        if len({layer for layer, _ in windows}) != len(windows):
+            raise ValueError("attention windows name a layer twice")
+        if windows and self.model_layout == "mla-trtllm-latent":
+            raise ValueError("windowed MLA is not a tested cell")
         if self.sparse_attention is not False:
             raise ValueError("initial profile excludes sparse attention")
         if isinstance(self.sink_token_length, bool) or not isinstance(
@@ -238,8 +252,6 @@ class ProfileSpec:
             raise ValueError("initial profile excludes LoRA")
         if isinstance(self.pool_count, bool) or not isinstance(self.pool_count, numbers.Integral):
             raise TypeError("pool_count must be an integer")
-        if self.pool_count != 1:
-            raise ValueError("initial profile requires one pool group")
         if (
             self.speculative_mode != "none"
             or self.model_role != "target"
@@ -249,6 +261,7 @@ class ProfileSpec:
             raise ValueError("initial profile excludes speculative and joint draft reuse")
         object.__setattr__(self, "topology", topology)
         object.__setattr__(self, "state_kinds", kinds)
+        object.__setattr__(self, "attention_windows", windows)
         object.__setattr__(self, "scope", derive_kv_scope(self))
 
 
@@ -310,11 +323,7 @@ def derive_kv_scope(profile: ProfileSpec) -> bytes:
         "compatibility_id": profile.compatibility_id,
         "writer_layout": profile.model_layout,
         "cache_dtype": profile.dtype,
-        "attention": {
-            "full": profile.full_attention,
-            "sparse": profile.sparse_attention,
-            "sink_tokens": int(profile.sink_token_length),
-        },
+        "attention": _attention_payload(profile.attention_windows),
         "lora_enabled": profile.lora_enabled,
         "speculative_mode": profile.speculative_mode,
         "model_role": profile.model_role,
@@ -322,6 +331,19 @@ def derive_kv_scope(profile: ProfileSpec) -> bytes:
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return b"trtllm-kv-scope-v1\0" + hashlib.sha256(encoded.encode("utf-8")).digest()
+
+
+def _attention_payload(windows: tuple[tuple[int, int], ...]) -> dict:
+    """The scope's attention facts: full attention keeps its payload; windows name each windowed
+    layer and its window, so another window setting names other blocks."""
+    if not windows:
+        return {"full": True, "sparse": False, "sink_tokens": 0}
+    return {
+        "full": False,
+        "sparse": False,
+        "sink_tokens": 0,
+        "windows": [[layer, window] for layer, window in windows],
+    }
 
 
 @dataclass(frozen=True)
@@ -414,11 +436,12 @@ def _validate_layout(profile: ProfileSpec, layout: PageLayout, namespace: Region
     kinds = {"attention": CacheKind.PAGED, "state": CacheKind.STATE}
     if tuple(kinds.get(group.kind) for group in layout.layer_groups) != profile.state_kinds:
         raise ValueError("lender layer kinds do not match the selected profile")
-    if any(
-        group.kept_window is not None or group.read_window is not None
-        for group in layout.layer_groups
-    ):
-        raise ValueError("initial profile requires full-attention layout")
+    windows = dict(profile.attention_windows)
+    for group in layout.layer_groups:
+        if group.kept_window != group.read_window:
+            raise ValueError("a layer group keeps a wider window than its attention reads")
+        if any(windows.get(layer) != group.read_window for layer in group.layers):
+            raise ValueError("lender windows do not match the selected profile")
     if any(group.num_sink_blocks != 0 for group in layout.layer_groups):
         raise ValueError("initial profile excludes attention sinks")
     if len(layout.pool_slot_bytes) != profile.pool_count:

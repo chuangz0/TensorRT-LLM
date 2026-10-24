@@ -76,7 +76,7 @@ def _profile() -> ProfileSpec:
         dtype="bfloat16",
         topology=(1, 1, 1, 1),
         state_kinds=(CacheKind.PAGED,),
-        full_attention=True,
+        attention_windows=(),
         sparse_attention=False,
         sink_token_length=0,
         lora_enabled=False,
@@ -229,7 +229,7 @@ def test_attachment_uses_public_layout_and_complete_namespace(
         ),
         (
             replace(_layout(), layer_groups=(LayerGroupDesc("attention", 32, 0, 0, (0,)),)),
-            "full-attention",
+            "windows do not match",
         ),
         (
             replace(_layout(), layer_groups=(LayerGroupDesc("attention", None, 1, 0, (0,)),)),
@@ -388,8 +388,9 @@ def test_view_rejects_unsupported_row_placement() -> None:
         ("state_kinds", (CacheKind.PAGED, CacheKind.STATE), ValueError),
         ("state_kinds", ("attention",), TypeError),
         ("dtype", "float16", ValueError),
-        ("full_attention", False, ValueError),
-        ("pool_count", 2, ValueError),
+        ("attention_windows", ((0, 0),), ValueError),
+        ("attention_windows", ((0, 32), (0, 64)), ValueError),
+        ("attention_windows", ((0, True),), TypeError),
         ("pool_count", True, TypeError),
         ("speculative_mode", "eagle", ValueError),
         ("model_role", "draft", ValueError),
@@ -419,8 +420,9 @@ def test_view_rejects_unsupported_row_placement() -> None:
         "hybrid-state",
         "noncanonical-kind",
         "dtype",
-        "window",
-        "multiple-pools",
+        "empty-window",
+        "layer-twice",
+        "boolean-window",
         "boolean-pool-count",
         "speculative-mode",
         "draft-role",
@@ -452,6 +454,50 @@ def test_profile_accepts_the_tested_cells_and_parallel_layouts(
     assert attach_domain(object(), fp8).lender is lender
     for topology in ((4, 1, 1, 1), (2, 2, 1, 1)):
         assert replace(_profile(), topology=topology).topology == topology
+
+
+def test_a_windowed_layout_attaches_to_the_profile_naming_its_windows_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A windowed layout attaches to the profile naming its windows, and to no other.
+
+    A windowed layer group and a full one, each on a pool group of its own: gemma-3's shape.
+    """
+    windowed = LayerGroupDesc("attention", 512, 0, 0, (0, 1))
+    layout = replace(
+        _layout(),
+        pool_slot_bytes={0: (64,), 1: (64,)},
+        layer_groups=(windowed, LayerGroupDesc("attention", None, 0, 1, (2,))),
+        staging_region_index={0: 0, 1: 1},
+    )
+    lender = SimpleNamespace(
+        page_layout=layout,
+        regions=tuple(
+            MemoryRegion("host", 0x1000 * (g + 1), 256, 64, 4, (g,), MemoryKind.HOST)
+            for g in (0, 1)
+        ),
+    )
+    monkeypatch.setattr(_assembly, "attach_lender", lambda *args, **kwargs: lender)
+    profile = replace(
+        _profile(),
+        state_kinds=(CacheKind.PAGED,) * 2,
+        pool_count=2,
+        attention_windows=((1, 512), (0, 512)),
+    )
+    assert profile.attention_windows == ((0, 512), (1, 512))
+    assert attach_domain(object(), profile).lender is lender
+    for other in (((0, 512), (1, 256)), ((0, 512),)):
+        with pytest.raises(ValueError, match="windows do not match"):
+            attach_domain(object(), replace(profile, attention_windows=other))
+    reads_less = replace(windowed, read_window=256)
+    lender.page_layout = replace(layout, layer_groups=(reads_less, layout.layer_groups[1]))
+    with pytest.raises(ValueError, match="keeps a wider window"):
+        attach_domain(object(), replace(profile, attention_windows=((0, 256), (1, 256))))
+    # Another window, or none, names other blocks.
+    scopes = {replace(profile, attention_windows=w).scope for w in ((), ((0, 256), (1, 256)))}
+    assert profile.scope not in scopes and len(scopes) == 2
+    with pytest.raises(ValueError, match="windowed MLA"):
+        replace(profile, model_layout="mla-trtllm-latent")
 
 
 def test_profile_preserves_scope_and_opaque_provider_config() -> None:
