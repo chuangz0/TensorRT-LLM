@@ -227,6 +227,7 @@ def _make_llm_args():
         garbage_collection_gen0_threshold=0,
         lora_config=None,
         kv_connector_config=None,
+        kv_sharing=None,
         scheduler_config=scheduler_config,
         peft_cache_config=SimpleNamespace(),
         kv_cache_config=kv_cache_config,
