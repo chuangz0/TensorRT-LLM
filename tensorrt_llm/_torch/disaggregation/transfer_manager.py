@@ -640,6 +640,22 @@ class TransferManager:
                 )
         return tuple(updates)
 
+    def start_submitted(self) -> None:
+        """Hands the backend each accepted operation whose lease view is ready, and does nothing
+        else: no lender progress, outcome polls, returns or releases. Lets an operation accepted
+        after this iteration's ``advance`` start while the forward runs; call it on the manager
+        thread where a failed lease poll may change page tables."""
+        self._owner()
+        for record in tuple(self.operations.values()):
+            binding = self.bindings[record.intent.binding_id]
+            if (
+                record.submission is Submission.NOT_CALLED
+                and not record.abandoned
+                and binding.accepting
+                and binding.domain_id not in self._domain_faults
+            ):
+                self._submit_when_ready(record)
+
     def _progress_lenders(self) -> None:
         """Run one round of progress of each lender whose domain has not stopped."""
         lenders = {
@@ -662,9 +678,7 @@ class TransferManager:
             if not binding.accepting:
                 self._abandon(record, "binding admission closed before exposure")
             if not record.abandoned:
-                self._poll_lease(record)
-                if record.lease_view is not None and not record.abandoned:
-                    self._submit_backend(record)
+                self._submit_when_ready(record)
         if record.attempt is not None and not binding.shutdown_started:
             if record.outcome is None:
                 try:
@@ -691,6 +705,12 @@ class TransferManager:
             record.access_ended = True
         if record.access_ended:
             self._return_lease(record)
+
+    def _submit_when_ready(self, record: OperationRecord) -> None:
+        """Polls the lease and makes the backend call once its view is ready."""
+        self._poll_lease(record)
+        if record.lease_view is not None and not record.abandoned:
+            self._submit_backend(record)
 
     def _poll_lease(self, record: OperationRecord) -> None:
         """Poll an unreleased lease on its owner thread until its view is ready."""

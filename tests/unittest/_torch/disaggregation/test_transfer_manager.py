@@ -1112,3 +1112,26 @@ def test_a_publication_puts_only_its_stripe_and_a_striped_fetch_is_refused() -> 
         assert h.manager.ready(result.operation_id)
         h.manager.return_now(result.operation_id, deliver=False)
         assert lease.released
+
+
+def test_start_submitted_starts_a_ready_operation_and_makes_no_other_progress() -> None:
+    """Between two ``advance`` calls, ``start_submitted`` hands the backend an accepted operation
+    whose view is ready, leaves one whose view is not, and runs no lender progress, outcome poll
+    or return."""
+    with _Harness(hold_returns=True) as h:
+        waiting, _ = h.submit(ready=False)
+        h.tick()
+        rounds = h.lender.progress_rounds
+        ready, operation = h.submit()
+        h.manager.start_submitted()
+        ((view, _, _),) = h.backend.submissions
+        assert view is h.view and ready.polls == 1 and waiting.polls == 2
+        h.complete()
+        h.backend.attempts[0].ended = True
+        h.manager.start_submitted()
+        assert len(h.backend.submissions) == 1 and h.lender.progress_rounds == rounds
+        assert not h.manager.ended(operation) and not ready.released
+        h.tick()
+        assert h.manager.ended(operation) and h.manager.ready(operation)
+        h.manager.return_now(operation, deliver=True)
+        assert ready.released
