@@ -368,16 +368,19 @@ class SharedKvOrchestrator:
 
     def start_fetches(self) -> set[int]:
         """The scheduler's admission hook: parks each candidate that fetches, and returns their
-        ids. A parked request takes no batch slot and no token budget."""
-        if not self._candidates:
+        ids. A parked request takes no batch slot and no token budget. Every candidate is tried
+        once, except that a generation-first request still waiting for its generation server
+        stays a candidate until the transceiver promotes it (alike on every rank). Its hit is not
+        probed again meanwhile: if the store evicted the objects, its fetch delivers short, drops
+        and computes the prompt."""
+        waiting = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
+        candidates = list(self._candidates.values())
+        self._candidates = {r.py_request_id: r for r in candidates if r.state == waiting}
+        tried = [r for r in candidates if r.state != waiting]
+        if not tried:
             return set()
         ready = next(self._ready_events)  # the pass's fetches share one
-        parked = set()
-        for request in self._candidates.values():
-            if self._park_for_fetch(request, ready):
-                parked.add(request.py_request_id)
-        self._candidates.clear()
-        return parked
+        return {r.py_request_id for r in tried if self._park_for_fetch(r, ready)}
 
     def publish_committed_blocks(self, context_requests: list[LlmRequest]) -> None:
         """Hands the store the prompt blocks this step's context requests committed. Call it after
@@ -391,16 +394,23 @@ class SharedKvOrchestrator:
         if self._unpublished:
             self._publish_waiting()
 
-    def cancel_fetch(self, request: LlmRequest) -> None:
+    def cancel_fetch(self, request: LlmRequest) -> bool:
         """Lets a request being cancelled go: its fetch is abandoned, and it no longer reads as
         in transfer. Its cache may be freed at once: under host staging the store writes into
         staging only, and under GPU Direct the lease's lock keeps the pages from reuse, until a
-        decision returns the lease."""
+        decision returns the lease. It also stops being a fetch candidate, so it never parks
+        later. Returns whether the request was parked for a fetch or its fetch was settling."""
         self._candidates.pop(request.py_request_id, None)
-        for op in self._ops:
-            if op.kind is OpKind.FETCH and op.state is not OpState.OPEN and op.request is request:
-                self._let_go(op)
+        fetches = [
+            op
+            for op in self._ops
+            if op.kind is OpKind.FETCH and op.state is not OpState.OPEN and op.request is request
+        ]
+        for op in fetches:
+            self._let_go(op)
         self._ops = [op for op in self._ops if not op.closed]
+        self.counters["fetches_cancelled"] += len(fetches)
+        return bool(fetches)
 
     def begin_shutdown(self) -> None:
         """Admits no new store operation, and drops parked fetches: their requests compute their

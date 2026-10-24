@@ -4396,6 +4396,7 @@ class PyExecutor:
 
         if self.kv_sharing is not None:
             self.kv_sharing.add_fetch_candidates(new_requests)
+            self._cancel_parked_requests()
 
         self.disagg.prepare_context_schedulable(new_requests)
         self.disagg.poll_gen_transfers()
@@ -6880,9 +6881,11 @@ class PyExecutor:
                     "totalKvBlocks"]
                 iter_stats_payload.kv_load_timestamp_ns = load_sample[
                     "timestampUnixNanos"]
-            # kv_sharing: this rank's open store work keeps rank 0 awake.
-            store_operations = (self.kv_sharing.open_operations()
-                                if self.kv_sharing is not None else 0)
+            # Work that keeps rank 0 from sleeping on an empty request queue
+            # while another rank still needs executor passes.
+            background_work = int(self._has_kv_transfers_in_flight()) + (
+                self.kv_sharing.open_operations()
+                if self.kv_sharing is not None else 0)
             if getattr(self, "_enable_remote_tail_adp", False):
                 context_ids, generation_ids = self._snapshot_remote_tail_phase_work(
                     active_requests)
@@ -6891,7 +6894,7 @@ class PyExecutor:
                     iter_stats_payload=iter_stats_payload,
                     forward_work=(len(context_ids), len(generation_ids)),
                     include_kv_cache_load=self._kv_load_tracker.enabled,
-                    store_operations=store_operations)
+                    background_work=background_work)
                 self._select_remote_tail_phase(all_rank_states, context_ids,
                                                generation_ids)
             else:
@@ -6899,7 +6902,7 @@ class PyExecutor:
                     active_requests,
                     iter_stats_payload=iter_stats_payload,
                     include_kv_cache_load=self._kv_load_tracker.enabled,
-                    store_operations=store_operations)
+                    background_work=background_work)
             if self._kv_load_tracker.enabled and self.dist.rank == 0:
                 self._kv_load_tracker.record_rank_states(all_rank_states)
             if self.enable_iter_perf_stats:
@@ -9321,9 +9324,6 @@ class PyExecutor:
         Returns:
             bool: True if the request can be canceled (either successfully cancelled or doesn't need cancellation).
         """
-        if self.kv_sharing is not None:
-            # A request parked for a store fetch reads as in transfer below.
-            self.kv_sharing.cancel_fetch(request)
         connector = getattr(self, "kv_connector_manager", None)
         if connector is not None:
             connector.release_unstarted_prefix_loads(request)
@@ -9355,6 +9355,33 @@ class PyExecutor:
             return False
 
         return self.disagg.request_cancellation(request)
+
+    def _cancel_parked_requests(self) -> None:
+        """Cancels each request parked for a store fetch in the pass its
+        cancel arrives; any other cancelled request loses its candidacy, so it
+        never parks. Call it after the pass's candidates are added and before
+        scheduling. ``_handle_canceled_requests`` runs only in passes with a
+        forward, so on an otherwise idle server a parked request's cancel
+        would wait for its fetch. Responses and terminations ride this pass's
+        response flush, as transfer completions' do."""
+        if not self.canceled_req_ids:
+            return
+        cancelled = set(self.canceled_req_ids)
+        for request in [
+                r for r in self.active_requests if r.py_request_id in cancelled
+        ]:
+            if not self.kv_sharing.cancel_fetch(request):
+                continue  # not parked: the response pass cancels it
+            request.finish_by_reason(FinishReason.CANCELLED)
+            request.decoding_iter = request.py_decoding_iter
+            self.active_requests.remove(request)
+            self.canceled_req_ids.remove(request.py_request_id)
+            response = request.create_response(False, self.dist.rank)
+            if response:
+                response.result.cached_tokens = request.cached_tokens
+                self._pending_transfer_responses.append(
+                    (request.py_request_id, response))
+            self._pending_response_terminations.append(request)
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):

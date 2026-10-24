@@ -64,7 +64,8 @@ from tensorrt_llm._torch.pyexecutor.scheduler import (
     ScheduledRequests,
     SerializableSchedulerOutput,
 )
-from tensorrt_llm.bindings.executor import RequestType
+from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import DefaultADPRouter
+from tensorrt_llm.bindings.executor import FinishReason, RequestType
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 from tensorrt_llm.llmapi import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, MTPDecodingConfig
@@ -4477,6 +4478,30 @@ def test_first_token_response_carries_the_prefill_logits(monkeypatch, overlap):
         assert torch.equal(response.result.generation_logits, first_logits.transpose(0, 1))
 
 
+def test_a_parked_requests_cancel_responds_in_the_pass_it_arrives():
+    """kv_sharing: the cancel of a request parked for a store fetch takes effect in the pass it
+    arrives, whether or not that pass runs a forward; its response and its termination wait for
+    the pass's response flush. Any other cancel is left to the response pass."""
+    parked, computing = Mock(py_request_id=1, py_decoding_iter=0), Mock(py_request_id=2)
+    executor = object.__new__(PyExecutor)
+    executor.dist = types.SimpleNamespace(rank=0)
+    executor.kv_sharing = Mock()
+    executor.kv_sharing.cancel_fetch.side_effect = lambda request: request is parked
+    executor.active_requests = [parked, computing]
+    executor.canceled_req_ids = [1, 2]
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+
+    executor._cancel_parked_requests()
+
+    parked.finish_by_reason.assert_called_once_with(FinishReason.CANCELLED)
+    computing.finish_by_reason.assert_not_called()
+    assert executor.active_requests == [computing]
+    assert executor.canceled_req_ids == [2]
+    assert executor._pending_transfer_responses == [(1, parked.create_response.return_value)]
+    assert executor._pending_response_terminations == [parked]
+
+
 @pytest.mark.parametrize("sending", [True, False])
 def test_a_context_server_does_not_wait_for_requests_while_kv_sends_are_in_flight(sending):
     """After its last chunk a context-only request leaves the active requests while its KV cache
@@ -4503,3 +4528,27 @@ def test_a_context_server_does_not_wait_for_requests_while_kv_sends_are_in_fligh
 
     expected = datetime.timedelta(0) if sending else None
     executor.executor_request_queue.get_from_request_queue.assert_called_once_with(expected)
+
+
+def test_under_attention_dp_a_rank_still_sending_kv_counts_as_live_work():
+    """Under attention DP a rank whose only work is a KV send in flight reports it in the
+    rank-state gather, so rank 0 does not wait for new requests while another rank sends."""
+    dist = MagicMock(tp_rank=0, tp_size=1, has_cp_helix=False)
+    dist.tp_allgather.side_effect = lambda payload: [payload]
+    executor = object.__new__(PyExecutor)
+    executor.dist = dist
+    executor.enable_attention_dp = True
+    executor.enable_iter_perf_stats = False
+    executor.adp_router = DefaultADPRouter(dist=dist, has_seq_slot_headroom=True)
+    executor.kv_sharing = None
+    executor.kv_cache_transceiver = Mock()
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.has_any_inflight_requests.return_value = True
+    executor._kv_load_tracker = KvLoadTracker(None, rank=0, enabled=False)
+    executor._kv_cache_capacity = {}
+
+    queue_wait = Mock(side_effect=RuntimeError("after the gather"))
+    executor._fetch_and_enqueue_requests = queue_wait
+    with pytest.raises(RuntimeError):
+        executor._fetch_new_requests(FCFSWaitingQueue(), [])
+    assert queue_wait.call_args.args[1] == 1  # total_num_live_requests

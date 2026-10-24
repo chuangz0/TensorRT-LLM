@@ -18,14 +18,15 @@ A server publishes the whole blocks of every prompt it computes, and nothing it 
 serves the same tokens as a server without the store. A fresh server fetches the stored prefix of a
 prompt instead of computing it, and its tokens equal those of a server that reused the same blocks
 locally, also when part of the prefix is in its own cache already; a request whose prefix left the
-store while it waited computes it. Servers move blocks over GPU Direct, which 'auto' picks here, or
-through host staging, and a block either path stores reads exactly on the other. Two instances of
-one service share system prompts and follow-up turns under concurrent load. The store and its
-drivers are the module's (``conftest.py``).
+store while it waited computes it, and one cancelled while a stuck store holds its fetch ends at
+once. Servers move blocks over GPU Direct, which 'auto' picks here, or through host staging, and a
+block either path stores reads exactly on the other. Two instances of one service share system
+prompts and follow-up turns under concurrent load. The store and its drivers are the module's
+(``conftest.py``).
 
-Needs a GPU (three for the disaggregated test, two for the service), ``mooncake_master`` on the path, the
-``mooncake.store`` SDK and, for the native driver, the built ``tensorrt_llm.mooncake_store_worker``,
-and fails without them.
+Needs a GPU (four for the disaggregated test, two for the service), ``mooncake_master`` on the
+path, the ``mooncake.store`` SDK and, for the native driver, the built
+``tensorrt_llm.mooncake_store_worker``, and fails without them.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from conftest import WAIT_S, Store, run_two_turn_workload, wait_until
+from conftest import DRIVER, WAIT_S, Store, rank_traces, run_two_turn_workload, wait_until
 from llmapi.apps.openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
 from utils.llm_data import llm_models_root
 
@@ -69,7 +70,7 @@ P_BLOCKS, Q_BLOCKS = len(P) // TOKENS_PER_BLOCK, len(Q) // TOKENS_PER_BLOCK
 # each test's publications are its own. A server holding P reuses exactly the 16 blocks.
 FETCHED = 512
 FETCHED_BLOCKS = FETCHED // TOKENS_PER_BLOCK
-SIBLINGS = ("exact", "refreshed", "disaggregated")
+SIBLINGS = ("exact", "refreshed", "cancelled", "disaggregated")
 T = {name: P[:FETCHED] + [_tokens.randrange(1000, 30000) for _ in range(200)] for name in SIBLINGS}
 # The aggregated tests compare with a server without the store; the disaggregated one with its own.
 REFERENCED = SIBLINGS[:-1]
@@ -104,12 +105,14 @@ def server(
     )
 
 
-def sharing(store: Store, key_prefix: str, max_fetch_tokens: int = 1024, **knobs) -> dict:
+def sharing(
+    store: Store, key_prefix: str, max_fetch_tokens: int = 1024, driver: str = DRIVER, **knobs
+) -> dict:
     """``kv_sharing`` with a small fetch size: these prompts are short. Publications in flight hold
     at most max(max_fetch_tokens, max_num_tokens) tokens. Unless ``knobs`` say otherwise, nothing
     shorter than ``max_fetch_tokens`` is fetched."""
     return {
-        "backends": [{"type": "mooncake", "config": store.config(key_prefix)}],
+        "backends": [{"type": "mooncake", "config": store.config(key_prefix, driver)}],
         "max_fetch_tokens": max_fetch_tokens,
         "min_fetch_tokens": max_fetch_tokens,
         **knobs,
@@ -464,6 +467,47 @@ def test_a_waiting_request_takes_the_normal_path_after_its_prefix_left_the_store
     assert output.cached_tokens == 0 and counters["fetches_started"] == 0
 
 
+def test_a_cancel_while_the_store_holds_a_fetch_ends_the_request_at_once(
+    store: Store,
+    published_p: None,
+    sibling_references: dict,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A client cancels a request whose fetch a stuck store holds: the request ends at once, not
+    when the store answers, and the server serves on once it does. (The test stalls the Python
+    driver's gets for seconds; the access watchdog ends the process only after minutes.)"""
+    store_answers = threading.Event()
+    get_rows = MooncakeDriver._get_rows
+
+    def stalled_get_rows(self, *args, **kwargs):
+        store_answers.wait()
+        return get_rows(self, *args, **kwargs)
+
+    monkeypatch.setenv("TRTLLM_KV_SHARING_TRACE_DIR", str(tmp_path))
+    llm = reader(monkeypatch, store, driver="python", fetch_timeout_s=60.0)
+    # Once started: the startup check reads through the store too.
+    monkeypatch.setattr(MooncakeDriver, "_get_rows", stalled_get_rows)
+    counters = llm._executor.engine.kv_sharing.counters
+    try:
+        cancelled = llm.generate_async(T["cancelled"], GREEDY)
+        assert wait_until(lambda: counters["fetches_started"] == 1)
+        cancelled.abort()
+        output = cancelled.result(timeout=5)
+        assert not store_answers.is_set()
+        store_answers.set()
+        assert wait_until(lambda: settled(llm._executor.engine))
+        served = complete(llm, T["cancelled"])
+    finally:
+        store_answers.set()
+        shut_down(llm)
+    assert output.outputs[0].finish_reason == "cancelled"
+    assert list(served.outputs[0].token_ids) == sibling_references["reused"]["cancelled"]
+    assert served.cached_tokens == FETCHED
+    assert counters["fetches_cancelled"] == 1 and counters["fetches_resumed"] == 1
+    assert rank_traces(tmp_path, 1).splitlines()[-1].endswith(" open=0")
+
+
 # Disaggregated serving: the context server shares through the store; P->D is unchanged.
 
 # NIXL's UCX backend needs a CUDA transport; servers on one node need no InfiniBand.
@@ -473,8 +517,10 @@ SERVER_UCX_TLS = "cuda_copy,cuda_ipc,sm,self,tcp"
 def test_disaggregated_context_server_fetches_computes_the_rest_and_publishes(
     store: Store, published_p: None, tmp_path: Path
 ) -> None:
+    """Each run has a generation server of its own: one that kept the reference run's blocks
+    would skip receiving them, and decode from those instead of the fetched ones."""
     gpus = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, check=True)
-    assert len(gpus.stdout.splitlines()) >= 3, "needs three GPUs"
+    assert len(gpus.stdout.splitlines()) >= 4, "needs four GPUs"
     worker = {
         "kv_cache_config": {"tokens_per_block": TOKENS_PER_BLOCK, "free_gpu_memory_fraction": 0.3},
         "max_batch_size": 8,
@@ -483,8 +529,9 @@ def test_disaggregated_context_server_fetches_computes_the_rest_and_publishes(
     }
     context = {**worker, "disable_overlap_scheduler": True}
     servers = {  # name: (role, GPU, extra LLM options)
-        "generation": ("generation", "1", worker),
+        "generation-without-store": ("generation", "3", worker),
         "context-without-store": ("context", "2", context),
+        "generation-with-store": ("generation", "1", worker),
         "context-with-store": (
             "context",
             "0",
@@ -518,7 +565,7 @@ def test_disaggregated_context_server_fetches_computes_the_rest_and_publishes(
             store_use: stack.enter_context(
                 RemoteDisaggOpenAIServer(
                     ctx_servers=[f"localhost:{started[f'context-{store_use}'].port}"],
-                    gen_servers=[f"localhost:{started['generation'].port}"],
+                    gen_servers=[f"localhost:{started[f'generation-{store_use}'].port}"],
                     log_path=str(tmp_path / f"router-{store_use}.log"),
                 )
             )

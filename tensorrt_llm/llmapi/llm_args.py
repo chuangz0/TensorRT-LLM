@@ -8021,10 +8021,6 @@ class TorchLlmArgs(BaseLlmArgs):
              "only", kv_cache.dtype not in ("auto", "bfloat16", "fp8")),
             ("pipeline or context parallelism", self.pipeline_parallel_size > 1
              or self.context_parallel_size > 1),
-            ("disaggregated serving with more than one GPU per server, for now",
-             self.cache_transceiver_config is not None
-             and self.cache_transceiver_config.backend is not None
-             and self.tensor_parallel_size > 1),
             ("speculative decoding", self.speculative_config is not None),
             ("LoRA", self.enable_lora or self.lora_config is not None),
             ("beam search", (self.max_beam_width or 1) > 1),

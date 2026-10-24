@@ -15,12 +15,17 @@
 """KV sharing across two GB200 nodes through one Mooncake store: a tensor-parallel server over both
 nodes' eight GPUs (Llama-3.1-8B TP8) reads exactly what an earlier server of that layout published,
 and two instances of one service, one per node (TP4 each), share system prompts and follow-up
-turns under concurrent load. The store has a provider on each node, so puts and gets cross nodes.
+turns under concurrent load. Disaggregated serving, with the store on the context servers of node
+0 and the generation server on node 1: two TP2 context instances run the same workload, one
+behind a context-first router and one behind a generation-first router (2P1D); and a TP2 context
+server restarted between the turns, as in a rolling upgrade, reads the first turns from the store
+while a generation server under attention DP serves on (1P1D, DeepSeek-V3-Lite). The store has a
+provider on each node, so puts and gets cross nodes.
 
 Runs as one pytest task per node of a two-node job (``SLURM_NODEID`` picks the role; four GPUs per
 task, its steps ``--overlap``) with ``TRTLLM_KV_SHARING_SHARED_DIR`` naming a directory both nodes
-see. Node 0 runs the master, a provider and every check; node 1 a provider and its instance of the
-service. An eight-rank server spans both nodes, so the job launches it outside these tasks once
+see. Node 0 runs the master, a provider and every check; node 1 a provider and the servers node 0
+asks it for. An eight-rank server spans both nodes, so the job launches it outside these tasks once
 node 0 wrote ``<name>.args``:
 ``srun -N2 --ntasks-per-node=4 --mpi=pmix trtllm-llmapi-launch trtllm-serve $(cat <name>.args)``
 with ``TRTLLM_KV_SHARING_TRACE_DIR=<shared dir>/<name>``. When node 0 writes ``<name>.stop``, the
@@ -36,6 +41,7 @@ import os
 import random
 import time
 from collections.abc import Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,7 +55,10 @@ from conftest import (
     TOKENS_PER_BLOCK,
     Completion,
     Store,
+    assert_agree,
+    conversations,
     decisions,
+    instance_counters,
     instance_options,
     puts_since,
     rank_traces,
@@ -58,8 +67,10 @@ from conftest import (
     running_store,
     send_at_once,
     start_instance,
+    whole_blocks,
+    workload_sharing,
 )
-from llmapi.apps.openai_server import RemoteOpenAIServer
+from llmapi.apps.openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
 from utils.llm_data import llm_models_root
 
 SHARED_DIR_ENV = "TRTLLM_KV_SHARING_SHARED_DIR"
@@ -76,16 +87,34 @@ T_NEW_BLOCKS = len(T) // TOKENS_PER_BLOCK - FETCHED // TOKENS_PER_BLOCK
 SERVER_START_S = 1200.0
 # How long a node waits for the other's step of the protocol.
 PEER_WAIT_S = 3600.0
+# The marker node 0 writes in a test's directory when its part of the test ended, however it ended.
+NODE_0_ENDED = "node0.ended"
+NODE_GPUS = "0,1,2,3"
+# Disaggregated serving: TP2 context servers on node 0, a TP4 generation server on node 1.
+CONTEXT_TP, GENERATION_TP = 2, 4
+TRANSCEIVER = {"cache_transceiver_config": {"backend": "DEFAULT"}}
+# With the autotuner on, each DeepSeek server process picks its own MoE kernels, and two processes'
+# outputs differ in the last bits.
+NO_AUTOTUNER = {"enable_autotuner": False}
 
 
 def model_path() -> str:
     return str(llm_models_root(check=True) / "llama-3.1-model" / "Llama-3.1-8B-Instruct")
 
 
-def wait_for_file(path: Path, timeout: float = PEER_WAIT_S) -> str:
-    """The text of ``path`` once the other node or the job wrote it."""
+def deepseek_path() -> str:
+    return str(llm_models_root(check=True) / "DeepSeek-V3-Lite" / "bf16")
+
+
+def wait_for_file(
+    path: Path, timeout: float = PEER_WAIT_S, unless: Path | None = None
+) -> str | None:
+    """The text of ``path`` once the other node or the job wrote it; None if ``unless`` appeared
+    first."""
     deadline = time.monotonic() + timeout
     while not path.exists():
+        if unless is not None and unless.exists():
+            return None
         assert time.monotonic() < deadline, f"{path} did not appear within {timeout:.0f} s"
         time.sleep(1.0)
     return path.read_text()
@@ -168,6 +197,17 @@ def store(node: Node) -> Iterator[Store | None]:
         write_file(node.shared / "provider1.ready")
         yield None
         wait_for_file(done)
+
+
+@pytest.fixture
+def run_dir(node: Node, request: pytest.FixtureRequest) -> Iterator[Path]:
+    """The test's directory, which both nodes see. Node 1 serves node 0's requests in it until
+    node 0's part of the test ended (``follow_node_0``)."""
+    path = node.shared / request.node.name
+    path.mkdir(exist_ok=True)
+    yield path
+    if node.index == 0:
+        write_file(path / NODE_0_ENDED)
 
 
 @contextlib.contextmanager
@@ -254,9 +294,56 @@ def test_a_server_over_both_nodes_reads_what_another_published_exactly(
     assert len(decisions(trace, "resume")) == 1, trace
 
 
+@contextlib.contextmanager
+def server_on_node_1(
+    run_dir: Path, name: str, tp: int, role: str | None, options: dict
+) -> Iterator[Remote]:
+    """A server node 1 runs over its four GPUs (``follow_node_0``), its ranks tracing into
+    ``run_dir/<name>``, until the context ends."""
+    spec = {"tp": tp, "role": role, "options": options}
+    write_file(run_dir / f"{name}.server.json", json.dumps(spec))
+    try:
+        address = wait_for_file(run_dir / f"{name}.address", unless=run_dir / f"{name}.stopped")
+        assert address, f"node 1's {name} did not start (see {name}.log)"
+        host, port = address.split(":")
+        yield Remote(host, int(port))
+    finally:
+        write_file(run_dir / f"{name}.stop")
+        wait_for_file(run_dir / f"{name}.stopped")
+
+
+def follow_node_0(model: str, run_dir: Path, names: tuple[str, ...]) -> None:
+    """Node 1: runs each server node 0 asks for (``server_on_node_1``), in order, until node 0
+    stops it or node 0's part of the test ended."""
+    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import local_address
+
+    ended = run_dir / NODE_0_ENDED
+    for name in names:
+        spec = wait_for_file(run_dir / f"{name}.server.json", unless=ended)
+        if spec is None:
+            return
+        server = json.loads(spec)
+        trace_dir = run_dir / name
+        try:
+            with start_instance(
+                model,
+                server["tp"],
+                NODE_GPUS,
+                trace_dir,
+                server["options"],
+                local_address(),
+                server["role"],
+            ) as instance:
+                instance.wait_for_server(timeout=SERVER_START_S)
+                write_file(run_dir / f"{name}.address", f"{instance.host}:{instance.port}")
+                wait_for_file(run_dir / f"{name}.stop", unless=ended)
+        finally:
+            write_file(run_dir / f"{name}.stopped")
+
+
 class TwoNodeService:
     """Two instances of one service, one per node (the workload's ``Instances``): node 0's runs in
-    this task, node 1's in node 1's (``follow_node_0``), started and stopped through files."""
+    this task, node 1's in node 1's."""
 
     def __init__(
         self,
@@ -269,57 +356,228 @@ class TwoNodeService:
     ) -> None:
         self.model = model
         self.trace_dirs = [run_dir / f"{name}-{index}" for index in range(2)]
-        self._run_dir, self._name = run_dir, name
         options = instance_options(sharing)
-        write_file(run_dir / f"{name}.options.json", json.dumps(options))
-        self.servers = [start_instance(model, tp, gpu_groups[0], self.trace_dirs[0], options)]
-        try:
-            self.servers[0].wait_for_server(timeout=SERVER_START_S)
-            host, port = wait_for_file(run_dir / f"{name}.address").split(":")
-        except BaseException:
-            self.stop()
-            raise
-        self.servers.append(Remote(host, int(port)))
+        with ExitStack() as starting:
+            local = start_instance(model, tp, gpu_groups[0], self.trace_dirs[0], options)
+            starting.enter_context(local)
+            remote = starting.enter_context(
+                server_on_node_1(run_dir, self.trace_dirs[1].name, tp, None, options)
+            )
+            local.wait_for_server(timeout=SERVER_START_S)
+            self._running = starting.pop_all()
+        self.servers = [local, remote]
 
     def converse(self, requests: list[tuple[int, list[int]]]) -> list[Completion]:
         return send_at_once(self.servers, self.model, requests)
 
     def stop(self) -> None:
-        self.servers[0].terminate()
-        write_file(self._run_dir / f"{self._name}.stop")
-        wait_for_file(self._run_dir / f"{self._name}.stopped")
-
-
-def follow_node_0(model: str, tp: int, run_dir: Path) -> None:
-    """Node 1: runs its instance of each service node 0 starts, until node 0 stops it."""
-    from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import local_address
-
-    for name in ("store-off", "store-on"):
-        options = json.loads(wait_for_file(run_dir / f"{name}.options.json"))
-        host, trace_dir = local_address(), run_dir / f"{name}-1"
-        try:
-            with start_instance(model, tp, "0,1,2,3", trace_dir, options, host) as server:
-                server.wait_for_server(timeout=SERVER_START_S)
-                write_file(run_dir / f"{name}.address", f"{host}:{server.port}")
-                wait_for_file(run_dir / f"{name}.stop")
-        finally:
-            write_file(run_dir / f"{name}.stopped")
+        self._running.close()
 
 
 def test_two_instances_of_one_service_one_per_node_share_system_prompts_and_follow_up_turns(
-    node: Node, store: Store | None
+    node: Node, store: Store | None, run_dir: Path
 ) -> None:
     """TP4 instances, with CUDA graphs as served by default, one on each node."""
-    run_dir = node.shared / "workload"
-    run_dir.mkdir(exist_ok=True)
     if node.index == 1:
-        follow_node_0(model_path(), 4, run_dir)
+        follow_node_0(model_path(), run_dir, ("store-off-1", "store-on-1"))
         return
     run_two_turn_workload(
         store,
         model_path(),
         tp=4,
-        gpu_groups=("0,1,2,3", "0,1,2,3"),
+        gpu_groups=(NODE_GPUS, NODE_GPUS),
         run_dir=run_dir,
         service=TwoNodeService,
     )
+
+
+# Disaggregated serving.
+
+
+def context_options(sharing: dict | None) -> dict:
+    """A context server of the workload's service: the cache transceiver, and the loop without
+    the overlap scheduler."""
+    return {**instance_options(sharing), **TRANSCEIVER, "disable_overlap_scheduler": True}
+
+
+def generation_options() -> dict:
+    """A generation server of the workload's service, without the store: production defaults
+    (block reuse, the overlap scheduler, CUDA graphs) and the cache transceiver."""
+    return {**instance_options(None), **TRANSCEIVER}
+
+
+# On main 9bb7931d6e a generation-first completion that asks for logprobs fails: the generation
+# server receives the first token without its logprobs. So generation-first requests ask for none,
+# and store-off deployments send every request context first, for the near-tie rule's logprobs.
+CONTEXT_FIRST, GENERATION_FIRST = "context_first", "generation_first"
+
+
+def router(
+    context: RemoteOpenAIServer, generation: Remote, style: str, node_id: int, log: Path
+) -> RemoteDisaggOpenAIServer:
+    """A router on this node between one context server and the generation server, sending
+    ``style`` (CONTEXT_FIRST or GENERATION_FIRST). Routers on one host need their own ``node_id``:
+    a request id is the time, the node id and a counter of the router process, so two routers
+    could give the generation server equal ids."""
+    return RemoteDisaggOpenAIServer(
+        ctx_servers=[f"localhost:{context.port}"],
+        gen_servers=[f"{generation.host}:{generation.port}"],
+        disagg_config={"schedule_style": style, "node_id": node_id},
+        log_path=str(log),
+    )
+
+
+class DisaggService:
+    """A disaggregated service (the workload's ``Instances``): two context instances on node 0,
+    traced at ``<name>-<instance>``, and one TP4 generation server on node 1. With the store,
+    instance 0's router sends requests context first and instance 1's generation first; without
+    it, both send context first."""
+
+    def __init__(
+        self,
+        model: str,
+        tp: int,
+        gpu_groups: tuple[str, str],
+        run_dir: Path,
+        name: str,
+        sharing: dict | None,
+    ) -> None:
+        self.model = model
+        self.trace_dirs = [run_dir / f"{name}-{index}" for index in range(2)]
+        styles = (CONTEXT_FIRST, GENERATION_FIRST if sharing else CONTEXT_FIRST)
+        self._logprobs = tuple(style == CONTEXT_FIRST for style in styles)
+        options = context_options(sharing)
+        with ExitStack() as starting:
+            contexts = [
+                starting.enter_context(
+                    start_instance(model, tp, gpus, trace_dir, options, role="context")
+                )
+                for gpus, trace_dir in zip(gpu_groups, self.trace_dirs)
+            ]
+            generation = starting.enter_context(
+                server_on_node_1(
+                    run_dir, f"{name}-generation", GENERATION_TP, "generation", generation_options()
+                )
+            )
+            for context in contexts:
+                context.wait_for_server(timeout=SERVER_START_S)
+            self.routers = [
+                starting.enter_context(
+                    router(context, generation, style, index, run_dir / f"{name}-router{index}.log")
+                )
+                for index, (context, style) in enumerate(zip(contexts, styles))
+            ]
+            self._running = starting.pop_all()
+
+    def converse(self, requests: list[tuple[int, list[int]]]) -> list[Completion]:
+        return send_at_once(self.routers, self.model, requests, self._logprobs)
+
+    def stop(self) -> None:
+        self._running.close()
+
+
+def test_disaggregated_2p1d_two_context_instances_share_system_prompts_and_follow_up_turns(
+    node: Node, store: Store | None, run_dir: Path
+) -> None:
+    """The two-turn workload on two TP2 context instances and a TP4 generation server. Turn 2
+    crosses instances, so both the context-first and the generation-first instance fetch."""
+    if node.index == 1:
+        follow_node_0(model_path(), run_dir, ("store-off-generation", "store-on-generation"))
+        return
+    run_two_turn_workload(
+        store,
+        model_path(),
+        tp=CONTEXT_TP,
+        gpu_groups=("0,1", "2,3"),
+        run_dir=run_dir,
+        service=DisaggService,
+    )
+
+
+@contextlib.contextmanager
+def context_behind_router(
+    model: str,
+    run_dir: Path,
+    name: str,
+    options: dict,
+    generation: Remote,
+    style: str,
+    node_id: int,
+) -> Iterator[RemoteDisaggOpenAIServer]:
+    """A TP2 context server on GPUs 0 and 1 of this node, traced at ``run_dir/<name>``, behind a
+    router sending ``style`` to ``generation``."""
+    trace_dir = run_dir / name
+    with start_instance(model, CONTEXT_TP, "0,1", trace_dir, options, role="context") as context:
+        context.wait_for_server(timeout=SERVER_START_S)
+        log = run_dir / f"{name}-router.log"
+        with router(context, generation, style, node_id, log) as entry:
+            yield entry
+
+
+def test_disaggregated_1p1d_a_restarted_context_server_reads_the_first_turns_from_the_store(
+    node: Node, store: Store | None, run_dir: Path
+) -> None:
+    """Sixteen conversations at once through one TP2 context server and a generation server under
+    attention DP (ADP4), with the store every request generation first. The context server
+    restarts between the turns while the generation server serves on: the fresh process reads
+    every follow-up's first prompt from the store. Both turns agree with a store-off deployment,
+    and each turn puts every new block once. DeepSeek-V3-Lite: MLA, whose latent cache both
+    context ranks hold, one object per block. (On main 9bb7931d6e, Llama-3.1-8B under attention
+    DP decodes wrong tokens, aggregated too.)"""
+    if node.index == 1:
+        follow_node_0(deepseek_path(), run_dir, ("store-off-generation", "store-on-generation"))
+        return
+    model = deepseek_path()
+    first, questions = conversations(model)
+    attention_dp = {**generation_options(), **NO_AUTOTUNER, "enable_attention_dp": True}
+    generation_server = (GENERATION_TP, "generation", attention_dp)
+
+    def converse(
+        entry: RemoteDisaggOpenAIServer, prompts: list[list[int]], logprobs: bool
+    ) -> list[Completion]:
+        return send_at_once([entry], model, [(0, prompt) for prompt in prompts], (logprobs,))
+
+    with server_on_node_1(run_dir, "store-off-generation", *generation_server) as generation:
+        options = {**context_options(None), **NO_AUTOTUNER}
+        with context_behind_router(
+            model, run_dir, "store-off", options, generation, CONTEXT_FIRST, 0
+        ) as entry:
+            reference_first = converse(entry, first, logprobs=True)
+            # From the store-off answers: both deployments send the same second prompts.
+            second = [p + a.token_ids + q for p, a, q in zip(first, reference_first, questions)]
+            reference_second = converse(entry, second, logprobs=True)
+
+    key_prefix = "disaggregated-1p1d"
+    options = {**context_options(workload_sharing(store, key_prefix)), **NO_AUTOTUNER}
+    puts = []  # the master's (asked, refused) keys per turn
+    # Puts are counted once a context server started: its startup check puts objects too.
+    with server_on_node_1(run_dir, "store-on-generation", *generation_server) as generation:
+        with context_behind_router(
+            model, run_dir, "store-on", options, generation, GENERATION_FIRST, 0
+        ) as entry:
+            before = store.master_metrics()
+            answers_first = converse(entry, first, logprobs=False)
+            store.assert_readable(key_prefix, len(whole_blocks(first)))
+            puts.append(puts_since(store, before))
+        # A rolling upgrade: a fresh context process, the same generation server.
+        restarted = "store-on-restarted"
+        with context_behind_router(
+            model, run_dir, restarted, options, generation, GENERATION_FIRST, 1
+        ) as entry:
+            before = store.master_metrics()
+            answers_second = converse(entry, second, logprobs=False)
+            store.assert_readable(key_prefix, len(whole_blocks(first + second)))
+            puts.append(puts_since(store, before))
+    print(f"keys put/refused per turn: {puts}")
+    assert_agree(reference_first + reference_second, answers_first + answers_second, model)
+    new_blocks = [whole_blocks(first), whole_blocks(first + second) - whole_blocks(first)]
+    assert [asked - refused for asked, refused in puts] == [len(b) for b in new_blocks]
+    for prompt, answer in zip(first, answers_second):
+        # The restarted process held nothing: it read the first prompt's blocks from the store.
+        assert answer.cached_tokens >= len(prompt) // TOKENS_PER_BLOCK * TOKENS_PER_BLOCK
+    for name in ("store-on", restarted):
+        trace = rank_traces(run_dir / name, CONTEXT_TP)
+        assert trace.splitlines()[-1].endswith(" open=0"), f"{name} left store work open"
+        counters = instance_counters(run_dir / name)
+        assert counters and not any(c.get("publications_failed") for c in counters), counters
+    assert decisions(rank_traces(run_dir / restarted, CONTEXT_TP), "resume"), "nothing fetched"

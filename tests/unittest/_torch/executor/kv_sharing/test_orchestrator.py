@@ -370,6 +370,27 @@ def test_a_cancel_while_settling_closes_the_fetch_without_a_resume(server):
     assert not server.manager.resumed and not server.transfers.operations
 
 
+def test_a_generation_first_request_fetches_once_its_generation_server_is_ready(server):
+    """A generation-first context request is scheduled only once every rank holds its generation
+    server's info: until the transceiver promotes it, it stays a candidate; a cancel while it
+    waits lets it go without a fetch."""
+    promoted, cancelled = request(1), request(2)
+    for waiting in (promoted, cancelled):
+        waiting.state = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
+    server.orchestrator.add_fetch_candidates([promoted, cancelled])
+    assert server.orchestrator.start_fetches() == set()
+    assert not server.lender.leases
+    promoted.state = LlmRequestState.CONTEXT_INIT
+    assert server.orchestrator.start_fetches() == {1}
+    assert promoted.state == PARKED_STATE
+    assert not server.orchestrator.cancel_fetch(cancelled)
+    cancelled.state = LlmRequestState.CONTEXT_INIT
+    assert server.orchestrator.start_fetches() == set()
+    assert server.orchestrator.cancel_fetch(promoted)
+    assert promoted.state == LlmRequestState.CONTEXT_INIT
+    assert server.counters["fetches_started"] == server.counters["fetches_cancelled"] == 1
+
+
 def test_a_refused_lend_drops_its_fetch_and_sharing_goes_on(server):
     server.lender.refusal = "no room"
     refused = request(1)

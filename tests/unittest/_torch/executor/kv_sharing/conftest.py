@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import functools
 import itertools
 import json
 import math
@@ -62,16 +63,16 @@ class Store:
     run_dir: Path
     client: object  # mooncake.store.MooncakeDistributedStore
 
-    def config(self, key_prefix: str) -> str:
+    def config(self, key_prefix: str, driver: str = DRIVER) -> str:
         """Writes a server's store config whose keys start with ``key_prefix``."""
         mooncake = {
             "master_server_address": self.master,
             "global_segment_size": 0,
             "protocol": PROTOCOL,
             "device_name": DEVICES,
-            "driver": DRIVER,
+            "driver": driver,
         }
-        path = self.run_dir / f"{key_prefix}.yaml"
+        path = self.run_dir / f"{key_prefix}-{driver}.yaml"
         path.write_text(yaml.safe_dump({"mooncake": mooncake, "blob": {"key_prefix": key_prefix}}))
         return str(path)
 
@@ -212,24 +213,37 @@ def conversations(model: str) -> tuple[list[list[int]], list[list[int]]]:
 @dataclass
 class Completion:
     token_ids: list[int]
-    top_logprobs: list[dict[str, float]]  # the most likely tokens per position, by text
+    # The most likely tokens per position, by text; None where they were not asked for.
+    top_logprobs: list[dict[str, float]] | None
     cached_tokens: int
 
 
-def ask(server: RemoteOpenAIServer, model: str, prompt: list[int]) -> Completion:
-    """``prompt``'s greedy completion, with the TOP_LOGPROBS most likely tokens at each
-    position."""
+def ask(
+    server: RemoteOpenAIServer, model: str, prompt: list[int], logprobs: bool = True
+) -> Completion:
+    """``prompt``'s greedy completion; with ``logprobs``, the TOP_LOGPROBS most likely tokens at
+    each position."""
     reply = server.get_client().completions.create(
         model=model,
         prompt=prompt,
         max_tokens=ANSWER_TOKENS,
         temperature=0,
-        logprobs=TOP_LOGPROBS,
+        logprobs=TOP_LOGPROBS if logprobs else None,
         extra_body={"detokenize": False},
     )
     (choice,) = reply.choices
     cached = reply.usage.prompt_tokens_details.cached_tokens
-    return Completion(list(choice.token_ids), choice.logprobs.top_logprobs, cached)
+    top_logprobs = choice.logprobs.top_logprobs if logprobs else None
+    return Completion(list(choice.token_ids), top_logprobs, cached)
+
+
+def workload_sharing(store: Store, key_prefix: str) -> dict:
+    """The ``kv_sharing`` of the workload's service, its keys under ``key_prefix``."""
+    return {
+        "backends": [{"type": "mooncake", "config": store.config(key_prefix)}],
+        "min_fetch_tokens": 2 * TOKENS_PER_BLOCK,
+        "max_fetch_tokens": 2048,
+    }
 
 
 def instance_options(sharing: dict | None) -> dict:
@@ -247,10 +261,17 @@ def instance_options(sharing: dict | None) -> dict:
 
 
 def start_instance(
-    model: str, tp: int, gpus: str, trace_dir: Path, options: dict, host: str = "localhost"
+    model: str,
+    tp: int,
+    gpus: str,
+    trace_dir: Path,
+    options: dict,
+    host: str = "localhost",
+    role: str | None = None,
 ) -> RemoteOpenAIServer:
     """One instance in its own ``trtllm-serve`` process over ``gpus``, its ranks tracing their
-    rounds into ``trace_dir``; not waited for."""
+    rounds into ``trace_dir``; not waited for. ``role`` makes it a disaggregated ``context`` or
+    ``generation`` server."""
     env = dict(
         os.environ,
         CUDA_VISIBLE_DEVICES=gpus,
@@ -259,9 +280,10 @@ def start_instance(
         TLLM_KV_CACHE_MANAGER_V2_THP="0",
     )
     env.pop("TLLM_WORKER_USE_SINGLE_PROCESS", None)
+    cli_args = ["--tp_size", str(tp)] + (["--server_role", role] if role else [])
     return RemoteOpenAIServer(
         model,
-        cli_args=["--tp_size", str(tp)],
+        cli_args=cli_args,
         host=host,
         env=env,
         extra_config=options,
@@ -315,11 +337,16 @@ class Instances(Protocol):
 
 
 def send_at_once(
-    servers: list, model: str, requests: list[tuple[int, list[int]]]
+    servers: list,
+    model: str,
+    requests: list[tuple[int, list[int]]],
+    logprobs: tuple[bool, ...] | None = None,
 ) -> list[Completion]:
-    """Sends every ``(instance, prompt)`` to ``servers[instance]`` at once and waits for all."""
+    """Sends every ``(instance, prompt)`` to ``servers[instance]`` at once and waits for all;
+    ``logprobs[instance]`` False asks that instance for tokens alone."""
+    logprobs = logprobs or (True,) * len(servers)
     with ThreadPoolExecutor(len(requests)) as pool:
-        return list(pool.map(lambda r: ask(servers[r[0]], model, r[1]), requests))
+        return list(pool.map(lambda r: ask(servers[r[0]], model, r[1], logprobs[r[0]]), requests))
 
 
 def instance_counters(trace_dir: Path) -> list[dict[str, int]]:
@@ -337,11 +364,13 @@ def whole_blocks(prompts: list[list[int]]) -> set[tuple[int, ...]]:
     }
 
 
-def agrees_with(reference: Completion, completion: Completion) -> bool:
+def agrees_with(
+    reference: Completion, completion: Completion, token_text: Callable[[int], str]
+) -> bool:
     """The store-off run's tokens, or a first different token at a near tie (NEAR_TIE): a token
-    this run found most likely there is within NEAR_TIE of the store-off run's best. A run that
-    ended earlier (end of sequence) differs at its length, where the longer run's two most likely
-    tokens must be a near tie."""
+    this run found most likely there (without logprobs: the token it took) is within NEAR_TIE of
+    the store-off run's best. A run that ended earlier (end of sequence) differs at its length,
+    where the longer run's two most likely tokens must be a near tie."""
     expected, got = reference.token_ids, completion.token_ids
     shorter = min(len(expected), len(got))
     position = next((i for i in range(shorter) if expected[i] != got[i]), shorter)
@@ -349,28 +378,57 @@ def agrees_with(reference: Completion, completion: Completion) -> bool:
         return True
     if position == shorter:
         longer = reference if len(expected) > len(got) else completion
+        if longer.top_logprobs is None:
+            return False  # nothing tells a near tie
         best, runner_up = sorted(longer.top_logprobs[position].values(), reverse=True)[:2]
         return best - runner_up <= NEAR_TIE
     # Keyed by decoded text: two tokens that decode alike share one entry, which is a tie.
-    store_off, this_run = reference.top_logprobs[position], completion.top_logprobs[position]
-    this_runs_best = max(this_run.values())
-    taken = [text for text, logprob in this_run.items() if logprob == this_runs_best]
+    store_off = reference.top_logprobs[position]
+    if completion.top_logprobs is None:
+        taken = [token_text(got[position])]
+    else:
+        this_run = completion.top_logprobs[position]
+        this_runs_best = max(this_run.values())
+        taken = [text for text, logprob in this_run.items() if logprob == this_runs_best]
     near_best = max(store_off.values()) - NEAR_TIE
     return any(store_off.get(text, -math.inf) >= near_best for text in taken)
 
 
-def first_difference(reference: Completion, completion: Completion) -> str:
+def first_difference(
+    reference: Completion, completion: Completion, token_text: Callable[[int], str]
+) -> str:
     """Where ``completion`` first leaves the store-off run's tokens, with both runs' TOP_LOGPROBS
-    most likely tokens there and the prompt tokens each found cached."""
+    most likely tokens there (or the token this run took) and the prompt tokens each found
+    cached."""
     expected, got = reference.token_ids, completion.token_ids
     position = next((i for i, (e, g) in enumerate(zip(expected, got)) if e != g), None)
     if position is None:
         return f"lengths {len(expected)} and {len(got)}"
+    if completion.top_logprobs is None:
+        this_run = f"took {token_text(got[position])!r}"
+    else:
+        this_run = f"{completion.top_logprobs[position]}"
     return (
         f"position {position}: store-off {reference.top_logprobs[position]}, this run "
-        f"{completion.top_logprobs[position]}; cached {reference.cached_tokens} and "
-        f"{completion.cached_tokens} prompt tokens"
+        f"{this_run}; cached {reference.cached_tokens} and {completion.cached_tokens} prompt "
+        "tokens"
     )
+
+
+def assert_agree(references: list[Completion], answers: list[Completion], model: str) -> None:
+    """Every answer agrees with the store-off run's (``agrees_with``), which reports logprobs."""
+    from transformers import AutoTokenizer
+
+    assert all(r.top_logprobs is not None for r in references), "store-off logprobs missing"
+    token_text = functools.cache(AutoTokenizer.from_pretrained(model).decode)
+    exact = sum(r.token_ids == a.token_ids for r, a in zip(references, answers))
+    print(f"{exact} of {len(answers)} requests equal the store-off run's tokens, others near ties")
+    disagreeing = {
+        i: first_difference(r, a, token_text)
+        for i, (r, a) in enumerate(zip(references, answers))
+        if not agrees_with(r, a, token_text)
+    }
+    assert not disagreeing, f"outputs disagree at confident positions: {disagreeing}"
 
 
 def rank_traces(trace_dir: Path, tp: int) -> str:
@@ -444,11 +502,7 @@ def run_two_turn_workload(
         store_off.stop()
 
     key_prefix = f"service-tp{tp}"
-    sharing = {
-        "backends": [{"type": "mooncake", "config": store.config(key_prefix)}],
-        "min_fetch_tokens": 2 * TOKENS_PER_BLOCK,
-        "max_fetch_tokens": 2048,
-    }
+    sharing = workload_sharing(store, key_prefix)
     puts = []  # the master's (asked, refused) keys per wave of turn 1, then turn 2
     sent: list[list[int]] = []  # every prompt the store-on service was sent
 
@@ -468,18 +522,8 @@ def run_two_turn_workload(
         answers += turn(second_requests)
     finally:
         store_on.stop()
-    references = reference_first + reference_second
-    exact = sum(r.token_ids == a.token_ids for r, a in zip(references, answers))
-    print(
-        f"{exact} of {len(answers)} requests equal the store-off run's tokens, the rest near "
-        f"ties; keys put/refused per wave and turn 2: {puts}"
-    )
-    disagreeing = {
-        i: first_difference(r, a)
-        for i, (r, a) in enumerate(zip(references, answers))
-        if not agrees_with(r, a)
-    }
-    assert not disagreeing, disagreeing
+    print(f"keys put/refused per wave and turn 2: {puts}")
+    assert_agree(reference_first + reference_second, answers, model)
     # Every distinct block was put once; each other put of it was refused as existing already.
     first_wave_blocks = whole_blocks([first[user] for user in waves[0]])
     new_blocks = [  # per wave of turn 1, then turn 2
