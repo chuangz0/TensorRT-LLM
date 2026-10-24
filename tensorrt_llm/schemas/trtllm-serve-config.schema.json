@@ -3377,7 +3377,7 @@
         },
         "max_fetch_tokens": {
           "default": 32768,
-          "description": "Longest prompt prefix one fetch reads. Under host staging each rank pins at most 8 GiB of host memory: one fetch of max(max_fetch_tokens, max_num_tokens) tokens of KV cache, and up to as much again for publications; the server refuses to start when one fetch does not fit.",
+          "description": "Longest prompt prefix one fetch reads. Under host staging each rank pins at most 8 GiB of host memory: one fetch of max(max_fetch_tokens, max_num_tokens) tokens of KV cache, and up to as much again for publications; the server refuses to start when one fetch and one publication do not fit.",
           "exclusiveMinimum": 0,
           "title": "Max Fetch Tokens",
           "type": "integer"

@@ -2815,7 +2815,7 @@ class KvSharingConfig(StrictBaseModel):
         "staging each rank pins at most 8 GiB of host memory: one fetch of "
         "max(max_fetch_tokens, max_num_tokens) tokens of KV cache, and up to "
         "as much again for publications; the server refuses to start when one "
-        "fetch does not fit.")
+        "fetch and one publication do not fit.")
     probe_hold_ms: NonNegativeFloat = Field(
         default=50.0,
         description="Longest a new request waits for the store to say how "
