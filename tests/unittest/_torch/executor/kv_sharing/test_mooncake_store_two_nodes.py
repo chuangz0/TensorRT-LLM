@@ -22,11 +22,12 @@ server restarted between the turns, as in a rolling upgrade, reads the first tur
 while a generation server under attention DP serves on (1P1D, DeepSeek-V3-Lite). The store has a
 provider on each node, so puts and gets cross nodes.
 
-Runs as one pytest task per node of a two-node job (``SLURM_NODEID`` picks the role; four GPUs per
-task, its steps ``--overlap``) with ``TRTLLM_KV_SHARING_SHARED_DIR`` naming a directory both nodes
-see. Node 0 runs the master, a provider and every check; node 1 a provider and the servers node 0
-asks it for. An eight-rank server spans both nodes, so the job launches it outside these tasks once
-node 0 wrote ``<name>.args``:
+Runs only with ``TRTLLM_MOONCAKE_E2E=1`` (it skips otherwise), as one pytest task per node of a
+two-node job (``SLURM_NODEID`` picks the role; four GPUs per task, its steps ``--overlap``) with
+``TRTLLM_KV_SHARING_SHARED_DIR`` naming a directory both nodes see. Node 0 runs the master, a
+provider and every check; node 1 a provider and the servers node 0 asks it for. An eight-rank
+server spans both nodes, so the job launches it outside these tasks once node 0 wrote
+``<name>.args``:
 ``srun -N2 --ntasks-per-node=4 --mpi=pmix trtllm-llmapi-launch trtllm-serve $(cat <name>.args)``
 with ``TRTLLM_KV_SHARING_TRACE_DIR=<shared dir>/<name>``. When node 0 writes ``<name>.stop``, the
 job sends rank 0's ``trtllm-serve`` SIGTERM (a graceful stop: every rank writes its trace's exit
@@ -66,12 +67,15 @@ from conftest import (
     run_two_turn_workload,
     running_store,
     send_at_once,
+    skip_unless_opted_in,
     start_instance,
     whole_blocks,
     workload_sharing,
 )
 from llmapi.apps.openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
 from utils.llm_data import llm_models_root
+
+pytestmark = skip_unless_opted_in
 
 SHARED_DIR_ENV = "TRTLLM_KV_SHARING_SHARED_DIR"
 NEW_TOKENS = 32

@@ -19,6 +19,7 @@ modules' realistic workload: two instances of one service, two-turn conversation
 ``TRTLLM_MOONCAKE_PROTOCOL`` (default rdma) and ``TRTLLM_MOONCAKE_DEVICES`` (default: the fastest
 InfiniBand devices) pick the transport; ``TRTLLM_MOONCAKE_E2E_DRIVER`` the servers' store driver:
 ``native`` (the default, the C++ store worker; a server refuses to start without it) or ``python``.
+The modules run only with ``TRTLLM_MOONCAKE_E2E=1`` and skip otherwise.
 """
 
 from __future__ import annotations
@@ -107,8 +108,17 @@ class Store:
         }
 
 
+# CI collects this directory. The end-to-end modules start servers on up to four GPUs or two nodes
+# and run for tens of minutes, so they run only when opted in.
+OPT_IN_ENV = "TRTLLM_MOONCAKE_E2E"
+skip_unless_opted_in = pytest.mark.skipif(
+    os.environ.get(OPT_IN_ENV) != "1",
+    reason=f"starts servers on a real Mooncake store; set {OPT_IN_ENV}=1",
+)
+
+
 def require_environment() -> None:
-    """Fails, not skips, where the test cannot run."""
+    """Fails, not skips, where an opted-in test cannot run."""
     assert torch.cuda.is_available(), "needs a GPU"
     assert shutil.which("mooncake_master"), "needs mooncake_master (mooncake-transfer-engine)"
     import mooncake.store  # noqa: F401

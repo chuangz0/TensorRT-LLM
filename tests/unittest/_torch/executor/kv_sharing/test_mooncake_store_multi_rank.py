@@ -28,9 +28,11 @@ turns under concurrent load. Every rank writes a trace of its rounds
 same one, which proves they entered the same store collectives with the same tables and page
 counts; under attention DP each rank closes its own store work before it exits.
 
-Needs four GPUs, ``mooncake_master`` on the path, the ``mooncake.store`` SDK and, for the native
-driver, the built ``tensorrt_llm.mooncake_store_worker``; fails without them. The store and its
-drivers are the module's (``conftest.py``). Servers run their ranks in worker processes.
+Runs only with ``TRTLLM_MOONCAKE_E2E=1`` (it skips otherwise), from ``tests/unittest``:
+``TRTLLM_MOONCAKE_E2E=1 pytest _torch/executor/kv_sharing/test_mooncake_store_multi_rank.py``.
+Then it needs four GPUs, ``mooncake_master`` on the path, the ``mooncake.store`` SDK and, for the
+native driver, the built ``tensorrt_llm.mooncake_store_worker``; fails without them. The store and
+its drivers are the module's (``conftest.py``). Servers run their ranks in worker processes.
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ from conftest import (
     puts_since,
     rank_traces,
     run_two_turn_workload,
+    skip_unless_opted_in,
 )
 from utils.llm_data import llm_models_root
 
@@ -59,6 +62,8 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.pyexecutor.kv_sharing.startup import TRACE_DIR_ENV
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.scheduling_params import SchedulingParams
+
+pytestmark = skip_unless_opted_in
 
 NEW_TOKENS = 32
 _tokens = random.Random(20261023)

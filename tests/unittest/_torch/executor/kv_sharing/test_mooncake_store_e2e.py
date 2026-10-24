@@ -27,7 +27,9 @@ master pauses probing and publishing, a full store declines puts without a pause
 provider only empties the store. The store and its drivers are the module's (``conftest.py``),
 except where a test needs a store of its own.
 
-Needs a GPU (four for the disaggregated test, two for the service), ``mooncake_master`` on the
+Runs only with ``TRTLLM_MOONCAKE_E2E=1`` (it skips otherwise), from ``tests/unittest``:
+``TRTLLM_MOONCAKE_E2E=1 pytest _torch/executor/kv_sharing/test_mooncake_store_e2e.py``. Then it
+needs a GPU (four for the disaggregated test, two for the service), ``mooncake_master`` on the
 path, the ``mooncake.store`` SDK and, for the native driver, the built
 ``tensorrt_llm.mooncake_store_worker``, and fails without them.
 """
@@ -56,6 +58,7 @@ from conftest import (
     run_two_turn_workload,
     running_provider,
     running_store,
+    skip_unless_opted_in,
     wait_until,
 )
 from llmapi.apps.openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer
@@ -67,6 +70,8 @@ from tensorrt_llm._torch.disaggregation.blob.store import ProbeStatus
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import MemoryKind
 from tensorrt_llm._torch.pyexecutor.kv_sharing import breaker, data_path, probe
 from tensorrt_llm.llmapi import KvCacheConfig
+
+pytestmark = skip_unless_opted_in
 
 TOKENS_PER_BLOCK = 32
 # Fills the last partial block of P and of Q: whole blocks then hold generated tokens.
