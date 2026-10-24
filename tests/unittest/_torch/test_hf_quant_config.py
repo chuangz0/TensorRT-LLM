@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+
 import pytest
 
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -176,3 +178,34 @@ def test_modelopt_preserves_w4a8_nvfp4_fp8_group_size(group_size: int | None) ->
     )
     assert quant_config.quant_algo == QuantAlgo.W4A8_NVFP4_FP8
     assert quant_config.group_size == group_size
+
+
+@pytest.mark.parametrize(
+    "hf_quant_config",
+    [{"quant_method": "mxfp4"}, {"quant_method": "fp8", "weight_block_size": [128, 128]}],
+    ids=["mxfp4", "fp8-block-scales"],
+)
+def test_merged_exclude_modules_keep_the_checkpoint_order_in_every_process(
+    hf_quant_config, monkeypatch
+):
+    """Every process of a server (each rank, and every server reading the same checkpoint) must
+    derive the same quant config; a set's order changes with each process's string hashing."""
+    monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "W4A16_MXFP4")  # MXFP4 asks no GPU for its algo
+    excluded = ["model.layers.*.self_attn", "model.layers.*.mlp.router", "model.embed_tokens"]
+    quant_config, _ = ModelConfig.load_hf_quant_config(
+        {**hf_quant_config, "modules_to_not_convert": excluded}, moe_backend="CUTLASS"
+    )
+    assert quant_config.exclude_modules[: len(excluded)] == excluded
+
+
+def test_a_dtypes_json_lists_its_excluded_modules_in_the_file_s_order(tmp_path, monkeypatch):
+    """As above, for a checkpoint whose dtypes.json gives each weight's dtype."""
+    monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "W4A16_MXFP4")
+    excluded = ["model.layers.0.self_attn", "model.layers.0.mlp.router", "model.embed_tokens"]
+    dtypes = {f"{module}.weight": "BF16" for module in excluded}
+    dtypes["model.layers.0.mlp.experts.weight.blocks"] = "MXFP4"
+    dtypes["model.layers.0.mlp.experts.weight.scales"] = "UE8"
+    path = tmp_path / "dtypes.json"
+    path.write_text(json.dumps(dtypes))
+    quant_config, _ = ModelConfig.load_quant_config_from_dtypes_json(str(path), "CUTLASS")
+    assert quant_config.exclude_modules == excluded
