@@ -788,6 +788,42 @@ def test_a_read_in_place_leaves_out_blocks_behind_a_window_and_blocks_without_a_
         lease.release()
 
 
+@pytest.mark.parametrize("memory_kind", [DEVICE, HOST], ids=["in_place", "staged"])
+def test_a_read_with_a_start_per_layer_group_lends_each_window_from_its_own_start(
+    kit, real_manager, memory_kind
+):
+    """A read of the last block by name, the full group from block 5 and the windowed one from
+    block 0: the full group lends block 5, the windowed group the blocks its window keeps at the
+    end, block 4 below the full group's start included."""
+    with real_manager(windows=[WINDOW, 256], num_layers=3) as mgr:
+        source = kit.published(mgr, SOURCE, LONG_PROMPT)
+        lender = attach(mgr)
+        windows = kit.windows(mgr)
+        assert None in windows and WINDOW in windows, windows
+        start, end = 5 * TPB, len(LONG_PROMPT)
+        starts = [start if window is None else 0 for window in windows]
+        with pytest.raises(ValueError, match="starts for"):
+            lender.lend_read(
+                source, starts[:1], end, memory_kind=memory_kind, rows=NAMED, ready_event=None
+            )
+        with pytest.raises(TypeError, match="start must be an integer"):  # a write: one start
+            lender.lend_write(
+                source, starts, end, memory_kind=memory_kind, rows=NAMED, ready_event=None
+            )
+        lease = lender.lend_read(
+            source, starts, end, memory_kind=memory_kind, rows=NAMED, ready_event=None
+        )
+        view = kit.ready_view(lease, mgr)
+        lent = {run.layer_group_index: run.page_ordinals.tolist() for run in view.groups}
+        assert lent == {
+            lg: [5] if window is None else kept_page_ordinals(window, end, TPB)
+            for lg, window in enumerate(windows)
+        }
+        assert kept_page_ordinals(WINDOW, end, TPB) == [4, 5]
+        assert (view.start, view.end) == (0, end), "a view starts at its smallest group start"
+        lease.release()
+
+
 def view_arrays(view):
     """Every array of ``view``, by (layer group, field)."""
     return {

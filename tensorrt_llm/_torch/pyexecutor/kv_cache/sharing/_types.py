@@ -663,7 +663,7 @@ class Lender(Protocol):
     def lend_read(
         self,
         request: LlmRequest,
-        start: int,
+        start: Union[int, Sequence[int]],
         end: int,
         *,
         memory_kind: MemoryKind,
@@ -699,8 +699,11 @@ class Lender(Protocol):
 
         Args:
             request: Request to read; the lease binds to the cache it holds now.
-            start: Nonnegative whole-block boundary.
-            end: Exclusive end, at least ``start``; a whole-block boundary for NAMED.
+            start: Nonnegative whole-block boundary, or one per layer group in ``page_layout``'s
+                ``layer_groups`` order: each group lends its rows from its own start (a windowed
+                group from 0 lends its sinks and the window rows needed at ``end``); the view's
+                ``start`` is the smallest.
+            end: Exclusive end, at least every start; a whole-block boundary for NAMED.
             memory_kind: Required ``MemoryKind``.
             rows: Required ``RowSelection``.
             ready_event: Required: an event with ``query()``, and ``wait()`` where rows are not the
@@ -895,4 +898,22 @@ class Lender(Protocol):
             ValueError: The prompt has fewer whole blocks, the layer group is unknown, a share
                 lies outside the group's shard count, or this lender names no blocks.
             RuntimeError: The lender's manager is gone."""
+        ...
+
+    def usable_end(self, present: Sequence[np.ndarray], *, known: int, limit: int) -> int:
+        """The largest whole-block end ``E``, ``known < E <= limit``, at which a NAMED fetch
+        ``[known, E)`` resumes once its every lent row arrived, given the rows the store holds:
+        ``present[lg][b]`` says block ``b`` of layer group ``lg`` is held (``page_layout``'s
+        ``layer_groups`` order; blocks past an array's end are not). Every row ``lend_write`` lends
+        for ``[known, E)`` must be held: full attention needs every block from ``known`` to ``E``,
+        a window its sinks and the blocks it keeps at ``E``. ``known`` where no such end exists.
+        Without a window every end below a usable one is usable too; with one, in general only the
+        ends a publication reached are.
+
+        Like ``prompt_object_keys`` it may run on any thread after attach.
+
+        Raises:
+            ValueError: A mask per layer group is missing, the lender names no blocks, or its
+                windows do not follow the window formula (V2 without Helix does; attach checks
+                it)."""
         ...

@@ -397,6 +397,7 @@ def test_the_protocols_keep_their_members_and_stay_unrelated():
         "progress",
         "poll_resume_bounds",
         "prompt_object_keys",
+        "usable_end",
         "stopped",
     }
     assert members(RegionHold) == {"release"}
@@ -428,6 +429,8 @@ def test_the_protocols_keep_their_members_and_stay_unrelated():
         "shares",
     ]
     assert params(_lender._ManagerLender.prompt_object_keys) == params(Lender.prompt_object_keys)
+    assert params(Lender.usable_end) == ["self", "present", "known", "limit"]
+    assert params(_lender._ManagerLender.usable_end) == params(Lender.usable_end)
 
     def shape(func):
         """The signature, annotated on its keyword-only parameters alone."""
@@ -481,6 +484,7 @@ LENDER_MEMBERS = {
     "progress",
     "poll_resume_bounds",
     "prompt_object_keys",
+    "usable_end",
     "stopped",
 }
 

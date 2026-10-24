@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from . import _manager
 
 if TYPE_CHECKING:
@@ -36,6 +38,19 @@ def _formula_stale_range(
     behind = history + 1 - window
     window_start = behind // tokens_per_block if behind >= 0 else -(-behind // tokens_per_block)
     return start, max(start, window_start)
+
+
+def _formula_stale_ranges(
+    window: int, sink_blocks: int, tokens_per_block: int, histories: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """``_formula_stale_range`` at each of the ``int64`` ``histories``: the arrays of their
+    ``[beg, end)``."""
+    histories = np.minimum(histories, _manager._MAX_TOKENS - tokens_per_block)
+    start = np.minimum(-(-histories // tokens_per_block), sink_blocks)
+    behind = histories + 1 - window
+    # Toward zero, as C++ divides: a negative ``behind`` rounds up.
+    window_start = np.where(behind >= 0, behind // tokens_per_block, -(-behind // tokens_per_block))
+    return start, np.maximum(start, window_start)
 
 
 def _stale_range(

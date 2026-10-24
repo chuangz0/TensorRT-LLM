@@ -756,7 +756,7 @@ class _ManagerLender:
     def lend_read(
         self,
         request: LlmRequest,
-        start: int,
+        start: int | Sequence[int],
         end: int,
         *,
         memory_kind: MemoryKind,
@@ -790,11 +790,11 @@ class _ManagerLender:
         if ready_event is not None and type(ready_event) is not _CUDA_EVENT:
             _check_ready_event(ready_event, memory_kind is MemoryKind.HOST)
         named = rows is RowSelection.NAMED
-        start, end = self._whole_blocks(start, end, named)
+        start, end = self._whole_blocks(start, end, named, per_group=True)
         request_id = int(request.py_request_id)
         manager = self._lending_manager()
         self._check_not_stopped()
-        if fast:
+        if fast and isinstance(start, int):
             lease = self._read_every_row_fast(manager, request, request_id, start, end, ready_event)
             if lease is not None:
                 return lease
@@ -837,6 +837,7 @@ class _ManagerLender:
         reuse_keys = (
             self._reuse_keys_for(manager, request, kv, entries.block_ordinals) if named else None
         )
+        view_start = start if isinstance(start, int) else min(start)  # per group: the smallest
         if memory_kind is MemoryKind.DEVICE:
             refusal = self._ledger._unsettled_fetch_refusal(request_id, kv, entries)
             if refusal is None:
@@ -850,13 +851,13 @@ class _ManagerLender:
                 "read",
                 entries,
                 reuse_keys,
-                start=start,
+                start=view_start,
                 end=end,
                 ready_event=ready_event,
             )
         lease = _StagingLease(self, "read", request_id, kv, entries, reuse_keys)
         lease._ready_event = ready_event
-        lease._range = (start, end)
+        lease._range = (view_start, end)
         self._admit(lease, counts)
         return lease
 
@@ -1173,6 +1174,48 @@ class _ManagerLender:
         return np.concatenate(
             [self._identity.object_keys(layer_group_index, reuse_keys, share) for share in shares]
         )
+
+    def usable_end(self, present: Sequence[np.ndarray], *, known: int, limit: int) -> int:
+        """See ``Lender.usable_end``."""
+        if self._no_names is not None:
+            raise ValueError(f"this lender names no blocks: {self._no_names}")
+        layout = self._layout
+        if self._any_window and not getattr(layout, "stale_ranges_by_formula", False):
+            raise ValueError("this lender's windows do not follow the window formula")
+        if len(present) != layout.num_layer_groups:
+            raise ValueError(
+                f"{len(present)} masks of held blocks for {layout.num_layer_groups} layer groups"
+            )
+        tpb = self._tokens_per_block
+        first, last = int(known) // tpb, int(limit) // tpb
+        if last <= first:
+            return int(known)
+        # Candidate ends ``ends[i] * tpb``, every whole block in (known, limit].
+        ends = np.arange(first + 1, last + 1, dtype=np.int64)
+        usable = np.ones(len(ends), dtype=bool)
+        for lg in range(layout.num_layer_groups):
+            if lg in self._recurrent_groups or not self._named_groups[lg]:
+                continue  # a named fetch lends such a group nothing
+            have = np.zeros(last, dtype=bool)
+            mask = np.asarray(present[lg], dtype=bool)[:last]
+            have[: len(mask)] = mask
+            have[:first] = True  # below ``known``: the request holds them
+            # missing[b]: the blocks below b the store does not hold.
+            missing = np.concatenate(([0], np.cumsum(~have)))
+            window = layout.windows[lg]
+            if window is None:  # every block from ``known`` to the end
+                usable &= missing[ends] == missing[first]
+                continue
+            # lend_write lends the sinks [0, sinks_end) and the window [window_start, end) at each
+            # end: the blocks around the stale range.
+            sinks_end, window_start = _ranges._formula_stale_ranges(
+                int(window), int(layout.sink_blocks[lg]), tpb, ends * tpb
+            )
+            usable &= missing[np.minimum(sinks_end, ends)] == missing[first]  # the sinks are held
+            usable &= missing[ends] == missing[np.clip(window_start, first, ends)]  # the window too
+        if not usable.any():
+            return int(known)
+        return int(ends[np.flatnonzero(usable)[-1]]) * tpb
 
     def return_writes(
         self,
@@ -2146,9 +2189,24 @@ class _ManagerLender:
                 f"{memory_kind} is not lent: this lender stages nothing, as {self._no_staging}"
             )
 
-    def _whole_blocks(self, start: int, end: int, whole_end: bool = True) -> tuple[int, int]:
+    def _whole_blocks(
+        self,
+        start: int | Sequence[int],
+        end: int,
+        whole_end: bool = True,
+        *,
+        per_group: bool = False,
+    ) -> tuple[int | list[int], int]:
         """Validate integer ``[start, end)``; require an ordered, non-negative range starting,
-        and with ``whole_end`` also ending, at a whole block."""
+        and with ``whole_end`` also ending, at a whole block. With ``per_group`` (a read's),
+        ``start`` may also be one start per layer group, each checked so and returned as a list."""
+        if per_group and isinstance(start, (list, tuple)):
+            starts = list(start)
+            if len(starts) != self._layout.num_layer_groups:
+                raise ValueError(
+                    f"{len(starts)} starts for {self._layout.num_layer_groups} layer groups"
+                )
+            return [self._whole_blocks(s, end, whole_end)[0] for s in starts], int(end)
         for name, value in (("start", start), ("end", end)):
             if isinstance(value, bool) or not isinstance(value, numbers.Integral):
                 raise TypeError(f"{name} must be an integer, got {type(value).__name__}")
