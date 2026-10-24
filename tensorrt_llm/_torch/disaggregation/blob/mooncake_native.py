@@ -29,7 +29,9 @@ from tensorrt_llm.logger import logger
 
 from .mooncake import (
     _ANOTHER_WRITER,
+    _POOL_FULL,
     _PUT_START_SKIPS,
+    _QUIET_SKIPS,
     AllocationRange,
     MooncakeDriver,
     _Code,
@@ -41,6 +43,7 @@ from .mooncake import (
     _Registration,
     _report,
     _reread_fault,
+    _warn_store_full,
 )
 from .store import (
     DriverRejected,
@@ -112,7 +115,9 @@ class _NativeOp:
     submitted: float
     finished: FinishedOp | None = None
     other_statuses: dict[int, RowStatus] = field(default_factory=dict)  # neither READY, MISS
-    puts_of_another_writer: int = 0  # other_statuses rows another writer is still putting
+    # other_statuses rows another writer is still putting or the full store declined: not warned
+    quiet_skips: int = 0
+    store_full: bool = False
     cancelled: np.ndarray | None = None  # bool [rows]; None when no row was cancelled
     first_failure: str | None = None  # the first row in other_statuses, with why, for the log
     call_errors: list[str] = field(default_factory=list)  # metadata calls' raises, for the log
@@ -330,8 +335,9 @@ class NativeMooncakeDriver(MooncakeDriver):
             else:  # NOT_READY or DECLINED
                 reason = _skip_reason(call, code)
                 skip_reasons.append(reason)
-                if reason == _ANOTHER_WRITER:
-                    op.puts_of_another_writer += 1
+                if reason in _QUIET_SKIPS:
+                    op.quiet_skips += 1
+                    op.store_full = op.store_full or reason == _POOL_FULL
                     continue
                 why = f"{status.value} ({reason})"
             op.first_failure = op.first_failure or f"{op.key(row)}: {why}"
@@ -367,10 +373,12 @@ def _log_finished(op: _NativeOp) -> None:
     if op.sessions_left_open:
         left_open = op.sessions_left_open
         logger.warning(f"mooncake: {len(left_open)} put sessions left open, first {left_open[0]}")
+    if op.store_full:
+        _warn_store_full()
     _report(
         "put" if op.is_put else "get",
         rows=len(op.names),
-        failed=len(op.other_statuses) - op.puts_of_another_writer,
+        failed=len(op.other_statuses) - op.quiet_skips,
         first=op.first_failure,
         ended=op.finished.access_ended,
         seconds=time.monotonic() - op.submitted,

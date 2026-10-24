@@ -97,6 +97,9 @@ class _Code(IntEnum):
     RPC_TIMEOUT = -901
     # Not an SDK code: a call raised or miscounted; storeWorker.h kCallFailed has the same value.
     CALL_FAILED = -100_000
+    # Not an SDK code: another put of this client held the key, so the row was not put;
+    # storeWorker.h kPutInFlightHere has the same value.
+    PUT_IN_FLIGHT_HERE = -100_001
 
 
 OBJECT_EXISTS, OBJECT_ABSENT = 1, 0  # batch_is_exist answers
@@ -130,22 +133,29 @@ _SKIPS = {
     # get -703: no complete replica, as while the object is written or once its replica's
     # endpoint went stale
     "being_written": _NOT_READY,
-    # put start -600: this client already holds a put session for the key, from a concurrent
-    # put of it or one left open (which keeps the key NOT_READY here until ``drain``), or the
-    # master refused the row with the same -600 (a cachelib master caps an object at
-    # 16 MiB - 16 B); the master's log says which
+    # put start -600: this client already holds a put session for the key, one left open (which
+    # keeps the key NOT_READY here until ``drain``), or the master refused the row with the same
+    # -600 (a cachelib master caps an object at 16 MiB - 16 B); the master's log says which
     "own_session_open": _NOT_READY,
-    "uncommitted": _NOT_READY,  # put start -705, and the master shows the object uncommitted
+    # another writer is still putting the object: put start -705 with the object uncommitted on
+    # the master, or another put of this client holds the key (skipped without a store call: the
+    # SDK keys put sessions per client)
+    "another_writer": _NOT_READY,
     "pool_full": _DECLINED,  # put start -200: no space for the object
 }
-# The skip of a put whose object another writer is still putting. That writer normally completes
-# the object (the same answer also follows a put revoked or discarded meanwhile, which nobody
-# completes), and two servers computing one prompt prefix at once do this in normal traffic, so
-# the row is no failure to warn about (``stats()`` counts it).
-_ANOTHER_WRITER = "uncommitted"
+# Normal traffic (two requests computing one prompt prefix at once), so no failure to warn about.
+# That writer normally completes the object. If its put fails, nobody retries: the object stays
+# missing until a server computes the prefix again without local reuse.
+_ANOTHER_WRITER = "another_writer"
+# The skip of a put the store declined for lack of space. A full store is a cache's normal state:
+# the master evicts within milliseconds to make room (Mooncake 0.3.13), so it is warned about once
+# per process, not per operation.
+_POOL_FULL = "pool_full"
+_QUIET_SKIPS = (_ANOTHER_WRITER, _POOL_FULL)
 _PUT_START_SKIPS = {
-    _Code.NO_AVAILABLE_HANDLE: "pool_full",
+    _Code.NO_AVAILABLE_HANDLE: _POOL_FULL,
     _Code.INVALID_PARAMS: "own_session_open",
+    _Code.PUT_IN_FLIGHT_HERE: _ANOTHER_WRITER,
 }
 
 
@@ -249,6 +259,7 @@ class MooncakeDriver:
         self._draining = False
         self._closed = False
         self._sessions_left_open: set[str] = set()
+        self._keys_being_put: set[str] = set()  # by puts that have not returned
         self._in_flight = 0  # put/get calls past admission and not yet returned
         self._unprovable = 0  # operations whose access never ended
         self._busy: Counter[_Registration] = Counter()  # operations whose access may touch it
@@ -312,11 +323,15 @@ class MooncakeDriver:
 
     def put(self, rows: Sequence[RowIO]) -> _Op:
         batch, started = self._admit(rows), time.monotonic()  # the only raise is in _admit
+        own = self._hold_keys_to_put(batch)
         try:
-            ended = self._put_rows(batch)
+            ended = self._put_rows(batch, own) if own else True
         except Exception as error:  # a bug, not an SDK answer: a transfer may still be running
-            batch.fault(range(len(batch.keys)), f"put failed: {error!r}")
+            batch.fault(own, f"put failed: {error!r}")
             ended = False
+        finally:
+            with self._lock:
+                self._keys_being_put.difference_update(batch.keys[i] for i in own)
         return self._conclude("put", batch, ended, time.monotonic() - started)
 
     def get(self, rows: Sequence[RowIO], hint: Hint = None) -> _Op:
@@ -401,11 +416,25 @@ class MooncakeDriver:
 
     # Put: start, one scatter, end what was written whole, revoke the rest.
 
-    def _put_rows(self, batch: _Batch) -> bool:
-        """Returns whether access ended."""
-        starts = self._metadata_call(self._store.batch_put_session_start, batch.keys, batch.sizes)
+    def _hold_keys_to_put(self, batch: _Batch) -> list[int]:
+        """The rows whose key no other put of this driver holds, now held until this put returns;
+        the others are skipped as another writer's."""
+        own = []
+        with self._lock:
+            for row, row_key in enumerate(batch.keys):
+                if row_key in self._keys_being_put:
+                    batch.skip(row, _ANOTHER_WRITER)
+                else:
+                    self._keys_being_put.add(row_key)
+                    own.append(row)
+        return own
+
+    def _put_rows(self, batch: _Batch, rows: list[int]) -> bool:
+        """Puts ``rows`` of the batch; returns whether access ended."""
+        keys, _, _, sizes = batch.pick(rows)
+        starts = self._metadata_call(self._store.batch_put_session_start, keys, sizes)
         started, existing = [], []
-        for row, code in enumerate(starts):
+        for row, code in zip(rows, starts):
             if code == _Code.OK:
                 started.append(row)
             elif code == _Code.OBJECT_ALREADY_EXISTS:
@@ -616,11 +645,13 @@ class MooncakeDriver:
 
     def _conclude(self, direction: str, batch: _Batch, ended: bool, seconds: float) -> _Op:
         self._release(batch.regions, ended, batch.skip_reasons.values())
+        if _POOL_FULL in batch.skip_reasons.values():
+            _warn_store_full()
         expected = (RowStatus.READY, RowStatus.MISS)
         failed = [
             i
             for i, r in enumerate(batch.results)
-            if r.status not in expected and batch.skip_reasons.get(i) != _ANOTHER_WRITER
+            if r.status not in expected and batch.skip_reasons.get(i) not in _QUIET_SKIPS
         ]
         first = None
         if failed:
@@ -799,12 +830,20 @@ def _describe(code: int) -> str:
         return f"code({code})"
 
 
+def _warn_store_full() -> None:
+    logger.warning_once(
+        "mooncake: the store declined objects for lack of space; its master evicts to make room "
+        "(driver stats rows_declined_pool_full)",
+        key="mooncake: the store declined objects for lack of space",
+    )
+
+
 def _report(
     direction: str, *, rows: int, failed: int, first: str | None, ended: bool, seconds: float
 ) -> None:
     """One warning per operation that failed or skipped a row (``first`` names the first, with
     why) or left access open; none otherwise. Cancelled rows, and puts of objects another writer
-    is still putting, count as neither."""
+    is still putting or the full store declined, count as neither."""
     if ended and not failed:
         return
     detail = f"; first {first}" if first else ""

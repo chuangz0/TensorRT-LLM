@@ -30,6 +30,7 @@
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace tensorrt_llm::mooncake_store_worker
@@ -156,21 +157,37 @@ void appendBuffers(Rows const& rows, size_t row, std::vector<void*>& buffers, st
     }
 }
 
-//! One store call over rows [begin, end) of an operation, on a worker thread. It follows mooncake.py:
-//! every SDK answer becomes a row's (state, code, call), and a call that raised or miscounted leaves
-//! access unproven only where it could have moved bytes.
+//! The keys of a call's rows, in order.
+mirror::Keys keysOfCall(Call const& call)
+{
+    mirror::Keys keys;
+    keys.reserve(call.end - call.begin);
+    for (size_t row = call.begin; row < call.end; ++row)
+    {
+        keys.push_back(keyOf(call.op->rows, row));
+    }
+    return keys;
+}
+
+//! One store call over rows [begin, begin + keys.size()) of an operation, on a worker thread. Rows already
+//! concluded are left out: holdPutKeys skips a put's rows whose key another running put call of this
+//! worker holds. It follows mooncake.py: every SDK answer becomes a row's (state, code, call), and a call
+//! that raised or miscounted leaves access unproven only where it could have moved bytes.
 class CallRun
 {
 public:
-    CallRun(mirror::PyClient& client, Op& op, size_t begin, size_t end)
+    CallRun(mirror::PyClient& client, Op& op, size_t begin, mirror::Keys const& keys)
         : mClient(client)
         , mOp(op)
         , mBegin(begin)
+        , mKeys(keys)
     {
-        for (size_t row = begin; row < end; ++row)
+        for (size_t row = begin; row < begin + keys.size(); ++row)
         {
-            mRows.push_back(row);
-            mKeys.push_back(keyOf(op.rows, row));
+            if (op.states[row] == static_cast<int8_t>(RowState::kPending))
+            {
+                mRows.push_back(row);
+            }
         }
     }
 
@@ -187,6 +204,10 @@ public:
     //! once the master shows it committed.
     CallOutcome put()
     {
+        if (mRows.empty())
+        {
+            return std::move(mOutcome);
+        }
         std::vector<size_t> sizes;
         for (size_t row : mRows)
         {
@@ -454,26 +475,23 @@ private:
     Op& mOp;
     size_t mBegin;
     std::vector<size_t> mRows;
-    mirror::Keys mKeys; // by row - mBegin
+    mirror::Keys const& mKeys; // by row - mBegin
     CallOutcome mOutcome;
 };
 
-CallOutcome runCall(mirror::PyClient& client, Call const& call)
+//! A failure of the worker itself, not a store answer: a transfer may have started for any row the call
+//! took, so its access stays unproven. Rows skipped for another put of this worker never reached the store.
+CallOutcome failedCall(Call const& call)
 {
-    try
+    StoreCall const dataCall = call.op->isPut ? StoreCall::kPutRanges : StoreCall::kGet;
+    for (size_t row = call.begin; row < call.end; ++row)
     {
-        CallRun run(client, *call.op, call.begin, call.end);
-        return call.op->isPut ? run.put() : run.get();
-    }
-    catch (...) // a failure of the worker itself: a transfer may have started
-    {
-        StoreCall const dataCall = call.op->isPut ? StoreCall::kPutRanges : StoreCall::kGet;
-        for (size_t row = call.begin; row < call.end; ++row)
+        if (call.op->codes[row] != kPutInFlightHere)
         {
             call.op->set(row, RowState::kFault, kCallFailed, dataCall);
         }
-        return CallOutcome{false, {{dataCall, "the store worker failed inside a store call"}}, {}};
     }
+    return CallOutcome{false, {{dataCall, "the store worker failed inside a store call"}}, {}};
 }
 
 //! Each row's bytes: its spans up to the first zero length, as appendBuffers reads them.
@@ -542,7 +560,8 @@ struct StoreWorker::State
     std::deque<Call> gets;
     std::deque<Call> puts;
     std::unordered_map<uint64_t, std::shared_ptr<Op>> open;
-    std::deque<std::shared_ptr<Op>> finished; // oldest first, until taken
+    std::deque<std::shared_ptr<Op>> finished;        // oldest first, until taken
+    std::unordered_set<std::string> putKeysInFlight; // held by running put calls
     uint64_t nextOp{1};
     int running{0};
     int putsRunning{0};
@@ -603,13 +622,52 @@ struct StoreWorker::State
                 call = std::move(*next);
                 callClient = client;
             }
-            CallOutcome outcome = runCall(*callClient, call); // never under the mutex
+            mirror::Keys keys;
+            std::vector<size_t> heldKeys; // keys[i] this call holds in putKeysInFlight until it returns
+            CallOutcome outcome;
+            try
+            {
+                keys = keysOfCall(call);
+                if (call.op->isPut)
+                {
+                    std::lock_guard lock(mutex);
+                    holdPutKeys(call, keys, heldKeys);
+                }
+                CallRun run(*callClient, *call.op, call.begin, keys); // never under the mutex
+                outcome = call.op->isPut ? run.put() : run.get();
+            }
+            catch (...)
+            {
+                outcome = failedCall(call);
+            }
             {
                 std::lock_guard lock(mutex);
+                for (size_t i : heldKeys)
+                {
+                    putKeysInFlight.erase(keys[i]);
+                }
                 finishCall(call, std::move(outcome));
             }
             callEnded.notify_all();
             workReady.notify_one(); // a put's thread may have come free
+        }
+    }
+
+    //! Adds to `held` the indices of the put call's keys it now holds until it returns; a key another
+    //! running put call holds concludes its row NOT_READY without a store call, as another writer's open put.
+    void holdPutKeys(Call const& call, mirror::Keys const& keys, std::vector<size_t>& held)
+    {
+        held.reserve(keys.size()); // no allocation once a key is held: every held key is released
+        for (size_t i = 0; i < keys.size(); ++i)
+        {
+            if (putKeysInFlight.insert(keys[i]).second)
+            {
+                held.push_back(i);
+            }
+            else
+            {
+                call.op->set(call.begin + i, RowState::kNotReady, kPutInFlightHere, StoreCall::kPutStart);
+            }
         }
     }
 

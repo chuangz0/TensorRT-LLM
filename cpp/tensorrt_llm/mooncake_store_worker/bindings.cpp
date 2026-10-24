@@ -48,7 +48,7 @@ constexpr char const* kClientCapsuleName = "mooncake.PyClient.shared_ptr";
 
 // blob/mooncake_setup.py STORE_WORKER_API_VERSION must equal this: bump it with any change Python sees,
 // so that a stale module is refused at startup instead of failing on the executor thread.
-constexpr int kApiVersion = 3;
+constexpr int kApiVersion = 4;
 
 template <typename T>
 using Matrix = nb::ndarray<T const, nb::ndim<2>, nb::c_contig, nb::device::cpu>;

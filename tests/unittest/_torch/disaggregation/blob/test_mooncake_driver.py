@@ -462,9 +462,57 @@ def test_an_object_being_written_is_not_ready_for_put_and_get(make_driver, monke
     results, access_ended = bench.run("put", "K")
     assert summary(results) == [("not_ready", None)] and access_ended
     stats = bench.driver.stats()
-    assert stats["rows_not_ready_being_written"] == stats["rows_not_ready_uncommitted"] == 1
+    assert stats["rows_not_ready_being_written"] == stats["rows_not_ready_another_writer"] == 1
     assert any(key("K") in line and "not_ready (being_written)" in line for line in warnings)
     assert [line for line in warnings if "mooncake put" in line] == []
+
+
+def test_a_put_of_a_key_this_driver_is_putting_skips_it_as_another_writer(
+    make_driver, monkeypatch
+) -> None:
+    """Two requests of one server publishing one block at once: the first put stores it; the
+    second skips it without a store call (the SDK keys put sessions per client) and warns
+    nothing."""
+    warnings: list[str] = []
+    monkeypatch.setattr(mooncake_module.logger, "warning", warnings.append)
+    bench = Bench(make_driver)
+    bench.fill_sources("put", "A", "B")
+    gate = bench.fake.block(PUT_RANGES)
+    first: list = []
+    putter = threading.Thread(target=lambda: first.append(bench.run("put", "A")))
+    putter.start()
+    try:
+        assert gate.entered.wait(WAIT_S)  # the first put holds A
+        second = bench.driver.put(bench.rows("A", "B"))
+        results = settled(bench.driver, second)
+    finally:
+        gate.release.set()
+        putter.join(WAIT_S)
+    assert summary(results) == [("not_ready", None), ("ready", None)]
+    assert summary(first[0][0]) == [("ready", None)]
+    assert bench.keys_of(PUT_START) == [key("A"), key("B")]
+    assert skipped_counts(bench) == {"rows_not_ready_another_writer": 1}
+    assert bench.fake.pool.objects[key("A")] == b"A" * SLOT
+    assert warnings == []
+    bench.run("put", "A")  # the first put returned: this driver puts A again
+    assert bench.keys_of(PUT_START)[-1] == key("A")
+
+
+def test_a_full_store_is_warned_about_once_not_per_operation(make_driver, monkeypatch) -> None:
+    warnings: list[str] = []
+    once: dict[str, str] = {}
+    monkeypatch.setattr(mooncake_module.logger, "warning", warnings.append)
+    monkeypatch.setattr(
+        mooncake_module.logger, "warning_once", lambda message, key: once.setdefault(key, message)
+    )
+    bench = Bench(make_driver)
+    for name in "AB":
+        bench.fake.script(PUT_START, [-200])
+        results, _ = bench.run("put", name)
+        assert summary(results) == [("declined", None)]
+    assert skipped_counts(bench) == {"rows_declined_pool_full": 2}
+    assert warnings == [] and len(once) == 1
+    assert "lack of space" in next(iter(once.values()))
 
 
 # Access end.

@@ -58,6 +58,9 @@ enum class StoreCall : int8_t
 //! Not an SDK code: the call raised or answered for another number of keys. mooncake.py _Code.CALL_FAILED
 //! reads this value.
 constexpr int64_t kCallFailed = -100'000;
+//! Not an SDK code: another put of this worker holds the key, so the row was not put (NOT_READY on
+//! kPutStart, as another writer's open put). mooncake.py _Code.PUT_IN_FLIGHT_HERE reads this value.
+constexpr int64_t kPutInFlightHere = -100'001;
 
 struct WorkerOptions
 {
@@ -108,7 +111,9 @@ struct FinishedOp
 //! take at most `putThreads`. Each operation is cut into calls of `rowsPerCall` rows and `bytesPerCall`
 //! bytes. A call follows mooncake.py's protocol: a get rereads once the rows whose read lease expired,
 //! a put starts sessions, scatters, then ends or revokes them and confirms keys that already existed.
-//! A call that faults a row drops the calls of its operation not started yet (CANCELLED).
+//! A call that faults a row drops the calls of its operation not started yet (CANCELLED). A put call
+//! skips the keys another running put call of this worker holds (kPutInFlightHere): the SDK keys put
+//! sessions per client, so a second session start would only fail.
 //! Every method but drain and stop returns in microseconds.
 class StoreWorker
 {

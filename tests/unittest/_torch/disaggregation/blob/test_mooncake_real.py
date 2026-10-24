@@ -358,9 +358,9 @@ class FirstScatterWaits:
 
 
 def test_real_concurrent_publishes_of_the_same_keys_from_one_client(clients, request) -> None:
-    # The first publish holds every key's put session while its scatter waits, so the second
-    # publish's session start finds them taken by this client (INVALID_PARAMS) and skips its
-    # rows; then the first publish delivers them all.
+    # The first publish holds every key while its scatter waits, so the driver skips the second
+    # publish's rows as another writer's, without a store call; then the first publish delivers
+    # them all.
     names = [f"{request.node.name}-{i}" for i in range(64)]
     sdk = FirstScatterWaits(clients.open_client())
     # Three workers: publishes leave one to fetches, so the two publishes run side by side.
@@ -377,7 +377,9 @@ def test_real_concurrent_publishes_of_the_same_keys_from_one_client(clients, req
     assert masks(writer.wait_outcome(first)) == [[True] * 64]
     for attempt in (first, second):
         writer.wait_quiesced(attempt)
-    assert writer.driver.inner.stats()["rows_not_ready_own_session_open"] == 64
+    stats = writer.driver.inner.stats()
+    assert stats["rows_not_ready_another_writer"] == 64
+    assert stats["rows_not_ready_own_session_open"] == 0
     assert writer.driver.peak_in_flight == 2
     reader = clients.endpoint(names, fill=0x2D)
     assert all(masks(finish(reader, reader.backend.fetch, *names))[0])

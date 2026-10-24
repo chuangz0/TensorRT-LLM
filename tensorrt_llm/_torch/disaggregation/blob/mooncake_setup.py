@@ -52,7 +52,7 @@ SECTIONS = ("blob", "mooncake")
 DRIVERS = ("auto", "native", "python")
 # The tensorrt_llm.mooncake_store_worker API this code speaks (its API_VERSION, bindings.cpp
 # kApiVersion): a module built from other sources is refused at startup.
-STORE_WORKER_API_VERSION = 3
+STORE_WORKER_API_VERSION = 4
 
 # Logged before setup, as Mooncake will read them.
 _LOGGED_ENVIRONMENT = (
