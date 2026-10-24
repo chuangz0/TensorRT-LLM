@@ -2269,6 +2269,14 @@ class PyExecutor:
                 or (transfers is not None
                     and transfers.has_any_inflight_requests()))
 
+    def _has_kv_transfers_in_flight(self) -> bool:
+        """Whether a disaggregated server still moves KV cache: a context
+        request's send, or a KV connector's save (the same manager tracks
+        both). Only executor passes reap them, free their pages and time them
+        out."""
+        return (getattr(self, "kv_cache_transceiver", None) is not None
+                and self.async_transfer_manager.has_any_inflight_requests())
+
     @contextmanager
     def _profiler(self):
         """Per-iteration profile bookkeeping driver.
@@ -6615,7 +6623,10 @@ class PyExecutor:
         idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
                 and not self.is_shutdown
                 and not self._has_pending_connector_transfers())
-        if idle:
+        # A KV send in flight is rank-local: it only keeps rank 0 from blocking
+        # on the queue. `idle` also picks the request-count probe's transport,
+        # which every rank must pick alike.
+        if idle and not self._has_kv_transfers_in_flight():
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
             timeout = datetime.timedelta(
