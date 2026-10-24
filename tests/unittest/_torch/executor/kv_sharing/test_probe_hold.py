@@ -14,8 +14,8 @@
 # limitations under the License.
 """Rank 0 keeps a new request out of the broadcast until the store said how much of its prompt it
 holds, the hold limit passed, or a cancel or shutdown needs it broadcast. A block counts only where
-the store holds every rank's share of it, and the hits of requests that still wait are measured
-again."""
+the store holds every rank's share of it, the lender's rule turns each layer group's blocks into
+the end a fetch may take, and the hits of requests that still wait are measured again."""
 
 import threading
 import time
@@ -42,17 +42,35 @@ HOLD_S = 0.05
 WAIT_S = 5.0
 
 
-def name(block: int, share: int = 0) -> str:
-    """The key of share ``share`` of block ``block`` of any prompt."""
-    return STEM + (bytes([block]) * 53 + bytes([share])).hex()
+def key(block: int, share: int = 0, group: int = 0) -> list[int]:
+    """The 54 bytes naming share ``share`` of block ``block`` of layer group ``group`` of any
+    prompt."""
+    return [block] * 52 + [group, share]
+
+
+def name(block: int, share: int = 0, group: int = 0) -> str:
+    """The store key of ``key(block, share, group)``."""
+    return STEM + bytes(key(block, share, group)).hex()
 
 
 class Lender:
-    """Names share ``s`` of block ``i`` of any prompt ``bytes([i]) * 53 + bytes([s])``."""
+    """Names the blocks of any prompt by ``key``. A fetch may end where every layer group holds
+    every block before it."""
+
+    def __init__(self) -> None:
+        self.asked: list[tuple] = []  # (present, known, limit) of each usable_end
 
     def prompt_object_keys(self, tokens, *, cache_salt, layer_group_index, num_blocks, shares):
-        assert layer_group_index == 0 and cache_salt == "tenant"
-        return np.array([[i] * 53 + [s] for s in shares for i in range(num_blocks)], dtype=np.uint8)
+        assert cache_salt == "tenant"
+        return np.array(
+            [key(i, s, layer_group_index) for s in shares for i in range(num_blocks)],
+            dtype=np.uint8,
+        )
+
+    def usable_end(self, present, *, known, limit):
+        self.asked.append((np.array(present), known, limit))
+        held = np.logical_and.reduce(present, axis=0)[: limit // TPB]
+        return (len(held) if held.all() else int(np.argmin(held))) * TPB
 
 
 class Driver:
@@ -73,14 +91,18 @@ class Driver:
         return tuple(ProbeStatus.HIT if key in self.stored else ProbeStatus.MISS for key in keys)
 
 
-def probe_service(driver: Driver, shares: int = 1, clock=time.monotonic) -> ProbeService:
+def probe_service(
+    driver: Driver, shares: int = 1, clock=time.monotonic, *, groups: int = 1, lender=None
+) -> ProbeService:
+    """A probe over ``groups`` layer groups of ``shares`` shares each; with several, windowed."""
     return ProbeService(
-        Lender(),
+        Lender() if lender is None else lender,
         driver,
         STEM,
         tokens_per_block=TPB,
         min_fetch_tokens=2 * TPB,
-        shares_per_group=(shares,),
+        shares_per_group=(shares,) * groups,
+        windowed=groups > 1,
         hold_s=HOLD_S,
         clock=clock,
     )
@@ -172,6 +194,27 @@ def test_the_probe_answers_the_run_of_blocks_every_share_holds():
     assert item.store_hit_tokens == 3 * TPB
     (keys,) = driver.probed
     assert keys == tuple(name(i, share) for share in (0, 1) for i in range(6))
+
+
+def test_the_probe_asks_the_lender_where_a_fetch_may_end_from_every_share_of_each_layer_group():
+    """Two layer groups of two shares, a sliding window in one: the lender gets one mask per group,
+    each block held where both its shares are, and may end a fetch no later than the whole blocks
+    before the last prompt token."""
+    driver = Driver()
+    driver.answer.set()
+    driver.stored = {name(i, s, g) for i in range(6) for s in (0, 1) for g in (0, 1)}
+    driver.stored.discard(name(2, share=1, group=1))
+    lender = Lender()
+    service = probe_service(driver, shares=2, groups=2, lender=lender)
+    try:
+        item = request_item(1, 6 * TPB)  # its last token ends block 5
+        probe_until_answered(service, item)
+    finally:
+        service.stop(wait_s=WAIT_S)
+    ((present, known, limit),) = lender.asked
+    assert present.tolist() == [[True] * 6, [True, True, False, True, True, True]]
+    assert (known, limit) == (0, 5 * TPB)
+    assert item.store_hit_tokens == 2 * TPB
 
 
 def wait_for(condition) -> None:

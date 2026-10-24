@@ -14,7 +14,8 @@
 # limitations under the License.
 """KV sharing through a real Mooncake store on several GPUs of one node: Llama-3.1-8B at TP2 and
 TP4; one case per other model class and layout: DeepSeek-V3-Lite (MLA) at TP2 and under attention
-DP, Qwen3-8B with an FP8 KV cache at TP2.
+DP, Qwen3-8B with an FP8 KV cache at TP2, and the sliding-window models gemma-3-1b at TP1 and
+gpt-oss-20b at TP2, whose readers extend the writer's prompt.
 
 Each stored object is put once: each rank puts its own share of every prompt block, and ranks
 holding the same bytes (MLA's latent cache) put one stripe each, or under host staging the first
@@ -81,12 +82,17 @@ SYSTEM, FIRST_TURN = 512, 256
 FOLLOW_UP = P[: SYSTEM + FIRST_TURN] + [_tokens.randrange(1000, 30000) for _ in range(200)]
 # The sibling every other model class's reader fetches.
 SIBLING = P[:FETCHED] + [_tokens.randrange(1000, 30000) for _ in range(200)]
+# A follow-up of P, the prompt windows serve: P's whole blocks, then 200 tokens of its own.
+P_END = P_BLOCKS * TOKENS_PER_BLOCK
+EXTENDS_P = P[:P_END] + [_tokens.randrange(1000, 30000) for _ in range(200)]
 GREEDY = SamplingParams(max_tokens=NEW_TOKENS, temperature=0.0)
 
 
 LLAMA = "llama-3.1-model/Llama-3.1-8B-Instruct"
 DEEPSEEK = "DeepSeek-V3-Lite/bf16"
 QWEN3 = "Qwen3/Qwen3-8B"
+GEMMA3 = "gemma/gemma-3-1b-it"
+GPT_OSS = "gpt_oss/gpt-oss-20b"
 
 
 def model_path(model: str = LLAMA) -> str:
@@ -403,4 +409,88 @@ def test_a_reader_of_each_model_class_and_layout_fetches_exactly_and_each_object
     assert output.cached_tokens == FETCHED
     assert puts == (new_objects, 0)
     trace = cell_trace(tmp_path / "reader", cell)
+    assert len(decisions(trace, "resume")) == 1, trace
+
+
+@dataclass(frozen=True)
+class WindowedCell:
+    """A model with a sliding window in some layers and full attention in the others, on ``tp``
+    GPUs; each rank holds KV heads of its own, so each layer group's block is ``tp`` objects.
+    ``window`` is the checkpoint's sliding window, which the KV cache keeps."""
+
+    model: str
+    tp: int
+    window: int
+
+
+WINDOWED_CELLS = {
+    "gemma-3-1b-tp1": WindowedCell(GEMMA3, tp=1, window=512),  # 5 local layers per global layer
+    "gpt-oss-20b-tp2": WindowedCell(GPT_OSS, tp=2, window=128),  # every other layer
+}
+
+
+def window_blocks(window: int, end: int) -> set[int]:
+    """The blocks a window of ``window`` tokens keeps at a whole-block ``end``: those holding one
+    of the tokens the next token reads."""
+    return set(range((end + 1 - window) // TOKENS_PER_BLOCK, end // TOKENS_PER_BLOCK))
+
+
+@pytest.mark.parametrize("name", WINDOWED_CELLS)
+def test_a_reader_of_each_windowed_model_fetches_to_the_writers_last_window_exactly(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """The writer publishes P: every block of its full-attention layers and, at the context's end,
+    the blocks its window keeps there. A fresh reader of a follow-up of P fetches to P's last whole
+    block, where the store holds the window, and serves the tokens of the writer's local reuse; it
+    puts its own new blocks once, and re-puts of window blocks the store holds are refused."""
+    cell = WINDOWED_CELLS[name]
+    window = cell.window
+    assert EXTENDS_P[P_END] != P[P_END]  # the follow-up leaves P at P's last whole block
+
+    def windowed_server(env: pytest.MonkeyPatch, trace_dir: Path) -> LLM:
+        # Fixed kernels let a reader match its writer exactly (gpt-oss is MoE, as cell_server).
+        return server(
+            env,
+            cell.tp,
+            trace_dir,
+            model=cell.model,
+            enable_autotuner=False,
+            kv_sharing=sharing(store, name),
+        )
+
+    with pytest.MonkeyPatch.context() as writer_env:
+        writer = windowed_server(writer_env, tmp_path / "writer")
+    at_p = window_blocks(window, P_END)
+    stored = cell.tp * (P_BLOCKS + len(at_p))
+    try:
+        before = store.master_metrics()
+        complete(writer, P)
+        store.assert_readable(name, stored)
+        assert puts_since(store, before) == (stored, 0)
+        complete(writer, P, cache_salt="reused")
+        reference = complete(writer, EXTENDS_P, cache_salt="reused")
+        assert reference.cached_tokens == P_END
+    finally:
+        shut_down(writer)
+    rank_traces(tmp_path / "writer", cell.tp)
+
+    # The reader puts its new whole blocks of every layer group, and the window it keeps at its
+    # prompt's last whole block, of which the store holds the blocks P's window kept already.
+    reader_end = len(EXTENDS_P) // TOKENS_PER_BLOCK * TOKENS_PER_BLOCK
+    at_reader_end = window_blocks(window, reader_end)
+    new = cell.tp * (reader_end // TOKENS_PER_BLOCK - P_BLOCKS + len(at_reader_end - at_p))
+    again = cell.tp * len(at_reader_end & at_p)
+    reader = windowed_server(monkeypatch, tmp_path / "reader")
+    try:
+        held, _ = store.readable_objects(name)  # the writer's salted prompts too
+        before = store.master_metrics()
+        output = complete(reader, EXTENDS_P)
+        store.assert_readable(name, held + new)
+        puts = puts_since(store, before)
+    finally:
+        shut_down(reader)
+    assert tokens(output) == tokens(reference)
+    assert output.cached_tokens == P_END
+    assert puts == (new + again, again)
+    trace = rank_traces(tmp_path / "reader", cell.tp)
     assert len(decisions(trace, "resume")) == 1, trace

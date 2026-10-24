@@ -22,9 +22,9 @@ class ReplicaSet:
     """The tensor-parallel ranks holding the same KV cache bytes as this one (MLA's latent cache,
     or KV heads several ranks share): this rank's position among them and their number.
 
-    Under GPU Direct every member lends each publication's range, so its pages lock alike on every
-    rank, and the member whose position is the block's index modulo the size puts the block. Under
-    host staging the first member puts every block and the others lend nothing (a host lease locks
+    Under GPU Direct every member lends each publication's rows, so its pages lock alike on every
+    rank, and the member whose position is a row's block index modulo the size puts the row. Under
+    host staging the first member puts every row and the others lend nothing (a host lease locks
     no page): striping would copy each block out to host memory on every member and take staging
     slots on all of them, where one member's copy suffices.
     """
@@ -32,16 +32,11 @@ class ReplicaSet:
     position: int = 0
     size: int = 1
 
-    def blocks_put(self, start_block: int, end_block: int, memory_kind: MemoryKind) -> int:
-        """How many of the blocks ``[start_block, end_block)`` this rank puts. Under GPU Direct:
-        the blocks ``b`` with ``b % size == position``, which ``TransferIntent.put_stripe``
-        selects (block ``b`` is page ordinal ``b`` without context parallelism)."""
-        if self.size == 1:
-            return end_block - start_block
-        if memory_kind is MemoryKind.HOST:
-            return end_block - start_block if self.position == 0 else 0
-        first = start_block + (self.position - start_block) % self.size
-        return len(range(first, end_block, self.size))
+    def lends(self, memory_kind: MemoryKind) -> bool:
+        """Whether this rank lends and submits each publication: every member under GPU Direct
+        (its pages lock alike; the transfer manager puts its stripe of the lent rows,
+        ``put_stripe``, which may be empty), the first member alone under host staging."""
+        return memory_kind is MemoryKind.DEVICE or self.position == 0
 
     def put_stripe(self, memory_kind: MemoryKind) -> Optional[tuple[int, int]]:
         """``(position, size)`` where this rank puts a stripe of the rows it lends (GPU Direct with

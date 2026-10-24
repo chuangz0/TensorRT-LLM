@@ -11,8 +11,10 @@ alone would leave its peers waiting in the next collective.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import os
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, TextIO, TypeVar
@@ -54,6 +56,7 @@ from .orchestrator import (
     PROFILE_ID,
     SharedKvOrchestrator,
     SharingPolicy,
+    StagingBudget,
 )
 from .probe import ProbeService
 from .replicas import ReplicaSet, replica_set
@@ -81,9 +84,10 @@ _CACHE_DTYPES = {DataType.BF16: "bfloat16", DataType.FP8: "fp8"}
 # What kv_sharing serves at this milestone, said before the reason a model is refused.
 SUPPORTED_MODELS = (
     "kv_sharing serves, for now, one GPU, tensor parallelism or attention DP, with multi-head "
-    "attention (BF16 or FP8 KV cache) or MLA (BF16) and full attention in every layer (no sliding "
-    "window, recurrent state or attention sinks), and under host staging one fetch of "
-    f"max(max_fetch_tokens, max_num_tokens) tokens within {HOST_STAGING_BYTES >> 30} GiB"
+    "attention (BF16 or FP8 KV cache) with full attention or sliding windows, or MLA (BF16) with "
+    "full attention; no recurrent state, sparse attention or attention sink tokens; and under host "
+    "staging one fetch of max(max_fetch_tokens, max_num_tokens) tokens within "
+    f"{HOST_STAGING_BYTES >> 30} GiB"
 )
 # Where each rank writes its round trace (rank<r>.txt), for multi-GPU tests to compare.
 TRACE_DIR_ENV = "TRTLLM_KV_SHARING_TRACE_DIR"
@@ -152,9 +156,11 @@ def start_kv_sharing(
     attached, facts_by_rank = _agree(dist, attach)
     if len({facts.scope for facts in facts_by_rank}) > 1:
         raise ValueError("kv_sharing: the ranks would name blocks differently")
-    publication_tokens = None
+    staging = None
     if memory_kind is MemoryKind.HOST:  # every rank gates ranges within the smallest budget
-        publication_tokens = min(facts.publication_tokens for facts in facts_by_rank)
+        # The ranks share the layout: only their free rows may differ.
+        least = tuple(map(min, zip(*(facts.staging.free_rows for facts in facts_by_rank))))
+        staging = dataclasses.replace(facts_by_rank[0].staging, free_rows=least)
     attention_dp = py_executor.enable_attention_dp
     # Attention DP needs no replica set: each rank serves requests of its own with every KV head,
     # so two ranks put one block only as two servers can, and the master refuses the later put.
@@ -179,7 +185,7 @@ def start_kv_sharing(
         min_fetch_tokens=config.min_fetch_tokens,
         max_fetch_tokens=config.max_fetch_tokens,
         fetch_timeout_s=config.fetch_timeout_s,
-        publication_tokens=publication_tokens,
+        staging=staging,
         max_util_for_resume=llm_args.kv_cache_config.max_util_for_resume,
         max_parked_fetches=py_executor.max_num_active_requests - 1 if attention_dp else None,
     )
@@ -197,6 +203,9 @@ def start_kv_sharing(
             tokens_per_block=tokens_per_block,
             min_fetch_tokens=config.min_fetch_tokens,
             shares_per_group=[count for count, _ in facts_by_rank[0].shards],
+            windowed=any(
+                group.kept_window is not None for group in attached.lender.page_layout.layer_groups
+            ),
             hold_s=config.probe_hold_ms / 1000,
         )
         py_executor.executor_request_queue.probe_on_enqueue = probe.submit
@@ -221,9 +230,11 @@ def start_kv_sharing(
         staging_bytes = sum(
             r.nbytes for r in attached.lender.regions if r.memory_kind is MemoryKind.HOST
         )
+        most = staging.longest
+        blocks = "any number of" if most == sys.maxsize else f"at most {most}"
         path = (
             f"host staging of {staging_bytes >> 20} MiB: one fetch of {fetch_tokens} tokens and "
-            f"{publication_tokens} tokens for publications"
+            f"publications of {blocks} blocks"
         )
     store_calls = "native" if isinstance(attached.driver, NativeMooncakeDriver) else "python"
     logger.info(
@@ -240,12 +251,12 @@ class _RankFacts:
     Attributes:
         scope: Names the stored blocks, with the layout; must be equal on every rank.
         shards: ``(count, index)`` of the share of each layer group this rank holds.
-        publication_tokens: Host staging's budget for open publications; None under GPU Direct.
+        staging: Host staging's budget for open publications; None under GPU Direct.
     """
 
     scope: bytes
     shards: tuple[tuple[int, int], ...]
-    publication_tokens: Optional[int]
+    staging: Optional[StagingBudget]
 
 
 @dataclass(frozen=True)
@@ -339,9 +350,9 @@ def _attach(
     except (TypeError, ValueError) as error:
         # The lender may stay attached; startup fails, so nothing lends through it.
         raise ValueError(f"{SUPPORTED_MODELS}; this server is refused: {error}") from error
-    publication_tokens = None
+    staging_budget = None
     if memory_kind is MemoryKind.HOST:
-        publication_tokens = _publication_tokens(domain.lender, fetch_tokens, tokens_per_block)
+        staging_budget = _staging_budget(domain.lender, fetch_tokens, tokens_per_block)
 
     transfers = TransferManager(wake=_nothing_to_wake, hold_returns=True)
     watchdog = RetirementWatchdog(_end_process)
@@ -359,7 +370,7 @@ def _attach(
     )
     shards = tuple((g.shard.count, g.shard.index) for g in domain.lender.page_layout.layer_groups)
     attached = _Attached(driver, domain.lender, transfers, watchdog, trace)
-    return attached, _RankFacts(profile.scope, shards, publication_tokens)
+    return attached, _RankFacts(profile.scope, shards, staging_budget)
 
 
 def _open_trace(rank: int) -> Optional[TextIO]:
@@ -371,24 +382,40 @@ def _open_trace(rank: int) -> Optional[TextIO]:
     return open(os.path.join(directory, f"rank{rank}.txt"), "w", buffering=1)
 
 
-def _publication_tokens(lender: Lender, fetch_tokens: int, tokens_per_block: int) -> int:
-    """Tokens open publications may hold, whole blocks: host staging less one fetch.
+def _staging_budget(lender: Lender, fetch_tokens: int, tokens_per_block: int) -> StagingBudget:
+    """The rows open publications may hold in each host staging region: its slots less one
+    fetch's. A block takes one slot of its pool group's region for each layer group the region
+    serves; a windowed group at most its sinks and window, whatever the range.
 
     Raises:
-        ValueError: Host staging holds no block beside one fetch.
+        ValueError: Host staging holds no publication beside one fetch.
     """
-    regions = [region for region in lender.regions if region.memory_kind is MemoryKind.HOST]
-    # A block takes one slot of its pool group's region for each layer group the region serves.
-    staged_blocks = min(region.slot_count // len(region.layer_group_indices) for region in regions)
+    layer_groups = lender.page_layout.layer_groups
     fetch_blocks = ceil_div(fetch_tokens, tokens_per_block)
-    if staged_blocks <= fetch_blocks:
+    regions = [region for region in lender.regions if region.memory_kind is MemoryKind.HOST]
+    free_rows, rows_per_block, window_rows = [], [], []
+    for region in regions:
+        served = [layer_groups[lg] for lg in region.layer_group_indices]
+        windows = [
+            group.num_sink_blocks + ceil_div(group.kept_window, tokens_per_block)
+            for group in served
+            if group.kept_window is not None
+        ]
+        full = len(served) - len(windows)
+        # One fetch's slots, as the lender sizes them (slots_per_fetch).
+        fetch_rows = full * fetch_blocks + sum(min(fetch_blocks, rows) for rows in windows)
+        free_rows.append(region.slot_count - fetch_rows)
+        rows_per_block.append(full)
+        window_rows.append(sum(windows))
+    budget = StagingBudget(tuple(free_rows), tuple(rows_per_block), tuple(window_rows))
+    if not budget.fits(1, []):
         staged_gib = sum(region.nbytes for region in regions) / (1 << 30)
         raise ValueError(
             f"kv_sharing: {staged_gib:.1f} GiB of host staging hold one fetch of {fetch_tokens} "
             "tokens, max(max_fetch_tokens, max_num_tokens), and no block for publications; "
             "lower max_fetch_tokens or max_num_tokens"
         )
-    return (staged_blocks - fetch_blocks) * tokens_per_block
+    return budget
 
 
 def _profile(
@@ -421,7 +448,7 @@ def _profile(
         # Under attention DP each tensor-parallel rank is a data-parallel rank of its own.
         topology=(mapping.tp_size, dp_size, mapping.pp_size, mapping.cp_size),
         state_kinds=(CacheKind.PAGED,) * manager.num_pools,
-        full_attention=True,
+        attention_windows=_attention_windows(manager),
         sparse_attention=llm_args.sparse_attention_config is not None,
         sink_token_length=llm_args.kv_cache_config.sink_token_length or 0,
         lora_enabled=False,
@@ -431,6 +458,15 @@ def _profile(
         draft_pool=None,
         joint_reuse=False,
         staging=staging,
+    )
+
+
+def _attention_windows(manager: KVCacheManagerV2) -> tuple[tuple[int, int], ...]:
+    """``(global layer, window)`` of each layer whose KV cache keeps a sliding window."""
+    return tuple(
+        (int(manager.pp_layers[local]), int(window))
+        for local, window in enumerate(manager.max_attention_window_vec)
+        if window is not None
     )
 
 

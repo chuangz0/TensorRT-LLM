@@ -12,8 +12,9 @@ import collections
 import datetime
 import itertools
 import re
+import sys
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, TextIO
 
@@ -92,6 +93,50 @@ class _PublicationLocks:
 
 
 @dataclass(frozen=True)
+class StagingBudget:
+    """Host staging rows open publications may hold, per staging region (one per pool group): its
+    slots less one fetch's. A publication of n blocks takes n rows of each full-attention layer
+    group the region serves and at most one window's rows of each windowed one, whatever n.
+
+    Attributes:
+        free_rows: Per region, its slots less one fetch's.
+        rows_per_block: Per region, the rows one published block takes: one per full-attention
+            layer group it serves.
+        window_rows: Per region, sinks plus ``ceil(window / tokens_per_block)`` blocks, summed over
+            the windowed layer groups it serves.
+    """
+
+    free_rows: tuple[int, ...]
+    rows_per_block: tuple[int, ...]
+    window_rows: tuple[int, ...]
+
+    def fits(self, blocks: int, open_blocks: Sequence[int]) -> bool:
+        """Whether a publication of ``blocks`` blocks fits beside open ones of ``open_blocks``."""
+        publications, total = 1 + len(open_blocks), blocks + sum(open_blocks)
+        return all(
+            per_block * total + window * publications <= free
+            for free, per_block, window in zip(
+                self.free_rows, self.rows_per_block, self.window_rows
+            )
+        )
+
+    @property
+    def longest(self) -> int:
+        """The most blocks one publication may hold alone; unbounded (``sys.maxsize``) where no
+        region serves a full-attention layer group."""
+        return min(
+            (
+                (free - window) // per_block
+                for free, per_block, window in zip(
+                    self.free_rows, self.rows_per_block, self.window_rows
+                )
+                if per_block
+            ),
+            default=sys.maxsize,
+        )
+
+
+@dataclass(frozen=True)
 class SharingPolicy:
     """What a server does with the store, and its limits.
 
@@ -101,11 +146,11 @@ class SharingPolicy:
         fetch: Whether requests read stored prompt prefixes.
         publish: Whether the server stores the prompt blocks it computes.
         min_fetch_tokens: Shorter stored prefixes are computed.
-        max_fetch_tokens: Longest prefix one fetch reads.
+        max_fetch_tokens: Longest prefix one fetch reads. With a sliding window a longer stored
+            prefix is computed instead of cut.
         fetch_timeout_s: A fetch still running this long after admission is abandoned.
-        publication_tokens: Under host staging, the most prompt tokens open publications may
-            hold, whole blocks: staging less one fetch, so publications never keep a fetch
-            waiting for staging. Unused under GPU Direct (None).
+        staging: Under host staging, the rows open publications may hold: staging less one
+            fetch, so publications never keep a fetch waiting for staging. None under GPU Direct.
         max_util_for_resume: The KV cache manager's own page budget for resumes.
         max_parked_fetches: Under attention DP, the most requests parked for a fetch at once:
             ``max_num_active_requests - 1``, so a rank whose requests all wait for the store
@@ -118,7 +163,7 @@ class SharingPolicy:
     min_fetch_tokens: int
     max_fetch_tokens: int
     fetch_timeout_s: float
-    publication_tokens: Optional[int]
+    staging: Optional[StagingBudget]
     max_util_for_resume: float
     max_parked_fetches: Optional[int] = None
 
@@ -198,13 +243,30 @@ class SharedKvOrchestrator:
         # Why this rank's lender or store binding stopped; None while they serve. Reported in each
         # round. With peers it stays None: a failure ends the server instead.
         self._stopped: Optional[str] = None
-        self._bytes_per_block = sum(
-            region.slot_bytes for region in lender.regions if region.memory_kind is MemoryKind.HOST
+        page_layout = lender.page_layout
+        layer_groups = page_layout.layer_groups
+        # Per layer group: whether it keeps a sliding window, the most pages it holds of one
+        # request (None for full attention), and the bytes of one of its stored objects. A window
+        # holds its sinks and up to ceil(W / tpb) + 1 pages: W tokens ending inside a block span
+        # one block more than at a block boundary, where fetches and publications end. That is its
+        # steady state; while a context chunk computes it also holds the chunk's pages, which these
+        # page checks leave out (they are heuristics: a refused grow takes the normal path).
+        self._windowed_groups = tuple(group.kept_window is not None for group in layer_groups)
+        self._windowed = any(self._windowed_groups)
+        self._window_pages = tuple(
+            None
+            if group.kept_window is None
+            else group.num_sink_blocks + ceil_div(group.kept_window, self._tokens_per_block) + 1
+            for group in layer_groups
+        )
+        self._object_bytes = tuple(
+            sum(page_layout.pool_slot_bytes[group.pool_group]) for group in layer_groups
         )
         # The lender's admission rule: parked pages must leave room for the largest request's
         # resume window and its next step.
-        self._resume_window_pages = ceil_div(kv_cache_manager.max_seq_len, self._tokens_per_block)
-        self._resume_window_pages += 1
+        self._resume_window_pages = self._pages_held(
+            kv_cache_manager.max_seq_len + self._tokens_per_block
+        )
 
     @property
     def memory_kind(self) -> MemoryKind:
@@ -460,6 +522,7 @@ class SharedKvOrchestrator:
         op = decision.op
         match decision.action:
             case Action.RETURN_ALL:
+                self._count_fetched(op)
                 self._transfers.return_now(op.operation_id, deliver=True)
             case Action.RETURN_NONE:
                 self._return_none(op)
@@ -484,7 +547,7 @@ class SharedKvOrchestrator:
 
     def _return_none(self, op: StoreOp) -> None:
         """The lease goes back with nothing delivered; the entry closes."""
-        if op.kind is OpKind.PUBLISH and op.blocks_put:
+        if op.kind is OpKind.PUBLISH and self._replicas.lends(op.memory_kind):
             self._count_puts(op)
         if op.operation_id is not None:
             self._transfers.return_now(op.operation_id, deliver=False)
@@ -493,23 +556,32 @@ class SharedKvOrchestrator:
         op.closed = True
 
     def _count_puts(self, op: StoreOp) -> None:
-        """Counts this rank's puts of a publication whose access ended: the blocks the store took,
-        and a failure where the store or the transfer failed. A block the store left alone without
-        a fault is skipped, not failed: another server was still putting the same object (it
-        normally completes it; two servers computing one prefix at once is normal traffic), the
-        store was full, or this client's own put session of the key was open or the master refused
-        the object's size. The outcome does not say which; the store driver's warning and stats
-        do (all but the first are warned)."""
+        """Counts this rank's puts of a publication whose access ended: the objects the store took
+        (one per lent row: a layer group's share of a block), and a failure where the store or the
+        transfer failed. An object the store left alone without a fault is skipped, not failed:
+        another server was still putting the same object (it normally completes it; two servers
+        computing one prefix at once is normal traffic), the store was full, or this client's own
+        put session of the key was open or the master refused the object's size. The outcome does
+        not say which; the store driver's warning and stats do (all but the first are warned)."""
         masks = None
         if op.operation_id is not None:
             masks = self._transfers.delivered_masks(op.operation_id)
         if masks is None:
             self.counters["publications_failed"] += 1
             return
-        stored = int(np.logical_and.reduce(masks).sum())  # every layer group's row of the block
-        self.counters["published_blocks"] += stored
-        if stored < op.blocks_put:
-            self.counters["publication_blocks_skipped"] += op.blocks_put - stored
+        stored = sum(int(mask.sum()) for mask in masks)
+        self.counters["published_objects"] += stored
+        self.counters["publication_objects_skipped"] += sum(len(mask) for mask in masks) - stored
+
+    def _count_fetched(self, op: StoreOp) -> None:
+        """Counts the objects and bytes a fetch whose every row arrived read from the store: its
+        view holds one group per layer group, in order, empty or not."""
+        masks = self._transfers.delivered_masks(op.operation_id)
+        if masks is None:  # its lender domain stopped earlier in this round
+            return
+        rows = [int(mask.sum()) for mask in masks]
+        self.counters["fetched_objects"] += sum(rows)
+        self.counters["fetched_bytes"] += sum(r * b for r, b in zip(rows, self._object_bytes))
 
     def _resume(self, op: StoreOp) -> None:
         """The request computes on from the fetch's end, which every rank holds; the entry
@@ -523,10 +595,8 @@ class SharedKvOrchestrator:
         self._kv_cache_manager.resume_served_prefix(op.request, op.end)
         op.request.py_published_end = op.end  # the store holds what was fetched
         op.closed = True
-        blocks = (op.end - op.start) // self._tokens_per_block
         self.counters["fetches_resumed"] += 1
-        self.counters["fetched_blocks"] += blocks
-        self.counters["fetched_bytes"] += blocks * self._bytes_per_block
+        self.counters["fetched_blocks"] += (op.end - op.start) // self._tokens_per_block
 
     def _drop(self, op: StoreOp, reason: str) -> None:
         """The request computes its prompt from its local prefix: the scheduler admits it again
@@ -581,12 +651,14 @@ class SharedKvOrchestrator:
             return False
         tpb = self._tokens_per_block
         claim = matched // tpb * tpb
+        hit = request.py_store_hit_tokens
         # A named fetch ends at the whole blocks before the last prompt token.
-        end = min(
-            request.py_store_hit_tokens,
-            claim + self._policy.max_fetch_tokens,
-            (request.prompt_len - 1) // tpb * tpb,
-        )
+        end = min(hit, claim + self._policy.max_fetch_tokens, (request.prompt_len - 1) // tpb * tpb)
+        if self._windowed and end != hit:
+            # Window rows are held only at the ends publications reached: a cut fetch would miss
+            # them, so the request computes its prompt.
+            self.counters["fetches_skipped_too_long"] += 1
+            return False
         if end - claim < self._policy.min_fetch_tokens:
             return False
         if not self._pages_allow_fetch(request):
@@ -636,9 +708,8 @@ class SharedKvOrchestrator:
         ends; under GPU Direct the prompt and one step of each request an open publication locks,
         once each (one freed meanwhile counts among the deferred closes); and the pages of caches
         whose close waits for a lease."""
-        tpb = self._tokens_per_block
         pinned = sum(
-            ceil_div(op.end, tpb)
+            self._pages_held(op.end)
             for op in self._ops
             if op.kind is OpKind.FETCH and op.state is not OpState.OPEN
         )
@@ -654,7 +725,13 @@ class SharedKvOrchestrator:
 
     def _pages_of(self, request: LlmRequest) -> int:
         """The request's whole prompt and one step."""
-        return ceil_div(request.prompt_len, self._tokens_per_block) + 1
+        return self._pages_held(request.prompt_len + self._tokens_per_block)
+
+    def _pages_held(self, tokens: int) -> int:
+        """The pages one request holding ``tokens`` tokens takes over every layer group: a
+        windowed group at most its window's."""
+        blocks = ceil_div(tokens, self._tokens_per_block)
+        return sum(blocks if cap is None else min(blocks, cap) for cap in self._window_pages)
 
     def _resume_room(self, total_pages: int) -> int:
         """The pages the manager may hold pinned and still resume its largest request."""
@@ -675,7 +752,7 @@ class SharedKvOrchestrator:
                 del self._unpublished[request.py_request_id]
                 continue
             if locks is None:
-                if not self._staging_fits(end - start):
+                if not self._staging_fits((end - start) // self._tokens_per_block):
                     self.counters["publication_waits"] += 1
                     return  # staging frees in order: the ranges behind wait too
             else:
@@ -702,12 +779,14 @@ class SharedKvOrchestrator:
                 del self._unpublished[request.py_request_id]
             self._publish(request, start, end, ready)
 
-    def _staging_fits(self, tokens: int) -> bool:
-        """Host staging: whether the range fits in what open publications leave of the budget."""
+    def _staging_fits(self, blocks: int) -> bool:
+        """Host staging: whether a range of ``blocks`` blocks fits in what open publications leave
+        of the budget."""
         # Every open publication counts, also a replica's that lent nothing here: all ranks gate
         # alike, so their tables stay equal.
-        open_tokens = sum(op.end - op.start for op in self._ops if op.kind is OpKind.PUBLISH)
-        return tokens <= self._policy.publication_tokens - open_tokens
+        tpb = self._tokens_per_block
+        open_blocks = [(op.end - op.start) // tpb for op in self._ops if op.kind is OpKind.PUBLISH]
+        return self._policy.staging.fits(blocks, open_blocks)
 
     def _publication_locks(self) -> _PublicationLocks:
         """GPU Direct: what one publishing pass may still lock."""
@@ -738,11 +817,12 @@ class SharedKvOrchestrator:
         # Nor those the store held at the probe, a resumed fetch's past its end included.
         start = max(published, min(request.py_store_hit_tokens or 0, committed_end))
         if self._policy.memory_kind is MemoryKind.HOST:
-            return start, min(committed_end, start + self._policy.publication_tokens), committed_end
+            longest = self._policy.staging.longest * tpb
+            return start, min(committed_end, start + longest), committed_end
         return start, committed_end, committed_end
 
     def _publish(self, request: LlmRequest, start: int, end: int, ready: torch.cuda.Event) -> None:
-        tpb, memory_kind = self._tokens_per_block, self._policy.memory_kind
+        memory_kind = self._policy.memory_kind
         op = StoreOp(
             seq=next(self._seq),
             kind=OpKind.PUBLISH,
@@ -751,14 +831,13 @@ class SharedKvOrchestrator:
             state=OpState.OPEN,
             start=start,
             end=end,
-            blocks_put=self._replicas.blocks_put(start // tpb, end // tpb, memory_kind),
         )
         request.py_published_end = end
-        # Under GPU Direct every replica lends the range, so its pages lock alike on every rank;
-        # under host staging a replica that puts nothing lends nothing (a host lease locks no page).
-        lends = op.blocks_put > 0 or memory_kind is MemoryKind.DEVICE
-        # A range that does not start (a lend refused) closes like one that put nothing.
-        if lends and not self._start(op, ready):
+        # Under GPU Direct every replica lends and submits the range, so its pages lock alike on
+        # every rank; under host staging a replica that puts nothing lends nothing (a host lease
+        # locks no page). A range that does not start (a lend refused) closes like one that put
+        # nothing.
+        if self._replicas.lends(memory_kind) and not self._start(op, ready):
             self.counters["publications_not_started"] += 1
         self._ops.append(op)
         self.counters["publications_started"] += 1
@@ -777,7 +856,7 @@ class SharedKvOrchestrator:
         try:
             lease = lend(
                 op.request,
-                op.start,
+                op.start if fetch else self._read_start(op.start),
                 op.end,
                 memory_kind=op.memory_kind,
                 rows=RowSelection.NAMED,
@@ -794,11 +873,6 @@ class SharedKvOrchestrator:
                 key=re.sub(r"\d+", "#", lease.failure),
             )
             return False
-        if not fetch and op.blocks_put == 0:
-            # Other replicas put these blocks; this rank holds its pages' lock like theirs until
-            # a round returns the lease, after every rank's access ended.
-            op.lease = lease
-            return True
         intent = TransferIntent(
             BINDING_ID,
             PROFILE_ID,
@@ -813,6 +887,15 @@ class SharedKvOrchestrator:
             return False
         op.operation_id = result.operation_id
         return True
+
+    def _read_start(self, start: int) -> int | list[int]:
+        """A publication's lend start: ``start`` under full attention; per layer group with
+        windows, a windowed group from block 0, so the lender lends its sinks and every window row
+        needed at the range's end, the rows below ``start`` included (fetched, reused locally or
+        computed by an earlier step)."""
+        if not self._windowed:
+            return start
+        return [0 if windowed else start for windowed in self._windowed_groups]
 
     def _store_failed(self, reason: str) -> None:
         """This rank's lender or store binding stopped. With peers the server ends: this rank's

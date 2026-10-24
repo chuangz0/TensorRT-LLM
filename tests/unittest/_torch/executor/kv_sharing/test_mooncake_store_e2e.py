@@ -171,7 +171,7 @@ def test_publication_stores_whole_prompt_blocks_and_keeps_output(
     assert store.readable_objects("overlap") == (stored, stored)  # no generated block came later
     counters = executor.kv_sharing.counters
     assert counters["publications_started"] == 2
-    assert counters["published_blocks"] == stored
+    assert counters["published_objects"] == stored
     assert counters["publications_not_started"] == counters["publications_failed"] == 0
 
 
@@ -219,7 +219,7 @@ def test_chunked_prefill_publishes_each_chunk_and_keeps_output(
     assert tokens == reference
     counters = executor.kv_sharing.counters
     assert counters["publications_started"] == 4  # [0, 256), [256, 512), [512, 768), [768, 992)
-    assert counters["published_blocks"] == P_BLOCKS
+    assert counters["published_objects"] == P_BLOCKS
     assert counters["publications_not_started"] == counters["publications_failed"] == 0
 
 
@@ -339,7 +339,7 @@ def test_a_fresh_server_fetches_a_prefix_published_on_the_other_data_path_exactl
     assert fetched.cached_tokens == FETCHED
     counters = executor.kv_sharing.counters
     assert counters["fetches_started"] == counters["fetches_resumed"] == 1
-    assert counters["fetched_blocks"] == FETCHED_BLOCKS
+    assert counters["fetched_blocks"] == counters["fetched_objects"] == FETCHED_BLOCKS
     assert counters["fetched_bytes"] == FETCHED_BLOCKS * block_bytes()
     assert list(salted.outputs[0].token_ids) == sibling_references["whole"]["exact"]
     assert salted.cached_tokens == 0

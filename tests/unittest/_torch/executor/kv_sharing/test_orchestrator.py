@@ -14,7 +14,8 @@
 # limitations under the License.
 """The orchestrator over a fake lender, a fake store and the real transfer manager holding leases:
 what the rounds do with fetches and publications, what a cancel, a stopped lender and the shutdown
-leave behind, and what bounds publications on each data path."""
+leave behind, what bounds publications on each data path, and where a model with a sliding window
+fetches to and what it publishes."""
 
 import time
 from types import SimpleNamespace
@@ -43,7 +44,9 @@ from tensorrt_llm._torch.pyexecutor.kv_sharing.orchestrator import (
     PROFILE_ID,
     SharedKvOrchestrator,
     SharingPolicy,
+    StagingBudget,
 )
+from tensorrt_llm._torch.pyexecutor.kv_sharing.startup import _staging_budget
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 
 pytestmark = pytest.mark.cpu_only
@@ -53,19 +56,28 @@ REGION = MemoryRegion("layout", 4096, 64, 16, 4, (0,), MemoryKind.HOST)  # four 
 POOL = MemoryRegion("pool", 1 << 20, 1024, 16, 64, (0,), MemoryKind.DEVICE)  # the KV cache's
 PROMPT = 13  # three whole blocks before the last token
 PROMPT_PAGES = 5  # the prompt's four pages and one step
+WINDOW_ROWS = 2  # the rows a windowed layer group lends: its window of two blocks
+# Staging for three blocks of open publications beside a fetch, one layer group.
+THREE_BLOCKS = StagingBudget(free_rows=(3,), rows_per_block=(1,), window_rows=(0,))
 
 
 class Lease:
     def __init__(
-        self, rows: int, memory_kind: MemoryKind, failure: str | None, ready_event
+        self, rows: list[int], memory_kind: MemoryKind, failure: str | None, ready_event
     ) -> None:
-        ordinals, keys = np.arange(rows, dtype=np.int64), np.zeros((rows, 54), dtype=np.uint8)
-        if memory_kind is MemoryKind.HOST:
-            addresses = REGION.address + REGION.slot_bytes * ordinals
-            group = LentLayerGroupRows(0, ordinals, keys, addresses, 0)
-        else:
-            group = LentLayerGroupRows(0, ordinals, keys, slots=ordinals, region_indices=(1,))
-        self.view = LeaseView((group,))
+        """Lends ``rows[lg]`` rows of each layer group ``lg``."""
+        groups = []
+        for lg, count in enumerate(rows):
+            ordinals = np.arange(count, dtype=np.int64)
+            keys = np.zeros((count, 54), dtype=np.uint8)
+            if memory_kind is MemoryKind.HOST:
+                addresses = REGION.address + REGION.slot_bytes * ordinals
+                groups.append(LentLayerGroupRows(lg, ordinals, keys, addresses, 0))
+            else:
+                groups.append(
+                    LentLayerGroupRows(lg, ordinals, keys, slots=ordinals, region_indices=(1,))
+                )
+        self.view = LeaseView(tuple(groups))
         self.failure = failure
         self.ready_event = ready_event
         self.released = False
@@ -78,21 +90,35 @@ class Lease:
 
 
 class Lender:
-    """Lends every range at once, or refuses it; a returned fetch settles when ``settle`` says."""
+    """Lends every range at once, or refuses it; a returned fetch settles when ``settle`` says.
+    Its layer group keeps the whole context; with ``windowed`` a second one keeps a window of
+    WINDOW_ROWS blocks, whose every lease lends WINDOW_ROWS rows."""
 
     regions = (REGION, POOL)
 
-    def __init__(self) -> None:
+    def __init__(self, windowed: bool = False) -> None:
         self.stopped = False
         self.refusal: str | None = None
         self.lend_error: Exception | None = None
         self.settled: set[int] = set()
         self.leases: list[Lease] = []
+        self.ranges: list[tuple] = []  # (start, end) of each lend
+        groups = [SimpleNamespace(kept_window=None, num_sink_blocks=0, pool_group=0)]
+        if windowed:
+            window = SimpleNamespace(kept_window=WINDOW_ROWS * TPB, num_sink_blocks=0, pool_group=0)
+            groups.append(window)
+        self.page_layout = SimpleNamespace(
+            layer_groups=tuple(groups), pool_slot_bytes={0: (REGION.slot_bytes,)}
+        )
 
     def _lend(self, request, start, end, *, memory_kind, rows, ready_event) -> Lease:
         if self.lend_error is not None:
             raise self.lend_error
-        self.leases.append(Lease((end - start) // TPB, memory_kind, self.refusal, ready_event))
+        self.ranges.append((start, end))
+        full_start = start[0] if isinstance(start, list) else start
+        windows = len(self.page_layout.layer_groups) - 1
+        counts = [(end - full_start) // TPB] + [WINDOW_ROWS] * windows
+        self.leases.append(Lease(counts, memory_kind, self.refusal, ready_event))
         return self.leases[-1]
 
     lend_read = lend_write = _lend
@@ -213,9 +239,11 @@ class Server:
         monkeypatch: pytest.MonkeyPatch,
         memory_kind: MemoryKind = MemoryKind.HOST,
         min_over_ranks=None,
+        windowed: bool = False,
+        max_fetch_tokens: int = 16 * TPB,
     ):
         monkeypatch.setattr(torch.cuda, "Event", Event)
-        self.lender, self.store, self.manager = Lender(), Store(), Manager()
+        self.lender, self.store, self.manager = Lender(windowed), Store(), Manager()
         self.transfers = TransferManager(wake=lambda: None, hold_returns=True)
         self.transfers.assemble(
             BINDING_ID,
@@ -235,9 +263,9 @@ class Server:
             fetch=True,
             publish=True,
             min_fetch_tokens=TPB,
-            max_fetch_tokens=16 * TPB,
+            max_fetch_tokens=max_fetch_tokens,
             fetch_timeout_s=60.0,
-            publication_tokens=3 * TPB if memory_kind is MemoryKind.HOST else None,
+            staging=THREE_BLOCKS if memory_kind is MemoryKind.HOST else None,
             max_util_for_resume=1.0,
         )
         self.orchestrator = SharedKvOrchestrator(
@@ -307,6 +335,8 @@ def test_a_fetch_whose_every_row_arrived_resumes_once_its_copy_settled(server):
     server.iterate()
     assert server.manager.resumed == {1: 8} and fetched.py_published_end == 8
     assert server.counters["fetches_resumed"] == 1 and server.counters["fetched_blocks"] == 2
+    assert server.counters["fetched_objects"] == 2
+    assert server.counters["fetched_bytes"] == 2 * REGION.slot_bytes
 
 
 def test_the_shutdown_drops_parked_and_settling_fetches_and_returns_their_leases(server):
@@ -388,7 +418,7 @@ def test_a_publication_that_does_not_fit_waits_for_the_open_one(server):
     server.iterate()
     server.store.end(1)
     server.iterate()
-    assert server.counters["published_blocks"] == 6
+    assert server.counters["published_objects"] == 6
 
 
 def test_blocks_another_server_is_still_putting_are_skipped_not_failed(server):
@@ -402,8 +432,8 @@ def test_blocks_another_server_is_still_putting_are_skipped_not_failed(server):
     attempt.ended = True
     server.iterate()
     assert server.lender.leases[0].released
-    assert server.counters["published_blocks"] == 1
-    assert server.counters["publication_blocks_skipped"] == 2
+    assert server.counters["published_objects"] == 1
+    assert server.counters["publication_objects_skipped"] == 2
     assert server.counters["publications_failed"] == 0
 
 
@@ -418,7 +448,8 @@ def test_a_publication_the_store_faulted_counts_as_failed(server):
     server.iterate()
     assert server.lender.leases[0].released
     assert server.counters["publications_failed"] == 1
-    assert server.counters["published_blocks"] == server.counters["publication_blocks_skipped"] == 0
+    assert server.counters["published_objects"] == 0
+    assert server.counters["publication_objects_skipped"] == 0
 
 
 def test_a_gpu_direct_publication_waits_while_its_locked_pages_would_crowd_out_resumes(
@@ -526,3 +557,64 @@ def test_refreshed_hits_update_only_waiting_requests(server):
     server.orchestrator.apply_refreshed_hits(waiting, ((1, 16), (9, 4)))  # 9 no longer waits
     assert [item.store_hit_tokens for item in waiting] == [16, 8]
     assert server.counters["hits_refreshed"] == 1
+
+
+def test_a_windowed_publication_lends_each_window_from_block_0_and_counts_objects_from_its_view(
+    monkeypatch,
+):
+    """A request whose first block the store held publishes blocks 1 and 2: the full group from
+    the range's start, the windowed one from block 0. The view holds 2 plus 2 rows; the store takes
+    3 of the 4 objects, the fourth was another server's open put."""
+    server = Server(monkeypatch, windowed=True)
+    try:
+        server.manager.kv_cache_map[1] = object()
+        server.orchestrator.publish_committed_blocks([request(1, stored=TPB, computed=PROMPT)])
+        assert server.lender.ranges == [([TPB, 0], 3 * TPB)]
+        server.iterate()  # the store starts writing
+        attempt = server.store.attempts[0]
+        assert [len(group) for group in attempt.view.groups] == [2, WINDOW_ROWS]
+        delivered = (np.array([True, True]), np.array([True, False]))
+        attempt.outcome = Outcome.for_view(attempt.view, delivered)
+        attempt.ended = True
+        server.iterate()
+        assert server.counters["published_objects"] == 3
+        assert server.counters["publication_objects_skipped"] == 1
+    finally:
+        server.shut_down()
+
+
+def test_a_windowed_fetch_longer_than_max_fetch_tokens_computes_instead_of_being_cut(monkeypatch):
+    """A windowed group's rows are stored only at the ends publications reached: a fetch cut
+    shorter would miss them, so the request computes its prompt."""
+    server = Server(monkeypatch, windowed=True, max_fetch_tokens=TPB)
+    try:
+        server.orchestrator.add_fetch_candidates([request(1, stored=2 * TPB)])
+        assert server.orchestrator.start_fetches() == set() and not server.lender.ranges
+        assert server.counters["fetches_skipped_too_long"] == 1
+    finally:
+        server.shut_down()
+
+
+def test_host_staging_holds_one_window_per_publication_beside_a_fetch():
+    """Staging less one fetch's rows, per region. gemma-3's shape: a region of its windowed group
+    (512 tokens, 16 blocks of 32) with two fetches' slots, and a region of its full group; a fetch
+    of 256 blocks."""
+    windowed = SimpleNamespace(kept_window=512, num_sink_blocks=0)
+    full = SimpleNamespace(kept_window=None, num_sink_blocks=0)
+    staging = (
+        MemoryRegion("windowed", 1 << 30, 32, 1, 32, (0,), MemoryKind.HOST),
+        MemoryRegion("full", 2 << 30, 512, 1, 512, (1,), MemoryKind.HOST),
+    )
+    lender = SimpleNamespace(
+        page_layout=SimpleNamespace(layer_groups=(windowed, full)), regions=(*staging, POOL)
+    )
+    budget = _staging_budget(lender, fetch_tokens=256 * 32, tokens_per_block=32)
+    assert budget == StagingBudget(free_rows=(16, 256), rows_per_block=(0, 1), window_rows=(16, 0))
+    # One publication at a time, of up to 256 blocks: the windowed region holds one window.
+    assert budget.longest == 256 and budget.fits(256, [])
+    assert not budget.fits(1, [1])
+    # gpt-oss's shape: one region serves a full group and a window of 4 blocks.
+    shared = StagingBudget(free_rows=(260,), rows_per_block=(1,), window_rows=(4,))
+    assert shared.longest == 256 and shared.fits(150, [100]) and not shared.fits(153, [100])
+    # Full attention alone: the budget counts blocks, as a token budget did.
+    assert THREE_BLOCKS.longest == 3 and THREE_BLOCKS.fits(2, [1]) and not THREE_BLOCKS.fits(1, [3])

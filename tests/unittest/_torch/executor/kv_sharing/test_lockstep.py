@@ -54,6 +54,7 @@ from tensorrt_llm._torch.pyexecutor.kv_sharing.orchestrator import (
     PROFILE_ID,
     SharedKvOrchestrator,
     SharingPolicy,
+    StagingBudget,
 )
 from tensorrt_llm._torch.pyexecutor.kv_sharing.replicas import ReplicaSet, replica_set
 from tensorrt_llm._torch.pyexecutor.kv_sharing.store_ops import OpKind, OpState, StoreOp
@@ -73,6 +74,8 @@ FETCH_TIMEOUT_S = 5.5
 RANKS = 4
 # A fetch appended in pass i is covered by pass i+2's round at the latest (pass i+1 announces it).
 COVERED_WITHIN_PASSES = 2
+# Host staging for twelve blocks of open publications beside a fetch.
+TWELVE_BLOCKS = StagingBudget(free_rows=(12,), rows_per_block=(1,), window_rows=(0,))
 _clock = threading.local()
 _real_monotonic = time.monotonic
 
@@ -154,9 +157,14 @@ class Lease:
 
 class Lender:
     """Lends every range; GPU Direct leases lock their request's pages until they go back. A
-    returned host staging fetch settles after a random number of progress calls."""
+    returned host staging fetch settles after a random number of progress calls. One layer group,
+    of full attention."""
 
     regions = (REGION, POOL)
+    page_layout = SimpleNamespace(
+        layer_groups=(SimpleNamespace(kept_window=None, num_sink_blocks=0, pool_group=0),),
+        pool_slot_bytes={0: (REGION.slot_bytes,)},
+    )
     stopped = False
 
     def __init__(self, rng: random.Random) -> None:
@@ -259,7 +267,8 @@ class Store:
         return attempt
 
     def publish(self, view, hint):
-        self.put[lease_key(view)] = view.groups[0].page_ordinals.tolist()
+        if len(view.groups[0]):  # a replica's empty stripe puts nothing and names no lease
+            self.put[lease_key(view)] = view.groups[0].page_ordinals.tolist()
         return self.fetch(view, hint)
 
     def tick(self, iteration: int) -> None:
@@ -271,10 +280,11 @@ class Store:
             draw = self.rng.random()
             if draw < 0.15:
                 masks, fault = attempt.view.row_masks(False), "the store failed"
-            elif draw < 0.3:
+            elif draw < 0.3 and len(masks[0]):
                 masks[0][-1] = False
             attempt.outcome, attempt.ended = Outcome.for_view(attempt.view, masks, fault), True
-            self.ended[lease_key(attempt.view)] = iteration
+            if len(attempt.view.groups[0]):
+                self.ended[lease_key(attempt.view)] = iteration
             self.running.remove(attempt)
 
     def shutdown(self, timeout: float) -> frozenset:
@@ -381,7 +391,7 @@ def run_rank(
             min_fetch_tokens=TPB,
             max_fetch_tokens=16 * TPB,
             fetch_timeout_s=FETCH_TIMEOUT_S,
-            publication_tokens=12 * TPB if memory_kind is MemoryKind.HOST else None,
+            staging=TWELVE_BLOCKS if memory_kind is MemoryKind.HOST else None,
             max_util_for_resume=1.0,
         ),
         kv_cache_manager=manager,
@@ -568,16 +578,19 @@ def test_a_table_that_differs_on_one_rank_ends_every_rank_in_the_same_round() ->
 
 def test_replicas_under_gpu_direct_put_each_published_block_once_between_them() -> None:
     """Ranks holding the same bytes: each lends every publication's range, which locks its pages
-    alike, and puts the blocks of its stripe; a rank with nothing to put holds its lock until the
-    round that follows the others' puts."""
+    alike, and submits the blocks of its stripe; a rank whose stripe is empty submits an empty view
+    and holds its lock until the round that follows the others' puts."""
     records = records_of(run_ranks(MemoryKind.DEVICE, seed=0, replicated=True)[0])
     assert_lockstep(records)
     publications = {key for key in records[0].lent if key[1] == OpKind.PUBLISH.value}
     assert len(publications) > 5, publications
+    empty_stripes = 0
     for key in publications:
         assert all(record.lent[key] == records[0].lent[key] for record in records), key
         put = sorted(block for record in records for block in record.put.get(key, []))
         assert put == records[0].lent[key], (key, [record.put.get(key) for record in records])
+        empty_stripes += sum(key not in record.put for record in records)
+    assert empty_stripes, "no publication left a replica without a block to put"
 
 
 def test_ranks_holding_the_same_share_of_every_layer_group_form_one_replica_set() -> None:

@@ -49,6 +49,8 @@ class _Prompt:
     tokens: np.ndarray  # int32
     cache_salt: Optional[str]
     num_blocks: int
+    # The largest answer: see ``_prompt_to_probe``.
+    answer_limit: int
 
 
 @dataclass
@@ -69,12 +71,14 @@ class _Hit:
 
 
 class ProbeService:
-    """Asks the store, on its own thread, how many leading whole blocks of each new prompt it
-    holds, and keeps rank 0's requests out of the broadcast until the answer came or the hold limit
-    passed. A request leaves with ``store_hit_tokens`` set to the answer, or ``None`` unanswered.
-    A block counts only where the store holds every share of it, in every layer group: each rank
-    reads its own shares. Requests that left with a hit worth fetching are probed again every
-    REFRESH_AFTER_S while they wait, and ``take_refreshed_hits`` reports the hits that changed.
+    """Asks the store, on its own thread, how much of each new prompt a fetch can read from it, and
+    keeps rank 0's requests out of the broadcast until the answer came or the hold limit passed. A
+    request leaves with ``store_hit_tokens`` set to the answer, or ``None`` unanswered. The answer
+    is the lender's ``usable_end`` of the blocks the store holds per layer group, a block counting
+    where the store holds every share of it (each rank reads its own shares): the leading run of
+    whole blocks under full attention; with a sliding window, an end a publication reached. Requests
+    that left with a hit worth fetching are probed again every REFRESH_AFTER_S while they wait, and
+    ``take_refreshed_hits`` reports the hits that changed.
 
     Args:
         lender: Names the blocks as a publication names them.
@@ -85,6 +89,7 @@ class ProbeService:
             probed, as a fetch leaves the last prompt token to compute.
         shares_per_group: How many distinct shares each layer group's content is split into
             (one per tensor-parallel rank with KV heads of its own; 1 for MLA and attention DP).
+        windowed: Whether a layer group keeps a sliding window.
         hold_s: Longest a request waits for its answer.
         clock: Monotonic seconds.
     """
@@ -98,6 +103,7 @@ class ProbeService:
         tokens_per_block: int,
         min_fetch_tokens: int,
         shares_per_group: Sequence[int],
+        windowed: bool,
         hold_s: float,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -109,6 +115,9 @@ class ProbeService:
         self._min_fetch_tokens = min_fetch_tokens
         self._shares_per_group = tuple(shares_per_group)
         self._keys_per_block = sum(shares_per_group)  # one key per (layer group, share) per block
+        # The first key row of each layer group among a prompt's rows, group-major.
+        self._group_rows = np.cumsum((0, *self._shares_per_group[:-1]))
+        self._windowed = windowed
         self._hold_s = hold_s
         self._clock = clock
         # Guards the six fields below and wakes the probe thread.
@@ -223,10 +232,15 @@ class ProbeService:
         tokens = request.input_token_ids
         if len(tokens) <= self._min_fetch_tokens:
             return None
-        # Every whole block: a fetch still stops before the last prompt token, and a publication
-        # starts past every block the store holds, the one ending the prompt included.
-        num_blocks = len(tokens) // self._tokens_per_block
-        return _Prompt(item.id, np.asarray(tokens, dtype=np.int32), request.cache_salt, num_blocks)
+        tpb = self._tokens_per_block
+        num_blocks = len(tokens) // tpb
+        # The answer is also where a publication starts. Without a window a fetch cuts it before
+        # the last prompt token itself, so it may name every whole block (and a publication then
+        # skips the block ending a whole-block prompt); with one a fetch takes the answer exactly,
+        # so it ends at the whole blocks before the last prompt token.
+        answer_limit = (len(tokens) - 1) // tpb * tpb if self._windowed else num_blocks * tpb
+        prompt = np.asarray(tokens, dtype=np.int32)
+        return _Prompt(item.id, prompt, request.cache_salt, num_blocks, answer_limit)
 
     def _leaves(self, item: RequestQueueItem, now: float, release: bool) -> bool:
         """Whether a request leaves the hold now, setting its answer if it came; a hit worth
@@ -294,9 +308,9 @@ class ProbeService:
                     self._refreshed[prompt.request_id] = (answer, probed_at)
 
     def _probe(self, batch: list[_Prompt]) -> list[Optional[int]]:
-        """Each prompt's leading tokens of which the store holds every share of every layer
-        group, in whole blocks; ``None`` for every one where naming or the store call failed. One
-        driver call for the batch; the driver asks PROBE_KEYS_PER_CALL keys per store call."""
+        """Each prompt's usable end; ``None`` for every one where naming, the store call or the
+        lender's rule failed. One driver call for the batch; the driver asks PROBE_KEYS_PER_CALL
+        keys per store call."""
         try:
             names = np.concatenate(
                 [
@@ -314,19 +328,26 @@ class ProbeService:
             hexed, width = names.tobytes().hex(), 2 * names.shape[1]  # one pass for the batch
             keys = [self._key_stem + hexed[i : i + width] for i in range(0, len(hexed), width)]
             statuses = self._driver.probe(keys, self._hold_s)
+            held = np.fromiter((status is ProbeStatus.HIT for status in statuses), dtype=bool)
+            answers = self._usable_ends(batch, held)
         except Exception as error:  # the requests compute their prompts
             self.counters["probe_errors"] += 1
             logger.warning_once(f"kv_sharing: a store probe failed: {error!r}", key="probe")
             return [None] * len(batch)
-        held = np.fromiter((status is ProbeStatus.HIT for status in statuses), dtype=bool)
+        self.counters["probes"] += 1
+        return answers
+
+    def _usable_ends(self, batch: list[_Prompt], held: np.ndarray) -> list[int]:
+        """Each prompt's usable end by the lender's rule, given ``held``, whether the store holds
+        each of the batch's keys."""
         rows = self._keys_per_block
         answers, offset = [], 0
         for prompt in batch:
             size = rows * prompt.num_blocks
-            # rows: one per (layer group, share); columns: blocks.
-            present = held[offset : offset + size].reshape(rows, prompt.num_blocks).all(axis=0)
+            # Rows: one per (layer group, share), group-major; columns: blocks.
+            present = held[offset : offset + size].reshape(rows, prompt.num_blocks)
             offset += size
-            leading = prompt.num_blocks if present.all() else int(np.argmin(present))
-            answers.append(leading * self._tokens_per_block)
-        self.counters["probes"] += 1
+            # One mask per layer group: a block counts where every share of it is held.
+            by_group = np.logical_and.reduceat(present, self._group_rows, axis=0)
+            answers.append(self._lender.usable_end(by_group, known=0, limit=prompt.answer_limit))
         return answers
