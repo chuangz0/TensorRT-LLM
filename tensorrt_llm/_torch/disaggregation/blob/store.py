@@ -394,9 +394,8 @@ class StoreDriver(Protocol):
         budget whatever the store does, and a driver with no capacity to ask answers UNKNOWN at
         once. A caller may count any UNKNOWN as a failed probe. A key held by an unfinished write
         is NOT_READY, as a get would report, or MISS where the store cannot tell it from an absent
-        key. Called only when ``capabilities.probe`` is
-        set, and with a hint only when ``capabilities.hints`` is. Raises on a store error rather
-        than answering MISS.
+        key. Called only when ``capabilities.probe`` is set, and with a hint only when
+        ``capabilities.hints`` is. Raises on a store error rather than answering MISS.
         """
         ...
 

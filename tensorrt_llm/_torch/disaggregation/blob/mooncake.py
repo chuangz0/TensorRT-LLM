@@ -127,8 +127,6 @@ _MISS = RowResult(RowStatus.MISS)
 _NOT_READY = RowResult(RowStatus.NOT_READY)
 _DECLINED = RowResult(RowStatus.DECLINED)
 
-# Why a row was skipped (nothing moved and nothing went wrong); ``stats()`` counts skipped rows by
-# reason and result.
 # get -703: no complete replica, as while the object is written or once its replica's endpoint
 # went stale.
 _BEING_WRITTEN = "being_written"
@@ -146,6 +144,8 @@ _ANOTHER_WRITER = "another_writer"
 # evicts within milliseconds to make room (Mooncake 0.3.13), so it is warned about once per
 # process, not per operation.
 _POOL_FULL = "pool_full"
+# The result each skip reason gives (nothing moved and nothing went wrong); ``stats()`` counts
+# skipped rows by reason and result.
 _SKIPS = {
     _BEING_WRITTEN: _NOT_READY,
     _OWN_SESSION_OPEN: _NOT_READY,

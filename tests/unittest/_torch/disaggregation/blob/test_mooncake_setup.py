@@ -134,12 +134,15 @@ def test_unknown_keys_and_values_of_the_wrong_type_are_rejected(case: str) -> No
         load_store_config(config)
 
 
-def test_store_config_reads_a_yaml_file(tmp_path: pathlib.Path) -> None:
+def test_store_config_reads_a_yaml_file_and_names_it_in_errors(tmp_path: pathlib.Path) -> None:
     path = tmp_path / "store.yaml"
     path.write_text(yaml.safe_dump(store_config(local_buffer_size=0)))
     blob, mooncake = load_store_config(path)
     assert blob == BlobConfig(key_prefix="t", rows_per_batch=4)
     assert mooncake == MooncakeConfig(MASTER, 0, protocol="tcp", local_buffer_size=0)
+    path.write_text(yaml.safe_dump({**store_config(), "blob": {"workers": 2.5}}))
+    with pytest.raises(ValueError, match=f"store config {path}, section 'blob': .*workers"):
+        load_store_config(path)
 
 
 # Opening the SDK.

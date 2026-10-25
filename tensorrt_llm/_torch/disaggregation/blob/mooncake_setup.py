@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opening Mooncake from a store config: the deployment glue around the driver.
 
-A store config has two sections: ``blob``, handed back untouched for the backend to read, and
-``mooncake``, read here. ``make_store_driver`` picks the driver: the native one, whose store calls
-run on C++ threads that never hold the GIL, wherever it can run, or the Python one.
+A store config has two sections, both read here: ``blob`` into the backend's ``BlobConfig``, and
+``mooncake``. ``make_store_driver`` picks the driver: the native one, whose store calls run on C++
+threads that never hold the GIL, wherever it can run, or the Python one.
 
 Mooncake reads its own environment variables, some once per process (``MOONCAKE_STORE_CHECKSUM``),
 some per client (``MC_STORE_MEMCPY``) and ``MC_TCP_PROTO`` on every transfer; this module logs them
-before setup and sets only the two RPC timeouts, from the config.
+before setup and sets only the two RPC timeouts: the call timeout from the config, the connect
+timeout to RPC_CONNECT_TIMEOUT_MS.
 
 Over RDMA, a process that used ibverbs before its first Mooncake client (importing
 ``tensorrt_llm`` does) logs ``RDMA context setup failed: fork compatibility: Invalid argument``
@@ -47,7 +48,8 @@ SDK_VERSION = "0.3.13"
 IB_SYSFS_ROOT = "/sys/class/infiniband"
 MASTER_WAIT_S = 60.0
 MASTER_RETRY_S = 0.5
-# How long one connection to the master may take; setup runs once the master accepts connections.
+# How long one connection to the master may take; short, as ``open_sdk`` first waits
+# (MASTER_WAIT_S) until the master accepts connections.
 RPC_CONNECT_TIMEOUT_MS = 5_000
 SECTIONS = ("blob", "mooncake")
 DRIVERS = ("auto", "native", "python")
@@ -133,26 +135,28 @@ def load_store_config(config: str | os.PathLike | Mapping) -> tuple[BlobConfig, 
         ValueError: An unknown section or key, a missing ``mooncake`` section or required key, or
             a value of the wrong type.
     """
-    document = config
-    if not isinstance(document, Mapping):
+    if isinstance(config, Mapping):
+        document, name = config, "store config"
+    else:
         with open(config) as file:
             document = yaml.safe_load(file)
+        name = f"store config {config}"
     if not isinstance(document, Mapping):
-        raise ValueError(f"store config {config} is not a mapping")
+        raise ValueError(f"{name} is not a mapping")
     unknown = sorted(set(document) - set(SECTIONS))
     if unknown:
-        raise ValueError(f"store config: unknown sections {unknown}; it has {list(SECTIONS)}")
+        raise ValueError(f"{name}: unknown sections {unknown}; it has {list(SECTIONS)}")
     blob, section = document.get("blob") or {}, document.get("mooncake")
     if not isinstance(blob, Mapping) or not isinstance(section, Mapping):
-        raise ValueError("store config: 'mooncake' is a required mapping, 'blob' an optional one")
+        raise ValueError(f"{name}: 'mooncake' is a required mapping, 'blob' an optional one")
     try:
         mooncake = MooncakeConfig(**section)
     except (TypeError, ValueError) as error:  # an unknown or missing key, or a bad value
-        raise ValueError(f"store config section 'mooncake': {error}") from error
+        raise ValueError(f"{name}, section 'mooncake': {error}") from error
     try:
         return BlobConfig(**blob), mooncake
     except (TypeError, ValueError) as error:
-        raise ValueError(f"store config section 'blob': {error}") from error
+        raise ValueError(f"{name}, section 'blob': {error}") from error
 
 
 def open_sdk(config: MooncakeConfig) -> Any:
