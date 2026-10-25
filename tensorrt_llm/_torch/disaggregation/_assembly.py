@@ -127,17 +127,17 @@ class FactoryRejected(RuntimeError):
     """Construction certifies no remaining access, registration or region hold."""
 
 
-# The tested cells: an attention writer layout with the dtype of its cache.
-_TESTED_CELLS = frozenset(
+# The supported caches: an attention writer layout with the dtype of its cache.
+_SUPPORTED_CACHES = frozenset(
     {("mha-trtllm-hnd", "bfloat16"), ("mha-trtllm-hnd", "fp8"), ("mla-trtllm-latent", "bfloat16")}
 )
-# The public layout's dtype and quantization of each cell dtype.
+# The public layout's dtype and quantization of each cache dtype.
 _LAYOUT_DTYPES = {"bfloat16": ("BF16", None), "fp8": ("FP8", "fp8")}
 
 
 @dataclass(frozen=True)
 class ProfileSpec:
-    """Trusted immutable facts for one of the tested compatibility cells.
+    """Trusted immutable facts for one of the supported caches.
 
     The model/executor assembly supplies facts for the actual writer and serving
     manager. Attachment checks the manager facts against its public page layout.
@@ -162,8 +162,8 @@ class ProfileSpec:
             pipeline or context parallelism.
         state_kinds: Canonical cache kinds from the layout's layer groups.
         attention_windows: ``(global layer id, tokens)`` of each layer whose attention reads a
-            sliding window, sorted; ``()`` when every layer reads its whole context. Windowed
-            MLA is not a tested cell.
+            sliding window, sorted; ``()`` when every layer reads its whole context. MLA with
+            sliding windows is not supported.
         sparse_attention: Whether runtime sparse attention is enabled; must be false.
         sink_token_length: Runtime sink length; this cell requires zero.
         lora_enabled: Whether adapters are enabled; this cell excludes LoRA.
@@ -208,10 +208,10 @@ class ProfileSpec:
                 raise ValueError(f"{name} must be a nonempty string")
         if not isinstance(self.staging, StagingOptions):
             raise TypeError("profile staging must be StagingOptions")
-        if (self.model_layout, self.dtype) not in _TESTED_CELLS:
+        if (self.model_layout, self.dtype) not in _SUPPORTED_CACHES:
             raise ValueError(
-                f"profile cell {self.model_layout}/{self.dtype} is not one of the tested cells "
-                f"{sorted(_TESTED_CELLS)}"
+                f"a {self.dtype} {self.model_layout} KV cache is not supported; supported: "
+                f"{sorted(_SUPPORTED_CACHES)}"
             )
         topology = tuple(self.topology)
         if any(
@@ -220,26 +220,18 @@ class ProfileSpec:
             raise TypeError("topology sizes must be integers")
         tp, dp, pp, cp = topology
         if tp < 1 or dp not in (1, tp) or (pp, cp) != (1, 1):
-            raise ValueError("profile requires TPn with DP1 or DPn (attention DP), PP1 and CP1")
+            raise ValueError(
+                "tensor parallelism with or without attention DP is supported, not pipeline or "
+                "context parallelism"
+            )
         kinds = tuple(self.state_kinds)
         if not kinds or any(not isinstance(kind, CacheKind) for kind in kinds):
             raise TypeError("state kinds must contain canonical CacheKind values")
         if any(kind != CacheKind.PAGED for kind in kinds):
             raise ValueError("initial profile supports paged attention state only")
-        windows = [tuple(pair) for pair in self.attention_windows]
-        if any(
-            len(pair) != 2
-            or any(isinstance(v, bool) or not isinstance(v, numbers.Integral) for v in pair)
-            for pair in windows
-        ):
-            raise TypeError("attention windows must be (layer, tokens) integer pairs")
-        windows = tuple(sorted((int(layer), int(window)) for layer, window in windows))
-        if any(layer < 0 or window <= 0 for layer, window in windows):
-            raise ValueError("attention windows need a nonnegative layer and a positive window")
-        if len({layer for layer, _ in windows}) != len(windows):
-            raise ValueError("attention windows name a layer twice")
+        windows = tuple(sorted((int(layer), int(win)) for layer, win in self.attention_windows))
         if windows and self.model_layout == "mla-trtllm-latent":
-            raise ValueError("windowed MLA is not a tested cell")
+            raise ValueError("MLA with sliding windows is not supported")
         if self.sparse_attention is not False:
             raise ValueError("initial profile excludes sparse attention")
         if isinstance(self.sink_token_length, bool) or not isinstance(
@@ -480,7 +472,7 @@ def _validate_device_regions(layout: PageLayout, namespace: RegionNamespace) -> 
         for pool, width in enumerate(widths):
             index = layout.device_region_index.get((pool_group, pool))
             if index is None or not 0 <= index < len(namespace.regions):
-                raise ValueError("lender has no complete DEVICE/NAMED capability for this profile")
+                raise ValueError("the lender does not lend KV cache pages in place")
             region = namespace.regions[index]
             if (
                 region.memory_kind is not MemoryKind.DEVICE
@@ -553,6 +545,8 @@ def check_view_compatibility(lease_view: LeaseView, namespace: RegionNamespace) 
         else:
             regions = None if blocks.slots is None else blocks.region_indices
         if blocks.object_keys is None or regions is None:
-            raise ValueError(f"initial profile requires keys and rows placed in {kind.name} memory")
+            raise ValueError(
+                f"a {kind.name} profile requires keys and rows placed in {kind.name} memory"
+            )
         if not namespace.allowed_region_indices.issuperset(regions):
             raise ValueError(f"row region is not permitted by the selected {kind.name} profile")

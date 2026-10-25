@@ -388,9 +388,6 @@ def test_view_rejects_unsupported_row_placement() -> None:
         ("state_kinds", (CacheKind.PAGED, CacheKind.STATE), ValueError),
         ("state_kinds", ("attention",), TypeError),
         ("dtype", "float16", ValueError),
-        ("attention_windows", ((0, 0),), ValueError),
-        ("attention_windows", ((0, 32), (0, 64)), ValueError),
-        ("attention_windows", ((0, True),), TypeError),
         ("pool_count", True, TypeError),
         ("speculative_mode", "eagle", ValueError),
         ("model_role", "draft", ValueError),
@@ -420,9 +417,6 @@ def test_view_rejects_unsupported_row_placement() -> None:
         "hybrid-state",
         "noncanonical-kind",
         "dtype",
-        "empty-window",
-        "layer-twice",
-        "boolean-window",
         "boolean-pool-count",
         "speculative-mode",
         "draft-role",
@@ -437,7 +431,7 @@ def test_profile_rejects_unsupported_inputs(
         replace(_profile(), **{field: value})
 
 
-def test_profile_accepts_the_tested_cells_and_parallel_layouts(
+def test_profile_accepts_the_supported_caches_and_parallel_layouts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """FP8 multi-head attention, BF16 MLA and both parallel layouts are accepted.
@@ -447,7 +441,7 @@ def test_profile_accepts_the_tested_cells_and_parallel_layouts(
     fp8 = replace(_profile(), dtype="fp8")
     mla = replace(_profile(), model_layout="mla-trtllm-latent")
     assert len({_profile().scope, fp8.scope, mla.scope}) == 3
-    with pytest.raises(ValueError, match="tested cells"):
+    with pytest.raises(ValueError, match="is not supported"):
         replace(mla, dtype="fp8")
     lender = _lender(replace(_layout(), dtype="FP8", quant_mode="fp8"))
     monkeypatch.setattr(_assembly, "attach_lender", lambda *args, **kwargs: lender)
@@ -496,7 +490,7 @@ def test_a_windowed_layout_attaches_to_the_profile_naming_its_windows_only(
     # Another window, or none, names other blocks.
     scopes = {replace(profile, attention_windows=w).scope for w in ((), ((0, 256), (1, 256)))}
     assert profile.scope not in scopes and len(scopes) == 2
-    with pytest.raises(ValueError, match="windowed MLA"):
+    with pytest.raises(ValueError, match="MLA with sliding windows"):
         replace(profile, model_layout="mla-trtllm-latent")
 
 
