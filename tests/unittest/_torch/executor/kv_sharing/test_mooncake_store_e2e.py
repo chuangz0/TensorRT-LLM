@@ -171,7 +171,7 @@ def test_publication_stores_whole_prompt_blocks_and_keeps_output(
         assert wait_until(lambda: not executor.disagg.has_pending_shared_transfers())
     finally:
         shut_down(llm)
-    assert tokens == references["store-off"]
+    assert tokens == references["fresh"]
     assert executor.disagg.shared_shutdown_complete()
     assert store.readable_objects("overlap") == (stored, stored)  # no generated block came later
     counters = executor.kv_sharing.counters
@@ -258,8 +258,9 @@ def settled(executor) -> bool:
 
 @pytest.fixture(scope="module")
 def references() -> dict[str, dict[str, list[int]]]:
-    """Greedy tokens from a server without the store: of P and Q ("store-off"), and of each
-    sibling computed whole and with P's first 16 blocks reused (P computed first)."""
+    """Greedy tokens of a server without the store: "fresh" for P and Q (nothing to reuse),
+    "whole" for each sibling under a salt of its own, "reused" for each sibling with P's first 16
+    blocks reused (P computed before it)."""
     with pytest.MonkeyPatch.context() as monkeypatch:
         llm = server(monkeypatch, in_process=True)
     try:
@@ -272,7 +273,7 @@ def references() -> dict[str, dict[str, list[int]]]:
     assert all(output.cached_tokens == 0 for output in whole.values())
     assert all(output.cached_tokens == FETCHED for output in reused.values())
     return {
-        "store-off": prompts,
+        "fresh": prompts,
         **{
             kind: {name: list(output.outputs[0].token_ids) for name, output in outputs.items()}
             for kind, outputs in (("whole", whole), ("reused", reused))

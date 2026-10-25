@@ -12,10 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""KV sharing through a real Mooncake store on several GPUs of one node: Qwen3-8B at TP2; one case
-per other model class and layout: DeepSeek-V3-Lite (MLA) at TP2 and under attention DP, Qwen3-8B
-with an FP8 KV cache at TP2, and the sliding-window models gemma-3-1b at TP1 and gpt-oss-20b at
-TP2, whose readers extend the writer's prompt.
+"""KV sharing through a real Mooncake store on several GPUs of one node: Qwen3-8B at TP2 (BF16 KV
+cache), and one case per other layout: DeepSeek-V3-Lite (MLA) at TP2 and under attention DP,
+Qwen3-8B with an FP8 KV cache at TP2, and the sliding-window models gemma-3-1b at TP1 and
+gpt-oss-20b at TP2, whose readers extend the writer's prompt.
 
 Each stored object is put once: each rank puts its own share of every prompt block, and ranks
 holding the same bytes (MLA's latent cache) put one stripe each, or under host staging the first
@@ -86,7 +86,6 @@ SIBLING = P[:FETCHED] + [_tokens.randrange(1000, 30000) for _ in range(200)]
 # A follow-up of P, the prompt windows serve: P's whole blocks, then 200 tokens of its own.
 P_END = P_BLOCKS * TOKENS_PER_BLOCK
 EXTENDS_P = P[:P_END] + [_tokens.randrange(1000, 30000) for _ in range(200)]
-GREEDY = SamplingParams(max_tokens=NEW_TOKENS, temperature=0.0)
 
 
 DEEPSEEK = "DeepSeek-V3-Lite/bf16"
@@ -137,8 +136,14 @@ def sharing(store: Store, key_prefix: str, **knobs) -> dict:
     }
 
 
+def greedy() -> SamplingParams:
+    """Fresh per call: the LLM fills in its own model's end id and generation defaults in place, so
+    parameters shared across servers of different models would carry the first one's."""
+    return SamplingParams(max_tokens=NEW_TOKENS, temperature=0.0)
+
+
 def complete(llm: LLM, prompt: list[int], **kwargs):
-    return llm.generate([prompt], GREEDY, **kwargs)[0]
+    return llm.generate([prompt], greedy(), **kwargs)[0]
 
 
 def tokens(output) -> list[int]:
@@ -204,7 +209,7 @@ def writer(store: Store, tmp_path_factory: pytest.TempPathFactory) -> Written:
     return Written(key_prefix, references)
 
 
-def test_a_tensor_parallel_reader_fetches_exactly_and_each_object_is_put_once(
+def test_a_host_staging_reader_fetches_a_gpu_direct_writers_blocks_exactly_and_puts_each_once(
     store: Store, writer: Written, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A reader over host staging fetches what the GPU Direct writer put."""
@@ -262,17 +267,20 @@ def test_a_prefix_partly_in_the_local_cache_reads_the_rest_from_the_store_exactl
         output = complete(llm, FOLLOW_UP)
         store.assert_readable(writer.key_prefix, held + TP * new_blocks)
         puts = puts_since(store, before)
+        # Each rank's process and the GPUs its threads use, the store worker's included.
         ranks = {pid: gpus for pid, gpus in gpus_by_process().items() if pid != os.getpid()}
         # The reader now holds P's first 24 blocks and the store all 31: both of these fetch.
-        cancelled = llm.generate_async(EXTENDS_P, GREEDY)
+        cancelled = llm.generate_async(EXTENDS_P, greedy())
         cancelled.abort()
-        llm.generate_async(P, GREEDY)  # the shutdown finds its fetch admitted or on its way
+        llm.generate_async(P, greedy())  # the shutdown finds its fetch admitted or on its way
     finally:
         shut_down(llm)
     assert tokens(output) == writer.references["follow-up"]
     assert output.cached_tokens == SYSTEM + FIRST_TURN
     assert puts == (TP * new_blocks, 0)
+    # Every rank's store threads use its own GPU only.
     assert len(ranks) >= TP and all(len(gpus) == 1 for gpus in ranks.values()), ranks
+    # The cancel and the shutdown ended cleanly: every rank wrote the same rounds and its exit.
     rank_traces(tmp_path, TP)
 
 
@@ -285,7 +293,7 @@ def test_two_instances_of_one_service_share_system_prompts_and_follow_up_turns(
 
 @dataclass(frozen=True)
 class Cell:
-    """A model class on a layout of CELL_TP GPUs: a writer publishes P over ``writer_path``, then
+    """A model class on a layout of TP GPUs: a writer publishes P over ``writer_path``, then
     a fresh reader of the same layout fetches the sibling over 'auto' (GPU Direct here).
 
     Attributes:
@@ -300,7 +308,6 @@ class Cell:
     kv_dtype: str = "auto"
 
 
-CELL_TP = 2
 CELLS = {
     "deepseek-tp2-host-staging-writer": Cell(DEEPSEEK, 1, writer_path="host_staging"),
     "qwen3-fp8-tp2": Cell(QWEN3, 2, kv_dtype="fp8"),
@@ -317,7 +324,7 @@ def cell_server(
 ) -> LLM:
     return server(
         monkeypatch,
-        CELL_TP,
+        TP,
         trace_dir,
         model=cell.model,
         kv_dtype=cell.kv_dtype,
@@ -333,8 +340,8 @@ def cell_trace(trace_dir: Path, cell: Cell) -> str:
     """The trace of the rank that served the requests: under tensor parallelism every rank's,
     which must agree; under attention DP rank 1's, after every rank ended with nothing open."""
     if not cell.attention_dp:
-        return rank_traces(trace_dir, CELL_TP)
-    traces = [(trace_dir / f"rank{rank}.txt").read_text() for rank in range(CELL_TP)]
+        return rank_traces(trace_dir, TP)
+    traces = [(trace_dir / f"rank{rank}.txt").read_text() for rank in range(TP)]
     for rank, trace in enumerate(traces):
         assert trace.splitlines()[-1].endswith(" open=0"), f"rank {rank}: {trace[-500:]}"
     return traces[1]
