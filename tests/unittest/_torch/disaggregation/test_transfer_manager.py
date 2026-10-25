@@ -370,7 +370,7 @@ def test_deferred_binding_leaves_caller_ownership(h: _Harness) -> None:
 
 
 def test_same_lease_cannot_have_two_accepted_operations(h: _Harness) -> None:
-    """M1 protects one Lease/Attempt owner and rejects accidental active reuse."""
+    """A lease has one owner: a second submit of a lease already accepted is rejected."""
     with h:
         lease, _ = h.submit()
         assert isinstance(h.manager.submit(lease, h.intent), Rejected)

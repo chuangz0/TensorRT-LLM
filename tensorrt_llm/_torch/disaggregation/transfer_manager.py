@@ -853,7 +853,9 @@ class TransferManager:
         self._count("released")
 
     def _retire(self, record: OperationRecord) -> None:
-        """Keep final result observation even after abandonment and early release."""
+        """Forgets the record once its lease went back (a failed release keeps it), a returned
+        Attempt's Outcome arrived and its Lifecycle closed; until then a late Outcome still lands
+        on it, also after an abandonment or an early release."""
         if not record.released or record.release_failed:
             return
         if record.submission is Submission.RETURNED and record.outcome is None:
