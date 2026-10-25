@@ -60,7 +60,8 @@ struct Op
     size_t callsLeft{0};
     bool accessEnded{true};
     std::map<int8_t, std::string> errors; // by StoreCall: the first raise or miscount of that call
-    std::vector<std::string> sessionsLeftOpen;
+    std::vector<std::string> sessionsLeftForDrain;
+    std::vector<std::string> sessionsLeftToMaster;
     Clock::time_point finishedAt;
 
     void set(size_t row, RowState state, int64_t code, StoreCall call)
@@ -84,7 +85,8 @@ struct CallOutcome
 {
     bool accessEnded{true};
     std::vector<std::pair<StoreCall, std::string>> errors;
-    std::vector<std::string> sessionsLeftOpen;
+    std::vector<std::string> sessionsLeftForDrain;
+    std::vector<std::string> sessionsLeftToMaster;
 };
 
 //! The SDK's arguments for some rows: each row's key, and its spans cut where a registration piece
@@ -182,45 +184,44 @@ public:
         , mBegin(begin)
         , mKeys(keys)
     {
-        for (size_t row = begin; row < begin + keys.size(); ++row)
-        {
-            if (op.states[row] == static_cast<int8_t>(RowState::kPending))
-            {
-                mRows.push_back(row);
-            }
-        }
     }
 
     //! mooncake.py _get_rows: one batch_get_into_multi_buffers; rows whose read lease expired mid-read
     //! are read once more.
     CallOutcome get()
     {
-        mOutcome.accessEnded = read(mRows, /*firstRead=*/true);
+        mOutcome.accessEnded = read(pendingRows(), /*firstRead=*/true);
         return std::move(mOutcome);
     }
 
-    //! mooncake.py _put_rows: a session per key, one scatter of the started rows, then the end of each
-    //! row written whole and the revocation of the rest; a key that already exists is readable only
-    //! once the master shows it committed.
-    CallOutcome put()
+    //! mooncake.py MooncakeDriver.put: a key whose session a call of this worker left open is never put
+    //! again, only checked for existence; every other row gets a session, one scatter of the started rows,
+    //! then the end of each row written whole and the revocation of the rest; a key that already exists is
+    //! readable only once the master shows it committed.
+    CallOutcome put(std::vector<size_t> const& heldByLeftSession)
     {
-        if (mRows.empty())
+        if (!heldByLeftSession.empty())
+        {
+            confirmExisting(heldByLeftSession, StoreCall::kLeftOpenExistence);
+        }
+        std::vector<size_t> const rows = pendingRows();
+        if (rows.empty())
         {
             return std::move(mOutcome);
         }
         std::vector<size_t> sizes;
-        for (size_t row : mRows)
+        for (size_t row : rows)
         {
             sizes.push_back(static_cast<size_t>(mOp.rowBytes[row]));
         }
-        auto const starts = metadataCall(StoreCall::kPutStart, "batch_put_session_start", mRows,
+        auto const starts = metadataCall(StoreCall::kPutStart, "batch_put_session_start", rows,
             [&](mirror::Keys const& keys)
             { return mClient.batch_put_session_start(keys, sizes, defaultReplicateConfig()); });
         std::vector<size_t> started;
         std::vector<size_t> existing;
-        for (size_t i = 0; i < mRows.size(); ++i)
+        for (size_t i = 0; i < rows.size(); ++i)
         {
-            size_t const row = mRows[i];
+            size_t const row = rows[i];
             switch (starts[i])
             {
             case mirror::kOk: started.push_back(row); break;
@@ -234,12 +235,26 @@ public:
         mOutcome.accessEnded = started.empty() || writeAndFinishSessions(started);
         if (!existing.empty())
         {
-            confirmExisting(existing);
+            confirmExisting(existing, StoreCall::kExistence);
         }
         return std::move(mOutcome);
     }
 
 private:
+    //! The call's rows not concluded yet.
+    std::vector<size_t> pendingRows() const
+    {
+        std::vector<size_t> rows;
+        for (size_t row = mBegin; row < mBegin + mKeys.size(); ++row)
+        {
+            if (mOp.states[row] == static_cast<int8_t>(RowState::kPending))
+            {
+                rows.push_back(row);
+            }
+        }
+        return rows;
+    }
+
     //! Returns whether access ended.
     bool read(std::vector<size_t> const& rows, bool firstRead)
     {
@@ -296,7 +311,8 @@ private:
     }
 
     //! Returns whether access ended: the scatter waits, without a timeout, for every fragment it
-    //! posted, so its return ends access whatever it answers.
+    //! posted, so its return ends access whatever it answers. Leaves open the sessions mooncake.py's
+    //! MooncakeDriver names.
     bool writeAndFinishSessions(std::vector<size_t> const& started)
     {
         SdkArguments const sdk = arguments(started);
@@ -323,31 +339,33 @@ private:
             // The scatter may still be reading the rows. Neither end (the object may be torn) nor revoke
             // (the master would give its space to another object while the scatter may still write).
             fail(started, StoreCall::kPutRanges, "batch_put_from_multi_buffer_ranges", error);
-            mOutcome.sessionsLeftOpen.insert(mOutcome.sessionsLeftOpen.end(), sdk.keys.begin(), sdk.keys.end());
+            leaveOpen(mOutcome.sessionsLeftToMaster, started);
             return false;
         }
         std::vector<size_t> written;
-        std::vector<size_t> unwritten;
+        std::vector<size_t> toRevoke;
+        std::vector<size_t> toMaster;
         for (size_t i = 0; i < started.size(); ++i)
         {
             size_t const row = started[i];
             if (answers[i] == mOp.rowBytes[row])
             {
                 written.push_back(row);
+                continue;
             }
-            else // its object must never be marked complete
-            {
-                unwritten.push_back(row);
-                mOp.set(row, RowState::kFault, answers[i], StoreCall::kPutRanges);
-            }
+            mOp.set(row, RowState::kFault, answers[i], StoreCall::kPutRanges); // never to be marked complete
+            // Over TCP the target may still write into the object's space (mooncake.py).
+            (answers[i] == mirror::kTransferFail ? toMaster : toRevoke).push_back(row);
         }
-        std::vector<size_t> const notEnded = endSessions(written);
-        unwritten.insert(unwritten.end(), notEnded.begin(), notEnded.end());
-        revokeSessions(unwritten);
+        std::vector<size_t> const refused = endSessions(written);
+        toRevoke.insert(toRevoke.end(), refused.begin(), refused.end());
+        revokeSessions(toRevoke);
+        leaveOpen(mOutcome.sessionsLeftToMaster, toMaster);
         return true;
     }
 
-    //! Ends the sessions of rows written whole; returns the rows whose session did not end.
+    //! Ends the sessions of rows written whole; returns the rows whose end was refused, to revoke. A session
+    //! whose end may still reach the master is left open for drain (mooncake.py _END_OUTCOME_UNKNOWN).
     std::vector<size_t> endSessions(std::vector<size_t> const& written)
     {
         if (written.empty())
@@ -355,12 +373,13 @@ private:
             return {};
         }
         auto end = [&](mirror::Keys const& keys) { return mClient.batch_put_session_end(keys); };
-        std::vector<int64_t> codes = metadataCall(StoreCall::kPutEnd, "batch_put_session_end", written, end);
+        std::vector<int64_t> const first = metadataCall(StoreCall::kPutEnd, "batch_put_session_end", written, end);
+        std::vector<int64_t> codes = first;
         std::vector<size_t> retried;
         std::vector<size_t> retriedAt;
         for (size_t i = 0; i < written.size(); ++i)
         {
-            if (codes[i] == mirror::kRpcFail || codes[i] == mirror::kRpcTimeout)
+            if (first[i] == mirror::kRpcFail || first[i] == mirror::kRpcTimeout)
             {
                 retried.push_back(written[i]);
                 retriedAt.push_back(i);
@@ -374,20 +393,24 @@ private:
                 codes[retriedAt[j]] = again[j];
             }
         }
-        std::vector<size_t> notEnded;
+        std::vector<size_t> refused;
+        std::vector<size_t> outcomeUnknown;
         for (size_t i = 0; i < written.size(); ++i)
         {
             bool const ended = codes[i] == mirror::kOk;
             mOp.set(written[i], ended ? RowState::kReady : RowState::kFault, codes[i], StoreCall::kPutEnd);
             if (!ended)
             {
-                notEnded.push_back(written[i]);
+                bool const mayStillLand
+                    = first[i] == mirror::kRpcFail || first[i] == mirror::kRpcTimeout || first[i] == kCallFailed;
+                (mayStillLand ? outcomeUnknown : refused).push_back(written[i]);
             }
         }
-        return notEnded;
+        leaveOpen(mOutcome.sessionsLeftForDrain, outcomeUnknown);
+        return refused;
     }
 
-    //! A session whose revocation neither succeeded nor found it gone (INVALID_PARAMS) is left open.
+    //! A session whose revocation neither succeeded nor found it gone (INVALID_PARAMS) is left open for drain.
     void revokeSessions(std::vector<size_t> const& rows)
     {
         if (rows.empty())
@@ -396,21 +419,33 @@ private:
         }
         auto const codes = metadataCall(StoreCall::kRevoke, "batch_put_session_revoke", rows,
             [&](mirror::Keys const& keys) { return mClient.batch_put_session_revoke(keys); });
+        std::vector<size_t> failed;
         for (size_t i = 0; i < rows.size(); ++i)
         {
             if (codes[i] != mirror::kOk && codes[i] != mirror::kInvalidParams)
             {
-                mOutcome.sessionsLeftOpen.push_back(mKeys[rows[i] - mBegin]);
+                failed.push_back(rows[i]);
             }
+        }
+        leaveOpen(mOutcome.sessionsLeftForDrain, failed);
+    }
+
+    void leaveOpen(std::vector<std::string>& sessions, std::vector<size_t> const& rows) const
+    {
+        for (size_t row : rows)
+        {
+            sessions.push_back(mKeys[row - mBegin]);
         }
     }
 
-    //! A key that already exists is readable only once the master shows it committed.
-    void confirmExisting(std::vector<size_t> const& existing)
+    //! Marks READY the rows whose object the master shows complete; NOT_READY the others, or FAULT when the
+    //! master could not tell. `call` names the check: of a key that already existed, or of one a session
+    //! this worker left open holds.
+    void confirmExisting(std::vector<size_t> const& rows, StoreCall call)
     {
-        auto const answers = metadataCall(StoreCall::kExistence, "batch_is_exist", existing,
-            [&](mirror::Keys const& keys) { return mClient.batchIsExist(keys); });
-        for (size_t i = 0; i < existing.size(); ++i)
+        auto const answers = metadataCall(
+            call, "batch_is_exist", rows, [&](mirror::Keys const& keys) { return mClient.batchIsExist(keys); });
+        for (size_t i = 0; i < rows.size(); ++i)
         {
             RowState state = RowState::kFault;
             if (answers[i] == mirror::kObjectExists)
@@ -421,7 +456,7 @@ private:
             {
                 state = RowState::kNotReady;
             }
-            mOp.set(existing[i], state, answers[i], StoreCall::kExistence);
+            mOp.set(rows[i], state, answers[i], call);
         }
     }
 
@@ -474,7 +509,6 @@ private:
     mirror::PyClient& mClient;
     Op& mOp;
     size_t mBegin;
-    std::vector<size_t> mRows;
     mirror::Keys const& mKeys; // by row - mBegin
     CallOutcome mOutcome;
 };
@@ -562,6 +596,7 @@ struct StoreWorker::State
     std::unordered_map<uint64_t, std::shared_ptr<Op>> open;
     std::deque<std::shared_ptr<Op>> finished;        // oldest first, until taken
     std::unordered_set<std::string> putKeysInFlight; // held by running put calls
+    std::unordered_set<std::string> keysLeftOpen;    // whose put session a call left open: never put again
     uint64_t nextOp{1};
     int running{0};
     int putsRunning{0};
@@ -623,7 +658,8 @@ struct StoreWorker::State
                 callClient = client;
             }
             mirror::Keys keys;
-            std::vector<size_t> heldKeys; // keys[i] this call holds in putKeysInFlight until it returns
+            std::vector<size_t> heldKeys;          // keys[i] this call holds in putKeysInFlight until it returns
+            std::vector<size_t> heldByLeftSession; // rows whose key is in keysLeftOpen
             CallOutcome outcome;
             try
             {
@@ -631,10 +667,10 @@ struct StoreWorker::State
                 if (call.op->isPut)
                 {
                     std::lock_guard lock(mutex);
-                    holdPutKeys(call, keys, heldKeys);
+                    holdPutKeys(call, keys, heldKeys, heldByLeftSession);
                 }
                 CallRun run(*callClient, *call.op, call.begin, keys); // never under the mutex
-                outcome = call.op->isPut ? run.put() : run.get();
+                outcome = call.op->isPut ? run.put(heldByLeftSession) : run.get();
             }
             catch (...)
             {
@@ -653,14 +689,20 @@ struct StoreWorker::State
         }
     }
 
-    //! Adds to `held` the indices of the put call's keys it now holds until it returns; a key another
-    //! running put call holds concludes its row NOT_READY without a store call, as another writer's open put.
-    void holdPutKeys(Call const& call, mirror::Keys const& keys, std::vector<size_t>& held)
+    //! Adds to `held` the indices of the put call's keys it now holds until it returns, and to
+    //! `heldByLeftSession` the rows whose key a session a call left open holds. A key another running put
+    //! call holds concludes its row NOT_READY without a store call, as another writer's open put.
+    void holdPutKeys(
+        Call const& call, mirror::Keys const& keys, std::vector<size_t>& held, std::vector<size_t>& heldByLeftSession)
     {
         held.reserve(keys.size()); // no allocation once a key is held: every held key is released
         for (size_t i = 0; i < keys.size(); ++i)
         {
-            if (putKeysInFlight.insert(keys[i]).second)
+            if (keysLeftOpen.count(keys[i]) != 0)
+            {
+                heldByLeftSession.push_back(call.begin + i);
+            }
+            else if (putKeysInFlight.insert(keys[i]).second)
             {
                 held.push_back(i);
             }
@@ -684,8 +726,14 @@ struct StoreWorker::State
         {
             op.errors.try_emplace(static_cast<int8_t>(storeCall), std::move(message)); // the first one stays
         }
-        op.sessionsLeftOpen.insert(op.sessionsLeftOpen.end(), std::make_move_iterator(outcome.sessionsLeftOpen.begin()),
-            std::make_move_iterator(outcome.sessionsLeftOpen.end()));
+        for (auto const* sessions : {&outcome.sessionsLeftForDrain, &outcome.sessionsLeftToMaster})
+        {
+            keysLeftOpen.insert(sessions->begin(), sessions->end());
+        }
+        op.sessionsLeftForDrain.insert(
+            op.sessionsLeftForDrain.end(), outcome.sessionsLeftForDrain.begin(), outcome.sessionsLeftForDrain.end());
+        op.sessionsLeftToMaster.insert(
+            op.sessionsLeftToMaster.end(), outcome.sessionsLeftToMaster.begin(), outcome.sessionsLeftToMaster.end());
         auto const callRows = op.states.begin();
         bool const faulted = std::any_of(callRows + call.begin, callRows + call.end,
             [](int8_t state) { return state == static_cast<int8_t>(RowState::kFault); });
@@ -815,8 +863,9 @@ std::vector<FinishedOp> StoreWorker::takeFinished()
     finished.reserve(taken.size());
     for (auto& op : taken) // finished: no thread touches it any more
     {
-        finished.push_back(FinishedOp{op->id, std::move(op->states), std::move(op->codes), std::move(op->calls),
-            op->accessEnded, std::move(op->errors), std::move(op->sessionsLeftOpen)});
+        finished.push_back(
+            FinishedOp{op->id, std::move(op->states), std::move(op->codes), std::move(op->calls), op->accessEnded,
+                std::move(op->errors), std::move(op->sessionsLeftForDrain), std::move(op->sessionsLeftToMaster)});
     }
     return finished;
 }

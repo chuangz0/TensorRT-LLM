@@ -30,6 +30,7 @@ from tensorrt_llm.logger import logger
 from .mooncake import (
     _ANOTHER_WRITER,
     _BEING_WRITTEN,
+    _OWN_SESSION_OPEN,
     _POOL_FULL,
     _PUT_START_SKIPS,
     _QUIET_SKIPS,
@@ -38,12 +39,14 @@ from .mooncake import (
     _Code,
     _existence_fault,
     _get_fault,
+    _LeftOpen,
     _put_end_fault,
     _put_ranges_fault,
     _put_start_fault,
     _Registration,
     _report,
     _reread_fault,
+    _warn_left_open,
     _warn_store_full,
 )
 from .store import (
@@ -85,6 +88,7 @@ class _StoreCall(IntEnum):
     PUT_END = 5
     EXISTENCE = 6
     REVOKE = 7
+    LEFT_OPEN_EXISTENCE = 8
 
 
 # The worker's errors of these calls fail only their keys: logged, as MooncakeDriver logs them.
@@ -93,6 +97,7 @@ _METADATA_CALLS = (
     _StoreCall.PUT_END,
     _StoreCall.EXISTENCE,
     _StoreCall.REVOKE,
+    _StoreCall.LEFT_OPEN_EXISTENCE,
 )
 # The worker's errors of these calls become their rows' fault text, as MooncakeDriver's do.
 _DATA_CALLS = (_StoreCall.GET, _StoreCall.REREAD, _StoreCall.PUT_RANGES)
@@ -122,7 +127,7 @@ class _NativeOp:
     cancelled: np.ndarray | None = None  # bool [rows]; None when no row was cancelled
     first_failure: str | None = None  # the first row in other_statuses, with why, for the log
     call_errors: list[str] = field(default_factory=list)  # metadata calls' raises, for the log
-    sessions_left_open: list[str] = field(default_factory=list)
+    sessions_left_open: dict[_LeftOpen, list[str]] = field(default_factory=dict)
     results: tuple[RowResult, ...] | None = None  # built for the first poll that wants them
 
     def key(self, row: int) -> str:
@@ -219,7 +224,7 @@ class NativeMooncakeDriver(MooncakeDriver):
     def drain(self, budget_s: float) -> bool:
         """Refuses new work for good, concludes the queued calls CANCELLED and waits up to
         ``budget_s`` for the running ones without the GIL; at once while an operation is
-        unprovable. When it returns True it also revokes the put sessions left open."""
+        unprovable. When it returns True it also revokes the put sessions left open for drain."""
         with self._lock:
             self._require_open()
             self._draining = True
@@ -326,7 +331,7 @@ class NativeMooncakeDriver(MooncakeDriver):
         """Under the lock: gives a finished worker op's handle its results and releases its
         regions. Only rows neither READY, MISS nor CANCELLED cost Python per row."""
         op = self._open.pop(done.op)
-        errors, left_open = done.errors, done.sessions_left_open  # each read converts anew
+        errors = done.errors  # each read converts anew
         faults, skip_reasons = {}, []
         for row, state, code, call in done.other_rows:
             status, call = _ROW_STATES[state], _StoreCall(call)
@@ -344,10 +349,14 @@ class NativeMooncakeDriver(MooncakeDriver):
             op.first_failure = op.first_failure or f"{op.key(row)}: {why}"
         op.cancelled = done.cancelled
         op.call_errors = [error for call, error in errors.items() if call in _METADATA_CALLS]
-        op.sessions_left_open = left_open
+        op.sessions_left_open = {
+            _LeftOpen.FOR_DRAIN: done.sessions_left_for_drain,
+            _LeftOpen.TO_MASTER: done.sessions_left_to_master,
+        }
         op.finished = FinishedOp(op, done.ready, faults, done.access_ended)
         self._release(op.regions, done.access_ended, skip_reasons)
-        self._sessions_left_open.update(left_open)
+        for by, keys in op.sessions_left_open.items():
+            self._sessions_left_open.update(dict.fromkeys(keys, by))
         self._untaken.append(op)
         return op
 
@@ -371,9 +380,9 @@ class NativeMooncakeDriver(MooncakeDriver):
 def _log_finished(op: _NativeOp) -> None:
     for error in op.call_errors:
         logger.warning(f"mooncake: {error}")
-    if op.sessions_left_open:
-        left_open = op.sessions_left_open
-        logger.warning(f"mooncake: {len(left_open)} put sessions left open, first {left_open[0]}")
+    for by, keys in op.sessions_left_open.items():
+        if keys:
+            _warn_left_open(keys, by)
     if op.store_full:
         _warn_store_full()
     _report(
@@ -400,7 +409,7 @@ def _fault_text(call: _StoreCall, code: int, size: int, errors: Mapping[int, str
         return _put_ranges_fault(code, size)
     if call is _StoreCall.PUT_END:
         return _put_end_fault(code)
-    if call is _StoreCall.EXISTENCE:
+    if call in (_StoreCall.EXISTENCE, _StoreCall.LEFT_OPEN_EXISTENCE):
         return _existence_fault(code)
     raise AssertionError(f"no row faults on {call!r}")  # NONE and REVOKE never fault a row
 
@@ -411,6 +420,8 @@ def _skip_reason(call: _StoreCall, code: int) -> str:
         return _PUT_START_SKIPS[code]
     if call is _StoreCall.EXISTENCE:
         return _ANOTHER_WRITER
+    if call is _StoreCall.LEFT_OPEN_EXISTENCE:
+        return _OWN_SESSION_OPEN
     if call is _StoreCall.GET:  # REPLICA_IS_NOT_READY
         return _BEING_WRITTEN
     raise AssertionError(f"no row skips on {call!r}")

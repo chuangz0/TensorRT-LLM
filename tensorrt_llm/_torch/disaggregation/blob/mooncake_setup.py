@@ -59,7 +59,7 @@ SECTIONS = ("blob", "mooncake")
 DRIVERS = ("auto", "native", "python")
 # The tensorrt_llm.mooncake_store_worker API this code speaks (its API_VERSION, bindings.cpp
 # kApiVersion): a module built from other sources is refused at startup.
-STORE_WORKER_API_VERSION = 4
+STORE_WORKER_API_VERSION = 5
 # The longest handshake message a process accepts. A process's first transfer with another sends
 # its transfer descriptor, which lists every buffer it registered: under GPU Direct thousands of KV
 # cache pieces. Mooncake drops a longer message than MC_HANDSHAKE_MAX_LENGTH (1 MiB unless set, at

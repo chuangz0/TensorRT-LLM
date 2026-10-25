@@ -48,7 +48,7 @@ constexpr char const* kClientCapsuleName = "mooncake.PyClient.shared_ptr";
 
 // blob/mooncake_setup.py STORE_WORKER_API_VERSION must equal this: bump it with any change Python sees,
 // so that a stale module is refused at startup instead of failing on the executor thread.
-constexpr int kApiVersion = 4;
+constexpr int kApiVersion = 5;
 
 template <typename T>
 using Matrix = nb::ndarray<T const, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
@@ -108,7 +108,8 @@ struct FinishedOpView
     std::vector<std::tuple<size_t, int8_t, int64_t, int8_t>> otherRows; //!< (row, RowState, code, StoreCall)
     bool accessEnded;
     std::map<int8_t, std::string> errors;                               //!< StoreCall -> its first raise or miscount
-    std::vector<std::string> sessionsLeftOpen;
+    std::vector<std::string> sessionsLeftForDrain;
+    std::vector<std::string> sessionsLeftToMaster;
 };
 
 nb::object numpyBools(std::unique_ptr<bool[]> values, size_t count)
@@ -127,7 +128,8 @@ FinishedOpView viewOf(FinishedOp&& finished)
         .cancelled = nb::none(),
         .accessEnded = finished.accessEnded,
         .errors = std::move(finished.errors),
-        .sessionsLeftOpen = std::move(finished.sessionsLeftOpen)};
+        .sessionsLeftForDrain = std::move(finished.sessionsLeftForDrain),
+        .sessionsLeftToMaster = std::move(finished.sessionsLeftToMaster)};
     for (size_t row = 0; row < rows; ++row)
     {
         auto const state = static_cast<RowState>(finished.states[row]);
@@ -180,7 +182,8 @@ NB_MODULE(mooncake_store_worker, m)
         .def_ro("other_rows", &FinishedOpView::otherRows)
         .def_ro("access_ended", &FinishedOpView::accessEnded)
         .def_ro("errors", &FinishedOpView::errors)
-        .def_ro("sessions_left_open", &FinishedOpView::sessionsLeftOpen);
+        .def_ro("sessions_left_for_drain", &FinishedOpView::sessionsLeftForDrain)
+        .def_ro("sessions_left_to_master", &FinishedOpView::sessionsLeftToMaster);
 
     auto const submit = [](bool isPut)
     {

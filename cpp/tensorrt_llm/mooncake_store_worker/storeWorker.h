@@ -53,6 +53,7 @@ enum class StoreCall : int8_t
     kPutEnd,
     kExistence,
     kRevoke,
+    kLeftOpenExistence, //!< The existence check of a key whose put session this worker left open.
 };
 
 //! Not an SDK code: the call raised or answered for another number of keys. mooncake.py _Code.CALL_FAILED
@@ -99,21 +100,23 @@ struct Rows
 struct FinishedOp
 {
     uint64_t op;
-    std::vector<int8_t> states;           //!< RowState
-    std::vector<int64_t> codes;           //!< the SDK answer, or kCallFailed
-    std::vector<int8_t> calls;            //!< StoreCall
-    bool accessEnded;                     //!< False: some call can never prove that its access ended.
-    std::map<int8_t, std::string> errors; //!< By StoreCall: the first raise or miscount of that call.
-    std::vector<std::string> sessionsLeftOpen;
+    std::vector<int8_t> states;                    //!< RowState
+    std::vector<int64_t> codes;                    //!< the SDK answer, or kCallFailed
+    std::vector<int8_t> calls;                     //!< StoreCall
+    bool accessEnded;                              //!< False: some call can never prove that its access ended.
+    std::map<int8_t, std::string> errors;          //!< By StoreCall: the first raise or miscount of that call.
+    std::vector<std::string> sessionsLeftForDrain; //!< Put sessions left open for MooncakeDriver.drain.
+    std::vector<std::string> sessionsLeftToMaster; //!< Put sessions a target may still write into.
 };
 
 //! Runs Mooncake store calls on threads of its own, which never touch Python. Gets go before puts; puts
 //! take at most `putThreads`. Each operation is cut into calls of `rowsPerCall` rows and `bytesPerCall`
 //! bytes. A call follows mooncake.py's protocol: a get rereads once the rows whose read lease expired,
-//! a put starts sessions, scatters, then ends or revokes them and confirms keys that already existed.
-//! A call that faults a row drops the calls of its operation not started yet (CANCELLED). A put call
-//! skips the keys another running put call of this worker holds (kPutInFlightHere): the SDK keys put
-//! sessions per client, so a second session start would only fail.
+//! a put starts sessions, scatters, then ends or revokes them, except the sessions it leaves open, and
+//! confirms keys that already existed. A call that faults a row drops the calls of its operation not
+//! started yet (CANCELLED). A put call skips the keys another running put call of this worker holds
+//! (kPutInFlightHere): the SDK keys put sessions per client, so a second session start would only fail.
+//! It only checks the existence of a key whose session a call left open: such a key is never put again.
 //! Every method but drain and stop returns in microseconds.
 class StoreWorker
 {
