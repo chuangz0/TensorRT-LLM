@@ -127,12 +127,23 @@ class FactoryRejected(RuntimeError):
     """Construction certifies no remaining access, registration or region hold."""
 
 
-# The supported caches: an attention writer layout with the dtype of its cache.
+# The supported caches: an attention writer layout with the dtype of its cache. MLA has no NVFP4
+# cache here: TensorRT-LLM turns block reuse off for FP4 MLA.
 _SUPPORTED_CACHES = frozenset(
-    {("mha-trtllm-hnd", "bfloat16"), ("mha-trtllm-hnd", "fp8"), ("mla-trtllm-latent", "bfloat16")}
+    {("mha-trtllm-hnd", dtype) for dtype in ("bfloat16", "float16", "fp8", "nvfp4")}
+    | {("mla-trtllm-latent", dtype) for dtype in ("bfloat16", "fp8")}
 )
 # The public layout's dtype and quantization of each cache dtype.
-_LAYOUT_DTYPES = {"bfloat16": ("BF16", None), "fp8": ("FP8", "fp8")}
+_LAYOUT_DTYPES = {
+    "bfloat16": ("BF16", None),
+    "float16": ("HALF", None),
+    "fp8": ("FP8", "fp8"),
+    "nvfp4": ("NVFP4", "nvfp4"),
+}
+# The supported sparse attention algorithms: DeepSeek sparse attention keeps its indexer keys in
+# the pool group of the MLA cache, and a query's top-k depends only on its prefix, so a fetched
+# prefix serves as a locally reused one does.
+SPARSE_ALGORITHMS = frozenset({"dsa"})
 
 
 @dataclass(frozen=True)
@@ -155,8 +166,8 @@ class ProfileSpec:
         scope: Derived immutable byte identity; callers cannot supply a raw scope.
         model_layout: Actual attention-writer layout identifier: ``mha-trtllm-hnd``
             or ``mla-trtllm-latent``.
-        dtype: Actual cache dtype supplied by model assembly: ``bfloat16``, or
-            ``fp8`` for the MHA layout.
+        dtype: Actual cache dtype supplied by model assembly: ``bfloat16`` or ``fp8``, or
+            for the MHA layout also ``float16`` or ``nvfp4``.
         topology: Tensor, data, pipeline and context parallel sizes; any tensor
             parallel size, data parallelism 1 or equal to it (attention DP), no
             pipeline or context parallelism.
@@ -164,7 +175,9 @@ class ProfileSpec:
         attention_windows: ``(global layer id, tokens)`` of each layer whose attention reads a
             sliding window, sorted; ``()`` when every layer reads its whole context. MLA with
             sliding windows is not supported.
-        sparse_attention: Whether runtime sparse attention is enabled; must be false.
+        sparse_attention: The model's effective sparse attention config as JSON values, or
+            ``None`` for dense attention; its ``algorithm`` must be in ``SPARSE_ALGORITHMS``.
+            The whole config enters the scope, so another setting names other blocks.
         sink_token_length: Runtime sink length; this cell requires zero.
         lora_enabled: Whether adapters are enabled; this cell excludes LoRA.
         pool_count: Number of physical pool groups in the selected layout.
@@ -189,7 +202,7 @@ class ProfileSpec:
     topology: tuple[int, int, int, int]
     state_kinds: tuple[CacheKind, ...]
     attention_windows: tuple[tuple[int, int], ...]
-    sparse_attention: bool
+    sparse_attention: dict | None
     sink_token_length: int
     lora_enabled: bool
     pool_count: int
@@ -232,8 +245,15 @@ class ProfileSpec:
         windows = tuple(sorted((int(layer), int(win)) for layer, win in self.attention_windows))
         if windows and self.model_layout == "mla-trtllm-latent":
             raise ValueError("MLA with sliding windows is not supported")
-        if self.sparse_attention is not False:
-            raise ValueError("initial profile excludes sparse attention")
+        if self.sparse_attention is not None:
+            if not isinstance(self.sparse_attention, dict):
+                raise TypeError("sparse_attention must be a config dict or None")
+            algorithm = self.sparse_attention.get("algorithm")
+            if algorithm not in SPARSE_ALGORITHMS:
+                raise ValueError(
+                    f"sparse attention {algorithm!r} is not supported; supported: "
+                    f"{sorted(SPARSE_ALGORITHMS)}"
+                )
         if isinstance(self.sink_token_length, bool) or not isinstance(
             self.sink_token_length, numbers.Integral
         ):
@@ -315,7 +335,7 @@ def derive_kv_scope(profile: ProfileSpec) -> bytes:
         "compatibility_id": profile.compatibility_id,
         "writer_layout": profile.model_layout,
         "cache_dtype": profile.dtype,
-        "attention": _attention_payload(profile.attention_windows),
+        "attention": _attention_payload(profile.attention_windows, profile.sparse_attention),
         "lora_enabled": profile.lora_enabled,
         "speculative_mode": profile.speculative_mode,
         "model_role": profile.model_role,
@@ -325,17 +345,14 @@ def derive_kv_scope(profile: ProfileSpec) -> bytes:
     return b"trtllm-kv-scope-v1\0" + hashlib.sha256(encoded.encode("utf-8")).digest()
 
 
-def _attention_payload(windows: tuple[tuple[int, int], ...]) -> dict:
-    """The scope's attention facts: full attention keeps its payload; windows name each windowed
-    layer and its window, so another window setting names other blocks."""
-    if not windows:
-        return {"full": True, "sparse": False, "sink_tokens": 0}
-    return {
-        "full": False,
-        "sparse": False,
-        "sink_tokens": 0,
-        "windows": [[layer, window] for layer, window in windows],
-    }
+def _attention_payload(windows: tuple[tuple[int, int], ...], sparse: dict | None) -> dict:
+    """The scope's attention facts: dense full attention keeps its payload; windows name each
+    windowed layer and its window, sparse attention its whole config, so another setting names
+    other blocks."""
+    payload = {"full": not windows, "sparse": False if sparse is None else sparse, "sink_tokens": 0}
+    if windows:
+        payload["windows"] = [[layer, window] for layer, window in windows]
+    return payload
 
 
 @dataclass(frozen=True)

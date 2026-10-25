@@ -77,7 +77,7 @@ def _profile() -> ProfileSpec:
         topology=(1, 1, 1, 1),
         state_kinds=(CacheKind.PAGED,),
         attention_windows=(),
-        sparse_attention=False,
+        sparse_attention=None,
         sink_token_length=0,
         lora_enabled=False,
         pool_count=1,
@@ -370,8 +370,8 @@ def test_view_rejects_unsupported_row_placement() -> None:
         ("compatibility_id", "", ValueError),
         ("compatibility_id", "   ", ValueError),
         ("compatibility_id", 1, ValueError),
-        ("sparse_attention", True, ValueError),
-        ("sparse_attention", 0, ValueError),
+        ("sparse_attention", {"algorithm": "rocket"}, ValueError),
+        ("sparse_attention", True, TypeError),
         ("sink_token_length", 1, ValueError),
         ("sink_token_length", False, TypeError),
         ("lora_enabled", True, ValueError),
@@ -387,7 +387,7 @@ def test_view_rejects_unsupported_row_placement() -> None:
         ("topology", (True, 1, 1, 1), TypeError),
         ("state_kinds", (CacheKind.PAGED, CacheKind.STATE), ValueError),
         ("state_kinds", ("attention",), TypeError),
-        ("dtype", "float16", ValueError),
+        ("dtype", "int8", ValueError),
         ("pool_count", True, TypeError),
         ("speculative_mode", "eagle", ValueError),
         ("model_role", "draft", ValueError),
@@ -399,7 +399,7 @@ def test_view_rejects_unsupported_row_placement() -> None:
         "empty-compatibility",
         "blank-compatibility",
         "compatibility-type",
-        "sparse-attention",
+        "sparse-algorithm",
         "sparse-type",
         "attention-sinks",
         "sink-type",
@@ -434,20 +434,40 @@ def test_profile_rejects_unsupported_inputs(
 def test_profile_accepts_the_supported_caches_and_parallel_layouts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """FP8 multi-head attention, BF16 MLA and both parallel layouts are accepted.
+    """Each supported cache is accepted and names blocks of its own; both parallel layouts too.
 
-    Tensor-parallel ranks lend shares of one cache, attention-DP ranks caches of their own.
+    Multi-head attention in BF16, FP16, FP8 or NVFP4; MLA in BF16 or FP8, also with DeepSeek sparse
+    attention. MLA in NVFP4 is refused. Tensor-parallel ranks lend shares of one cache,
+    attention-DP ranks caches of their own.
     """
-    fp8 = replace(_profile(), dtype="fp8")
-    mla = replace(_profile(), model_layout="mla-trtllm-latent")
-    assert len({_profile().scope, fp8.scope, mla.scope}) == 3
+    mha = [replace(_profile(), dtype=dtype) for dtype in ("bfloat16", "float16", "fp8", "nvfp4")]
+    mla = [
+        replace(_profile(), model_layout="mla-trtllm-latent", dtype=dtype)
+        for dtype in ("bfloat16", "fp8")
+    ]
+    dsa = replace(mla[1], sparse_attention={"algorithm": "dsa", "index_topk": 2048})
+    assert len({profile.scope for profile in [*mha, *mla, dsa]}) == 7
     with pytest.raises(ValueError, match="is not supported"):
-        replace(mla, dtype="fp8")
+        replace(mla[0], dtype="nvfp4")
     lender = _lender(replace(_layout(), dtype="FP8", quant_mode="fp8"))
     monkeypatch.setattr(_assembly, "attach_lender", lambda *args, **kwargs: lender)
-    assert attach_domain(object(), fp8).lender is lender
+    assert attach_domain(object(), mha[2]).lender is lender
     for topology in ((4, 1, 1, 1), (2, 2, 1, 1)):
         assert replace(_profile(), topology=topology).topology == topology
+
+
+def test_dense_attention_keeps_the_scope_its_stored_blocks_are_named_under() -> None:
+    """A dense server's scope stays fixed, with full attention or with windows.
+
+    Another scope would rename every block its deployment stored.
+    """
+    windowed = replace(_profile(), attention_windows=((0, 512), (1, 512)))
+    assert _profile().scope[-32:].hex() == (
+        "9833952ee10e44adc7c6e2e1e00bf018e4be22bc9ef8cf69882086649daa4926"
+    )
+    assert windowed.scope[-32:].hex() == (
+        "79f7866cc3b92ea216b45ff257e24bb56e787c5693c6998ae42e223ccc5e49f4"
+    )
 
 
 def test_a_windowed_layout_attaches_to_the_profile_naming_its_windows_only(

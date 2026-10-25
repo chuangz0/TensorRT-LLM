@@ -69,7 +69,7 @@ def _profile() -> ProfileSpec:
         topology=(1, 1, 1, 1),
         state_kinds=(CacheKind.PAGED,),
         attention_windows=(),
-        sparse_attention=False,
+        sparse_attention=None,
         sink_token_length=0,
         lora_enabled=False,
         pool_count=1,
