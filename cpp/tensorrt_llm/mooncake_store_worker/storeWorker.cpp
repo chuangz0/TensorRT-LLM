@@ -757,16 +757,17 @@ struct StoreWorker::State
         op.sessionsLeftToMaster.insert(
             op.sessionsLeftToMaster.end(), outcome.sessionsLeftToMaster.begin(), outcome.sessionsLeftToMaster.end());
         auto const callRows = op.states.begin();
-        bool const faulted = std::any_of(callRows + call.begin, callRows + call.end,
-            [](int8_t state) { return state == static_cast<int8_t>(RowState::kFault); });
+        bool const getFaulted = !op.isPut
+            && std::any_of(callRows + call.begin, callRows + call.end,
+                [](int8_t state) { return state == static_cast<int8_t>(RowState::kFault); });
         if (--op.callsLeft == 0)
         {
             finishOp(call.op);
         }
-        else if (faulted)
+        else if (getFaulted)
         {
-            // A fault fails the operation: its calls not started yet are dropped, as BlobBackend stops
-            // an attempt at its first fault. The operation finishes once no call of it runs.
+            // A fault fails a get: its calls not started yet are dropped, as BlobBackend stops a fetch at
+            // its first fault; a put's rows stand alone. The operation finishes once no call of it runs.
             cancelQueued(&op);
         }
     }

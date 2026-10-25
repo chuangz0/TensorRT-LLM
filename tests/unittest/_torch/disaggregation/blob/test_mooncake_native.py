@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The native Mooncake driver's own rules, over the fake SDK through the store worker's test client:
 gets go before puts and puts leave a thread for gets, operations are cut into store calls, a cancel
-or a drain concludes the calls not started CANCELLED, a fault stops the rest of its operation and of
-its attempt, rows as arrays are admitted by column, and an operation naming one object twice is
+or a drain concludes the calls not started CANCELLED, a fault stops the rest of a get and of its
+attempt, rows as arrays are admitted by column, and an operation naming one object twice is
 refused. What both drivers share is pinned in ``test_mooncake_driver.py``."""
 
 from __future__ import annotations
@@ -119,17 +119,25 @@ def test_a_cancelled_fetch_never_reaches_the_store_and_leaves_its_slots_alone(
     reader.close()
 
 
-def test_a_faulted_call_drops_the_calls_of_its_operation_not_started_yet() -> None:
+@pytest.mark.parametrize("direction", ["get", "put"])
+def test_a_faulted_call_drops_the_rest_of_a_get_but_not_of_a_put(direction: str) -> None:
+    """A get serves one fetch, which a fault stops: its request computes instead. A put's rows
+    stand alone: the other blocks of a prompt are still worth storing."""
     fake = FakeMooncakeStore()
     driver = native_driver(fake, threads=1, put_threads=1, rows_per_call=1)
     buffer = HostBuffer(3 * SLOT, fill=0x2D)
     driver.register(buffer.address, buffer.nbytes, RegionLayout(SLOT, 3))
-    for name in "ABC":
-        fake.pool.objects[key(name)] = name.encode() * SLOT
-    fake.script(GET, [-900])  # RPC_FAIL for A: a fault
     rows = [RowIO(key(name), (buffer.span(i * SLOT, SLOT),)) for i, name in enumerate("ABC")]
-    assert statuses(driver, driver.get(rows)) == ["fault", "cancelled", "cancelled"]
-    assert [call.args[0] for call in fake.calls_to(GET)] == [[key("A")]]
+    if direction == "get":
+        for name in "ABC":
+            fake.pool.objects[key(name)] = name.encode() * SLOT
+        fake.script(GET, [-900])  # RPC_FAIL for A: a fault
+        assert statuses(driver, driver.get(rows)) == ["fault", "cancelled", "cancelled"]
+        assert [call.args[0] for call in fake.calls_to(GET)] == [[key("A")]]
+    else:
+        fake.script(PUT_START, [-900])
+        assert statuses(driver, driver.put(rows)) == ["fault", "ready", "ready"]
+        assert sorted(fake.pool.objects) == [key("B"), key("C")]
 
 
 def test_an_operation_that_names_one_object_twice_is_refused_before_the_store() -> None:

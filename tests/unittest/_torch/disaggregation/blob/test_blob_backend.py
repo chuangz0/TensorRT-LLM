@@ -6,7 +6,7 @@ Covers the Store document's behaviour cases (a late write after a fault, results
 either order, cancel and shutdown races) and the backend's own rules: the submitting thread never
 waits on the driver, only regions the driver can access are registered and rows elsewhere are
 refused, each operation's access end is counted once, a fault waits for the batches already
-started, and shutdown never calls the driver.
+started and stops a fetch but not a publish, and shutdown never calls the driver.
 Every synchronisation is an event, a gate or a bounded wait on a condition.
 """
 
@@ -254,6 +254,24 @@ def test_a_later_batch_fault_waits_for_earlier_batches_and_the_first_recorded_is
     reader.close()
 
 
+def test_a_publish_row_the_store_faults_stops_nothing_and_the_other_rows_are_stored(
+    store: MemoryStore,
+) -> None:
+    """A publish's rows stand alone: the other blocks of a prompt are still worth storing. Only a
+    driver call that fails as a whole stops it."""
+    published(store, {"B": b"stale..."})  # B's put faults: the key holds other bytes
+    writer = Endpoint(MemoryDriver(store), ["A", "B", "C"], rows_per_batch=1)
+    for name in "ABC":
+        writer.write(name, name.encode() * SLOT_BYTES)
+    attempt = writer.backend.publish(writer.view("A", "B", "C"), None)
+    outcome = writer.wait_outcome(attempt)
+    assert masks(outcome) == [[True, False, True]]
+    assert outcome.fault == "group 0 row 1: key exists with different content"
+    assert store.committed_payload(store_key("C")) == b"C" * SLOT_BYTES
+    writer.wait_quiesced(attempt)
+    writer.close()
+
+
 @pytest.mark.parametrize("first_half", ["results_first", "access_end_first"])
 def test_results_and_access_end_are_each_recorded_once_per_batch(
     store: MemoryStore, first_half: str
@@ -450,6 +468,30 @@ def test_a_raise_faults_the_batch_and_only_a_refusal_ends_its_access(
     with pytest.raises(RuntimeError, match="region:0"):
         writer.binding.release_hold()
     assert not writer.hold.released
+
+
+@keeps_backend_threads
+def test_a_call_that_can_never_prove_its_access_ended_is_warned_of_outside_the_lock(
+    store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slow log sink must never hold up a thread that waits for the backend's lock."""
+    writer = Endpoint(MemoryDriver(store), ["A"])
+    warnings: list[tuple[str, bool]] = []  # each with whether the lock was free
+
+    def warning_once(message: str, key) -> None:
+        lock_free = writer.backend._lock.acquire(timeout=PROMPT_S)
+        if lock_free:
+            writer.backend._lock.release()
+        warnings.append((message, lock_free))
+
+    monkeypatch.setattr(backend_module.logger, "warning_once", warning_once)
+    writer.driver.fail("put", RuntimeError("x"))  # outside the protocol: access never proven
+    attempt = writer.backend.publish(writer.view("A"), None)
+    wait_until(lambda: warnings, "the warning")
+    message, lock_free = warnings[0]
+    assert f"a store call of {attempt.label} can never prove its access ended" in message
+    assert lock_free
+    assert attempt.label in writer.backend.shutdown(0)
 
 
 class ShortPollDriver(MemoryDriver):

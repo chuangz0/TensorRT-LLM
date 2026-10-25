@@ -113,10 +113,11 @@ struct FinishedOp
 //! take at most `putThreads`. Each operation is cut into calls of `rowsPerCall` rows and `bytesPerCall`
 //! bytes. A call follows mooncake.py's protocol: a get rereads once the rows whose read lease expired,
 //! a put starts sessions, scatters, then ends or revokes them, except the sessions it leaves open, and
-//! confirms keys that already existed. A call that faults a row drops the calls of its operation not
-//! started yet (CANCELLED). A put call skips the keys another running put call of this worker holds
-//! (kPutInFlightHere): the SDK keys put sessions per client, so a second session start would only fail.
-//! It only checks the existence of a key whose session a call left open: such a key is never put again.
+//! confirms keys that already existed. A get call that faults a row drops the calls of its operation not
+//! started yet (CANCELLED); a put's rows stand alone. A put call skips the keys another running put call
+//! of this worker holds (kPutInFlightHere): the SDK keys put sessions per client, so a second session
+//! start would only fail. It only checks the existence of a key whose session a call left open: such a
+//! key is never put again.
 //! Every method but drain and stop returns in microseconds.
 class StoreWorker
 {
