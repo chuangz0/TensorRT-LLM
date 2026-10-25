@@ -495,7 +495,7 @@ class RequestBroadcaster:
             with nvtx_range("send_request_count_to_next_pp"):
                 self.dist.send_object(request_count, self.dist.next_pp_rank, tag)
 
-        return request_count, 0  # kv_sharing refuses pipeline parallelism
+        return request_count, 0  # kv_sharing fetches only without pipeline parallelism
 
     def _collect_py_objects(self, new_requests: List) -> Tuple:
         """Collect Python-only objects from requests."""

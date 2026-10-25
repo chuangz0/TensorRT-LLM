@@ -84,17 +84,18 @@ def test_auto_takes_host_staging_when_the_device_round_trip_fails(store, monkeyp
     monkeypatch.setattr(data_path.logger, "warning", warnings.append)
     store.script(GET, [None])  # the host get reads
     store.script(GET, [-600])  # the get into device memory fails
-    client, lent, gpu_direct_error = data_path.open_store("auto", CONFIG, 0)
-    assert client is store and lent is None
+    client, gpu_direct_error = data_path.open_store("auto", CONFIG)
+    assert client is store
+    gpu_direct_error = data_path.check_store(client, gpu_direct_error)
     assert choose_data_path("auto", [gpu_direct_error]) is MemoryKind.HOST
     (fallback,) = [warning for warning in warnings if "through host staging" in warning]
     assert "a round trip through device memory" in fallback and "INVALID_PARAMS" in fallback
 
 
-def test_a_store_failing_the_host_round_trip_refuses_the_server(store) -> None:
+def test_a_store_failing_the_host_round_trip_fails_the_check(store) -> None:
     store.script(GET, [-900])  # RPC_FAIL
-    with pytest.raises(ValueError, match="opened and checked: a round trip through host memory"):
-        data_path.open_store("auto", CONFIG, 0)
+    with pytest.raises(RuntimeError, match="a round trip through host memory"):
+        data_path.check_store(store, None)
 
 
 @pytest.mark.cpu_only
@@ -111,19 +112,7 @@ def test_a_client_that_does_not_open_on_one_rank_refuses_the_server_on_every_ran
     # Rank 0 opened its store and can take GPU Direct: _agree gathers (error, shared result).
     rank_1 = SimpleNamespace(world_size=2, allgather=lambda own: [(None, None), own])
     with pytest.raises(ValueError, match="rank 1: kv_sharing: the store could not be opened"):
-        startup._agree(rank_1, lambda: (data_path.open_store("auto", CONFIG, 0), None))
-
-
-def test_a_server_lends_its_memory_before_its_check_so_it_can_be_the_stores_only_memory(
-    store,
-) -> None:
-    client, lent, _ = data_path.open_store("host_staging", CONFIG, 1 << 30)
-    assert lent.segment_ids
-    methods = [call.method for call in client.calls]
-    assert methods.index("allocate_and_mount_segment") < methods.index("batch_put_session_start")
-    store.mount_answer = -1
-    with pytest.raises(ValueError, match="opened and checked: mooncake: lending 1073741824 bytes"):
-        data_path.open_store("host_staging", CONFIG, 1 << 30)
+        startup._agree(rank_1, lambda: data_path.open_store("auto", CONFIG))
 
 
 def test_a_host_round_trip_that_does_not_answer_in_time_refuses_the_store(

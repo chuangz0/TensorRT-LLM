@@ -433,8 +433,9 @@ class PyExecutor:
     # Set by kv_sharing startup. A class default keeps executors that tests
     # build partially working.
     kv_sharing: Optional["SharedKvOrchestrator"] = None
-    # Host memory this rank lends the KV store, also set by kv_sharing startup.
-    lent_store_memory: Optional["StoreSegment"] = None
+    # The host memory this rank provides the KV store, also set by kv_sharing
+    # startup.
+    store_segment: Optional["StoreSegment"] = None
 
     def __init__(
         self,
@@ -1997,7 +1998,19 @@ class PyExecutor:
 
     def shutdown(self):
         """Shut down the terminal executor and all CUDA graphs it owns."""
-        self._shutdown(release_model_owned_graphs=True)
+        store_segment = self.store_segment
+        if store_segment is None:
+            self._shutdown(release_model_owned_graphs=True)
+            return
+        # First, so that its grace and Mooncake's cleanup run while the
+        # executor stops.
+        store_segment.begin_unmount()
+        try:
+            self._shutdown(release_model_owned_graphs=True)
+        finally:
+            # Other servers may read the memory until Mooncake frees it: the
+            # process must not end before.
+            store_segment.wait_until_freed()
 
     def shutdown_for_kv_cache_estimation(self):
         """Shut down a temporary profiling executor whose model is reused."""
@@ -2009,11 +2022,6 @@ class PyExecutor:
         Model-owned graphs are terminal model resources, unlike executor-owned
         graphs that may reference the resource managers torn down below.
         """
-        lent_store_memory = self.lent_store_memory
-        if lent_store_memory is not None:
-            # First, so that its grace and Mooncake's cleanup run while the
-            # executor stops; the last step waits for the rest.
-            lent_store_memory.begin_unmount()
         node_server = getattr(self, "_openengine_node_server", None)
         if node_server is not None:
             node_server.close()
@@ -2111,9 +2119,6 @@ class PyExecutor:
         if self.dwdp_manager is not None:
             self.dwdp_manager.__exit__(None, None, None)
             self.dwdp_manager = None
-        if lent_store_memory is not None:
-            # Other servers may still read the memory until Mooncake frees it.
-            lent_store_memory.wait_until_freed()
 
     def can_enqueue_requests(self) -> bool:
         """

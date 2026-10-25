@@ -6,15 +6,16 @@ GPU Direct: the store's NICs read and write the KV cache pages in place. Host st
 copied through pinned host memory. Both store a block as the same bytes under the same key, so
 servers on either path share blocks.
 
-Deployment assumptions: a process that lends the store memory and was not started by
-TensorRT-LLM (``open_sdk``) sets ``MC_HANDSHAKE_MAX_LENGTH`` as ``open_sdk`` does, since a GPU
-Direct server's first transfer sends it a descriptor of every registered piece of KV cache memory.
-Where a peer-memory module is loaded but the KV cache pools could not be allocated
-GPUDirect-capable, the check (on an ordinary device buffer) passes and registering the pools fails:
-the server is refused, also under 'auto'. A process lending memory (a provider, or a server under
-the role 'provide') that dies while a server reads from it can end that server about two minutes
-later (a store access it cannot prove ended); one stopped normally leaves gracefully and ends no
-reader, and only empties the store of its objects.
+Deployment assumptions: a process that provides the store memory without going through
+``open_sdk`` (neither a server nor ``trtllm-serve mooncake_provider``) sets
+``MC_HANDSHAKE_MAX_LENGTH`` as ``open_sdk`` does, since a GPU Direct server's first transfer sends
+it a descriptor of every registered piece of KV cache memory. Where a peer-memory module is loaded
+but the KV cache pools could not be allocated GPUDirect-capable, the check (on an ordinary device
+buffer) passes and registering the pools fails: the server is refused, also under 'auto'. A process
+providing memory (a provider, or a server under the role 'provide') that dies while a server reads
+from it can end that server about two minutes later (a store access it cannot prove ended); one
+stopped normally unmounts its memory gracefully, ends no reader, and only empties the store of its
+objects.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from tensorrt_llm.logger import logger
 
 from ...disaggregation.base.memory import MemoryKind
 from ...disaggregation.blob.mooncake import MooncakeDriver
-from ...disaggregation.blob.mooncake_setup import MooncakeConfig, StoreSegment, open_sdk
+from ...disaggregation.blob.mooncake_setup import MooncakeConfig, open_sdk
 from ...disaggregation.blob.store import RegionLayout, RowIO, RowStatus, Span
 from ..connectors.mooncake_store.gpudirect import (
     PEERMEM_ENV,
@@ -55,34 +56,24 @@ STORE_CHECK_KEY_PREFIX = "kv-sharing-startup-check/"
 _CHECK_MEMORY: list[torch.Tensor] = []
 
 
-def open_store(
-    requested: str, mooncake: MooncakeConfig, lent_bytes: int
-) -> tuple[Any, Optional[StoreSegment], Optional[str]]:
-    """Opens the store client, lends the store ``lent_bytes`` of host memory (nothing for 0) and
-    checks the store with one round trip: the client, the lent memory (None for 0), and why GPU
-    Direct cannot serve this rank, or None where it can. The memory is lent before the check: where
-    servers lend all of the store's memory, the first server's check object needs its own.
+def open_store(requested: str, mooncake: MooncakeConfig) -> tuple[Any, Optional[str]]:
+    """Opens the store client: the client, and why GPU Direct cannot serve this rank as far as
+    this process can tell without asking the store, or None. ``check_store`` then asks the store.
 
     Run it before any other Mooncake client of the process opens: the first one fixes how the
     process registers device memory.
 
     Raises:
-        ValueError: The store did not open, did not take the memory, or failed the round trip
-            through host memory.
+        ValueError: The store did not open.
     """
     if requested == HOST_STAGING:
         gpu_direct_error = "host staging was asked for"
     else:
         gpu_direct_error = prepare_gpu_direct(mooncake.protocol)
     try:
-        store = open_sdk(mooncake)
-        lent = StoreSegment.mount(store, lent_bytes, mooncake.protocol) if lent_bytes else None
-        # The check runs on its own Python driver, before any store worker thread exists.
-        return store, lent, check_store(store, gpu_direct_error)
+        return open_sdk(mooncake), gpu_direct_error
     except Exception as error:
-        raise ValueError(
-            f"kv_sharing: the store could not be opened and checked: {error}"
-        ) from error
+        raise ValueError(f"kv_sharing: the store could not be opened: {error}") from error
 
 
 def prepare_gpu_direct(protocol: str) -> Optional[str]:
@@ -112,7 +103,8 @@ def check_store(store: Any, gpu_direct_error: Optional[str]) -> Optional[str]:
     """A round trip of a random object through the store from host memory and, unless
     ``gpu_direct_error`` already says why GPU Direct is out, into device memory and back out of
     it: why GPU Direct cannot serve this rank, or None. Each half waits at most
-    STORE_CHECK_TIMEOUT_S: a timeout of the device half is GPU Direct's error, not the store's.
+    STORE_CHECK_TIMEOUT_S: a timeout of the device half is GPU Direct's error, not the store's. The
+    check runs on its own Python driver, before any store worker thread exists.
 
     Raises:
         RuntimeError: The round trip through host memory failed.

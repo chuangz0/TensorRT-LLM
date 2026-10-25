@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Wires KV sharing into a built executor, on its construction thread before its worker starts:
-the store client and its data path, the host memory the server lends the store, the KV cache
-manager's lender, the transfer manager and the orchestrator. A server that only lends memory
-(roles [provide]) gets the store client and the lent memory alone.
+the store client and its data path, the store segment of host memory the server provides, the KV
+cache manager's lender, the transfer manager and the orchestrator. A server that only provides
+memory (roles [provide]) gets the store client and its segment alone.
 
 Every rank of a tensor-parallel server runs it. Each step that can fail on one rank alone ends in
 one collective every rank reaches, and every rank then raises naming each failure: a rank raising
@@ -59,12 +59,13 @@ from ...weight_sharing.artifact_identity import ArtifactIdentity
 from ...weight_sharing.source_identity import SourceIdentity
 from ..config_utils import is_mla
 from ..connectors.mooncake_store.gpudirect import allocation_range
+from ..connectors.mooncake_store.validation import NODE_BUDGET_RESERVE_BYTES
 from ..hang_detector import propagate_hard_kill
 from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from ..kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from ..kv_cache.sharing import Lender, MemoryKind, StagingOptions
 from ..scheduler.scheduler_v2 import KVCacheV2Scheduler
-from .data_path import choose_data_path, open_store
+from .data_path import check_store, choose_data_path, open_store
 from .orchestrator import (
     BINDING_ID,
     DOMAIN_ID,
@@ -92,9 +93,6 @@ _Shared = TypeVar("_Shared")
 STORE_ACCESS_DEADLINE_S = 120.0
 # Pinned host memory each rank stages fetches and publications through, at most.
 HOST_STAGING_BYTES = 8 << 30
-# Host memory a node keeps free beside what its ranks lend the store and stage through: the page
-# cache, allocator arenas and the runtime's own host buffers (as the Mooncake connector's check).
-NODE_MEMORY_RESERVE_BYTES = 32 << 30
 # The attention writer layouts of the TRTLLM backend, which stored blocks carry.
 MHA_LAYOUT = "mha-trtllm-hnd"
 MLA_LAYOUT = "mla-trtllm-latent"
@@ -125,15 +123,43 @@ def start_kv_sharing(
     *,
     checkpoint_dir: str | None,
     max_num_tokens: int,
-) -> SharedKvOrchestrator:
-    """Opens the store, attaches the lender and hands the executor its orchestrator.
+) -> None:
+    """Shares KV cache blocks through the store or, on a server whose only role is 'provide',
+    gives the store host memory and nothing else.
 
-    Run it once, on the final executor, before its worker starts, on every rank.
+    Run it once, on the final executor, before its worker starts, on every rank. Other servers may
+    use a rank's store segment as soon as it is mounted, so a start that fails afterwards unmounts
+    it gracefully before raising, about 13 s later.
 
     Raises:
         ValueError: The executor or the model is not one kv_sharing serves, the store config is
-            invalid, or a step failed on some rank (every rank raises, naming each failure).
+            invalid, the node has too little host memory, or a step failed on some rank (every
+            rank raises, naming each failure).
     """
+    try:
+        if llm_args.kv_sharing.only_provides:
+            _provide_store_memory(py_executor, llm_args)
+        else:
+            _share_blocks(
+                py_executor, llm_args, checkpoint_dir=checkpoint_dir, max_num_tokens=max_num_tokens
+            )
+    except Exception:
+        segment = py_executor.store_segment
+        if segment is not None:
+            segment.begin_unmount()
+            segment.wait_until_freed()
+        raise
+
+
+def _share_blocks(
+    py_executor: PyExecutor,
+    llm_args: TorchLlmArgs,
+    *,
+    checkpoint_dir: str | None,
+    max_num_tokens: int,
+) -> None:
+    """Opens the store (mounting this rank's segment under 'provide'), attaches the lender and
+    hands the executor its orchestrator."""
     config = llm_args.kv_sharing
     (backend,) = config.backends
     manager = py_executor.kv_cache_manager
@@ -173,7 +199,11 @@ def start_kv_sharing(
         mooncake, blob_config = _store_config(backend.config)
         if backend.segment_size:
             # Host staging is not chosen yet: count its cap.
-            _check_node_memory(backend.segment_size, HOST_STAGING_BYTES, dist.local_world_size)
+            _check_node_memory(
+                backend.segment_size,
+                staging_bytes=HOST_STAGING_BYTES,
+                ranks_on_node=dist.local_world_size,
+            )
         if dist.rank != 0:
             return (mooncake, blob_config), None
         if not os.path.isdir(checkpoint):
@@ -183,17 +213,22 @@ def start_kv_sharing(
         logger.info(f"kv_sharing: reading every file of {checkpoint} to name its stored blocks")
         return (mooncake, blob_config), ArtifactIdentity.from_checkpoint(checkpoint)
 
-    def open_and_check() -> tuple[tuple[Any, Optional[StoreSegment]], Optional[str]]:
-        store, lent, gpu_direct_error = open_store(config.data_path, mooncake, backend.segment_size)
-        return (store, lent), gpu_direct_error
+    def open_and_check() -> tuple[Any, Optional[str]]:
+        store, gpu_direct_error = open_store(config.data_path, mooncake)
+        if backend.segment_size:
+            # Before the check, whose object needs memory somewhere in the store, maybe only here.
+            # Recorded at once: start_kv_sharing unmounts it if a later step fails.
+            py_executor.store_segment = StoreSegment.mount(
+                store, backend.segment_size, mooncake.protocol
+            )
+        return store, check_store(store, gpu_direct_error)
 
     # Three collectives every rank reaches, whatever failed on it: prepare (which checks the node's
-    # memory before any rank lends), opening and checking the store, attach. Every check after them
-    # reads gathered facts, so it raises on every rank.
+    # memory before any rank mounts its segment), opening and checking the store, attach. Every
+    # check after them reads gathered facts, so it raises on every rank.
     (mooncake, blob_config), identity_by_rank = _agree(dist, prepare)
     # Before the lender pins its staging memory: an unreachable master fails here, within a minute.
-    (store, lent), gpu_direct_errors = _agree(dist, open_and_check)
-    py_executor.lent_store_memory = lent
+    store, gpu_direct_errors = _agree(dist, open_and_check)
     memory_kind = choose_data_path(config.data_path, gpu_direct_errors)
 
     tokens_per_block = manager.tokens_per_block
@@ -294,42 +329,43 @@ def start_kv_sharing(
             f"publications of {blocks} blocks"
         )
     store_calls = "native" if isinstance(attached.driver, NativeMooncakeDriver) else "python"
-    lending = f", lending {backend.segment_size >> 20} MiB per rank" if lent else ""
+    providing = (
+        f", providing {backend.segment_size >> 20} MiB per rank" if backend.segment_size else ""
+    )
     logger.info(
         f"kv_sharing: store master {mooncake.master_server_address} over {mooncake.protocol}, "
-        f"roles {backend.roles}, {store_calls} store driver, {path}{lending}"
+        f"roles {backend.roles}, {store_calls} store driver, {path}{providing}"
     )
-    return orchestrator
 
 
-def lend_store_memory(py_executor: PyExecutor, llm_args: TorchLlmArgs) -> None:
-    """Lends the store ``segment_size`` bytes of each rank's host memory and does nothing else with
-    the store: a server whose only role is 'provide', a generation server say. No rank fetches or
-    publishes, and the KV cache manager gets no lender.
-
-    Run it once, on the final executor, before its worker starts, on every rank.
-
-    Raises:
-        ValueError: The store config is invalid, the node has too little host memory, or the store
-            did not open or take the memory on some rank (every rank raises, naming each failure).
-    """
+def _provide_store_memory(py_executor: PyExecutor, llm_args: TorchLlmArgs) -> None:
+    """Gives the store ``segment_size`` bytes of each rank's host memory and does nothing else with
+    it, for a server whose only role is 'provide', such as a generation server. No rank fetches or
+    publishes, and the KV cache manager gets no lender."""
     (backend,) = llm_args.kv_sharing.backends
     dist = py_executor.dist
 
     def prepare() -> tuple[MooncakeConfig, None]:
         mooncake, _ = _store_config(backend.config)
-        _check_node_memory(backend.segment_size, 0, dist.local_world_size)
+        _check_node_memory(
+            backend.segment_size, staging_bytes=0, ranks_on_node=dist.local_world_size
+        )
         return mooncake, None
 
-    def open_and_lend() -> tuple[StoreSegment, None]:
-        return StoreSegment.mount(open_sdk(mooncake), backend.segment_size, mooncake.protocol), None
+    def open_and_mount() -> tuple[None, None]:
+        store = open_sdk(mooncake)
+        # Recorded at once: start_kv_sharing unmounts it if another rank failed.
+        py_executor.store_segment = StoreSegment.mount(
+            store, backend.segment_size, mooncake.protocol
+        )
+        return None, None
 
-    # Two collectives, so that every rank checks the node's memory before any rank lends.
+    # Two collectives, so that every rank checks the node's memory before any rank mounts its
+    # segment.
     mooncake, _ = _agree(dist, prepare)
-    lent, _ = _agree(dist, open_and_lend)
-    py_executor.lent_store_memory = lent
+    _agree(dist, open_and_mount)
     logger.info(
-        f"kv_sharing: lending {backend.segment_size >> 20} MiB per rank to the store at "
+        f"kv_sharing: providing {backend.segment_size >> 20} MiB per rank to the store at "
         f"{mooncake.master_server_address}; this server neither fetches nor publishes"
     )
 
@@ -364,22 +400,20 @@ def _agree(
     dist: Distributed, attempt: Callable[[], tuple[_Local, _Shared]]
 ) -> tuple[_Local, list[_Shared]]:
     """Runs ``attempt`` on every rank: its local result, and every rank's shared one in rank
-    order. If it failed on any rank, every rank raises naming each failure. On one rank,
-    ``attempt`` runs as is.
+    order. If it failed on any rank, every rank raises naming each failure. One rank gathers
+    nothing.
 
     Raises:
         ValueError: ``attempt`` raised on some rank.
     """
-    if dist.world_size == 1:
-        local, shared = attempt()
-        return local, [shared]
     failure: Optional[Exception] = None
     local = shared = None
     try:
         local, shared = attempt()
     except Exception as error:  # noqa: BLE001 - every rank must reach the gather below
         failure = error
-    results = dist.allgather((None if failure is None else str(failure), shared))
+    own = (None if failure is None else str(failure), shared)
+    results = [own] if dist.world_size == 1 else dist.allgather(own)
     ranks_by_error: dict[str, list[str]] = {}
     for rank, (error, _) in enumerate(results):
         if error is not None:
@@ -398,39 +432,41 @@ def _store_config(path: str) -> tuple[MooncakeConfig, BlobConfig]:
     """The ``mooncake`` and ``blob`` sections of the store config at ``path``.
 
     Raises:
-        ValueError: The config is invalid or lends the store memory.
+        ValueError: The config is invalid or gives the store memory itself.
     """
     blob, mooncake = load_store_config(path)
     if mooncake.global_segment_size != 0:
         raise ValueError(
-            f"kv_sharing: set mooncake.global_segment_size to 0 in {path}; a server lends the "
+            f"kv_sharing: set mooncake.global_segment_size to 0 in {path}; a server provides the "
             "store memory through its role 'provide' and segment_size, 'trtllm-serve "
             "mooncake_provider' through its --segment_size"
         )
     return mooncake, blob
 
 
-def _check_node_memory(segment_bytes: int, staging_bytes: int, ranks_on_node: int) -> None:
-    """Refuses to lend the store more host memory than this node can give: each of the server's
-    ranks on it lends ``segment_bytes`` and stages through up to ``staging_bytes``, and
-    NODE_MEMORY_RESERVE_BYTES stay free. Run on every rank before any rank lends.
+def _check_node_memory(segment_bytes: int, *, staging_bytes: int, ranks_on_node: int) -> None:
+    """Refuses to give the store more host memory than this node can give: each of the server's
+    ranks on it provides ``segment_bytes`` and stages through up to ``staging_bytes``, and the
+    connector's NODE_BUDGET_RESERVE_BYTES stay free. Run on every rank before any rank mounts its
+    segment. It sees this server's ranks and the host's available memory only: neither other
+    servers starting on the node at the same time nor a cgroup memory limit (Slurm's).
 
     Raises:
         ValueError: The node's available memory is too small.
     """
     claimed = ranks_on_node * (segment_bytes + staging_bytes)
     available = psutil.virtual_memory().available
-    if claimed <= available - NODE_MEMORY_RESERVE_BYTES:
+    if claimed <= available - NODE_BUDGET_RESERVE_BYTES:
         return
     gib = 1 << 30
+    staging = f" and stage through up to {staging_bytes / gib:.1f} GiB" if staging_bytes else ""
     raise ValueError(
         f"kv_sharing: this node cannot give the store the host memory asked for: {ranks_on_node} "
-        f"rank(s) here would lend {segment_bytes / gib:.1f} GiB each and stage through up to "
-        f"{staging_bytes / gib:.1f} GiB each, {claimed / gib:.1f} GiB in all, but "
-        f"{available / gib:.1f} GiB is available and {NODE_MEMORY_RESERVE_BYTES // gib} GiB of "
-        "it stays free. Lower segment_size, or set kv_cache_config.host_cache_size: unset, KV "
-        "cache manager V2 takes up to half the node's available memory for its host tier before "
-        "the server lends any"
+        f"rank(s) here would provide {segment_bytes / gib:.1f} GiB each{staging}, "
+        f"{claimed / gib:.1f} GiB in all, but {available / gib:.1f} GiB is available and "
+        f"{NODE_BUDGET_RESERVE_BYTES // gib} GiB of it stays free. Lower segment_size, or set "
+        "kv_cache_config.host_cache_size to leave room: unset, KV cache manager V2's host tier "
+        "takes up to half of the node's available memory when the server starts"
     )
 
 
