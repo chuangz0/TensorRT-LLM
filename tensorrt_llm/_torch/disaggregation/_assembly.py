@@ -210,8 +210,8 @@ class ProfileSpec:
             raise TypeError("profile staging must be StagingOptions")
         if (self.model_layout, self.dtype) not in _SUPPORTED_CACHES:
             raise ValueError(
-                f"a {self.dtype} {self.model_layout} KV cache is not supported; supported: "
-                f"{sorted(_SUPPORTED_CACHES)}"
+                f"KV cache layout {self.model_layout} with dtype {self.dtype} is not supported; "
+                f"supported: {sorted(_SUPPORTED_CACHES)}"
             )
         topology = tuple(self.topology)
         if any(
