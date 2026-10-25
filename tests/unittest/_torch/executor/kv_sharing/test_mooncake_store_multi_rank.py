@@ -13,9 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """KV sharing through a real Mooncake store on several GPUs of one node: Qwen3-8B at TP2 (BF16 KV
-cache), and one case per other layout: DeepSeek-V3-Lite (MLA) at TP2 and under attention DP,
-Qwen3-8B with an FP8 KV cache at TP2, and the sliding-window models gemma-3-1b at TP1 and
-gpt-oss-20b at TP2, whose readers extend the writer's prompt.
+cache), and one case per other layout: DeepSeek-V3-Lite (MLA) at TP2 and under attention DP, also
+with an FP8 KV cache, Qwen3-8B with an FP8 KV cache and an NVFP4 one at TP2, and the
+sliding-window models gemma-3-1b at TP1 and gpt-oss-20b at TP2, whose readers extend the writer's
+prompt. On request, DeepSeek-V3.2 (DeepSeek sparse attention, FP8 KV cache) under attention DP on
+the node's four GPUs.
 
 Each stored object is put once: each rank puts its own share of every prompt block, and ranks
 holding the same bytes (MLA's latent cache) put one stripe each, or under host staging the first
@@ -29,7 +31,8 @@ same one, which proves they entered the same store collectives with the same tab
 counts; under attention DP each rank closes its own store work before it exits.
 
 Runs only with ``TRTLLM_MOONCAKE_E2E=1`` (it skips otherwise), from ``tests/unittest``:
-``TRTLLM_MOONCAKE_E2E=1 pytest _torch/executor/kv_sharing/test_mooncake_store_multi_rank.py``.
+``TRTLLM_MOONCAKE_E2E=1 pytest _torch/executor/kv_sharing/test_mooncake_store_multi_rank.py``;
+the DeepSeek-V3.2 case also needs ``TRTLLM_MOONCAKE_E2E_DSA=1``.
 Then it needs four GPUs, ``mooncake_master`` on the path, the ``mooncake.store`` SDK and, for the
 native driver, the built ``tensorrt_llm.mooncake_store_worker``; fails without them. The store and
 its drivers are the module's (``conftest.py``). Servers run their ranks in worker processes.
@@ -86,10 +89,22 @@ SIBLING = P[:FETCHED] + [_tokens.randrange(1000, 30000) for _ in range(200)]
 # A follow-up of P, the prompt windows serve: P's whole blocks, then 200 tokens of its own.
 P_END = P_BLOCKS * TOKENS_PER_BLOCK
 EXTENDS_P = P[:P_END] + [_tokens.randrange(1000, 30000) for _ in range(200)]
+# DeepSeek-V3.2's prompts pass its indexer's top-k (2048 tokens), so the sparse path runs: its
+# reader's queries pick their 2048 keys among fetched indexer keys. LONG_P is 96 blocks, its sibling
+# shares the first 80.
+LONG_P = [1000] + [_tokens.randrange(1000, 30000) for _ in range(96 * TOKENS_PER_BLOCK - 1)]
+LONG_FETCHED = 80 * TOKENS_PER_BLOCK
+LONG_SIBLING = LONG_P[:LONG_FETCHED] + [_tokens.randrange(1000, 30000) for _ in range(512)]
 
 
 DEEPSEEK = "DeepSeek-V3-Lite/bf16"
+# NVFP4 MoE weights, BF16 attention: the checkpoint TensorRT-LLM runs with an FP8 KV cache and reuse.
+DEEPSEEK_NVFP4_MOE = "DeepSeek-V3-Lite/nvfp4_moe_only"
+# DeepSeek sparse attention; about 390 GiB, so one server takes the whole node.
+DEEPSEEK_V32 = "DeepSeek-V3.2-NVFP4"
 QWEN3 = "Qwen3/Qwen3-8B"
+# NVFP4 weights; the checkpoint carries the KV cache scales an NVFP4 KV cache uses.
+QWEN3_NVFP4 = "Qwen3/nvidia-Qwen3-8B-NVFP4"
 GEMMA3 = "gemma/gemma-3-1b-it"
 GPT_OSS = "gpt_oss/gpt-oss-20b"
 
@@ -105,6 +120,7 @@ def server(
     *,
     model: str = QWEN3,
     max_batch_size: int = 8,
+    max_seq_len: int = 2048,
     kv_dtype: str = "auto",
     **kwargs,
 ) -> LLM:
@@ -120,17 +136,17 @@ def server(
         ),
         cuda_graph_config=None,
         max_batch_size=max_batch_size,
-        max_seq_len=2048,
+        max_seq_len=max_seq_len,
         **kwargs,
     )
 
 
 def sharing(store: Store, key_prefix: str, **knobs) -> dict:
-    """``kv_sharing`` sized for these short prompts; readers fetch prefixes of two blocks or
-    more."""
+    """``kv_sharing`` sized for these prompts, of 4096 tokens at most; readers fetch prefixes of
+    two blocks or more."""
     return {
         "backends": [{"type": "mooncake", "config": store.config(key_prefix)}],
-        "max_fetch_tokens": 1024,
+        "max_fetch_tokens": 4096,
         "min_fetch_tokens": 2 * TOKENS_PER_BLOCK,
         **knobs,
     }
@@ -293,8 +309,9 @@ def test_two_instances_of_one_service_share_system_prompts_and_follow_up_turns(
 
 @dataclass(frozen=True)
 class Cell:
-    """A model class on a layout of TP GPUs: a writer publishes P over ``writer_path``, then
-    a fresh reader of the same layout fetches the sibling over 'auto' (GPU Direct here).
+    """A model class on a layout of ``tp`` GPUs: a writer publishes a prompt over
+    ``writer_path``, then a fresh reader of the same layout fetches a sibling's shared prefix over
+    'auto' (GPU Direct here).
 
     Attributes:
         objects_per_block: Objects the store holds per prompt block: one per share of the KV
@@ -306,12 +323,17 @@ class Cell:
     writer_path: str = "auto"
     attention_dp: bool = False
     kv_dtype: str = "auto"
+    tp: int = TP
 
 
 CELLS = {
     "deepseek-tp2-host-staging-writer": Cell(DEEPSEEK, 1, writer_path="host_staging"),
     "qwen3-fp8-tp2": Cell(QWEN3, 2, kv_dtype="fp8"),
     "deepseek-attention-dp2": Cell(DEEPSEEK, 1, attention_dp=True),
+    "deepseek-fp8-kv-tp2": Cell(DEEPSEEK_NVFP4_MOE, 1, kv_dtype="fp8"),
+    # NVFP4 block scales are a second pool, so each object is two spans; the writer stages them
+    # through host memory, the reader writes them in place.
+    "qwen3-nvfp4-kv-tp2": Cell(QWEN3_NVFP4, 2, writer_path="host_staging", kv_dtype="nvfp4"),
 }
 # Under attention DP every request goes to rank 1, never to rank 0 (which probes): rank 0 keeps
 # stepping only because rank 1 reports open store work, and rank 1, whose one request is parked,
@@ -320,11 +342,11 @@ ON_RANK_1 = SchedulingParams(attention_dp_rank=1, attention_dp_relax=False)
 
 
 def cell_server(
-    monkeypatch: pytest.MonkeyPatch, cell: Cell, trace_dir: Path, kv_sharing: dict
+    monkeypatch: pytest.MonkeyPatch, cell: Cell, trace_dir: Path, kv_sharing: dict, **llm_args
 ) -> LLM:
     return server(
         monkeypatch,
-        TP,
+        cell.tp,
         trace_dir,
         model=cell.model,
         kv_dtype=cell.kv_dtype,
@@ -333,6 +355,7 @@ def cell_server(
         # them the last bits of MoE outputs: fixed kernels let a reader match its writer exactly.
         enable_autotuner=False,
         kv_sharing=kv_sharing,
+        **llm_args,
     )
 
 
@@ -340,51 +363,103 @@ def cell_trace(trace_dir: Path, cell: Cell) -> str:
     """The trace of the rank that served the requests: under tensor parallelism every rank's,
     which must agree; under attention DP rank 1's, after every rank ended with nothing open."""
     if not cell.attention_dp:
-        return rank_traces(trace_dir, TP)
-    traces = [(trace_dir / f"rank{rank}.txt").read_text() for rank in range(TP)]
+        return rank_traces(trace_dir, cell.tp)
+    traces = [(trace_dir / f"rank{rank}.txt").read_text() for rank in range(cell.tp)]
     for rank, trace in enumerate(traces):
         assert trace.splitlines()[-1].endswith(" open=0"), f"rank {rank}: {trace[-500:]}"
     return traces[1]
+
+
+def check_a_reader_fetches_exactly_and_each_object_is_put_once(
+    store: Store,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    cell: Cell,
+    prompt: list[int],
+    sibling: list[int],
+    fetched: int,
+    **llm_args,
+) -> None:
+    """A writer publishes ``prompt``, every object once, then serves ``sibling`` reusing their
+    first ``fetched`` tokens locally; a fresh reader fetches those from the store, serves the same
+    tokens and puts only its own new blocks."""
+    pinned = {"scheduling_params": ON_RANK_1} if cell.attention_dp else {}
+    with pytest.MonkeyPatch.context() as writer_env:
+        writer = cell_server(
+            writer_env,
+            cell,
+            tmp_path / "writer",
+            sharing(store, name, data_path=cell.writer_path),
+            **llm_args,
+        )
+    stored = cell.objects_per_block * (len(prompt) // TOKENS_PER_BLOCK)
+    try:
+        before = store.master_metrics()
+        complete(writer, prompt, **pinned)
+        store.assert_readable(name, stored)
+        assert puts_since(store, before) == (stored, 0)
+        complete(writer, prompt, cache_salt="reused", **pinned)
+        reference = complete(writer, sibling, cache_salt="reused", **pinned)
+        assert reference.cached_tokens == fetched
+    finally:
+        shut_down(writer)
+    cell_trace(tmp_path / "writer", cell)
+
+    new_blocks = len(sibling) // TOKENS_PER_BLOCK - fetched // TOKENS_PER_BLOCK
+    new_objects = cell.objects_per_block * new_blocks
+    reader = cell_server(monkeypatch, cell, tmp_path / "reader", sharing(store, name), **llm_args)
+    try:
+        held, _ = store.readable_objects(name)  # the writer's salted prompts too
+        before = store.master_metrics()
+        output = complete(reader, sibling, **pinned)
+        store.assert_readable(name, held + new_objects)
+        puts = puts_since(store, before)
+    finally:
+        shut_down(reader)
+    assert tokens(output) == tokens(reference)
+    assert output.cached_tokens == fetched
+    assert puts == (new_objects, 0)
+    trace = cell_trace(tmp_path / "reader", cell)
+    assert len(decisions(trace, "resume")) == 1, trace
 
 
 @pytest.mark.parametrize("name", CELLS)
 def test_a_reader_of_each_model_class_and_layout_fetches_exactly_and_each_object_is_put_once(
     store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
 ) -> None:
-    cell = CELLS[name]
-    pinned = {"scheduling_params": ON_RANK_1} if cell.attention_dp else {}
-    with pytest.MonkeyPatch.context() as writer_env:
-        writer = cell_server(
-            writer_env, cell, tmp_path / "writer", sharing(store, name, data_path=cell.writer_path)
-        )
-    stored = cell.objects_per_block * P_BLOCKS
-    try:
-        before = store.master_metrics()
-        complete(writer, P, **pinned)
-        store.assert_readable(name, stored)
-        assert puts_since(store, before) == (stored, 0)
-        complete(writer, P, cache_salt="reused", **pinned)
-        reference = complete(writer, SIBLING, cache_salt="reused", **pinned)
-        assert reference.cached_tokens == FETCHED
-    finally:
-        shut_down(writer)
-    cell_trace(tmp_path / "writer", cell)
+    check_a_reader_fetches_exactly_and_each_object_is_put_once(
+        store, tmp_path, monkeypatch, name, CELLS[name], P, SIBLING, FETCHED
+    )
 
-    new_objects = cell.objects_per_block * (T_BLOCKS - FETCHED_BLOCKS)
-    reader = cell_server(monkeypatch, cell, tmp_path / "reader", sharing(store, name))
-    try:
-        held, _ = store.readable_objects(name)  # the writer's salted prompts too
-        before = store.master_metrics()
-        output = complete(reader, SIBLING, **pinned)
-        store.assert_readable(name, held + new_objects)
-        puts = puts_since(store, before)
-    finally:
-        shut_down(reader)
-    assert tokens(output) == tokens(reference)
-    assert output.cached_tokens == FETCHED
-    assert puts == (new_objects, 0)
-    trace = cell_trace(tmp_path / "reader", cell)
-    assert len(decisions(trace, "resume")) == 1, trace
+
+# Each DeepSeek-V3.2 server start loads its whole checkpoint, so the case runs only on request.
+DSA_OPT_IN_ENV = "TRTLLM_MOONCAKE_E2E_DSA"
+
+
+@pytest.mark.skipif(
+    os.environ.get(DSA_OPT_IN_ENV) != "1",
+    reason=f"starts two DeepSeek-V3.2 servers on the node's four GPUs; set {DSA_OPT_IN_ENV}=1",
+)
+def test_a_reader_with_deepseek_sparse_attention_fetches_its_mla_and_indexer_caches_exactly(
+    store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DeepSeek-V3.2 with an FP8 KV cache under attention DP and expert parallelism on four GPUs:
+    a writer, then a reader in its place. Each object holds a block's MLA latent and indexer keys,
+    and the reader's queries select their top-k among the fetched indexer keys."""
+    cell = Cell(DEEPSEEK_V32, 1, attention_dp=True, kv_dtype="fp8", tp=4)
+    check_a_reader_fetches_exactly_and_each_object_is_put_once(
+        store,
+        tmp_path,
+        monkeypatch,
+        "deepseek-v32-attention-dp4",
+        cell,
+        LONG_P,
+        LONG_SIBLING,
+        LONG_FETCHED,
+        moe_expert_parallel_size=4,
+        max_seq_len=4096,
+    )
 
 
 @dataclass(frozen=True)

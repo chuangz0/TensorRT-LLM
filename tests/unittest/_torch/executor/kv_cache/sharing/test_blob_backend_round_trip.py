@@ -19,13 +19,15 @@ them into a request of its own. A test lease holder drives the lender as the run
 wait for the view, submit it to the backend as it stands, wait until the attempt quiesces, then
 release a read lease or return a write lease with what arrived. The store is the in-memory one, or
 with ``TRTLLM_MOONCAKE_REAL=1`` a real Mooncake pool (``TRTLLM_MOONCAKE_PROTOCOL``, default rdma).
-Allocates device pools.
+The caches: FP16 and NVFP4 multi-head attention, and DeepSeek sparse attention's MLA latent with
+its indexer keys. Allocates device pools.
 """
 
 from __future__ import annotations
 
 import os
 import threading
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -49,6 +51,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     StagingOptions,
     attach_lender,
 )
+from tensorrt_llm.bindings import DataType
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="allocates KV cache pools")
 
@@ -136,6 +139,42 @@ def stores(request, tmp_path):
             opened.close()
 
 
+def dsa_manager():
+    """DeepSeek-V3.2's cache, small: each layer's MLA latent and indexer keys, two pools of one pool
+    group."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa import DSACacheManagerV2
+    from tensorrt_llm.bindings.internal.batch_manager import CacheType
+    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig, KvCacheConfig
+    from tensorrt_llm.mapping import Mapping
+
+    return DSACacheManagerV2(
+        kv_cache_config=KvCacheConfig(enable_block_reuse=True, max_tokens=2048, host_cache_size=0),
+        kv_cache_type=CacheType.SELFKONLY,
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=576,
+        tokens_per_block=TPB,
+        max_seq_len=256,
+        max_batch_size=4,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1),
+        dtype=DataType.BF16,
+        vocab_size=32000,
+        execution_stream=torch.cuda.Stream(),
+        sparse_attention_config=DeepSeekSparseAttentionConfig(
+            index_n_heads=4, index_head_dim=128, index_topk=64
+        ),
+        pretrained_config=SimpleNamespace(num_hidden_layers=2, qk_rope_head_dim=64),
+    )
+
+
+def cache_manager(kit, cache: str):
+    """A small manager of ``cache`` ("fp16", "nvfp4" or "dsa"), shut down when the block exits."""
+    if cache == "dsa":
+        return kit.managed(dsa_manager)
+    dtype = DataType.NVFP4 if cache == "nvfp4" else DataType.HALF
+    return kit.managed(lambda: kit.make_manager(dtype=dtype))
+
+
 def attach(mgr):
     return attach_lender(mgr, scope=SCOPE, staging=StagingOptions(END))
 
@@ -190,8 +229,13 @@ def fetch(stores, kit, mgr):
     return target, lender, lease, outcome, backend, binding
 
 
-def test_publish_then_fetch_restores_pages(kit, real_manager, stores) -> None:
-    with real_manager() as mgr_a, real_manager() as mgr_b:
+@pytest.mark.parametrize("cache", ["fp16", "nvfp4", "dsa"])
+def test_publish_then_fetch_restores_pages(kit, stores, cache: str) -> None:
+    """Every byte of each page comes back, from every pool of its pool group: NVFP4's block scales
+    and DSA's indexer keys are pools of their own."""
+    with cache_manager(kit, cache) as mgr_a, cache_manager(kit, cache) as mgr_b:
+        (pool_group,) = mgr_a.impl.pool_group_descs
+        assert len(pool_group.pools) == (1 if cache == "fp16" else 2)
         source, _ = publish(stores, kit, mgr_a)
         target, lender, lease, outcome, backend, binding = fetch(stores, kit, mgr_b)
         assert outcome.fault is None
