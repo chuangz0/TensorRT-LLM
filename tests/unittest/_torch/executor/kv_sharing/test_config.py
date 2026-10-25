@@ -26,7 +26,11 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHyb
 from tensorrt_llm._torch.pyexecutor.kv_sharing import startup
 from tensorrt_llm._torch.pyexecutor.kv_sharing.startup import start_kv_sharing
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import (
+    CSA2SparseAttentionConfig,
+    DeepSeekSparseAttentionConfig,
+    TorchLlmArgs,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -51,7 +55,10 @@ def test_minimal_kv_sharing_config_is_accepted(store_config: str) -> None:
     sharing = llm_args(store_config).kv_sharing
     assert sharing.backends[0].roles == ["fetch", "publish"]
     assert sharing.data_path == "auto"
-    llm_args(store_config, kv_cache_config={"dtype": "fp8"})  # an FP8 KV cache shares too
+    # FP8 and NVFP4 KV caches share too, and so does DeepSeek sparse attention.
+    llm_args(store_config, kv_cache_config={"dtype": "fp8"})
+    llm_args(store_config, kv_cache_config={"dtype": "nvfp4"})
+    llm_args(store_config, sparse_attention_config={"algorithm": "dsa"})
 
 
 UNSUPPORTED = {
@@ -67,7 +74,18 @@ UNSUPPORTED = {
     ),
     "block reuse off": ({"kv_cache_config": {"enable_block_reuse": False}}, "block reuse off"),
     "PP2": ({"pipeline_parallel_size": 2}, "pipeline or context parallelism"),
-    "an NVFP4 KV cache": ({"kv_cache_config": {"dtype": "nvfp4"}}, "BF16 or FP8 KV caches only"),
+    "DeepSeek-V4's FP8 MLA KV cache": (
+        {"kv_cache_config": {"dtype": "fp8_ds_mla"}},
+        "BF16, FP8 or NVFP4 KV caches only",
+    ),
+    "skip-softmax sparse attention": (
+        {"sparse_attention_config": {"algorithm": "skip_softmax"}},
+        "skip_softmax sparse attention",
+    ),
+    "KV cache compression": (
+        {"kv_cache_compression_config": {"algorithm": "quantization_for_cold_page"}},
+        "kv_cache_compression_config (quantization_for_cold_page)",
+    ),
     "speculative decoding": (
         {"speculative_config": {"decoding_type": "NGram", "max_draft_len": 1}},
         "speculative decoding",
@@ -90,19 +108,33 @@ def test_kv_sharing_rejects_setups_it_cannot_serve(store_config: str, setup: str
         llm_args(store_config, **kwargs)
 
 
-@pytest.mark.parametrize("fact", ["sparse attention", "recurrent state"])
-def test_startup_refuses_a_model_with_sparse_attention_or_recurrent_state_before_any_store_work(
+@pytest.mark.parametrize("fact", ["csa2 sparse attention", "recurrent state"])
+def test_startup_refuses_a_model_with_other_sparse_attention_or_recurrent_state_before_store_work(
     store_config: str, fact: str
 ) -> None:
-    """A DSA checkpoint fills in its sparse attention config only when the model loads, and a
-    hybrid model's recurrent state shows in the manager built for it."""
+    """A checkpoint fills in its sparse attention config only when the model loads (DeepSeek-V4.1
+    CSA2 here), and a hybrid model's recurrent state shows in the manager built for it."""
     hybrid = fact == "recurrent state"
     manager = object.__new__(MambaHybridCacheManagerV2 if hybrid else KVCacheManagerV2)
-    sparse_attention_config = None if hybrid else object()
+    sparse_attention_config = None if hybrid else CSA2SparseAttentionConfig()
     # No collective, store or checkpoint work may start.
     built = executor(manager, sparse_attention_config, dist=None)
     with pytest.raises(ValueError, match=f"this server is refused: the model has {fact}$"):
         start_kv_sharing(built, llm_args(store_config), checkpoint_dir=None, max_num_tokens=64)
+
+
+def test_a_dsa_server_names_blocks_after_its_sparse_config_not_its_cuda_graphs() -> None:
+    """The scope carries the whole effective config: another top-k or indexer key dtype changes
+    the cache bytes and names other blocks; capturing CUDA graphs sets ``seq_len_threshold`` and
+    names the same ones."""
+    config = DeepSeekSparseAttentionConfig(index_n_heads=64, index_head_dim=128, index_topk=2048)
+    scoped = startup.scoped_sparse_config(config)
+    assert scoped["algorithm"] == "dsa"
+    config.needs_separate_short_long_cuda_graphs()
+    assert config.seq_len_threshold == 2048
+    assert startup.scoped_sparse_config(config) == scoped
+    for change in ({"index_topk": 1024}, {"indexer_k_dtype": "fp4"}):
+        assert startup.scoped_sparse_config(config.model_copy(update=change)) != scoped
 
 
 @pytest.mark.parametrize(

@@ -8005,12 +8005,16 @@ class TorchLlmArgs(BaseLlmArgs):
     def validate_kv_sharing(self) -> 'TorchLlmArgs':
         """Refuse setups kv_sharing cannot serve yet, naming every reason.
 
-        Model facts (sliding windows, MLA, the KV cache dtype a checkpoint
-        resolves to) are checked when the executor starts.
+        Model facts (sliding windows, MLA, the KV cache dtype and sparse
+        attention a checkpoint resolves to) are checked when the executor
+        starts.
         """
         if self.kv_sharing is None:
             return self
         kv_cache = self.kv_cache_config
+        sparse = getattr(self.sparse_attention_config, "algorithm", None)
+        compression = getattr(self.kv_cache_compression_config, "algorithm",
+                              None)
         checks = (
             ("kv_connector_config: one way to load KV cache from outside per "
              "server", self.kv_connector_config is not None),
@@ -8022,14 +8026,18 @@ class TorchLlmArgs(BaseLlmArgs):
              or kv_cache.block_reuse_config.policy != "all_reusable"),
             ("kv_cache_config.enable_swa_scratch_reuse",
              kv_cache.enable_swa_scratch_reuse),
-            (f"kv_cache_config.dtype={kv_cache.dtype!r}: BF16 or FP8 KV caches "
-             "only", kv_cache.dtype not in ("auto", "bfloat16", "fp8")),
+            (f"kv_cache_config.dtype={kv_cache.dtype!r}: BF16, FP8 or NVFP4 KV "
+             "caches only", kv_cache.dtype
+             not in ("auto", "bfloat16", "fp8", "nvfp4")),
+            (f"kv_cache_compression_config ({compression})", compression
+             is not None),
             ("pipeline or context parallelism", self.pipeline_parallel_size > 1
              or self.context_parallel_size > 1),
             ("speculative decoding", self.speculative_config is not None),
             ("LoRA", self.enable_lora or self.lora_config is not None),
             ("beam search", (self.max_beam_width or 1) > 1),
-            ("sparse attention", self.sparse_attention_config is not None),
+            (f"{sparse} sparse attention: DeepSeek sparse attention ('dsa') "
+             "only", sparse not in (None, "dsa")),
             ("sleep_config: sleep releases the KV cache memory",
              self.sleep_config is not None),
             ("orchestrator_type='ray'", self.orchestrator_type == "ray"),

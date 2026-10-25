@@ -25,7 +25,13 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 
-from ...disaggregation._assembly import FactoryRejected, OwnerCleanupFn, ProfileSpec, attach_domain
+from ...disaggregation._assembly import (
+    SPARSE_ALGORITHMS,
+    FactoryRejected,
+    OwnerCleanupFn,
+    ProfileSpec,
+    attach_domain,
+)
 from ...disaggregation.base.backend import CacheKind, SlotRegion, WakeFn
 from ...disaggregation.blob.backend import (
     BlobBackend,
@@ -67,7 +73,7 @@ from .probe import ProbeService
 from .replicas import ReplicaSet, replica_set
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+    from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, TorchLlmArgs
 
     from ...distributed import Distributed
     from ..py_executor import PyExecutor
@@ -85,14 +91,19 @@ HOST_STAGING_BYTES = 8 << 30
 MHA_LAYOUT = "mha-trtllm-hnd"
 MLA_LAYOUT = "mla-trtllm-latent"
 # The cache dtypes stored blocks carry, by the KV cache manager's dtype.
-_CACHE_DTYPES = {DataType.BF16: "bfloat16", DataType.FP8: "fp8"}
+_CACHE_DTYPES = {
+    DataType.BF16: "bfloat16",
+    DataType.HALF: "float16",
+    DataType.FP8: "fp8",
+    DataType.NVFP4: "nvfp4",
+}
 # Prefixes the reason a model is refused.
 SUPPORTED_MODELS = (
     "kv_sharing serves one GPU, tensor parallelism or attention DP, with multi-head "
-    "attention (BF16 or FP8 KV cache) with full attention or sliding windows, or MLA (BF16) with "
-    "full attention; no recurrent state, sparse attention or attention sink tokens; and under host "
-    "staging one fetch of max(max_fetch_tokens, max_num_tokens) tokens within "
-    f"{HOST_STAGING_BYTES >> 30} GiB"
+    "attention (BF16, FP16, FP8 or NVFP4 KV cache) with full attention or sliding windows, or MLA "
+    "(BF16 or FP8 KV cache) with full attention or DeepSeek sparse attention (DSA); no recurrent "
+    "state, other sparse attention or attention sink tokens; and under host staging one fetch of "
+    f"max(max_fetch_tokens, max_num_tokens) tokens within {HOST_STAGING_BYTES >> 30} GiB"
 )
 # Where each rank writes its round trace (rank<r>.txt), for multi-GPU tests to compare.
 TRACE_DIR_ENV = "TRTLLM_KV_SHARING_TRACE_DIR"
@@ -133,8 +144,9 @@ def start_kv_sharing(
     # checkpoint read or store work.
     model_config = py_executor.model_engine.model.model_config
     unserved: list[str] = []
-    if model_config.sparse_attention_config is not None:
-        unserved.append("sparse attention")
+    sparse = model_config.sparse_attention_config
+    if sparse is not None and sparse.algorithm not in SPARSE_ALGORITHMS:
+        unserved.append(f"{sparse.algorithm} sparse attention")
     if isinstance(manager, MambaHybridCacheManagerV2):
         unserved.append("recurrent state")
     if unserved:
@@ -467,7 +479,7 @@ def _profile(
         topology=(mapping.tp_size, dp_size, mapping.pp_size, mapping.cp_size),
         state_kinds=(CacheKind.PAGED,) * manager.num_pools,
         attention_windows=_attention_windows(manager),
-        sparse_attention=model_config.sparse_attention_config is not None,
+        sparse_attention=scoped_sparse_config(model_config.sparse_attention_config),
         sink_token_length=llm_args.kv_cache_config.sink_token_length or 0,
         lora_enabled=False,
         pool_count=len(manager.impl.pool_group_descs),
@@ -477,6 +489,15 @@ def _profile(
         joint_reuse=False,
         staging=staging,
     )
+
+
+def scoped_sparse_config(config: Optional[BaseSparseAttentionConfig]) -> Optional[dict]:
+    """The effective sparse attention config that names stored blocks, as JSON values; None for
+    dense attention. Leaves out ``seq_len_threshold``: it only picks CUDA graphs, and DSA sets it to
+    its top-k when they are captured."""
+    if config is None:
+        return None
+    return config.model_dump(mode="json", exclude={"seq_len_threshold"})
 
 
 def _attention_windows(manager: KVCacheManagerV2) -> tuple[tuple[int, int], ...]:
