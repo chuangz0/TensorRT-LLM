@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Wires KV sharing into a built executor, on its construction thread before its worker starts:
-the store client and its data path, the KV cache manager's lender, the transfer manager and the
-orchestrator.
+the store client and its data path, the host memory the server lends the store, the KV cache
+manager's lender, the transfer manager and the orchestrator. A server that only lends memory
+(roles [provide]) gets the store client and the lent memory alone.
 
 Every rank of a tensor-parallel server runs it. Each step that can fail on one rank alone ends in
 one collective every rank reaches, and every rank then raises naming each failure: a rank raising
@@ -16,8 +17,9 @@ import os
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, TextIO, TypeVar
+from typing import TYPE_CHECKING, Any, Optional, TextIO, TypeVar
 
+import psutil
 import torch
 
 import tensorrt_llm
@@ -44,9 +46,11 @@ from ...disaggregation.blob.keys import key_stem
 from ...disaggregation.blob.mooncake import MooncakeDriver
 from ...disaggregation.blob.mooncake_native import NativeMooncakeDriver
 from ...disaggregation.blob.mooncake_setup import (
+    LentMemory,
     MooncakeConfig,
     load_store_config,
     make_store_driver,
+    open_sdk,
 )
 from ...disaggregation.lifecycle.retirement import QuiescenceFatalEvent, RetirementWatchdog
 from ...disaggregation.transfer_manager import LifecycleBinding, TransferManager
@@ -88,6 +92,9 @@ _Shared = TypeVar("_Shared")
 STORE_ACCESS_DEADLINE_S = 120.0
 # Pinned host memory each rank stages fetches and publications through, at most.
 HOST_STAGING_BYTES = 8 << 30
+# Host memory a node keeps free beside what its ranks lend the store and stage through: the page
+# cache, allocator arenas and the runtime's own host buffers (as the Mooncake connector's check).
+NODE_MEMORY_RESERVE_BYTES = 32 << 30
 # The attention writer layouts of the TRTLLM backend, which stored blocks carry.
 MHA_LAYOUT = "mha-trtllm-hnd"
 MLA_LAYOUT = "mla-trtllm-latent"
@@ -164,6 +171,9 @@ def start_kv_sharing(
 
     def prepare() -> tuple[tuple[MooncakeConfig, BlobConfig], Optional[ArtifactIdentity]]:
         mooncake, blob_config = _store_config(backend.config)
+        if backend.segment_size:
+            # Host staging is not chosen yet: count its cap.
+            _check_node_memory(backend.segment_size, HOST_STAGING_BYTES, dist.local_world_size)
         if dist.rank != 0:
             return (mooncake, blob_config), None
         if not os.path.isdir(checkpoint):
@@ -173,11 +183,17 @@ def start_kv_sharing(
         logger.info(f"kv_sharing: reading every file of {checkpoint} to name its stored blocks")
         return (mooncake, blob_config), ArtifactIdentity.from_checkpoint(checkpoint)
 
-    # Three collectives every rank reaches, whatever failed on it: prepare, opening and checking
-    # the store, attach. Every check after them reads gathered facts, so it raises on every rank.
+    def open_and_check() -> tuple[tuple[Any, Optional[LentMemory]], Optional[str]]:
+        store, lent, gpu_direct_error = open_store(config.data_path, mooncake, backend.segment_size)
+        return (store, lent), gpu_direct_error
+
+    # Three collectives every rank reaches, whatever failed on it: prepare (which checks the node's
+    # memory before any rank lends), opening and checking the store, attach. Every check after them
+    # reads gathered facts, so it raises on every rank.
     (mooncake, blob_config), identity_by_rank = _agree(dist, prepare)
     # Before the lender pins its staging memory: an unreachable master fails here, within a minute.
-    store, gpu_direct_errors = _agree(dist, lambda: open_store(config.data_path, mooncake))
+    (store, lent), gpu_direct_errors = _agree(dist, open_and_check)
+    py_executor.lent_store_memory = lent
     memory_kind = choose_data_path(config.data_path, gpu_direct_errors)
 
     tokens_per_block = manager.tokens_per_block
@@ -278,11 +294,44 @@ def start_kv_sharing(
             f"publications of {blocks} blocks"
         )
     store_calls = "native" if isinstance(attached.driver, NativeMooncakeDriver) else "python"
+    lending = f", lending {backend.segment_size >> 20} MiB per rank" if lent else ""
     logger.info(
         f"kv_sharing: store master {mooncake.master_server_address} over {mooncake.protocol}, "
-        f"roles {backend.roles}, {store_calls} store driver, {path}"
+        f"roles {backend.roles}, {store_calls} store driver, {path}{lending}"
     )
     return orchestrator
+
+
+def lend_store_memory(py_executor: PyExecutor, llm_args: TorchLlmArgs) -> None:
+    """Lends the store ``segment_size`` bytes of each rank's host memory and does nothing else with
+    the store: a server whose only role is 'provide', a generation server say. No rank fetches or
+    publishes, and the KV cache manager gets no lender.
+
+    Run it once, on the final executor, before its worker starts, on every rank.
+
+    Raises:
+        ValueError: The store config is invalid, the node has too little host memory, or the store
+            did not open or take the memory on some rank (every rank raises, naming each failure).
+    """
+    (backend,) = llm_args.kv_sharing.backends
+    dist = py_executor.dist
+
+    def prepare() -> tuple[MooncakeConfig, None]:
+        mooncake, _ = _store_config(backend.config)
+        _check_node_memory(backend.segment_size, 0, dist.local_world_size)
+        return mooncake, None
+
+    def open_and_lend() -> tuple[LentMemory, None]:
+        return LentMemory.lend(open_sdk(mooncake), backend.segment_size, mooncake.protocol), None
+
+    # Two collectives, so that every rank checks the node's memory before any rank lends.
+    mooncake, _ = _agree(dist, prepare)
+    lent, _ = _agree(dist, open_and_lend)
+    py_executor.lent_store_memory = lent
+    logger.info(
+        f"kv_sharing: lending {backend.segment_size >> 20} MiB per rank to the store at "
+        f"{mooncake.master_server_address}; this server neither fetches nor publishes"
+    )
 
 
 @dataclass(frozen=True)
@@ -354,10 +403,35 @@ def _store_config(path: str) -> tuple[MooncakeConfig, BlobConfig]:
     blob, mooncake = load_store_config(path)
     if mooncake.global_segment_size != 0:
         raise ValueError(
-            "kv_sharing servers lend no memory to the store: set mooncake.global_segment_size to 0 "
-            f"in {path} and run 'trtllm-serve mooncake_provider'"
+            f"kv_sharing: set mooncake.global_segment_size to 0 in {path}; a server lends the "
+            "store memory through its role 'provide' and segment_size, 'trtllm-serve "
+            "mooncake_provider' through its --segment_size"
         )
     return mooncake, blob
+
+
+def _check_node_memory(segment_bytes: int, staging_bytes: int, ranks_on_node: int) -> None:
+    """Refuses to lend the store more host memory than this node can give: each of the server's
+    ranks on it lends ``segment_bytes`` and stages through up to ``staging_bytes``, and
+    NODE_MEMORY_RESERVE_BYTES stay free. Run on every rank before any rank lends.
+
+    Raises:
+        ValueError: The node's available memory is too small.
+    """
+    claimed = ranks_on_node * (segment_bytes + staging_bytes)
+    available = psutil.virtual_memory().available
+    if claimed <= available - NODE_MEMORY_RESERVE_BYTES:
+        return
+    gib = 1 << 30
+    raise ValueError(
+        f"kv_sharing: this node cannot give the store the host memory asked for: {ranks_on_node} "
+        f"rank(s) here would lend {segment_bytes / gib:.1f} GiB each and stage through up to "
+        f"{staging_bytes / gib:.1f} GiB each, {claimed / gib:.1f} GiB in all, but "
+        f"{available / gib:.1f} GiB is available and {NODE_MEMORY_RESERVE_BYTES // gib} GiB of "
+        "it stays free. Lower segment_size, or set kv_cache_config.host_cache_size: unset, KV "
+        "cache manager V2 takes up to half the node's available memory for its host tier before "
+        "the server lends any"
+    )
 
 
 def _attach(

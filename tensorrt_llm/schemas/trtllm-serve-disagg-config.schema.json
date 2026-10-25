@@ -2323,7 +2323,7 @@
             }
           ],
           "default": null,
-          "description": "Share prompt KV cache blocks with other servers through a KV store. Set it on aggregated and context servers, not on generation servers: there it turns off the reuse of generated blocks and helps only requests that conditional disaggregation lets the server prefill itself.",
+          "description": "Share prompt KV cache blocks with other servers through a KV store, or lend the store host memory. Aggregated and context servers fetch and publish blocks; a generation server only lends memory (roles: [provide]).",
           "status": "prototype"
         },
         "layer_wise_benchmarks_config": {
@@ -4889,22 +4889,36 @@
       "description": "A KV store that servers share prompt KV cache blocks through.",
       "properties": {
         "config": {
-          "description": "Path to the store config, a YAML file every server and provider of the store reads: a 'mooncake' section (master address, protocol, RDMA devices, RPC timeouts; servers set global_segment_size to 0, since 'trtllm-serve mooncake_provider' lends the store its memory) and an optional 'blob' section (key prefix, store workers, rows and bytes per store call).",
+          "description": "Path to the store config, a YAML file every server and provider of the store reads: a 'mooncake' section (master address, protocol, RDMA devices, RPC timeouts; global_segment_size 0, as servers lend memory through the role 'provide' and 'trtllm-serve mooncake_provider' through its --segment_size) and an optional 'blob' section (key prefix, store workers, rows and bytes per store call).",
           "title": "Config",
           "type": "string"
         },
         "roles": {
-          "description": "'fetch' reads stored prompt prefixes instead of computing them; 'publish' stores the prompt blocks this server computes.",
+          "description": "'fetch' reads stored prompt prefixes instead of computing them; 'publish' stores the prompt blocks this server computes; 'provide' lends the store segment_size bytes of each rank's host memory, which holds other servers' blocks too. Aggregated and context servers fetch and publish. A generation server sets only 'provide': it lends memory and leaves its KV cache alone, since fetching or publishing there would turn off the reuse of generated blocks.",
           "items": {
             "enum": [
               "fetch",
-              "publish"
+              "publish",
+              "provide"
             ],
             "type": "string"
           },
           "minItems": 1,
           "title": "Roles",
           "type": "array"
+        },
+        "segment_size": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "default": 0,
+          "description": "Host memory each rank lends the store under the role 'provide', as a binary size ('32GiB') or a byte count; required with 'provide' and 0 without it. Startup refuses a size the node cannot give: the segments and host staging of its ranks must fit in the available memory less 32 GiB. A lending server takes about 13 s longer to stop, while reads of its memory finish.",
+          "title": "Segment Size"
         },
         "type": {
           "const": "mooncake",
@@ -8801,7 +8815,7 @@
         }
       ],
       "default": null,
-      "description": "Share prompt KV cache blocks with other servers through a KV store. Set it on aggregated and context servers, not on generation servers: there it turns off the reuse of generated blocks and helps only requests that conditional disaggregation lets the server prefill itself.",
+      "description": "Share prompt KV cache blocks with other servers through a KV store, or lend the store host memory. Aggregated and context servers fetch and publish blocks; a generation server only lends memory (roles: [provide]).",
       "status": "prototype"
     },
     "layer_wise_benchmarks_config": {

@@ -2768,15 +2768,29 @@ class KvSharingBackendConfig(StrictBaseModel):
     config: str = Field(
         description="Path to the store config, a YAML file every server and "
         "provider of the store reads: a 'mooncake' section (master address, "
-        "protocol, RDMA devices, RPC timeouts; servers set "
-        "global_segment_size to 0, since 'trtllm-serve mooncake_provider' "
-        "lends the store its memory) and an optional 'blob' section (key "
-        "prefix, store workers, rows and bytes per store call).")
-    roles: List[Literal["fetch", "publish"]] = Field(
+        "protocol, RDMA devices, RPC timeouts; global_segment_size 0, as "
+        "servers lend memory through the role 'provide' and "
+        "'trtllm-serve mooncake_provider' through its --segment_size) and an "
+        "optional 'blob' section (key prefix, store workers, rows and bytes "
+        "per store call).")
+    roles: List[Literal["fetch", "publish", "provide"]] = Field(
         default_factory=lambda: ["fetch", "publish"],
         min_length=1,
         description="'fetch' reads stored prompt prefixes instead of computing "
-        "them; 'publish' stores the prompt blocks this server computes.")
+        "them; 'publish' stores the prompt blocks this server computes; "
+        "'provide' lends the store segment_size bytes of each rank's host "
+        "memory, which holds other servers' blocks too. Aggregated and context "
+        "servers fetch and publish. A generation server sets only 'provide': "
+        "it lends memory and leaves its KV cache alone, since fetching or "
+        "publishing there would turn off the reuse of generated blocks.")
+    segment_size: Union[int, str] = Field(
+        0,
+        description="Host memory each rank lends the store under the role "
+        "'provide', as a binary size ('32GiB') or a byte count; required with "
+        "'provide' and 0 without it. Startup refuses a size the node cannot "
+        "give: the segments and host staging of its ranks must fit in the "
+        "available memory less 32 GiB. A lending server takes about 13 s "
+        "longer to stop, while reads of its memory finish.")
 
     @field_validator("config")
     @classmethod
@@ -2784,6 +2798,28 @@ class KvSharingBackendConfig(StrictBaseModel):
         if not os.path.isfile(path):
             raise ValueError(f"the store config {path!r} is not a file")
         return path
+
+    @field_validator("segment_size", mode="after")
+    @classmethod
+    def _segment_size_in_bytes(cls, value: Union[int, str]) -> int:
+        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
+            parse_size
+        nbytes = parse_size(value, strict_units=True)
+        if nbytes < 0:
+            raise ValueError(f"segment_size {value!r} is negative")
+        return nbytes
+
+    @model_validator(mode="after")
+    def _segment_size_goes_with_provide(self) -> "KvSharingBackendConfig":
+        provides = "provide" in self.roles
+        if provides and self.segment_size == 0:
+            raise ValueError(
+                "the role 'provide' needs segment_size: the host memory each "
+                "rank lends the store")
+        if not provides and self.segment_size > 0:
+            raise ValueError(
+                "segment_size lends memory only under the role 'provide'")
+        return self
 
 
 class KvSharingConfig(StrictBaseModel):
@@ -7035,10 +7071,9 @@ class TorchLlmArgs(BaseLlmArgs):
     kv_sharing: Optional[KvSharingConfig] = Field(
         default=None,
         description="Share prompt KV cache blocks with other servers through "
-        "a KV store. Set it on aggregated and context servers, not on "
-        "generation servers: there it turns off the reuse of generated blocks "
-        "and helps only requests that conditional disaggregation lets the "
-        "server prefill itself.",
+        "a KV store, or lend the store host memory. Aggregated and context "
+        "servers fetch and publish blocks; a generation server only lends "
+        "memory (roles: [provide]).",
         status="prototype",
     )
 
@@ -8005,19 +8040,38 @@ class TorchLlmArgs(BaseLlmArgs):
     def validate_kv_sharing(self) -> 'TorchLlmArgs':
         """Refuse setups kv_sharing cannot serve yet, naming every reason.
 
+        A server that only lends the store memory (roles: [provide]) leaves
+        its KV cache alone: only a KV connector refuses it.
+
         Model facts (sliding windows, MLA, the KV cache dtype and sparse
         attention a checkpoint resolves to) are checked when the executor
         starts.
         """
         if self.kv_sharing is None:
             return self
+        connector = ("kv_connector_config: one way per server to share KV "
+                     "cache through a store", self.kv_connector_config
+                     is not None)
+        if self.kv_sharing.backends[0].roles == ["provide"]:
+            checks = (connector, )
+        else:
+            checks = (connector, *self._kv_sharing_cache_checks())
+        reasons = [reason for reason, applies in checks if applies]
+        if reasons:
+            raise ValueError("kv_sharing does not support: " +
+                             "; ".join(reasons))
+        return self
+
+    def _kv_sharing_cache_checks(self) -> Tuple[Tuple[str, bool], ...]:
+        """Setups a server that fetches or publishes blocks cannot serve.
+
+        Returns ``(reason, applies)`` of each.
+        """
         kv_cache = self.kv_cache_config
         sparse = getattr(self.sparse_attention_config, "algorithm", None)
         compression = getattr(self.kv_cache_compression_config, "algorithm",
                               None)
-        checks = (
-            ("kv_connector_config: one way to load KV cache from outside per "
-             "server", self.kv_connector_config is not None),
+        return (
             ("kv_cache_config.use_kv_cache_manager_v2=False",
              kv_cache.use_kv_cache_manager_v2 is False),
             ("block reuse off or a block_reuse_config.policy other than "
@@ -8047,11 +8101,6 @@ class TorchLlmArgs(BaseLlmArgs):
             (f"attn_backend={self.attn_backend!r}: stored blocks have the "
              "TRTLLM backend's layout", self.attn_backend != "TRTLLM"),
         )
-        reasons = [reason for reason, applies in checks if applies]
-        if reasons:
-            raise ValueError("kv_sharing does not support: " +
-                             "; ".join(reasons))
-        return self
 
     @model_validator(mode='after')
     def sync_quant_config_with_kv_cache_config_dtype(self) -> 'TorchLlmArgs':

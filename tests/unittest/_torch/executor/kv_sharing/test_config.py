@@ -13,14 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Which setups ``kv_sharing`` accepts: the LLM argument's checks where the user builds the args,
-startup's refusal of model facts only the built executor knows, and the store driver each data
-path gets."""
+startup's refusal of model facts only the built executor knows, the store driver each data path
+gets, and the host memory a server lends the store."""
 
 import re
 from types import SimpleNamespace
 from typing import get_args
 
 import pytest
+from _torch.disaggregation.blob.fake_mooncake import FakeMooncakeStore
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.disaggregation._assembly import ProfileSpec
@@ -29,7 +30,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import StagingOptions
 from tensorrt_llm._torch.pyexecutor.kv_sharing import startup
-from tensorrt_llm._torch.pyexecutor.kv_sharing.startup import start_kv_sharing
+from tensorrt_llm._torch.pyexecutor.kv_sharing.startup import lend_store_memory, start_kv_sharing
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm._torch.weight_sharing.artifact_identity import ArtifactIdentity
 from tensorrt_llm.bindings import DataType
@@ -109,6 +110,35 @@ def test_kv_sharing_rejects_setups_it_cannot_serve(store_config: str, setup: str
     kwargs, reason = UNSUPPORTED[setup]
     with pytest.raises(ValueError, match=re.escape(reason)):
         llm_args(store_config, **kwargs)
+
+
+def lending(store_config: str, roles: list[str], segment_size="32GiB") -> dict:
+    """``kv_sharing`` of a server whose ``roles`` lend the store ``segment_size`` per rank."""
+    backend = {"type": "mooncake", "config": store_config, "roles": roles}
+    return {"backends": [{**backend, "segment_size": segment_size}]}
+
+
+def test_the_role_provide_and_segment_size_go_together(store_config: str) -> None:
+    sharing = llm_args(store_config, lending(store_config, ["fetch", "publish", "provide"]))
+    assert sharing.kv_sharing.backends[0].segment_size == 32 << 30
+    with pytest.raises(ValueError, match="'provide' needs segment_size"):
+        llm_args(store_config, lending(store_config, ["provide"], segment_size=0))
+    with pytest.raises(ValueError, match="segment_size lends memory only under the role 'provide'"):
+        llm_args(store_config, lending(store_config, ["fetch", "publish"]))
+    with pytest.raises(ValueError, match="ambiguous unit 'GB'"):
+        llm_args(store_config, lending(store_config, ["provide"], segment_size="32GB"))
+
+
+def test_a_server_that_only_lends_memory_is_refused_only_for_a_kv_connector(
+    store_config: str,
+) -> None:
+    """A generation server leaves its KV cache alone, so the setups that refuse a server that
+    fetches or publishes serve."""
+    lend_only = lending(store_config, ["provide"])
+    for setup in ("block reuse off", "PP2", "KV cache compression", "speculative decoding"):
+        llm_args(store_config, lend_only, **UNSUPPORTED[setup][0])
+    with pytest.raises(ValueError, match="does not support: kv_connector_config: [^;]*$"):
+        llm_args(store_config, lend_only, **UNSUPPORTED["a KV cache connector"][0])
 
 
 # Each algorithm of the sparse attention config union.
@@ -200,7 +230,11 @@ def test_the_store_driver_registers_device_memory_only_under_gpu_direct(
     """Under host staging the store reads and writes host memory only. One rank, a store that
     opens and checks as the data path asks; startup stops at attach, past the driver it made."""
     gpu_direct_error = None if data_path == "gpu_direct" else "host staging was asked for"
-    monkeypatch.setattr(startup, "open_store", lambda requested, mooncake: (None, gpu_direct_error))
+    monkeypatch.setattr(
+        startup,
+        "open_store",
+        lambda requested, mooncake, lent_bytes: (None, None, gpu_direct_error),
+    )
     monkeypatch.setattr(startup.ArtifactIdentity, "from_checkpoint", lambda checkpoint: None)
     drivers = []
 
@@ -215,6 +249,62 @@ def test_the_store_driver_registers_device_memory_only_under_gpu_direct(
         start_kv_sharing(built, args, checkpoint_dir=str(tmp_path), max_num_tokens=64)
     (driver,) = drivers
     assert driver.capabilities.device_memory is device_memory
+
+
+def test_a_context_server_lends_only_what_its_node_can_give_with_host_staging(
+    store_config: str, tmp_path, monkeypatch
+) -> None:
+    """Two ranks on a node of 70 GiB available, each lending 16 GiB and staging through up to
+    8 GiB: 48 GiB is more than the 38 GiB left after the 32 GiB reserve. Every rank refuses before
+    any rank opens the store."""
+    gib = 1 << 30
+    monkeypatch.setattr(
+        startup.psutil, "virtual_memory", lambda: SimpleNamespace(available=70 * gib)
+    )
+    monkeypatch.setattr(startup, "open_store", fail_if_called)
+    monkeypatch.setattr(startup.ArtifactIdentity, "from_checkpoint", lambda checkpoint: None)
+    built = executor(dist=SimpleNamespace(rank=0, world_size=1, local_world_size=2))
+    args = llm_args(store_config, lending(store_config, ["fetch", "publish", "provide"], "16GiB"))
+    refused = (
+        "2 rank(s) here would lend 16.0 GiB each and stage through up to 8.0 GiB each, 48.0 GiB "
+        "in all, but 70.0 GiB is available and 32 GiB of it stays free"
+    )
+    with pytest.raises(ValueError, match=re.escape(refused)) as error:
+        start_kv_sharing(built, args, checkpoint_dir=str(tmp_path), max_num_tokens=64)
+    assert "kv_cache_config.host_cache_size" in str(error.value)
+
+
+def test_a_mount_that_fails_on_one_rank_refuses_a_lending_server_on_every_rank(
+    store_config: str, monkeypatch
+) -> None:
+    """A generation server of two ranks: Mooncake takes rank 0's memory and not rank 1's. Each
+    rank gathers ``(error, shared result)`` of both from its two steps, check and lend."""
+    store = FakeMooncakeStore()
+    monkeypatch.setattr(startup, "open_sdk", lambda mooncake: store)
+    monkeypatch.setattr(
+        startup.psutil, "virtual_memory", lambda: SimpleNamespace(available=1 << 40)
+    )
+    args = llm_args(store_config, lending(store_config, ["provide"]))
+    failed = "rank 1: mooncake: lending 34359738368 bytes of host memory failed with -1"
+
+    def server(rank: int, allgather) -> SimpleNamespace:
+        dist = SimpleNamespace(rank=rank, world_size=2, local_world_size=2, allgather=allgather)
+        return SimpleNamespace(dist=dist, lent_store_memory=None)
+
+    store.mount_answer = -1
+    rank_1 = server(1, lambda own: [(None, None), own])
+    with pytest.raises(ValueError, match=failed):
+        lend_store_memory(rank_1, args)
+    store.mount_answer = 0
+    rank_1_steps = iter([(None, None), (failed.removeprefix("rank 1: "), None)])
+    rank_0 = server(0, lambda own: [own, next(rank_1_steps)])
+    with pytest.raises(ValueError, match=failed):
+        lend_store_memory(rank_0, args)
+    assert rank_0.lent_store_memory is rank_1.lent_store_memory is None
+
+
+def fail_if_called(*args, **kwargs):
+    raise AssertionError("called after a refusal")
 
 
 def executor(

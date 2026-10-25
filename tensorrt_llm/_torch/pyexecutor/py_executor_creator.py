@@ -1300,11 +1300,14 @@ def _create_py_executor(
     _adjust_torch_mem_fraction()
 
     if llm_args.kv_sharing is not None:
-        from .kv_sharing.startup import start_kv_sharing
-        start_kv_sharing(py_executor,
-                         llm_args,
-                         checkpoint_dir=checkpoint_dir,
-                         max_num_tokens=max_num_tokens)
+        from .kv_sharing.startup import lend_store_memory, start_kv_sharing
+        if llm_args.kv_sharing.backends[0].roles == ["provide"]:
+            lend_store_memory(py_executor, llm_args)
+        else:
+            start_kv_sharing(py_executor,
+                             llm_args,
+                             checkpoint_dir=checkpoint_dir,
+                             max_num_tokens=max_num_tokens)
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")

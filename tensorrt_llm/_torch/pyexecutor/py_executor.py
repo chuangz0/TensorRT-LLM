@@ -136,6 +136,7 @@ if TYPE_CHECKING:
 
     from tensorrt_llm.bindings import MpiProgressThread
 
+    from ..disaggregation.blob.mooncake_setup import LentMemory
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
     from .kv_sharing.orchestrator import SharedKvOrchestrator
 
@@ -432,6 +433,8 @@ class PyExecutor:
     # Set by kv_sharing startup. A class default keeps executors that tests
     # build partially working.
     kv_sharing: Optional["SharedKvOrchestrator"] = None
+    # Host memory this rank lends the KV store, also set by kv_sharing startup.
+    lent_store_memory: Optional["LentMemory"] = None
 
     def __init__(
         self,
@@ -2006,6 +2009,11 @@ class PyExecutor:
         Model-owned graphs are terminal model resources, unlike executor-owned
         graphs that may reference the resource managers torn down below.
         """
+        lent_store_memory = self.lent_store_memory
+        if lent_store_memory is not None:
+            # First, so that its grace and Mooncake's cleanup run while the
+            # executor stops; the last step waits for the rest.
+            lent_store_memory.begin_leaving()
         node_server = getattr(self, "_openengine_node_server", None)
         if node_server is not None:
             node_server.close()
@@ -2103,6 +2111,9 @@ class PyExecutor:
         if self.dwdp_manager is not None:
             self.dwdp_manager.__exit__(None, None, None)
             self.dwdp_manager = None
+        if lent_store_memory is not None:
+            # Other servers may still read the memory until Mooncake frees it.
+            lent_store_memory.wait_until_left()
 
     def can_enqueue_requests(self) -> bool:
         """

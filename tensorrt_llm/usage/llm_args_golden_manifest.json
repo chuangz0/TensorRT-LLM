@@ -897,11 +897,17 @@
     {
       "allowed_values": [
         "fetch",
-        "publish"
+        "publish",
+        "provide"
       ],
       "capture_policy": "list[list[literal]]",
       "kind": "categorical",
       "path": "kv_sharing.backends.roles"
+    },
+    {
+      "capture_policy": "list[int]",
+      "kind": "value",
+      "path": "kv_sharing.backends.segment_size"
     },
     {
       "allowed_values": [
