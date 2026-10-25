@@ -509,7 +509,7 @@ def test_single_round_empty_iteration_is_one_collective():
     hang_detector = MagicMock()
     broadcaster = RequestBroadcaster(dist, hang_detector)
 
-    assert broadcaster.broadcast([]) == ([], None, 0)
+    assert broadcaster.broadcast([], 0) == ([], None, 0)
     assert dist.calls == [("broadcast_or_none", None)]
     hang_detector.pause.assert_called_once()
 
@@ -519,7 +519,7 @@ def test_single_round_busy_iteration_sends_requests_and_py_objects_once():
     broadcaster = RequestBroadcaster(dist, MagicMock())
     items = [_make_broadcast_item(1), _make_broadcast_item(2)]
 
-    new_requests, py_request_objects, _ = broadcaster.broadcast(items)
+    new_requests, py_request_objects, _ = broadcaster.broadcast(items, 0)
 
     assert new_requests == items
     assert py_request_objects == broadcaster._collect_py_objects(items)
@@ -536,11 +536,11 @@ def test_single_round_non_root_receives_payload_or_nothing():
     )
 
     dist = _SingleRoundDist(rank=1, received=(items, py_objects))
-    assert RequestBroadcaster(dist, MagicMock()).broadcast([]) == (items, py_objects, 0)
+    assert RequestBroadcaster(dist, MagicMock()).broadcast([], 0) == (items, py_objects, 0)
     assert dist.calls == [("broadcast_or_none", None)]
 
     dist = _SingleRoundDist(rank=1, received=None)
-    assert RequestBroadcaster(dist, MagicMock()).broadcast([]) == ([], None, 0)
+    assert RequestBroadcaster(dist, MagicMock()).broadcast([], 0) == ([], None, 0)
 
 
 @pytest.mark.parametrize(
@@ -556,7 +556,7 @@ def test_single_round_falls_back_to_probe_when_not_applicable(kwargs, reason):
     broadcaster = RequestBroadcaster(dist, MagicMock())
     items = [_make_broadcast_item(1)]
 
-    new_requests, _, _ = broadcaster.broadcast(items)
+    new_requests, _, _ = broadcaster.broadcast(items, 0)
 
     assert new_requests == items, reason
     assert all(kind != "broadcast_or_none" for kind, *_ in dist.calls), reason
@@ -569,7 +569,7 @@ def test_single_round_idle_path_keeps_cpu_probe():
     dist = _SingleRoundDist(rank=0)
     broadcaster = RequestBroadcaster(dist, MagicMock())
 
-    assert broadcaster.broadcast([], prefer_cpu=True) == ([], None, 0)
+    assert broadcaster.broadcast([], 0, prefer_cpu=True) == ([], None, 0)
     assert dist.calls == [("broadcast_int64", [0, 0], True)]
 
 

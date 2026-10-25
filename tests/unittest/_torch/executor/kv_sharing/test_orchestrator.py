@@ -401,28 +401,18 @@ def test_a_refused_lend_drops_its_fetch_and_sharing_goes_on(server):
     server.park(request(2))  # still admitting
 
 
-@pytest.mark.parametrize(
-    "failure,dropped", [("a lend raises", 2), ("the lender stops on its own", 1)]
-)
-def test_a_stopped_lender_stops_sharing_and_drops_fetches(server, failure, dropped):
-    settling, later = request(1), request(2)
-    server.park(settling)
-    server.iterate()
-    server.store.end(0)
-    server.iterate()
+@pytest.mark.parametrize("failure", ["a lend raises", "the lender stops on its own"])
+def test_a_stopped_lender_ends_a_one_gpu_server(server, failure):
+    """Also on one GPU, a lend that raises or a lender that stops ends the server: its KV cache
+    may no longer match its store operations."""
     if failure == "a lend raises":
         server.lender.lend_error = RuntimeError("the lender stopped")
-        server.park(later)
+        with pytest.raises(RuntimeError, match="a lend failed: the lender stopped; .* ends the"):
+            server.park(request(1))
     else:
         server.lender.stopped = True
-    server.iterate()
-    assert settling.state == LlmRequestState.CONTEXT_INIT and not server.manager.resumed
-    # The settling fetch, and the one that never started where the lend raised.
-    assert server.counters["fetches_dropped_stopped"] == dropped
-    server.orchestrator.add_fetch_candidates([request(3)])
-    assert server.orchestrator.start_fetches() == set()  # sharing stopped
-    # A stopped lender domain tears its store binding down on a thread, which ends here.
-    server.shut_down()
+        with pytest.raises(RuntimeError, match="the KV cache lender stopped; .* ends the server"):
+            server.iterate()
 
 
 def test_a_publication_that_does_not_fit_waits_for_the_open_one(server):

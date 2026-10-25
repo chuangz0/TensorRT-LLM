@@ -38,31 +38,41 @@ WAITING_ID = 7
 ROUND_SIZE = 3
 
 
+class Probe:
+    """Rank 0's probe: it measured the waiting request's hit again; records the order of calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def take_refreshed_hits(self, waiting):
+        self.calls.append("take_refreshed_hits")
+        return ((WAITING_ID, 64),)
+
+    def hold_until_probed(self, fetched):
+        self.calls.append("hold_until_probed")
+        return fetched
+
+
 class Sharing:
     """The executor's kv_sharing hooks on one rank: rank 0 announces a round, has measured the
-    waiting request's hit again and pauses publishing; applying the update is the orchestrator's
-    own code."""
+    waiting request's hit again and pauses publishing; building and applying the update is the
+    orchestrator's own code."""
+
+    _shared_table = True
 
     def __init__(self, rank: int) -> None:
         self.rank = rank
         self.counters = collections.Counter()
         self.announced = None
+        self._admitting = True
+        # Only rank 0 probes and decides publishing; here a pause began.
+        self._probe = Probe() if rank == 0 else None
+        self._publication_breaker = SimpleNamespace(allows=lambda now: False) if rank == 0 else None
         self._publishing = True
         self._unpublished = {7: object()}  # a range waiting for room, dropped at the pause
 
     def request_queue_wait(self, timeout):
         return timeout
-
-    def hold_until_probed(self, fetched):
-        return fetched
-
-    def take_refreshed_hits(self, waiting):
-        assert self.rank == 0, "only rank 0 measures hits"
-        return ((WAITING_ID, 64),)
-
-    def take_publishing_switch(self):
-        assert self.rank == 0, "only rank 0 switches publishing"
-        return False
 
     def round_to_announce(self) -> int:
         return ROUND_SIZE if self.rank == 0 else 0
@@ -70,6 +80,7 @@ class Sharing:
     def round_announced(self, entries: int) -> None:
         self.announced = entries
 
+    take_rank0_items = SharedKvOrchestrator.take_rank0_items
     apply_store_update = SharedKvOrchestrator.apply_store_update
 
 
@@ -121,3 +132,6 @@ def test_the_round_size_and_the_store_update_reach_every_rank_before_activation(
         assert waiting.store_hit_tokens == 64
         assert executor.kv_sharing.counters["hits_refreshed"] == 1
         assert executor.kv_sharing._publishing is False and not executor.kv_sharing._unpublished
+    # The hits are taken before the hold releases requests: a refresh scan forgets hits not in
+    # the waiting queue, which a released request joins only after the broadcast.
+    assert executors[0].kv_sharing._probe.calls == ["take_refreshed_hits", "hold_until_probed"]

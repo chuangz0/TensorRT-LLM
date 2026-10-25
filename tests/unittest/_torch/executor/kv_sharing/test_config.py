@@ -12,12 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Which setups the ``kv_sharing`` LLM argument accepts, checked where the user builds the args."""
+"""Which setups ``kv_sharing`` accepts: the LLM argument's checks where the user builds the args,
+and startup's refusal of model facts only the built executor knows."""
 
 import re
+from types import SimpleNamespace
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_sharing.startup import start_kv_sharing
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 pytestmark = pytest.mark.cpu_only
@@ -98,3 +104,23 @@ def test_kv_sharing_rejects_setups_it_cannot_serve(store_config: str, setup: str
     kwargs, reason = UNSUPPORTED[setup]
     with pytest.raises(ValueError, match=re.escape(reason)):
         llm_args(store_config, **kwargs)
+
+
+@pytest.mark.parametrize("fact", ["sparse attention", "recurrent state"])
+def test_startup_refuses_a_model_with_sparse_attention_or_recurrent_state_before_any_store_work(
+    store_config: str, fact: str
+) -> None:
+    """A DSA checkpoint fills in its sparse attention config only when the model loads, and a
+    hybrid model's recurrent state shows in the manager built for it."""
+    hybrid = fact == "recurrent state"
+    manager = object.__new__(MambaHybridCacheManagerV2 if hybrid else KVCacheManagerV2)
+    manager.enable_block_reuse = True
+    model_config = SimpleNamespace(sparse_attention_config=None if hybrid else object())
+    executor = SimpleNamespace(
+        kv_cache_manager=manager,
+        scheduler=object.__new__(KVCacheV2Scheduler),
+        model_engine=SimpleNamespace(model=SimpleNamespace(model_config=model_config)),
+        dist=None,  # no collective, store or checkpoint work may start
+    )
+    with pytest.raises(ValueError, match=f"this server is refused: the model has {fact}$"):
+        start_kv_sharing(executor, llm_args(store_config), checkpoint_dir=None, max_num_tokens=64)

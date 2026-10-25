@@ -11,7 +11,6 @@ alone would leave its peers waiting in the next collective.
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 import os
 import sys
@@ -37,18 +36,24 @@ from ...disaggregation.blob.backend import (
 from ...disaggregation.blob.keys import key_stem
 from ...disaggregation.blob.mooncake import MooncakeDriver
 from ...disaggregation.blob.mooncake_native import NativeMooncakeDriver
-from ...disaggregation.blob.mooncake_setup import MooncakeConfig, load_store_config
+from ...disaggregation.blob.mooncake_setup import (
+    MooncakeConfig,
+    load_store_config,
+    make_store_driver,
+)
 from ...disaggregation.lifecycle.retirement import QuiescenceFatalEvent, RetirementWatchdog
 from ...disaggregation.transfer_manager import LifecycleBinding, TransferManager
 from ...distributed.communicator import ReduceOp
 from ...weight_sharing.artifact_identity import ArtifactIdentity
 from ...weight_sharing.source_identity import SourceIdentity
 from ..config_utils import is_mla
+from ..connectors.mooncake_store.gpudirect import allocation_range
 from ..hang_detector import propagate_hard_kill
 from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from ..kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from ..kv_cache.sharing import Lender, MemoryKind, StagingOptions
 from ..scheduler.scheduler_v2 import KVCacheV2Scheduler
-from .data_path import open_store, serving_driver
+from .data_path import choose_data_path, open_store
 from .orchestrator import (
     BINDING_ID,
     DOMAIN_ID,
@@ -81,9 +86,9 @@ MHA_LAYOUT = "mha-trtllm-hnd"
 MLA_LAYOUT = "mla-trtllm-latent"
 # The cache dtypes stored blocks carry, by the KV cache manager's dtype.
 _CACHE_DTYPES = {DataType.BF16: "bfloat16", DataType.FP8: "fp8"}
-# What kv_sharing serves at this milestone, said before the reason a model is refused.
+# Prefixes the reason a model is refused.
 SUPPORTED_MODELS = (
-    "kv_sharing serves, for now, one GPU, tensor parallelism or attention DP, with multi-head "
+    "kv_sharing serves one GPU, tensor parallelism or attention DP, with multi-head "
     "attention (BF16 or FP8 KV cache) with full attention or sliding windows, or MLA (BF16) with "
     "full attention; no recurrent state, sparse attention or attention sink tokens; and under host "
     "staging one fetch of max(max_fetch_tokens, max_num_tokens) tokens within "
@@ -124,6 +129,20 @@ def start_kv_sharing(
             "kv_sharing fetches through the KV cache manager v2 scheduler; this executor built "
             f"{type(py_executor.scheduler).__name__}"
         )
+    # Facts of the model every rank reads alike: refused before any collective or store work.
+    model_config = py_executor.model_engine.model.model_config
+    unserved = [
+        fact
+        for fact, applies in (
+            ("sparse attention", model_config.sparse_attention_config is not None),
+            ("recurrent state", isinstance(manager, MambaHybridCacheManagerV2)),
+        )
+        if applies
+    ]
+    if unserved:
+        raise ValueError(
+            f"{SUPPORTED_MODELS}; this server is refused: the model has {' and '.join(unserved)}"
+        )
     checkpoint = checkpoint_dir or llm_args.model
 
     def prepare() -> tuple[tuple[MooncakeConfig, BlobConfig], Optional[ArtifactIdentity]]:
@@ -137,30 +156,29 @@ def start_kv_sharing(
         logger.info(f"kv_sharing: reading every file of {checkpoint} to name its stored blocks")
         return (mooncake, blob_config), ArtifactIdentity.from_checkpoint(checkpoint)
 
-    # Three collectives every rank reaches, whatever failed on it: prepare, the store check inside
-    # open_store, attach. Every check after them reads gathered facts, so it raises on every rank.
-    (mooncake, blob_config), identities = _agree(dist, prepare)
+    # Three collectives every rank reaches, whatever failed on it: prepare, opening and checking
+    # the store, attach. Every check after them reads gathered facts, so it raises on every rank.
+    (mooncake, blob_config), identity_by_rank = _agree(dist, prepare)
     # Before the lender pins its staging memory: an unreachable master fails here, within a minute.
-    gather = dist.allgather if dist.world_size > 1 else lambda check: [check]
-    memory_kind, store = open_store(config.data_path, mooncake, gather)
+    store, gpu_direct_errors = _agree(dist, lambda: open_store(config.data_path, mooncake))
+    memory_kind = choose_data_path(config.data_path, gpu_direct_errors)
 
     tokens_per_block = manager.tokens_per_block
     fetch_tokens = max(config.max_fetch_tokens, max_num_tokens)
 
     def attach() -> tuple[_Attached, _RankFacts]:
-        driver = serving_driver(store, memory_kind, mooncake, blob_config)
-        trace = _open_trace(dist.rank)
-        profile_of = functools.partial(_profile, py_executor, llm_args, identities[0])
-        return _attach(manager, profile_of, memory_kind, fetch_tokens, driver, blob_config, trace)
+        driver = make_store_driver(
+            store,
+            mooncake,
+            blob_config,
+            allocation_range=allocation_range if memory_kind is MemoryKind.DEVICE else None,
+        )
+        profile_of = functools.partial(_profile, py_executor, llm_args, identity_by_rank[0])
+        return _attach(manager, profile_of, memory_kind, fetch_tokens, driver, blob_config)
 
     attached, facts_by_rank = _agree(dist, attach)
     if len({facts.scope for facts in facts_by_rank}) > 1:
         raise ValueError("kv_sharing: the ranks would name blocks differently")
-    staging = None
-    if memory_kind is MemoryKind.HOST:  # every rank gates ranges within the smallest budget
-        # The ranks share the layout: only their free rows may differ.
-        least = tuple(map(min, zip(*(facts.staging.free_rows for facts in facts_by_rank))))
-        staging = dataclasses.replace(facts_by_rank[0].staging, free_rows=least)
     attention_dp = py_executor.enable_attention_dp
     # Attention DP needs no replica set: each rank serves requests of its own with every KV head,
     # so two ranks put one block only as two servers can, and the master refuses the later put.
@@ -185,7 +203,7 @@ def start_kv_sharing(
         min_fetch_tokens=config.min_fetch_tokens,
         max_fetch_tokens=config.max_fetch_tokens,
         fetch_timeout_s=config.fetch_timeout_s,
-        staging=staging,
+        staging=attached.staging,
         max_util_for_resume=llm_args.kv_cache_config.max_util_for_resume,
         max_parked_fetches=py_executor.max_num_active_requests - 1 if attention_dp else None,
     )
@@ -222,7 +240,7 @@ def start_kv_sharing(
         min_over_ranks=min_over_ranks,
         replicas=replicas,
         decides_publishing=min_over_ranks is None or dist.rank == 0,
-        trace=attached.trace,
+        trace=_open_trace(dist.rank),
     )
     py_executor.kv_sharing = orchestrator
     py_executor.scheduler.store_fetches = orchestrator
@@ -232,7 +250,7 @@ def start_kv_sharing(
         staging_bytes = sum(
             r.nbytes for r in attached.lender.regions if r.memory_kind is MemoryKind.HOST
         )
-        most = staging.longest
+        most = attached.staging.longest
         blocks = "any number of" if most == sys.maxsize else f"at most {most}"
         path = (
             f"host staging of {staging_bytes >> 20} MiB: one fetch of {fetch_tokens} tokens and "
@@ -253,23 +271,23 @@ class _RankFacts:
     Attributes:
         scope: Names the stored blocks, with the layout; must be equal on every rank.
         shards: ``(count, index)`` of the share of each layer group this rank holds.
-        staging: Host staging's budget for open publications; None under GPU Direct.
     """
 
     scope: bytes
     shards: tuple[tuple[int, int], ...]
-    staging: Optional[StagingBudget]
 
 
 @dataclass(frozen=True)
 class _Attached:
-    """What one rank set up for sharing before the ranks agreed on it."""
+    """What one rank set up for sharing before the ranks agreed on it. ``staging``: host
+    staging's budget for open publications, a function of the layout and so equal on every rank;
+    None under GPU Direct."""
 
     driver: MooncakeDriver
     lender: Lender
     transfers: TransferManager
     watchdog: RetirementWatchdog
-    trace: Optional[TextIO]
+    staging: Optional[StagingBudget]
 
 
 def _agree(
@@ -328,7 +346,6 @@ def _attach(
     fetch_tokens: int,
     driver: MooncakeDriver,
     blob_config: BlobConfig,
-    trace: Optional[TextIO],
 ) -> tuple[_Attached, _RankFacts]:
     """Attaches the lender over the KV cache manager and assembles the transfer manager with the
     store backend, which registers this rank's memory with the store."""
@@ -368,8 +385,8 @@ def _attach(
         config=blob_config,
     )
     shards = tuple((g.shard.count, g.shard.index) for g in domain.lender.page_layout.layer_groups)
-    attached = _Attached(driver, domain.lender, transfers, watchdog, trace)
-    return attached, _RankFacts(profile.scope, shards, staging_budget)
+    attached = _Attached(driver, domain.lender, transfers, watchdog, staging_budget)
+    return attached, _RankFacts(profile.scope, shards)
 
 
 def _open_trace(rank: int) -> Optional[TextIO]:
@@ -448,7 +465,7 @@ def _profile(
         topology=(mapping.tp_size, dp_size, mapping.pp_size, mapping.cp_size),
         state_kinds=(CacheKind.PAGED,) * manager.num_pools,
         attention_windows=_attention_windows(manager),
-        sparse_attention=llm_args.sparse_attention_config is not None,
+        sparse_attention=model_config.sparse_attention_config is not None,
         sink_token_length=llm_args.kv_cache_config.sink_token_length or 0,
         lora_enabled=False,
         pool_count=len(manager.impl.pool_group_descs),

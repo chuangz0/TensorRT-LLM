@@ -22,7 +22,6 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -30,10 +29,8 @@ import torch
 from tensorrt_llm.logger import logger
 
 from ...disaggregation.base.memory import MemoryKind
-from ...disaggregation.blob.backend import BlobConfig
 from ...disaggregation.blob.mooncake import MooncakeDriver
-from ...disaggregation.blob.mooncake_native import NativeMooncakeDriver
-from ...disaggregation.blob.mooncake_setup import MooncakeConfig, make_store_driver, open_sdk
+from ...disaggregation.blob.mooncake_setup import MooncakeConfig, open_sdk
 from ...disaggregation.blob.store import RegionLayout, RowIO, RowStatus, Span
 from ..connectors.mooncake_store.gpudirect import (
     PEERMEM_ENV,
@@ -57,64 +54,28 @@ STORE_CHECK_KEY_PREFIX = "kv-sharing-startup-check/"
 _CHECK_MEMORY: list[torch.Tensor] = []
 
 
-@dataclass(frozen=True)
-class PathCheck:
-    """What one rank's startup check found.
-
-    Attributes:
-        store_error: Why the store does not serve this rank at all, or None.
-        gpu_direct_error: Why GPU Direct cannot serve this rank, or None where it can.
-    """
-
-    store_error: Optional[str]
-    gpu_direct_error: Optional[str]
-
-
-def open_store(
-    requested: str,
-    mooncake: MooncakeConfig,
-    gather: Callable[[PathCheck], Sequence[PathCheck]],
-) -> tuple[MemoryKind, Any]:
-    """Opens the store client, checks it with one round trip and picks the data path every rank
-    takes from every rank's check, which ``gather`` collects (a collective every rank reaches,
-    whether its client opened or not).
+def open_store(requested: str, mooncake: MooncakeConfig) -> tuple[Any, Optional[str]]:
+    """Opens the store client and checks it with one round trip: the client, and why GPU Direct
+    cannot serve this rank, or None where it can.
 
     Run it before any other Mooncake client of the process opens: the first one fixes how the
     process registers device memory.
 
-    Returns:
-        DEVICE for GPU Direct or HOST for host staging, and the opened client.
-
     Raises:
-        ValueError: Some rank's store failed the check or did not open, or 'gpu_direct' was asked
-            for and is not possible on some rank.
+        ValueError: The store did not open or failed the round trip through host memory.
     """
     if requested == HOST_STAGING:
         gpu_direct_error = "host staging was asked for"
     else:
         gpu_direct_error = prepare_gpu_direct(mooncake.protocol)
-    store = None
     try:
         store = open_sdk(mooncake)
         # The check runs on its own Python driver, before any store worker thread exists.
-        check = check_store(store, gpu_direct_error)
-    except Exception as error:  # noqa: BLE001 - every rank must reach the gather below
-        check = PathCheck(f"the store could not be opened and checked: {error}", None)
-    path = choose_data_path(requested, gather(check))
-    return (MemoryKind.HOST if path == HOST_STAGING else MemoryKind.DEVICE), store
-
-
-def serving_driver(
-    store: Any, memory_kind: MemoryKind, mooncake: MooncakeConfig, blob: BlobConfig
-) -> MooncakeDriver | NativeMooncakeDriver:
-    """The serving driver over the client ``open_store`` opened: native or Python as
-    ``mooncake.driver`` picks; it registers device memory exactly under GPU Direct.
-
-    Raises:
-        RuntimeError: The driver 'native' was asked for and cannot run here.
-    """
-    lookup = allocation_range if memory_kind is MemoryKind.DEVICE else None
-    return make_store_driver(store, mooncake, blob, allocation_range=lookup)
+        return store, check_store(store, gpu_direct_error)
+    except Exception as error:
+        raise ValueError(
+            f"kv_sharing: the store could not be opened and checked: {error}"
+        ) from error
 
 
 def prepare_gpu_direct(protocol: str) -> Optional[str]:
@@ -140,11 +101,15 @@ def prepare_gpu_direct(protocol: str) -> Optional[str]:
     return None
 
 
-def check_store(store: Any, gpu_direct_error: Optional[str]) -> PathCheck:
+def check_store(store: Any, gpu_direct_error: Optional[str]) -> Optional[str]:
     """A round trip of a random object through the store from host memory and, unless
     ``gpu_direct_error`` already says why GPU Direct is out, into device memory and back out of
-    it. Each half waits at most STORE_CHECK_TIMEOUT_S: a timeout of the device half is GPU
-    Direct's error, not the store's."""
+    it: why GPU Direct cannot serve this rank, or None. Each half waits at most
+    STORE_CHECK_TIMEOUT_S: a timeout of the device half is GPU Direct's error, not the store's.
+
+    Raises:
+        RuntimeError: The round trip through host memory failed.
+    """
     source = torch.randint(0, 256, (STORE_CHECK_BYTES,), dtype=torch.uint8)
     landed = torch.zeros(STORE_CHECK_BYTES, dtype=torch.uint8)
     _CHECK_MEMORY.extend((source, landed))
@@ -153,50 +118,41 @@ def check_store(store: Any, gpu_direct_error: Optional[str]) -> PathCheck:
     store_error = _on_a_thread(
         "a round trip through host memory", lambda: _host_round_trip(driver, key, source, landed)
     )
-    if store_error is not None or gpu_direct_error is not None:
-        return PathCheck(store_error, gpu_direct_error)
+    if store_error is not None:
+        raise RuntimeError(store_error)
+    if gpu_direct_error is not None:
+        return gpu_direct_error
     device = torch.zeros(STORE_CHECK_BYTES, dtype=torch.uint8, device="cuda")
     _CHECK_MEMORY.append(device)
     torch.cuda.synchronize()  # the zeroing ran before the NIC writes
-    return PathCheck(
-        None,
-        _on_a_thread(
-            "a round trip through device memory",
-            lambda: _device_round_trip(driver, key, device, source, landed),
-        ),
+    return _on_a_thread(
+        "a round trip through device memory",
+        lambda: _device_round_trip(driver, key, device, source, landed),
     )
 
 
-def choose_data_path(requested: str, checks: Sequence[PathCheck]) -> str:
-    """The path every rank takes: the one requested, or for 'auto' GPU Direct where every rank
-    can take it and host staging otherwise, logged with each rank's reason.
+def choose_data_path(requested: str, gpu_direct_errors: Sequence[Optional[str]]) -> MemoryKind:
+    """The path every rank takes, given why GPU Direct cannot serve each rank: the one requested,
+    or for 'auto' GPU Direct (DEVICE) where every rank can take it and host staging (HOST)
+    otherwise, logged with each rank's reason.
 
     Raises:
-        ValueError: Some rank's store failed its check, or 'gpu_direct' was asked for and some
-            rank cannot take it.
+        ValueError: 'gpu_direct' was asked for and some rank cannot take it.
     """
-    for rank, check in enumerate(checks):
-        if check.store_error is not None:
-            raise ValueError(
-                f"kv_sharing: the store failed its startup check on rank {rank}: "
-                f"{check.store_error}"
-            )
     if requested == HOST_STAGING:
-        return HOST_STAGING
+        return MemoryKind.HOST
     reasons = "; ".join(
-        f"rank {rank}: {check.gpu_direct_error}"
-        for rank, check in enumerate(checks)
-        if check.gpu_direct_error is not None
+        f"rank {rank}: {error}" for rank, error in enumerate(gpu_direct_errors) if error is not None
     )
     if not reasons:
-        return GPU_DIRECT
+        return MemoryKind.DEVICE
     if requested == GPU_DIRECT:
         raise ValueError(f"kv_sharing: data_path 'gpu_direct' is not possible here: {reasons}")
     logger.warning(
         "kv_sharing: data_path 'auto' moves KV cache blocks through host staging, as GPU Direct "
         f"is not possible here: {reasons}"
     )
-    return HOST_STAGING
+    return MemoryKind.HOST
 
 
 class _CheckFailed(Exception):

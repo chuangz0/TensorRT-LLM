@@ -2323,7 +2323,7 @@
             }
           ],
           "default": null,
-          "description": "Share prompt KV cache blocks with other servers through a KV store.",
+          "description": "Share prompt KV cache blocks with other servers through a KV store. In disaggregated serving, set it on context servers: a generation server gains nothing unless conditional disaggregation lets it prefill requests itself.",
           "status": "prototype"
         },
         "layer_wise_benchmarks_config": {
@@ -4925,7 +4925,7 @@
       "description": "Share prompt KV cache blocks with other servers through a KV store.\n\nA server fetches the stored part of a prompt instead of computing it, and\nstores the whole prompt blocks it computes.",
       "properties": {
         "backends": {
-          "description": "The store to share through; one for now.",
+          "description": "The store to share through; exactly one.",
           "items": {
             "$ref": "#/$defs/KvSharingBackendConfig"
           },
@@ -4968,7 +4968,7 @@
         },
         "probe_hold_ms": {
           "default": 50.0,
-          "description": "Longest a new request waits for the store to say how much of its prompt it holds before it is scheduled without fetching.",
+          "description": "Longest a new request waits for the store to say how much of its prompt it holds before it is scheduled without fetching; 0 never makes a request wait for the store.",
           "minimum": 0,
           "title": "Probe Hold Ms",
           "type": "number"
@@ -8801,7 +8801,7 @@
         }
       ],
       "default": null,
-      "description": "Share prompt KV cache blocks with other servers through a KV store.",
+      "description": "Share prompt KV cache blocks with other servers through a KV store. In disaggregated serving, set it on context servers: a generation server gains nothing unless conditional disaggregation lets it prefill requests itself.",
       "status": "prototype"
     },
     "layer_wise_benchmarks_config": {

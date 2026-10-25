@@ -33,9 +33,6 @@ if TYPE_CHECKING:
 REFRESH_AFTER_S = 4.0
 # How often rank 0 looks for waiting hits due for a refresh.
 REFRESH_SCAN_S = 1.0
-# A refresh round stops adding prompts once it reached this many keys, one store call's worth; the
-# refreshes then fill what room new requests leave in the thread's calls, or take calls of their own.
-REFRESH_KEYS_PER_ROUND = PROBE_KEYS_PER_CALL
 # A request waits for its answer one hold from when its own store call starts; queued behind other
 # requests' calls, it waits at most this many holds for that start (a burst of long prompts on a
 # healthy store drains within it).
@@ -203,7 +200,7 @@ class ProbeService:
         """The hits of waiting requests that a refresh changed, as ``(request id, hit)``. At most
         once per REFRESH_SCAN_S it forgets requests no longer ``waiting`` and queues one probe of
         the waiting hits last probed REFRESH_AFTER_S ago or earlier, in queue order, adding
-        prompts until REFRESH_KEYS_PER_ROUND keys. Runs on the executor thread, every pass, before
+        prompts until PROBE_KEYS_PER_CALL keys. Runs on the executor thread, every pass, before
         ``hold_until_probed``: ``waiting`` must hold every request an earlier pass released."""
         if not self._waiting_hits:
             return ()
@@ -233,7 +230,7 @@ class ProbeService:
     def record_fetch(self, failed: bool, why: str = "") -> None:
         """Counts how the store served a round's fetches: ``failed`` where it failed one."""
         with self._cond:
-            if self._fetch_breaker.record(failed, self._clock(), why):
+            if self._fetch_breaker.record(self._clock(), failed=failed, why=why):
                 self.counters["fetch_pauses"] += 1
 
     def stop(self, wait_s: float = 0.0) -> None:
@@ -279,11 +276,12 @@ class ProbeService:
             return None
         tpb = self._tokens_per_block
         num_blocks = len(tokens) // tpb
-        # The answer is also where a publication starts. Without a window a fetch cuts it before
-        # the last prompt token itself, so it may name every whole block (and a publication then
-        # skips the block ending a whole-block prompt); with one a fetch takes the answer exactly,
-        # so it ends at the whole blocks before the last prompt token.
-        answer_limit = (len(tokens) - 1) // tpb * tpb if self._windowed else num_blocks * tpb
+        # The answer is also where publication starts, so under full attention it covers every
+        # whole block held: admission itself cuts a fetch before the last prompt token. With
+        # windows admission takes the answer as is (a cut fetch would miss window rows), so it
+        # stops at the whole blocks before the last prompt token.
+        before_last_token = (len(tokens) - 1) // tpb * tpb
+        answer_limit = before_last_token if self._windowed else num_blocks * tpb
         prompt = np.asarray(tokens, dtype=np.int32)
         return _Prompt(item.id, prompt, request.cache_salt, num_blocks, answer_limit)
 
@@ -319,7 +317,9 @@ class ProbeService:
             kept = self._waiting_hits.get(item.id)
             if paused or kept is None or kept.refreshing or now - kept.probed_at < REFRESH_AFTER_S:
                 continue
-            if keys >= REFRESH_KEYS_PER_ROUND:
+            # One store call's worth of keys per round; the refreshes then fill what room new
+            # requests leave in the thread's calls, or take calls of their own.
+            if keys >= PROBE_KEYS_PER_CALL:
                 self.counters["refreshes_deferred"] += 1
                 continue
             kept.refreshing = True
@@ -347,7 +347,7 @@ class ProbeService:
                 self._call_started_at = None
                 # At the call's return: a pause then lasts PAUSE_S whatever the call took.
                 why = "a store probe failed or timed out"
-                if self._probe_breaker.record(not answered, self._clock(), why):
+                if self._probe_breaker.record(self._clock(), failed=not answered, why=why):
                     self.counters["probe_pauses"] += 1
                 for prompt, answer in zip(first, answers):
                     if prompt.request_id in self._deadlines:

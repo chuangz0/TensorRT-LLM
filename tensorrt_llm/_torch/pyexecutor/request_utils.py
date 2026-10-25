@@ -380,7 +380,7 @@ class RequestBroadcaster:
         self.send_requests_handler = None
 
     def broadcast(
-        self, new_requests: List, store_round_size: int = 0, prefer_cpu: bool = False
+        self, new_requests: List, store_round_size: int, prefer_cpu: bool = False
     ) -> Tuple[List, Optional[Tuple], int]:
         """Broadcast requests and Python objects across ranks.
 

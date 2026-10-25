@@ -421,11 +421,14 @@ def run_rank(
         orchestrator.resolve_store_operations()
         record.parked.append({op.seq for op in orchestrator._ops if op.state is OpState.PARKED})
         orchestrator.round_announced(group.broadcast(rank, orchestrator.round_to_announce()))
-        publishing = group.broadcast(rank, orchestrator.take_publishing_switch())
-        orchestrator.apply_store_update([], (), publishing)
+        switch = None
+        if rank == 0:
+            _, update = orchestrator.take_rank0_items([], [])
+            switch = None if update is None else update.store_publishing
+        orchestrator.apply_store_update([], (), group.broadcast(rank, switch))
         if rank == 1 and diverge_at is not None and iteration >= diverge_at and orchestrator._ops:
             head = orchestrator._ops[0]
-            extra = StoreOp(0, OpKind.PUBLISH, head.request, memory_kind, OpState.OPEN, 0, TPB)
+            extra = StoreOp(0, OpKind.PUBLISH, head.request, OpState.OPEN, 0, TPB)
             orchestrator._ops.insert(0, extra)
             diverge_at = None
         if iteration == SHUTDOWN_AT:

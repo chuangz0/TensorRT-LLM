@@ -2796,7 +2796,7 @@ class KvSharingConfig(StrictBaseModel):
     backends: List[KvSharingBackendConfig] = Field(
         min_length=1,
         max_length=1,
-        description="The store to share through; one for now.")
+        description="The store to share through; exactly one.")
     data_path: Literal["auto", "gpu_direct", "host_staging"] = Field(
         default="auto",
         description="How blocks move between the store and the KV cache: "
@@ -2819,7 +2819,8 @@ class KvSharingConfig(StrictBaseModel):
     probe_hold_ms: NonNegativeFloat = Field(
         default=50.0,
         description="Longest a new request waits for the store to say how "
-        "much of its prompt it holds before it is scheduled without fetching.")
+        "much of its prompt it holds before it is scheduled without fetching; "
+        "0 never makes a request wait for the store.")
     fetch_timeout_s: float = Field(
         default=5.0,
         gt=0,
@@ -7033,7 +7034,9 @@ class TorchLlmArgs(BaseLlmArgs):
     kv_sharing: Optional[KvSharingConfig] = Field(
         default=None,
         description="Share prompt KV cache blocks with other servers through "
-        "a KV store.",
+        "a KV store. In disaggregated serving, set it on context servers: a "
+        "generation server gains nothing unless conditional disaggregation "
+        "lets it prefill requests itself.",
         status="prototype",
     )
 

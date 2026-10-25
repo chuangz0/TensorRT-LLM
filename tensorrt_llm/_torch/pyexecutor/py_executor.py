@@ -87,7 +87,6 @@ from .disagg_adapter import PyExecutorEffects, PyExecutorRequestRegistry
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
 from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
-                                     STORE_UPDATE_REQUEST_ID,
                                      ExecutorRequestQueue,
                                      RequestAdmissionState, RequestQueueItem)
 from .gpu_keepalive import GpuKeepalive
@@ -6663,23 +6662,15 @@ class PyExecutor:
             with self.hang_detector.pause():
                 fetched = self.executor_request_queue.get_from_request_queue(
                     timeout)
-            hits, publishing = (), None
+            store_update = None
             if kv_sharing is not None:
-                # Before the hold: a request it releases joins the waiting
-                # queue only after the broadcast, and a refresh scan forgets
-                # hits not in the waiting queue.
-                hits = kv_sharing.take_refreshed_hits(waiting_queue)
-                publishing = kv_sharing.take_publishing_switch()
-                fetched = kv_sharing.hold_until_probed(fetched)
+                fetched, store_update = kv_sharing.take_rank0_items(
+                    fetched, waiting_queue)
             new_requests.extend(fetched)
-            if hits or publishing is not None:
+            if store_update is not None:
                 # First, so a shutdown or control item ending the envelope
                 # does not cut it off.
-                new_requests.insert(
-                    0,
-                    RequestQueueItem(STORE_UPDATE_REQUEST_ID,
-                                     store_hits=hits,
-                                     store_publishing=publishing))
+                new_requests.insert(0, store_update)
 
         if connector is not None and self.dist.rank == 0:
             completed = connector.take_finished_prefix_loads()

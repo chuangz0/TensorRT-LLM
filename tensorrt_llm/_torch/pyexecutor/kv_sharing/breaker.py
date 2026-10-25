@@ -23,7 +23,7 @@ class Breaker:
     failures_in_a_row: int = 0
     paused_until: float = 0.0  # monotonic; 0 while no pause is pending
 
-    def record(self, failed: bool, now: float, why: str = "") -> bool:
+    def record(self, now: float, *, failed: bool, why: str = "") -> bool:
         """Counts one outcome; the FAILURES_TO_PAUSE-th failure in a row starts a pause. Outcomes
         during a pause, of work started before it, count nothing. Returns whether a pause
         started."""
