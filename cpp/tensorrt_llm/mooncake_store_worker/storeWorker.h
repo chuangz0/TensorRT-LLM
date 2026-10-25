@@ -105,8 +105,8 @@ struct FinishedOp
     std::vector<int8_t> calls;                     //!< StoreCall
     bool accessEnded;                              //!< False: some call can never prove that its access ended.
     std::map<int8_t, std::string> errors;          //!< By StoreCall: the first raise or miscount of that call.
-    std::vector<std::string> sessionsLeftForDrain; //!< Put sessions left open for MooncakeDriver.drain.
-    std::vector<std::string> sessionsLeftToMaster; //!< Put sessions a target may still write into.
+    std::vector<std::string> sessionsLeftForDrain; //!< Put sessions left open for MooncakeDriver.drain to revoke.
+    std::vector<std::string> sessionsLeftToMaster; //!< Left open for the master to free: a target may still write.
 };
 
 //! Runs Mooncake store calls on threads of its own, which never touch Python. Gets go before puts; puts
@@ -114,10 +114,10 @@ struct FinishedOp
 //! bytes. A call follows mooncake.py's protocol: a get rereads once the rows whose read lease expired,
 //! a put starts sessions, scatters, then ends or revokes them, except the sessions it leaves open, and
 //! confirms keys that already existed. A get call that faults a row, or a put call that faults every row,
-//! drops the calls of its operation not started yet (CANCELLED). A put call skips the keys another running put call
-//! of this worker holds (kPutInFlightHere): the SDK keys put sessions per client, so a second session
-//! start would only fail. It only checks the existence of a key whose session a call left open: such a
-//! key is never put again.
+//! drops the calls of its operation not started yet (CANCELLED). A put call skips the keys another running
+//! put call of this worker holds (kPutInFlightHere): the SDK keys put sessions per client, so a second
+//! session start would only fail. It only checks the existence of a key whose session a call left open:
+//! such a key is never put again.
 //! Every method but drain and stop returns in microseconds.
 class StoreWorker
 {
@@ -128,8 +128,8 @@ public:
     StoreWorker(StoreWorker const&) = delete;
     StoreWorker& operator=(StoreWorker const&) = delete;
 
-    //! Queues the rows and returns the operation's id. Throws std::invalid_argument for bad rows, a name
-    //! repeated included, and std::runtime_error after drain; nothing is queued then.
+    //! Queues the rows and returns the operation's id. Throws std::invalid_argument for bad rows (a repeated
+    //! name among them) and std::runtime_error after drain; nothing is queued then.
     uint64_t submit(bool isPut, Rows rows);
     //! Calls not started yet conclude their rows CANCELLED; running calls go on. Unknown ids are ignored.
     void cancel(uint64_t op);

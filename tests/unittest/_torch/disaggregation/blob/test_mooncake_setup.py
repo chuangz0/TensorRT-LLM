@@ -268,7 +268,8 @@ def test_the_newer_transfer_engine_is_refused(
 def test_an_sdk_other_than_a_pinned_build_of_0_3_13_is_refused(
     sdk: Sdk, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, build: str
 ) -> None:
-    """Under every driver choice, ``auto`` included: the access-end rules were read from 0.3.13."""
+    """``open_sdk`` refuses it before any driver is chosen, so ``auto`` cannot fall back on it: the
+    access-end rules were read from 0.3.13."""
     module = sys.modules["mooncake.store"]
     if build == "older_version":
         install_sdk_build(tmp_path / "older", module, "0.3.12", monkeypatch)

@@ -303,9 +303,9 @@ def make_store_driver(
     *,
     allocation_range: AllocationRange | None = None,
 ) -> MooncakeDriver:
-    """The serving driver over a set-up ``store`` from ``open_sdk``, which admits only the pinned
-    SDK builds, as ``config.driver`` asks: the native driver with ``blob.workers`` store threads
-    where it can run, else the Python driver.
+    """The serving driver over ``store`` (set up by ``open_sdk``, which admits only the pinned SDK
+    builds), as ``config.driver`` asks: the native driver with ``blob.workers`` store threads where
+    it can run, else the Python driver.
 
     Raises:
         RuntimeError: The driver ``native`` was asked for and cannot run here.
@@ -376,7 +376,8 @@ def _refuse_newer_transfer_engine() -> None:
     selected = [name for name in ("MC_USE_TENT", "MC_USE_TEV1") if name in os.environ]
     if selected:
         raise ValueError(
-            f"{', '.join(selected)} selects a transfer engine the driver does not cover"
+            f"{' and '.join(selected)} set: Mooncake would use its TENT transfer engine, which the "
+            "store drivers do not support; unset it"
         )
 
 
@@ -411,8 +412,8 @@ def _require_pinned_sdk(sdk: Any) -> None:
             found.append(f"{name}=={build.version}")
     raise ImportError(
         f"mooncake.store ({file}) comes from {', '.join(found) or 'no pinned distribution'}; the "
-        f"driver follows {SDK_VERSION} of {', '.join(PINNED_SDK_DISTRIBUTIONS)} only. Install "
-        f"{SDK_DISTRIBUTION}=={SDK_VERSION}."
+        f"store drivers support only {SDK_VERSION} of {' / '.join(PINNED_SDK_DISTRIBUTIONS)}. "
+        f"Install {SDK_DISTRIBUTION}=={SDK_VERSION}."
     )
 
 

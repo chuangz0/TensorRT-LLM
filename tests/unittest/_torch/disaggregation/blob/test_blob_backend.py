@@ -489,13 +489,13 @@ def test_a_call_that_can_never_prove_its_access_ended_is_warned_of_outside_the_l
     writer = Endpoint(MemoryDriver(store), ["A"])
     warnings: list[tuple[str, bool]] = []  # each with whether the lock was free
 
-    def warning_once(message: str, key) -> None:
+    def warning(message: str) -> None:
         lock_free = writer.backend._lock.acquire(timeout=PROMPT_S)
         if lock_free:
             writer.backend._lock.release()
         warnings.append((message, lock_free))
 
-    monkeypatch.setattr(backend_module.logger, "warning_once", warning_once)
+    monkeypatch.setattr(backend_module.logger, "warning", warning)
     writer.driver.fail("put", RuntimeError("x"))  # outside the protocol: access never proven
     attempt = writer.backend.publish(writer.view("A"), None)
     wait_until(lambda: warnings, "the warning")

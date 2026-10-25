@@ -165,10 +165,13 @@ _PUT_START_SKIPS = {
     _Code.INVALID_PARAMS: _OWN_SESSION_OPEN,
     _Code.PUT_IN_FLIGHT_HERE: _ANOTHER_WRITER,
 }
+# Session-end answers sent once more: the master ends a session idempotently. An end call that
+# raised or miscounted is not retried.
+_END_RETRIED = (_Code.RPC_FAIL, _Code.RPC_TIMEOUT)
 # Session-end answers after which the end may still reach the master, even when its retry is
 # refused. Such a session is left open and its key never put again: the master matches an end by
 # key and client, so a late end would mark complete this client's next object of the key.
-_END_OUTCOME_UNKNOWN = (_Code.RPC_FAIL, _Code.RPC_TIMEOUT, _Code.CALL_FAILED)
+_END_OUTCOME_UNKNOWN = (*_END_RETRIED, _Code.CALL_FAILED)
 
 
 class _LeftOpen(Enum):
@@ -482,8 +485,8 @@ class MooncakeDriver:
 
     def _write_and_finish_sessions(self, batch: _Batch, started: list[int]) -> bool:
         """Writes the rows whose put session started in one scatter, then ends the session of each
-        row written whole and revokes the rest; leaves open the sessions the class docstring
-        names. Returns whether access ended."""
+        row written whole and revokes the rest, except the sessions the class docstring leaves
+        open. Returns whether access ended."""
         keys, buffers, lengths, sizes = batch.pick(started)
         # A row's buffers fill its object back to back from offset 0.
         dst_offsets = [list(itertools.accumulate(row[:-1], initial=0)) for row in lengths]
@@ -504,24 +507,27 @@ class MooncakeDriver:
                     written.append(i)
                     continue
                 batch.fault([i], _put_ranges_fault(answer, size))  # never to be marked complete
-                # Over TCP the target may still write into the object's space (module docstring).
-                (to_master if answer == _Code.TRANSFER_FAIL else to_revoke).append(i)
-        to_revoke += self._end_put_sessions(batch, written)
-        self._revoke_put_sessions([batch.keys[i] for i in to_revoke])
-        self._leave_open([batch.keys[i] for i in to_master], _LeftOpen.TO_MASTER)
+                if answer == _Code.TRANSFER_FAIL:  # a TCP target may still write (module docstring)
+                    to_master.append(batch.keys[i])
+                else:
+                    to_revoke.append(batch.keys[i])
+        refused, end_outcome_unknown = self._end_put_sessions(batch, written)
+        revoke_failed = self._revoke_put_sessions(to_revoke + refused)
+        self._leave_open(end_outcome_unknown + revoke_failed, _LeftOpen.FOR_DRAIN)
+        self._leave_open(to_master, _LeftOpen.TO_MASTER)
         return True
 
-    def _end_put_sessions(self, batch: _Batch, written: list[int]) -> list[int]:
-        """Ends the sessions of rows written whole; returns the rows whose end was refused, to
-        revoke. A session whose end may still reach the master is left open for drain."""
+    def _end_put_sessions(self, batch: _Batch, written: list[int]) -> tuple[list[str], list[str]]:
+        """Ends the sessions of rows written whole. Returns the keys whose end was refused, to
+        revoke, and those whose end may still reach the master (``_END_OUTCOME_UNKNOWN``)."""
         if not written:
-            return []
+            return [], []
         end = self._store.batch_put_session_end
         keys = [batch.keys[i] for i in written]
         first = self._metadata_call(end, keys)
         final = dict(zip(keys, first))
-        retry = [key for key, code in final.items() if code in (_Code.RPC_FAIL, _Code.RPC_TIMEOUT)]
-        if retry:  # ending is idempotent on the master
+        retry = [key for key, code in final.items() if code in _END_RETRIED]
+        if retry:
             final.update(zip(retry, self._metadata_call(end, retry)))
         refused, outcome_unknown = [], []
         for i, row_key, first_code in zip(written, keys, first):
@@ -530,15 +536,18 @@ class MooncakeDriver:
                 batch.results[i] = _READY
                 continue
             batch.results[i] = faulted(_put_end_fault(code))
-            (outcome_unknown if first_code in _END_OUTCOME_UNKNOWN else refused).append(i)
-        self._leave_open([batch.keys[i] for i in outcome_unknown], _LeftOpen.FOR_DRAIN)
-        return refused
+            if first_code in _END_OUTCOME_UNKNOWN:
+                outcome_unknown.append(row_key)
+            else:
+                refused.append(row_key)
+        return refused, outcome_unknown
 
-    def _revoke_put_sessions(self, keys: list[str]) -> None:
-        if keys:
-            codes = self._metadata_call(self._store.batch_put_session_revoke, keys)
-            failed = [key for key, code in zip(keys, codes) if not _gone(code)]
-            self._leave_open(failed, _LeftOpen.FOR_DRAIN)
+    def _revoke_put_sessions(self, keys: list[str]) -> list[str]:
+        """Revokes the sessions of ``keys``; returns those neither revoked nor found gone."""
+        if not keys:
+            return []
+        codes = self._metadata_call(self._store.batch_put_session_revoke, keys)
+        return [key for key, code in zip(keys, codes) if not _gone(code)]
 
     def _leave_open(self, keys: list[str], kind: _LeftOpen) -> None:
         if keys:

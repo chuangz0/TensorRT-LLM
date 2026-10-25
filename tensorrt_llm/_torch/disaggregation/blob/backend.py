@@ -427,8 +427,8 @@ class BlobBackend:
             slot_rows=capabilities.multi_span,
         )
         self._unprovable_batches = 0
-        # The label of the first unprovable batch's attempt, which the progress thread warns of.
-        self._first_unprovable: str | None = None
+        # The first unprovable batch's attempt, until the progress thread warns of it outside the lock.
+        self._unprovable_to_warn: str | None = None
         # A queued driver runs its own calls: no worker thread, and batches handed over by handle.
         self._queued = capabilities.queued
         self._batch_of: dict[OpHandle, _Batch] = {}
@@ -791,9 +791,9 @@ class BlobBackend:
         if unprovable and not batch.unprovable:  # counted, held for good, no longer polled
             batch.unprovable = True
             self._unprovable_batches += 1
-            if self._first_unprovable is None:
-                self._first_unprovable = attempt.label
-                self._poke_progress()  # which warns, outside the lock
+            if self._unprovable_batches == 1:  # warned of once
+                self._unprovable_to_warn = attempt.label
+                self._poke_progress()
         if batch.settled:
             self._watched.discard(batch)
         return self._conclude_or_quiesce(attempt)
@@ -817,7 +817,8 @@ class BlobBackend:
                 self._observe_watched()
                 if self._queued:
                     self._collect(0.0 if self._closing else UNCOLLECTED_GRACE_S)
-                self._report_stuck_and_unprovable_calls()
+                self._warn_unprovable_call()
+                self._report_stuck_calls()
             except Exception as error:  # the thread must live on, or the labels never clear
                 self._warn_progress_raised(error)
             try:  # even when the round above raised: shutdown must still finish
@@ -844,21 +845,23 @@ class BlobBackend:
         if any(wake_due):
             self._call_wake()
 
-    def _report_stuck_and_unprovable_calls(self) -> None:
-        """Warns, outside the lock, once of the first call that can never prove its access ended,
-        and once of each call out longer than STUCK_CALL_WARNING_S."""
+    def _warn_unprovable_call(self) -> None:
+        """Warns, outside the lock, of the first call that can never prove its access ended."""
+        with self._lock:
+            label, self._unprovable_to_warn = self._unprovable_to_warn, None
+        if label is not None:
+            logger.warning(
+                f"blob backend: a store call of {label} can never prove its access ended; its slots "
+                "stay held"
+            )
+
+    def _report_stuck_calls(self) -> None:
+        """Warns, outside the lock, once of each call out longer than STUCK_CALL_WARNING_S."""
         now = time.monotonic()
         with self._lock:
             stuck = [
                 b for b, started in self._in_driver.items() if now - started > STUCK_CALL_WARNING_S
             ]
-            unprovable = self._first_unprovable
-        if unprovable is not None:
-            logger.warning_once(
-                f"blob backend: a store call of {unprovable} can never prove its access ended; its "
-                "slots stay held",
-                key=(self._name, "unprovable"),
-            )
         for batch in stuck:
             logger.warning_once(
                 f"blob backend: a store call of {batch.attempt.label} has been out for over "
