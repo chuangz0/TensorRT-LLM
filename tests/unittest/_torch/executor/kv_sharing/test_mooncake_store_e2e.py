@@ -81,8 +81,8 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
-    LEAVE_GRACE_S,
-    MOONCAKE_LEAVE_CLEANUP_S,
+    MOONCAKE_UNMOUNT_CLEANUP_S,
+    UNMOUNT_GRACE_S,
 )
 from tensorrt_llm._torch.disaggregation.blob.store import ProbeStatus
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import MemoryKind
@@ -854,7 +854,7 @@ def test_a_lending_server_that_stops_normally_ends_no_server_reading_its_memory(
         stop_server(b)
     print(f"A stopped in {a_stop_s:.1f} s; the store's segments went through {statuses}")
     assert "GRACEFULLY_UNMOUNTING" in statuses
-    assert a_stop_s >= LEAVE_GRACE_S + MOONCAKE_LEAVE_CLEANUP_S
+    assert a_stop_s >= UNMOUNT_GRACE_S + MOONCAKE_UNMOUNT_CLEANUP_S
     assert_agree(references, answers, model)
     whole_system_prompt = [answer.cached_tokens >= SYSTEM_TOKENS for answer in answers]
     # Read whole from both lenders' memory, then partly once A's blocks left.

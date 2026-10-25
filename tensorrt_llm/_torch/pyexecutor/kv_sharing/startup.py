@@ -46,8 +46,8 @@ from ...disaggregation.blob.keys import key_stem
 from ...disaggregation.blob.mooncake import MooncakeDriver
 from ...disaggregation.blob.mooncake_native import NativeMooncakeDriver
 from ...disaggregation.blob.mooncake_setup import (
-    LentMemory,
     MooncakeConfig,
+    StoreSegment,
     load_store_config,
     make_store_driver,
     open_sdk,
@@ -183,7 +183,7 @@ def start_kv_sharing(
         logger.info(f"kv_sharing: reading every file of {checkpoint} to name its stored blocks")
         return (mooncake, blob_config), ArtifactIdentity.from_checkpoint(checkpoint)
 
-    def open_and_check() -> tuple[tuple[Any, Optional[LentMemory]], Optional[str]]:
+    def open_and_check() -> tuple[tuple[Any, Optional[StoreSegment]], Optional[str]]:
         store, lent, gpu_direct_error = open_store(config.data_path, mooncake, backend.segment_size)
         return (store, lent), gpu_direct_error
 
@@ -321,8 +321,8 @@ def lend_store_memory(py_executor: PyExecutor, llm_args: TorchLlmArgs) -> None:
         _check_node_memory(backend.segment_size, 0, dist.local_world_size)
         return mooncake, None
 
-    def open_and_lend() -> tuple[LentMemory, None]:
-        return LentMemory.lend(open_sdk(mooncake), backend.segment_size, mooncake.protocol), None
+    def open_and_lend() -> tuple[StoreSegment, None]:
+        return StoreSegment.mount(open_sdk(mooncake), backend.segment_size, mooncake.protocol), None
 
     # Two collectives, so that every rank checks the node's memory before any rank lends.
     mooncake, _ = _agree(dist, prepare)

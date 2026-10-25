@@ -11,8 +11,8 @@ some per client (``MC_STORE_MEMCPY``) and ``MC_TCP_PROTO`` on every transfer; th
 before setup and sets the two RPC timeouts (the call timeout from the config, the connect timeout
 to RPC_CONNECT_TIMEOUT_MS) and, unless set, ``MC_HANDSHAKE_MAX_LENGTH``.
 
-``LentMemory`` is host memory a process lends the store: a segment that holds other processes'
-objects too.
+``StoreSegment`` is host memory a process gives the store: a segment that holds any process's
+objects.
 
 Over RDMA, a process that used ibverbs before its first Mooncake client (importing
 ``tensorrt_llm`` does) logs ``RDMA context setup failed: fork compatibility: Invalid argument``
@@ -40,8 +40,8 @@ from .mooncake import AllocationRange, MooncakeDriver
 from .mooncake_native import NativeMooncakeDriver
 
 __all__ = [
-    "LentMemory",
     "MooncakeConfig",
+    "StoreSegment",
     "load_store_config",
     "make_store_driver",
     "open_sdk",
@@ -65,16 +65,16 @@ STORE_WORKER_API_VERSION = 4
 # cache pieces. Mooncake drops a longer message than MC_HANDSHAKE_MAX_LENGTH (1 MiB unless set, at
 # most 128 MiB), which it reads once per process.
 HANDSHAKE_MAX_BYTES = 64 << 20
-# How long memory that leaves stays readable (LentMemory.begin_leaving): a get that misses after it
-# costs a request its fetch, nothing more.
-LEAVE_GRACE_S = 2
-# Mooncake frees memory that left gracefully this long after its grace ended, once the master
-# confirms (client_service.cpp, Client::StartGracefulUnmountTimer): a get that found the memory
+# How long a segment being unmounted stays readable (StoreSegment.begin_unmount): a get that misses
+# after it costs a request its fetch, nothing more.
+UNMOUNT_GRACE_S = 2
+# Mooncake frees a segment unmounted gracefully this long after its grace ended, once the master
+# confirms (client_service.cpp, Client::StartGracefulUnmountTimer): a get that found the segment
 # before the grace ended has that long to finish.
-MOONCAKE_LEAVE_CLEANUP_S = 10
-# For that confirmation and the free.
-_LEAVE_MARGIN_S = 1
-# Lent memory's location hint: Mooncake reads the NUMA node from the memory itself.
+MOONCAKE_UNMOUNT_CLEANUP_S = 10
+# Slack after Mooncake's cleanup, for the master's confirmation and the free itself.
+_UNMOUNT_MARGIN_S = 1
+# A segment's location hint: Mooncake reads the NUMA node from the memory itself.
 _ANY_LOCATION = "*"
 
 # Logged before setup, as Mooncake will read them.
@@ -184,8 +184,8 @@ def open_sdk(config: MooncakeConfig) -> Any:
     """Opens a set-up ``MooncakeDistributedStore``, on the builder thread: ``setup`` holds the GIL
     while it mounts this process's segment. Sets the process's ``MC_RPC_TIMEOUT_MS`` from
     ``config``, ``MC_RPC_CONNECT_TIMEOUT_MS`` and, unless set, ``MC_HANDSHAKE_MAX_LENGTH`` first:
-    every process may receive another's descriptor, a lending one from each process that reads its
-    memory.
+    every process may receive another's descriptor, one with a segment from each process that
+    reads it.
 
     Raises:
         ValueError: TCP would use its legacy framing, or the local hot cache is on.
@@ -231,28 +231,29 @@ def open_sdk(config: MooncakeConfig) -> Any:
 
 
 @dataclass
-class LentMemory:
-    """Host memory this process lends the store: a segment of fresh, pinned memory that the
-    master places objects in and other clients read and write directly.
+class StoreSegment:
+    """Host memory this process gives the store: a segment of fresh, pinned memory that the master
+    places objects in and other clients read and write directly.
 
-    Leaving takes two calls. ``begin_leaving``: no new object lands here, and the objects here stay
-    readable for LEAVE_GRACE_S; after that the master drops them and gets miss. Mooncake keeps the
-    memory registered MOONCAKE_LEAVE_CLEANUP_S longer for gets already under way, then frees it.
-    ``wait_until_left`` returns after that; then the process may exit.
+    Unmounting takes two calls. ``begin_unmount``: no new object lands here, and the objects here
+    stay readable for UNMOUNT_GRACE_S; after that the master drops them and gets miss. Mooncake
+    keeps the memory registered MOONCAKE_UNMOUNT_CLEANUP_S longer for gets already under way, then
+    frees it. ``wait_until_freed`` returns after that; then the process may exit.
 
-    Rules: never ``close()`` the client of lent memory, nor end the process before
-    ``wait_until_left`` returns: either frees the memory while other processes may read it, and a
-    reader whose get then fails cannot prove the get ended, which ends it. Lend at most once per
-    process: memory lent later would go by the same segment name (the client's address), where a
-    peer's retried read of an old object could land.
+    Rules: never ``close()`` the client, nor end the process before ``wait_until_freed`` returns:
+    either frees the memory under a reader's get, that get fails without proof that its transfers
+    ended, and the reader's process ends. Mount at most once per client: a later segment would go
+    by the same name (the client's address), where a peer's retried read of an old object could
+    land.
     """
 
     store: Any  # the MooncakeDistributedStore that mounted the memory
     segment_ids: list[str]
-    _left_by: Optional[float] = field(default=None, init=False)  # monotonic time, once freed
+    # When Mooncake will have freed the memory (time.monotonic()); None until an unmount was taken.
+    _freed_at: Optional[float] = field(default=None, init=False)
 
     @classmethod
-    def lend(cls, store: Any, nbytes: int, protocol: str) -> LentMemory:
+    def mount(cls, store: Any, nbytes: int, protocol: str) -> StoreSegment:
         """Mounts ``nbytes`` of fresh host memory as a segment of ``store``, a client opened with
         no segment of its own (``global_segment_size`` 0). Mooncake rounds the size up to whole
         allocator slabs.
@@ -263,25 +264,25 @@ class LentMemory:
         mounted = store.allocate_and_mount_segment(nbytes, protocol, _ANY_LOCATION)
         if mounted["ret"] != 0:
             raise RuntimeError(
-                f"mooncake: lending {nbytes} bytes of host memory failed with {mounted['ret']}"
+                f"mooncake: mounting {nbytes} bytes of host memory failed with {mounted['ret']}"
             )
         return cls(store, list(mounted["segment_ids"]))
 
-    def begin_leaving(self) -> None:
-        """Stops new objects landing in the memory; the old ones stay readable for LEAVE_GRACE_S.
-        If the master does not take the leave, the memory goes when the process exits."""
-        code = self.store.unmount_and_free_segment(self.segment_ids, LEAVE_GRACE_S)
+    def begin_unmount(self) -> None:
+        """Stops new objects landing in the segment; the old ones stay readable for
+        UNMOUNT_GRACE_S. If the master refuses, the memory goes when the process exits."""
+        code = self.store.unmount_and_free_segment(self.segment_ids, UNMOUNT_GRACE_S)
         if code != 0:
-            logger.error(f"mooncake: lent memory did not begin leaving (code {code})")
+            logger.error(f"mooncake: the master refused to unmount the segment (code {code})")
             return
-        self._left_by = (
-            time.monotonic() + LEAVE_GRACE_S + MOONCAKE_LEAVE_CLEANUP_S + _LEAVE_MARGIN_S
+        self._freed_at = (
+            time.monotonic() + UNMOUNT_GRACE_S + MOONCAKE_UNMOUNT_CLEANUP_S + _UNMOUNT_MARGIN_S
         )
 
-    def wait_until_left(self) -> None:
-        """Returns once Mooncake freed the memory that began leaving, at once if none did."""
-        if self._left_by is not None:
-            time.sleep(max(0.0, self._left_by - time.monotonic()))
+    def wait_until_freed(self) -> None:
+        """Sleeps until Mooncake has freed the memory; returns at once if no unmount was taken."""
+        if self._freed_at is not None:
+            time.sleep(max(0.0, self._freed_at - time.monotonic()))
 
 
 class _NativeDriverUnavailable(Exception):

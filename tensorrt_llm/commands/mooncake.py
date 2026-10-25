@@ -20,9 +20,9 @@ publishes them as a manifest that each server's
 `kv_connector_config.mooncake_store.pool` names.
 
 Capacity needs no command for the connector: every rank that joins the pool
-lends the memory its own config asks for. Servers that share KV cache through
-`kv_sharing` lend only what their role 'provide' asks for; `mooncake_provider`
-lends the pool host memory for them.
+gives it the memory its own config asks for. Servers that share KV cache through
+`kv_sharing` give it memory only under the role 'provide' (`segment_size`);
+`mooncake_provider` gives the pool host memory for them.
 """
 
 import contextlib
@@ -270,19 +270,19 @@ def mooncake_master(
 )
 @_telemetry_option
 def mooncake_provider(config: str, segment_size: int, ready_file: Optional[str], telemetry: bool):
-    """Lend host memory to a Mooncake pool for as long as this command runs.
+    """Give a Mooncake pool host memory for as long as this command runs.
 
     Start it after the master and before the servers that share KV cache
-    through the pool. On SIGTERM or SIGINT it leaves the pool gracefully and
-    exits about 13 s later: no new object lands in its memory, and servers
-    read the old ones for a short grace, then miss them. So it may restart
-    while servers read from it; a provider killed outright can end a server
-    that was reading from it, about two minutes later.
+    through the pool. On SIGTERM or SIGINT it unmounts its memory gracefully
+    and exits about 13 s later: no new object lands in it, and servers read
+    the old ones for a short grace, then miss them. So it may restart while
+    servers read from it; a provider killed outright can end a server that
+    was reading from it, about two minutes later.
     """
     _apply_cli_telemetry(telemetry)
 
     from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
-        LentMemory,
+        StoreSegment,
         load_store_config,
         open_sdk,
     )
@@ -290,10 +290,10 @@ def mooncake_provider(config: str, segment_size: int, ready_file: Optional[str],
     _, mooncake = load_store_config(config)
     with _signal_handoff():
         store = open_sdk(dataclasses.replace(mooncake, global_segment_size=0))
-        lent = LentMemory.lend(store, segment_size, mooncake.protocol)
+        segment = StoreSegment.mount(store, segment_size, mooncake.protocol)
         try:
             logger.warning(
-                f"mooncake-store: lending {segment_size} bytes to the pool at "
+                f"mooncake-store: providing {segment_size} bytes to the pool at "
                 f"{mooncake.master_server_address} until this command stops"
             )
             if ready_file:
@@ -302,8 +302,8 @@ def mooncake_provider(config: str, segment_size: int, ready_file: Optional[str],
                 # The handler raises, so a signal ends this wait rather than resuming it.
                 time.sleep(1.0)
         finally:
-            lent.begin_leaving()
-            lent.wait_until_left()
+            segment.begin_unmount()
+            segment.wait_until_freed()
 
 
 @click.command("mooncake_pool_report")

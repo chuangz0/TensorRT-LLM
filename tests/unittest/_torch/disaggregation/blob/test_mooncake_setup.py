@@ -26,10 +26,9 @@ from tensorrt_llm._torch.disaggregation.blob import mooncake_setup
 from tensorrt_llm._torch.disaggregation.blob.backend import BlobConfig
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
-    LEAVE_GRACE_S,
-    MOONCAKE_LEAVE_CLEANUP_S,
-    LentMemory,
+    UNMOUNT_GRACE_S,
     MooncakeConfig,
+    StoreSegment,
     load_store_config,
     make_store_driver,
     open_sdk,
@@ -278,7 +277,7 @@ def test_setup_failure_closes_the_half_open_client(sdk: Sdk) -> None:
     assert len(store.calls_to("close")) == 1
 
 
-# Lent memory.
+# Store segments.
 
 
 class Clock:
@@ -296,41 +295,38 @@ class Clock:
         self.now += seconds
 
 
-def test_lent_memory_stays_until_its_grace_and_mooncakes_cleanup_have_passed(
+def test_a_store_segment_is_freed_13_s_after_its_unmount_began(
     sdk: Sdk, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clock = Clock()
     monkeypatch.setattr(mooncake_setup, "time", clock)
     store = open_sdk(MooncakeConfig(MASTER, 0, "rdma", device_name="mlx5_0"))
-    lent = LentMemory.lend(store, 1 << 30, "rdma")
+    segment = StoreSegment.mount(store, 1 << 30, "rdma")
     (mount,) = store.calls_to("allocate_and_mount_segment")
     assert mount.args == (1 << 30, "rdma", "*")
-    lent.begin_leaving()
-    (leave,) = store.calls_to("unmount_and_free_segment")
-    assert leave.args == (lent.segment_ids, LEAVE_GRACE_S)
+    segment.begin_unmount()
+    (unmount,) = store.calls_to("unmount_and_free_segment")
+    assert unmount.args == (segment.segment_ids, UNMOUNT_GRACE_S)
     clock.now += 5.0  # the executor's own shutdown
-    lent.wait_until_left()
-    assert clock.slept == [LEAVE_GRACE_S + MOONCAKE_LEAVE_CLEANUP_S + 1 - 5.0]
+    segment.wait_until_freed()
+    assert clock.slept == [8.0]  # 13 s after begin_unmount, 5 of them spent stopping the executor
     assert store.calls_to("close") == []  # closing would free the memory at once
 
 
-def test_a_failed_mount_raises_and_a_leave_the_master_refused_waits_for_nothing(
+def test_an_unmount_the_master_refuses_waits_for_nothing(
     sdk: Sdk, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clock = Clock()
     monkeypatch.setattr(mooncake_setup, "time", clock)
     store = open_sdk(MooncakeConfig(MASTER, 0, "tcp"))
-    store.mount_answer = -1
-    with pytest.raises(RuntimeError, match="lending 1073741824 bytes of host memory failed"):
-        LentMemory.lend(store, 1 << 30, "tcp")
-    store.mount_answer, store.leave_answer = 0, -900
-    lent = LentMemory.lend(store, 1 << 30, "tcp")
+    store.unmount_answer = -900
+    segment = StoreSegment.mount(store, 1 << 30, "tcp")
     errors: list[str] = []
     monkeypatch.setattr(mooncake_setup.logger, "error", errors.append)
-    lent.begin_leaving()
-    lent.wait_until_left()
+    segment.begin_unmount()
+    segment.wait_until_freed()
     assert clock.slept == []  # the memory goes when the process exits
-    assert errors == ["mooncake: lent memory did not begin leaving (code -900)"]
+    assert errors == ["mooncake: the master refused to unmount the segment (code -900)"]
 
 
 # Layering.

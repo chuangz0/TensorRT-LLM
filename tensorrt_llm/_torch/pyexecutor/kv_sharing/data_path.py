@@ -31,7 +31,7 @@ from tensorrt_llm.logger import logger
 
 from ...disaggregation.base.memory import MemoryKind
 from ...disaggregation.blob.mooncake import MooncakeDriver
-from ...disaggregation.blob.mooncake_setup import LentMemory, MooncakeConfig, open_sdk
+from ...disaggregation.blob.mooncake_setup import MooncakeConfig, StoreSegment, open_sdk
 from ...disaggregation.blob.store import RegionLayout, RowIO, RowStatus, Span
 from ..connectors.mooncake_store.gpudirect import (
     PEERMEM_ENV,
@@ -57,7 +57,7 @@ _CHECK_MEMORY: list[torch.Tensor] = []
 
 def open_store(
     requested: str, mooncake: MooncakeConfig, lent_bytes: int
-) -> tuple[Any, Optional[LentMemory], Optional[str]]:
+) -> tuple[Any, Optional[StoreSegment], Optional[str]]:
     """Opens the store client, lends the store ``lent_bytes`` of host memory (nothing for 0) and
     checks the store with one round trip: the client, the lent memory (None for 0), and why GPU
     Direct cannot serve this rank, or None where it can. The memory is lent before the check: where
@@ -76,7 +76,7 @@ def open_store(
         gpu_direct_error = prepare_gpu_direct(mooncake.protocol)
     try:
         store = open_sdk(mooncake)
-        lent = LentMemory.lend(store, lent_bytes, mooncake.protocol) if lent_bytes else None
+        lent = StoreSegment.mount(store, lent_bytes, mooncake.protocol) if lent_bytes else None
         # The check runs on its own Python driver, before any store worker thread exists.
         return store, lent, check_store(store, gpu_direct_error)
     except Exception as error:

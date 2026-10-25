@@ -26,10 +26,12 @@ memory from a separate process, `trtllm-serve mooncake_provider`.
 """
 
 import contextlib
+import json
 import os
 import subprocess  # nosec B404
 import sys
 import time
+import urllib.request
 from typing import Iterator
 
 import yaml
@@ -40,7 +42,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
 )
 from tensorrt_llm._utils import get_free_ports
 
-__all__ = ["running_master_on_free_ports", "running_segment_provider"]
+__all__ = ["master_segments", "running_master_on_free_ports", "running_segment_provider"]
 
 PORT_ATTEMPTS = 5
 # The provider imports tensorrt_llm before it joins the pool, which takes long on a cold network
@@ -122,7 +124,7 @@ def running_segment_provider(
     log_path = os.path.join(run_dir, "segment_provider.log")
     mooncake = {
         "master_server_address": master_address,
-        "global_segment_size": 0,  # the command lends --segment_size instead
+        "global_segment_size": 0,  # the command mounts --segment_size instead
         "protocol": protocol,
         "device_name": device_name,
     }
@@ -143,9 +145,19 @@ def running_segment_provider(
             time.sleep(0.1)
         yield process
     finally:
-        process.terminate()  # the provider leaves the pool gracefully, in about 13 s
+        process.terminate()  # the provider unmounts its memory gracefully, in about 13 s
         try:
             process.wait(timeout=30)
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+
+
+def master_segments(metrics_url: str) -> list[dict]:
+    """The segments the master at `metrics_url` (`http://host:port`) lists.
+
+    One per mounted segment (`/get_segments_detail`): `segment_name` (the client's `host:port`),
+    `status` and `allocator_used_bytes` among others.
+    """
+    with urllib.request.urlopen(f"{metrics_url}/get_segments_detail", timeout=10) as reply:
+        return json.load(reply)["segments"]

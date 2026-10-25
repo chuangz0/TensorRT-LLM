@@ -136,7 +136,7 @@ if TYPE_CHECKING:
 
     from tensorrt_llm.bindings import MpiProgressThread
 
-    from ..disaggregation.blob.mooncake_setup import LentMemory
+    from ..disaggregation.blob.mooncake_setup import StoreSegment
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
     from .kv_sharing.orchestrator import SharedKvOrchestrator
 
@@ -434,7 +434,7 @@ class PyExecutor:
     # build partially working.
     kv_sharing: Optional["SharedKvOrchestrator"] = None
     # Host memory this rank lends the KV store, also set by kv_sharing startup.
-    lent_store_memory: Optional["LentMemory"] = None
+    lent_store_memory: Optional["StoreSegment"] = None
 
     def __init__(
         self,
@@ -2013,7 +2013,7 @@ class PyExecutor:
         if lent_store_memory is not None:
             # First, so that its grace and Mooncake's cleanup run while the
             # executor stops; the last step waits for the rest.
-            lent_store_memory.begin_leaving()
+            lent_store_memory.begin_unmount()
         node_server = getattr(self, "_openengine_node_server", None)
         if node_server is not None:
             node_server.close()
@@ -2113,7 +2113,7 @@ class PyExecutor:
             self.dwdp_manager = None
         if lent_store_memory is not None:
             # Other servers may still read the memory until Mooncake frees it.
-            lent_store_memory.wait_until_left()
+            lent_store_memory.wait_until_freed()
 
     def can_enqueue_requests(self) -> bool:
         """
