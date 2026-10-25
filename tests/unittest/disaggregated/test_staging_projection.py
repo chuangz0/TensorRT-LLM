@@ -436,22 +436,30 @@ def test_profile_accepts_the_supported_caches_and_parallel_layouts(
 ) -> None:
     """Each supported cache is accepted and names blocks of its own; both parallel layouts too.
 
-    Multi-head attention in BF16, FP16, FP8 or NVFP4; MLA in BF16 or FP8, also with DeepSeek sparse
-    attention. MLA in NVFP4 is refused. Tensor-parallel ranks lend shares of one cache,
-    attention-DP ranks caches of their own.
+    Multi-head attention in BF16, FP16, FP8 or NVFP4, each attaching to the layout its lender
+    reports; MLA in BF16 or FP8, also with DeepSeek sparse attention. MLA in NVFP4 is refused.
+    Tensor-parallel ranks lend shares of one cache, attention-DP ranks caches of their own.
     """
-    mha = [replace(_profile(), dtype=dtype) for dtype in ("bfloat16", "float16", "fp8", "nvfp4")]
-    mla = [
-        replace(_profile(), model_layout="mla-trtllm-latent", dtype=dtype)
+    # Each MHA cache dtype with the dtype and quantization its lender's public layout reports.
+    mha_layouts = {
+        "bfloat16": ("BF16", None),
+        "float16": ("HALF", None),
+        "fp8": ("FP8", "fp8"),
+        "nvfp4": ("NVFP4", "nvfp4"),
+    }
+    mha = {dtype: replace(_profile(), dtype=dtype) for dtype in mha_layouts}
+    mla = {
+        dtype: replace(_profile(), model_layout="mla-trtllm-latent", dtype=dtype)
         for dtype in ("bfloat16", "fp8")
-    ]
-    dsa = replace(mla[1], sparse_attention={"algorithm": "dsa", "index_topk": 2048})
-    assert len({profile.scope for profile in [*mha, *mla, dsa]}) == 7
+    }
+    dsa = replace(mla["fp8"], sparse_attention={"algorithm": "dsa", "index_topk": 2048})
+    assert len({profile.scope for profile in [*mha.values(), *mla.values(), dsa]}) == 7
     with pytest.raises(ValueError, match="is not supported"):
-        replace(mla[0], dtype="nvfp4")
-    lender = _lender(replace(_layout(), dtype="FP8", quant_mode="fp8"))
-    monkeypatch.setattr(_assembly, "attach_lender", lambda *args, **kwargs: lender)
-    assert attach_domain(object(), mha[2]).lender is lender
+        replace(mla["bfloat16"], dtype="nvfp4")
+    for dtype, (layout_dtype, quant_mode) in mha_layouts.items():
+        lender = _lender(replace(_layout(), dtype=layout_dtype, quant_mode=quant_mode))
+        monkeypatch.setattr(_assembly, "attach_lender", lambda *args, lender=lender, **kw: lender)
+        assert attach_domain(object(), mha[dtype]).lender is lender
     for topology in ((4, 1, 1, 1), (2, 2, 1, 1)):
         assert replace(_profile(), topology=topology).topology == topology
 

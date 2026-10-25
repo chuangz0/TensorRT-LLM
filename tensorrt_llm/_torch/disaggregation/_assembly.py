@@ -128,8 +128,9 @@ class FactoryRejected(RuntimeError):
 
 
 # The supported caches: an attention writer layout with the dtype of its cache. MLA has no NVFP4
-# cache here: TensorRT-LLM turns block reuse off for FP4 MLA.
-_SUPPORTED_CACHES = frozenset(
+# cache here: dense FP4 MLA has no block reuse upstream, and NVFP4 with DeepSeek sparse attention
+# is not qualified yet.
+SUPPORTED_CACHES = frozenset(
     {("mha-trtllm-hnd", dtype) for dtype in ("bfloat16", "float16", "fp8", "nvfp4")}
     | {("mla-trtllm-latent", dtype) for dtype in ("bfloat16", "fp8")}
 )
@@ -221,10 +222,10 @@ class ProfileSpec:
                 raise ValueError(f"{name} must be a nonempty string")
         if not isinstance(self.staging, StagingOptions):
             raise TypeError("profile staging must be StagingOptions")
-        if (self.model_layout, self.dtype) not in _SUPPORTED_CACHES:
+        if (self.model_layout, self.dtype) not in SUPPORTED_CACHES:
             raise ValueError(
                 f"KV cache layout {self.model_layout} with dtype {self.dtype} is not supported; "
-                f"supported: {sorted(_SUPPORTED_CACHES)}"
+                f"supported: {sorted(SUPPORTED_CACHES)}"
             )
         topology = tuple(self.topology)
         if any(
