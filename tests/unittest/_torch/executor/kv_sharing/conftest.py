@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The real Mooncake store of the end-to-end modules: one master and one provider
-(``trtllm-serve mooncake_provider``) per module; servers lend the store no memory. And the
-modules' realistic workload: two instances of one service, two-turn conversations.
+(``trtllm-serve mooncake_provider``) per module; servers lend the store no memory unless a test
+says so. And the modules' realistic workload: two instances of one service, two-turn
+conversations.
 
 ``TRTLLM_MOONCAKE_PROTOCOL`` (default rdma) and ``TRTLLM_MOONCAKE_DEVICES`` (default: the fastest
 InfiniBand devices) pick the transport; ``TRTLLM_MOONCAKE_E2E_DRIVER`` the servers' store driver:
@@ -53,6 +54,9 @@ assert DRIVER in ("native", "python"), f"TRTLLM_MOONCAKE_E2E_DRIVER={DRIVER!r}"
 DEVICES = os.environ.get("TRTLLM_MOONCAKE_DEVICES", "")
 PROVIDER_BYTES = 4 << 30
 WAIT_S = 60.0
+# How long a server may take to stop: one that lends the store memory stops about 13 s after its
+# executor began to, once Mooncake freed the memory.
+SERVER_STOP_S = 120.0
 
 
 @dataclass
@@ -98,6 +102,13 @@ class Store:
             f"the store holds {self.readable_objects(key_prefix)}; expected {objects}"
         )
 
+    def segments(self) -> list[dict]:
+        """The memory lent to the store (``/get_segments_detail``), one entry per lending client:
+        ``segment_name`` (the client's ``host:port``), ``status`` and ``allocator_used_bytes``
+        among others."""
+        with urllib.request.urlopen(f"{self.metrics_url}/get_segments_detail", timeout=10) as reply:
+            return json.loads(reply.read())["segments"]
+
     def master_metrics(self) -> dict[str, float]:
         """The master's counters (``/metrics``), by name."""
         with urllib.request.urlopen(f"{self.metrics_url}/metrics", timeout=10) as reply:
@@ -122,6 +133,17 @@ def require_environment() -> None:
     assert torch.cuda.is_available(), "needs a GPU"
     assert shutil.which("mooncake_master"), "needs mooncake_master (mooncake-transfer-engine)"
     import mooncake.store  # noqa: F401
+
+
+def stop_server(server: RemoteOpenAIServer) -> float:
+    """Stops ``server`` as an operator would (SIGTERM) and waits up to SERVER_STOP_S for it to
+    exit; returns the seconds it took."""
+    started = time.monotonic()
+    server.proc.terminate()
+    server.proc.wait(timeout=SERVER_STOP_S)
+    took = time.monotonic() - started
+    server.terminate()  # the process is gone; this closes its log
+    return took
 
 
 def puts_since(store: Store, before: dict[str, float]) -> tuple[float, float]:

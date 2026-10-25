@@ -19,7 +19,9 @@ on node 1: two TP2 context instances share system prompts and follow-up turns un
 load, one behind a context-first router and one behind a generation-first router (2P1D, Qwen3-8B);
 and a TP2 context server restarted between the turns, as in a rolling upgrade, reads the first
 turns from the store while a generation server under attention DP serves on (1P1D,
-DeepSeek-V3-Lite). The store has a provider on each node, so puts and gets cross nodes.
+DeepSeek-V3-Lite). The store has a provider on each Grace socket of both nodes, as deployments run
+them, so puts and gets cross nodes. In one more 1P1D deployment (Qwen3-8B) the store has no
+provider: the generation server lends it all of its memory.
 
 Runs only with ``TRTLLM_MOONCAKE_E2E=1`` (it skips otherwise), as one pytest task per node of a
 two-node job (``SLURM_NODEID`` picks the role; four GPUs per task, its steps ``--overlap``) with
@@ -30,7 +32,8 @@ server spans both nodes, so the job launches it outside these tasks once node 0 
 ``srun -N2 --ntasks-per-node=4 --mpi=pmix trtllm-llmapi-launch trtllm-serve $(cat <name>.args)``
 with ``TRTLLM_KV_SHARING_TRACE_DIR=<shared dir>/<name>``. When node 0 writes ``<name>.stop``, the
 job sends rank 0's ``trtllm-serve`` SIGTERM (a graceful stop: every rank writes its trace's exit
-line, which the test checks), then writes ``<name>.stopped``. Fails unless it runs on two nodes.
+line, which the test checks), then writes ``<name>.stopped``. Fails unless it runs on two nodes;
+the providers need ``numactl``.
 """
 
 from __future__ import annotations
@@ -49,7 +52,6 @@ import openai
 import pytest
 import requests
 from conftest import (
-    DEVICES,
     PROTOCOL,
     PROVIDER_BYTES,
     TOKENS_PER_BLOCK,
@@ -68,6 +70,7 @@ from conftest import (
     send_at_once,
     skip_unless_opted_in,
     start_instance,
+    stop_server,
     whole_blocks,
     workload_sharing,
 )
@@ -99,6 +102,8 @@ TRANSCEIVER = {"cache_transceiver_config": {"backend": "DEFAULT"}}
 # With the autotuner on, each DeepSeek server process picks its own MoE kernels, and two processes'
 # outputs differ in the last bits.
 NO_AUTOTUNER = {"enable_autotuner": False}
+# Host memory each rank of a generation server lends the store when it holds all of the store.
+GENERATION_LENT_BYTES = 4 << 30
 
 
 def model_path() -> str:
@@ -172,17 +177,54 @@ def node() -> Node:
     return Node(index, Path(shared))
 
 
-@pytest.fixture(scope="module")
-def store(node: Node) -> Iterator[Store | None]:
-    """Node 0: the master, a provider and a client; node 1: a provider, until node 0 is done."""
+def infiniband_by_socket() -> dict[int, list[str]]:
+    """The active InfiniBand devices of each NUMA node of this host."""
+    found: dict[int, list[str]] = {}
+    for device in sorted(Path("/sys/class/infiniband").iterdir()):
+        port = device / "ports" / "1"
+        if (port / "link_layer").read_text().strip() != "InfiniBand":
+            continue
+        if "ACTIVE" in (port / "state").read_text():
+            socket = int((device / "device" / "numa_node").read_text())
+            found.setdefault(socket, []).append(device.name)
+    return found
+
+
+@contextlib.contextmanager
+def providers_per_socket(master: str, run_dir: Path) -> Iterator[None]:
+    """A provider on each Grace socket of this node, as deployments run them: under ``numactl``
+    on the socket's CPUs and memory, over its InfiniBand devices; PROVIDER_BYTES between them."""
     from test_common.mooncake_utils import running_segment_provider
 
+    sockets = infiniband_by_socket()
+    with ExitStack() as providers:
+        for socket, devices in sockets.items():
+            providers.enter_context(
+                running_segment_provider(
+                    master,
+                    str(run_dir / f"provider-{socket}"),
+                    segment_size=PROVIDER_BYTES // len(sockets),
+                    protocol=PROTOCOL,
+                    device_name=",".join(devices),
+                    launcher=("numactl", f"--cpunodebind={socket}", f"--membind={socket}"),
+                )
+            )
+        yield
+
+
+@pytest.fixture(scope="module")
+def store(node: Node) -> Iterator[Store | None]:
+    """Node 0: the master, its providers and a client; node 1: its providers, until node 0 is
+    done."""
     master_file, done = node.shared / "master.json", node.shared / "node0.done"
     if node.index == 0:
         try:
             run_dir = node.shared / "store"
             run_dir.mkdir()
-            with running_store(run_dir) as store:
+            with (
+                running_store(run_dir, provider_bytes=0) as store,
+                providers_per_socket(store.master, run_dir),
+            ):
                 write_file(master_file, json.dumps({"master": store.master}))
                 wait_for_file(node.shared / "provider1.ready")
                 yield store
@@ -190,16 +232,16 @@ def store(node: Node) -> Iterator[Store | None]:
             write_file(done)
         return
     master = json.loads(wait_for_file(master_file))["master"]
-    with running_segment_provider(
-        master,
-        str(node.shared / "provider1"),
-        segment_size=PROVIDER_BYTES,
-        protocol=PROTOCOL,
-        device_name=DEVICES,
-    ):
+    with providers_per_socket(master, node.shared / "provider1"):
         write_file(node.shared / "provider1.ready")
         yield None
         wait_for_file(done)
+
+
+def on_node_1(store: Store, segments: list[dict]) -> list[dict]:
+    """The ``segments`` of lending processes on node 1: the master runs on node 0."""
+    master_host = store.master.rsplit(":", 1)[0]
+    return [s for s in segments if s["segment_name"].rsplit(":", 1)[0] != master_host]
 
 
 @pytest.fixture
@@ -340,6 +382,7 @@ def follow_node_0(model: str, run_dir: Path, names: tuple[str, ...]) -> None:
                 instance.wait_for_server(timeout=SERVER_START_S)
                 write_file(run_dir / f"{name}.address", f"{instance.host}:{instance.port}")
                 wait_for_file(run_dir / f"{name}.stop", unless=ended)
+                stop_server(instance)  # a server that lends the store memory stops 13 s later
         finally:
             write_file(run_dir / f"{name}.stopped")
 
@@ -433,7 +476,10 @@ def test_disaggregated_2p1d_two_context_instances_share_system_prompts_and_follo
     node: Node, store: Store | None, run_dir: Path
 ) -> None:
     """The two-turn workload on two TP2 context instances and a TP4 generation server. Turn 2
-    crosses instances, so both the context-first and the generation-first instance fetch."""
+    crosses instances, so both the context-first and the generation-first instance fetch. The
+    master places each object in a random provider, so every provider on node 1, the generation
+    node, holds objects afterwards, and nearly every follow-up reads some of them: of its 80 or so
+    objects, each lies on node 1 with odds of one half."""
     if node.index == 1:
         follow_node_0(model_path(), run_dir, ("store-off-generation", "store-on-generation"))
         return
@@ -445,6 +491,9 @@ def test_disaggregated_2p1d_two_context_instances_share_system_prompts_and_follo
         run_dir=run_dir,
         service=DisaggService,
     )
+    generation_node = on_node_1(store, store.segments())
+    assert len(generation_node) == len(infiniband_by_socket()), generation_node
+    assert all(s["allocator_used_bytes"] > 0 for s in generation_node), generation_node
 
 
 @contextlib.contextmanager
@@ -533,3 +582,92 @@ def test_disaggregated_1p1d_a_restarted_context_server_reads_the_first_turns_fro
         counters = instance_counters(run_dir / name)
         assert counters and not any(c.get("publications_failed") for c in counters), counters
     assert decisions(rank_traces(run_dir / restarted, CONTEXT_TP), "resume"), "nothing fetched"
+
+
+def mean_tpot_ms(server: Remote) -> float | None:
+    """The mean time per output token of the requests ``server`` finished, from its Prometheus
+    histogram (it needs ``return_perf_metrics``); None where it reports none."""
+    metrics = requests.get(f"http://{server.host}:{server.port}/prometheus/metrics", timeout=10)
+    totals = {"sum": 0.0, "count": 0.0}
+    for line in metrics.text.splitlines():
+        name, _, value = line.rpartition(" ")
+        for part in totals:
+            if name.startswith(f"trtllm_time_per_output_token_seconds_{part}"):
+                totals[part] += float(value)
+    return 1000 * totals["sum"] / totals["count"] if totals["count"] else None
+
+
+def test_disaggregated_1p1d_the_generation_server_lends_the_store_all_of_its_memory(
+    node: Node, run_dir: Path
+) -> None:
+    """A store with no provider: the TP4 generation server on node 1 lends each rank's 4 GiB and
+    does nothing else with the store (roles [provide]), so every object lives in generation-node
+    memory. Sixteen conversations at once through a TP2 context server on node 0, which fetches,
+    publishes and lends nothing, and restarts between the turns: the fresh process reads every
+    follow-up's first prompt from the generation node's memory. Both turns agree with a store-off
+    deployment; the generation server's TPOT with and without lending is printed. Qwen3-8B."""
+    if node.index == 1:
+        follow_node_0(model_path(), run_dir, ("store-off-generation", "store-on-generation"))
+        return
+    model = model_path()
+    first, questions = conversations(model)
+
+    def converse(
+        entry: RemoteDisaggOpenAIServer, prompts: list[list[int]], logprobs: bool
+    ) -> list[Completion]:
+        return send_at_once([entry], model, [(0, prompt) for prompt in prompts], (logprobs,))
+
+    def generation_server(sharing: dict | None) -> tuple[int, str, dict]:
+        """A TP4 generation server that reports its TPOT; with ``sharing``, its kv_sharing."""
+        options = {**instance_options(sharing), **TRANSCEIVER, "return_perf_metrics": True}
+        return GENERATION_TP, "generation", options
+
+    tpot = {}
+    with server_on_node_1(run_dir, "store-off-generation", *generation_server(None)) as generation:
+        with context_behind_router(
+            model, run_dir, "store-off", context_options(None), generation, CONTEXT_FIRST, 0
+        ) as entry:
+            reference_first = converse(entry, first, logprobs=True)
+            # From the store-off answers: both deployments send the same second prompts.
+            second = [p + a.token_ids + q for p, a, q in zip(first, reference_first, questions)]
+            reference_second = converse(entry, second, logprobs=True)
+        tpot["store-off"] = mean_tpot_ms(generation)
+
+    key_prefix = "generation-lends"
+    restarted = "store-on-restarted"
+    with running_store(run_dir / "store", provider_bytes=0) as own:
+        backend = {"type": "mooncake", "config": own.config(key_prefix), "roles": ["provide"]}
+        lend_only = {"backends": [{**backend, "segment_size": GENERATION_LENT_BYTES}]}
+        options = context_options(workload_sharing(own, key_prefix))
+        # The generation server is up first: a context server's startup check puts an object.
+        with server_on_node_1(
+            run_dir, "store-on-generation", *generation_server(lend_only)
+        ) as generation:
+            with context_behind_router(
+                model, run_dir, "store-on", options, generation, GENERATION_FIRST, 0
+            ) as entry:
+                answers_first = converse(entry, first, logprobs=False)
+                own.assert_readable(key_prefix, CONTEXT_TP * len(whole_blocks(first)))
+            lent = own.segments()
+            # A rolling upgrade: a fresh context process, the same generation server.
+            with context_behind_router(
+                model, run_dir, restarted, options, generation, GENERATION_FIRST, 1
+            ) as entry:
+                answers_second = converse(entry, second, logprobs=False)
+                own.assert_readable(key_prefix, CONTEXT_TP * len(whole_blocks(first + second)))
+            tpot["store-on"] = mean_tpot_ms(generation)
+    print(f"generation server TPOT (ms): {tpot}")
+    assert len(on_node_1(own, lent)) == len(lent) == GENERATION_TP, lent
+    assert all(s["allocator_used_bytes"] > 0 for s in lent), lent
+    assert_agree(reference_first + reference_second, answers_first + answers_second, model)
+    for prompt, answer in zip(first, answers_second):
+        # The restarted process held nothing: it read the first prompt's blocks from node 1.
+        assert answer.cached_tokens >= len(prompt) // TOKENS_PER_BLOCK * TOKENS_PER_BLOCK
+    for name in ("store-on", restarted):
+        trace = rank_traces(run_dir / name, CONTEXT_TP)
+        assert trace.splitlines()[-1].endswith(" open=0"), f"{name} left store work open"
+        counters = instance_counters(run_dir / name)
+        assert counters and not any(c.get("publications_failed") for c in counters), counters
+    assert decisions(rank_traces(run_dir / restarted, CONTEXT_TP), "resume"), "nothing fetched"
+    generation_log = (run_dir / "store-on-generation.log").read_text(errors="replace")
+    assert "this server neither fetches nor publishes" in generation_log
