@@ -7104,7 +7104,7 @@
         }
       ],
       "default": null,
-      "description": "Share prompt KV cache blocks with other servers through a KV store. Set it on aggregated and context servers, not on generation servers: a generation server gains nothing unless conditional disaggregation lets it prefill requests itself, and loses the reuse of its generated blocks.",
+      "description": "Share prompt KV cache blocks with other servers through a KV store. Set it on aggregated and context servers, not on generation servers: there it turns off the reuse of generated blocks and helps only requests that conditional disaggregation lets the server prefill itself.",
       "status": "prototype"
     },
     "layer_wise_benchmarks_config": {

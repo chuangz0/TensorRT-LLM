@@ -1001,10 +1001,13 @@ class SharedKvOrchestrator:
         KV cache and locks may no longer follow its store operations, nor under tensor parallelism
         its peers'. With several ranks the executor's rank-crash path then kills every rank
         (``hard_kill_on_rank_crash``), so peers waiting in a collective do not hang."""
-        raise RuntimeError(
+        failure = RuntimeError(
             f"kv_sharing: {reason}; a store failure ends the server, as this rank's KV cache may no "
             "longer match its store operations"
-        ) from cause
+        )
+        if cause is None:
+            raise failure
+        raise failure from cause
 
     def _free_cache(self, request: LlmRequest) -> None:
         if request.py_request_id in self._kv_cache_manager.kv_cache_map:

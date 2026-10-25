@@ -141,7 +141,9 @@ def test_store_config_reads_a_yaml_file_and_names_it_in_errors(tmp_path: pathlib
     assert blob == BlobConfig(key_prefix="t", rows_per_batch=4)
     assert mooncake == MooncakeConfig(MASTER, 0, protocol="tcp", local_buffer_size=0)
     path.write_text(yaml.safe_dump({**store_config(), "blob": {"workers": 2.5}}))
-    with pytest.raises(ValueError, match=f"store config {path}, section 'blob': .*workers"):
+    with pytest.raises(
+        ValueError, match=f"store config {re.escape(str(path))}, section 'blob': .*workers"
+    ):
         load_store_config(path)
 
 

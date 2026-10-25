@@ -7036,9 +7036,9 @@ class TorchLlmArgs(BaseLlmArgs):
         default=None,
         description="Share prompt KV cache blocks with other servers through "
         "a KV store. Set it on aggregated and context servers, not on "
-        "generation servers: a generation server gains nothing unless "
-        "conditional disaggregation lets it prefill requests itself, and loses "
-        "the reuse of its generated blocks.",
+        "generation servers: there it turns off the reuse of generated blocks "
+        "and helps only requests that conditional disaggregation lets the "
+        "server prefill itself.",
         status="prototype",
     )
 
