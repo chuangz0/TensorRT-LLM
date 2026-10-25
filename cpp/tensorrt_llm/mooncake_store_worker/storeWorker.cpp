@@ -756,19 +756,20 @@ struct StoreWorker::State
             op.sessionsLeftForDrain.end(), outcome.sessionsLeftForDrain.begin(), outcome.sessionsLeftForDrain.end());
         op.sessionsLeftToMaster.insert(
             op.sessionsLeftToMaster.end(), outcome.sessionsLeftToMaster.begin(), outcome.sessionsLeftToMaster.end());
-        auto const callRows = op.states.begin();
-        bool const getFaulted = !op.isPut
-            && std::any_of(callRows + call.begin, callRows + call.end,
-                [](int8_t state) { return state == static_cast<int8_t>(RowState::kFault); });
+        auto const first = op.states.begin() + call.begin;
+        auto const last = op.states.begin() + call.end;
+        auto const isFault = [](int8_t state) { return state == static_cast<int8_t>(RowState::kFault); };
+        // As BlobBackend stops an attempt: any fault fails a get. A put's rows stand alone, but a put
+        // call that faulted every row (a stalled master times out each call) fails its operation: the
+        // calls not started yet would fail alike, holding their slots meanwhile.
+        bool const dropRestOfOp = op.isPut ? std::all_of(first, last, isFault) : std::any_of(first, last, isFault);
         if (--op.callsLeft == 0)
         {
             finishOp(call.op);
         }
-        else if (getFaulted)
+        else if (dropRestOfOp)
         {
-            // A fault fails a get: its calls not started yet are dropped, as BlobBackend stops a fetch at
-            // its first fault; a put's rows stand alone. The operation finishes once no call of it runs.
-            cancelQueued(&op);
+            cancelQueued(&op); // the operation finishes once no call of it runs
         }
     }
 

@@ -400,30 +400,37 @@ def test_every_started_put_session_is_ended_revoked_or_left_open(
 
 
 def test_a_session_whose_end_may_still_land_stays_open_and_its_key_is_never_put_again(
-    make_driver,
+    make_driver, monkeypatch
 ) -> None:
     """The end of A times out twice: it may still reach the master, which matches an end by key
     and client. Revoked and put again, A's late end could complete an object never written. So the
-    driver leaves A's session open, and a later put of A only asks whether A exists."""
+    driver leaves A's session open, and a later put of A only asks whether A exists: a skip warned
+    of once, when the session was left open."""
+    warnings: list[str] = []
+    monkeypatch.setattr(mooncake_module.logger, "warning", warnings.append)
     bench = Bench(make_driver)
     bench.fill_sources("put", "A")
     bench.fake.script(PUT_END, [-901])
-    bench.fake.script(PUT_END, [-901])
+    bench.fake.script(PUT_END, [-901])  # and its retry
     results, _ = bench.run("put", "A")
     assert summary(results) == [("fault", "put session end: RPC_TIMEOUT(-901)")]
     assert bench.keys_of(PUT_REVOKE) == []
     assert bench.driver.stats()["put_sessions_left_for_drain"] == 1
+    assert any("put sessions left open for the shutdown drain" in w for w in warnings)
 
+    warnings.clear()
     results, _ = bench.run("put", "A")
     assert summary(results) == [("not_ready", None)]
-    assert skipped_counts(bench) == {"rows_not_ready_own_session_open": 1}
+    assert skipped_counts(bench) == {"rows_not_ready_session_left_open": 1}
+    assert warnings == []
     assert bench.fake.batch_put_session_end([key("A")]) == [0]  # the late end lands
     results, _ = bench.run("put", "A")
     assert summary(results) == [("ready", None)]
-    assert bench.keys_of(PUT_START) == [key("A")] and bench.keys_of(IS_EXIST) == [key("A")] * 2
+    assert bench.keys_of(PUT_START) == [key("A")]
+    assert bench.keys_of(IS_EXIST) == [key("A")] * 2
 
     assert bench.driver.drain(0.0) is True  # its revoke finds the session gone
-    assert bench.driver.stats()["put_sessions_left_for_drain"] == 0
+    assert bench.keys_of(PUT_REVOKE) == [key("A")]
     assert bench.fake.pool.objects[key("A")] == b"A" * SLOT
 
 
@@ -440,7 +447,7 @@ def test_a_put_row_answered_transfer_fail_is_left_to_the_master_even_by_drain(ma
     assert bench.keys_of(PUT_REVOKE) == [] and bench.fake.put_sessions == {key("A")}
 
 
-def test_sessions_left_open_are_revoked_only_in_drain(make_driver) -> None:
+def test_sessions_left_for_drain_are_revoked_only_in_drain(make_driver) -> None:
     bench = Bench(make_driver)
     bench.write(0, b"aaaaaaaa")
     bench.fake.script(PUT_END, [-704])
@@ -456,10 +463,32 @@ def test_sessions_left_open_are_revoked_only_in_drain(make_driver) -> None:
     bench.fake.script(PUT_REVOKE, [-900])
     assert bench.driver.drain(0.0) is True  # sessions left open hold no lender memory
     assert bench.keys_of(PUT_REVOKE) == [key("A")] * 2
-    assert bench.driver.stats()["put_sessions_left_for_drain"] == 1
+    assert bench.fake.put_sessions == {key("A")}
     assert bench.driver.drain(0.0) is True
-    assert bench.driver.stats()["put_sessions_left_for_drain"] == 0
     assert bench.fake.put_sessions == set()
+    assert bench.driver.drain(0.0) is True  # nothing left to revoke
+    assert bench.keys_of(PUT_REVOKE) == [key("A")] * 3
+    assert bench.driver.stats()["put_sessions_left_for_drain"] == 1  # sessions ever left open
+
+
+def test_a_put_that_raises_faults_every_row_it_took_even_those_only_checked_for_existence(
+    monkeypatch,
+) -> None:
+    """A raise inside the driver is a bug, not a store answer. Every row of the put must still
+    conclude, or its attempt never lands an outcome."""
+    bench = Bench(python_driver)
+    bench.fill_sources("put", "A", "B")
+    bench.fake.script(PUT_END, [-901])
+    bench.fake.script(PUT_END, [-901])  # and its retry: A's session is left for drain
+    bench.run("put", "A")
+
+    def raise_bug(*args) -> None:
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(MooncakeDriver, "_confirm_existing", raise_bug)
+    op = bench.driver.put(bench.rows("A", "B"))
+    assert summary(bench.driver.poll(op)) == [("fault", "put failed: RuntimeError('bug')")] * 2
+    assert bench.driver.access_unprovable(op)
 
 
 def test_drain_leaves_sessions_alone_while_access_is_unproven(make_driver) -> None:

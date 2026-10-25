@@ -6,7 +6,8 @@ Covers the Store document's behaviour cases (a late write after a fault, results
 either order, cancel and shutdown races) and the backend's own rules: the submitting thread never
 waits on the driver, only regions the driver can access are registered and rows elsewhere are
 refused, each operation's access end is counted once, a fault waits for the batches already
-started and stops a fetch but not a publish, and shutdown never calls the driver.
+started and stops a fetch, but a publish only at a batch whose every row faulted, and shutdown
+never calls the driver.
 Every synchronisation is an event, a gate or a bounded wait on a condition.
 """
 
@@ -254,20 +255,30 @@ def test_a_later_batch_fault_waits_for_earlier_batches_and_the_first_recorded_is
     reader.close()
 
 
-def test_a_publish_row_the_store_faults_stops_nothing_and_the_other_rows_are_stored(
-    store: MemoryStore,
+@pytest.mark.parametrize(
+    "rows_per_batch, rest_stored",
+    [
+        pytest.param(2, True, id="a_row_of_a_batch_faulted"),
+        pytest.param(1, False, id="every_row_of_a_batch_faulted"),
+    ],
+)
+def test_a_publish_stops_only_at_a_batch_whose_every_row_faulted(
+    store: MemoryStore, rows_per_batch: int, rest_stored: bool
 ) -> None:
-    """A publish's rows stand alone: the other blocks of a prompt are still worth storing. Only a
-    driver call that fails as a whole stops it."""
+    """A publish's rows stand alone: the other blocks of a prompt are still worth storing. A batch
+    whose every row faulted stops it: a stalled store faults every row of each call, and the
+    batches after it would only hold their slots until they failed alike."""
     published(store, {"B": b"stale..."})  # B's put faults: the key holds other bytes
-    writer = Endpoint(MemoryDriver(store), ["A", "B", "C"], rows_per_batch=1)
+    # One worker: the batches go to the driver one after another, A's (and B's) first.
+    writer = Endpoint(MemoryDriver(store), ["A", "B", "C"], rows_per_batch=rows_per_batch)
     for name in "ABC":
         writer.write(name, name.encode() * SLOT_BYTES)
     attempt = writer.backend.publish(writer.view("A", "B", "C"), None)
     outcome = writer.wait_outcome(attempt)
-    assert masks(outcome) == [[True, False, True]]
+    assert masks(outcome) == [[True, False, rest_stored]]
     assert outcome.fault == "group 0 row 1: key exists with different content"
-    assert store.committed_payload(store_key("C")) == b"C" * SLOT_BYTES
+    put_keys = [row.key for call in writer.driver.calls_to("put") for row in call.rows]
+    assert (store_key("C") in put_keys) is rest_stored
     writer.wait_quiesced(attempt)
     writer.close()
 

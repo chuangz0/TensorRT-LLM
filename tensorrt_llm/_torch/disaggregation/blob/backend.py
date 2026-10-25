@@ -84,7 +84,8 @@ _instance_ids = itertools.count()  # names each backend and binding in thread na
 
 class _BatchResults(NamedTuple):
     """A batch's rows: which landed READY, the fault text of each FAULT row, and whether the driver
-    call failed as a whole (refused, raised or broke its protocol) rather than row by row."""
+    call failed as a whole (refused, raised, broke its protocol or faulted every row) rather than
+    row by row."""
 
     ready: np.ndarray
     faults: Mapping[int, str]
@@ -343,7 +344,7 @@ class BlobAttempt:
         self._backend._cancel(self)
 
     def _apply(self, batch: _Batch, results: _BatchResults) -> bool:
-        """Writes ``batch``'s results into the masks and keeps the first fault. True when that
+        """Writes ``batch``'s results into the masks and keeps the first fault. Returns whether that
         fault stops the attempt: any fault stops a fetch, whose request has a gap to fill some other
         way; a publish's rows stand alone, so only a batch that failed as a whole stops it."""
         self._masks[batch.group][batch.start : batch.stop] = results.ready
@@ -352,10 +353,7 @@ class BlobAttempt:
         row = min(results.faults)
         where = f"group {batch.group} row {batch.start + row}"
         self._fault = self._fault or f"{where}: {results.faults[row]}"
-        if not (self.is_fetch or results.whole_batch_failed):
-            return False
-        self._stop()
-        return True
+        return self.is_fetch or results.whole_batch_failed
 
     def _stop(self) -> None:
         self._stopped = True
@@ -620,7 +618,10 @@ class BlobBackend:
             except Exception as error:  # DriverRejected certifies nothing escaped; others may have
                 refused = isinstance(error, DriverRejected)
                 wake_due = self._record(
-                    batch, _faults(batch, _refusal(error, refused)), refused, not refused
+                    batch,
+                    _whole_batch_failure(batch, _refusal(error, refused)),
+                    refused,
+                    not refused,
                 )
                 # The fault stopped the attempt (its queued count is 0) and cancelled the groups
                 # handed over before this one; the groups after it are never handed over.
@@ -654,7 +655,7 @@ class BlobBackend:
                 del self._in_driver[batch]
                 wake_due |= self._record(
                     batch,
-                    _BatchResults(done.ready, done.faults),
+                    _row_results(done.ready, done.faults),
                     done.access_ended,
                     not done.access_ended,
                 )
@@ -718,7 +719,7 @@ class BlobBackend:
             # DriverRejected certifies nothing escaped; any other raise from the driver is outside
             # its protocol: the rows may be accessed for good.
             refused = not driver_called or isinstance(error, DriverRejected)
-            results = _faults(batch, _refusal(error, refused))
+            results = _whole_batch_failure(batch, _refusal(error, refused))
             self._finish(batch, results, ended=refused, unprovable=not refused)
             return
         batch.op = op
@@ -753,12 +754,12 @@ class BlobBackend:
             return None, False, False
         if count != len(batch):  # outside the driver protocol: no later answer proves an access end
             reason = f"the store driver gave {count} results for {len(batch)} rows"
-            return _faults(batch, reason), False, not batch.access_recorded
+            return _whole_batch_failure(batch, reason), False, not batch.access_recorded
         if not done:
             return None, ended, unprovable
         ready = np.fromiter((r.status is RowStatus.READY for r in results), bool, len(results))
         faults = {row: r.fault for row, r in enumerate(results) if r.fault is not None}
-        return _BatchResults(ready, faults), ended, unprovable
+        return _row_results(ready, faults), ended, unprovable
 
     def _finish(self, batch: _Batch, results: _Results, ended: bool, unprovable: bool) -> None:
         with self._lock:
@@ -781,8 +782,9 @@ class BlobBackend:
         if results is not None and not batch.results_recorded:
             batch.results_recorded = True
             attempt._results_pending -= 1
-            if attempt._apply(batch, results):  # a queued driver drops the calls not started
-                self._cancel_queued_calls(attempt)
+            if attempt._apply(batch, results):
+                attempt._stop()
+                self._cancel_queued_calls(attempt)  # a queued driver drops the calls not started
         if ended and not batch.access_recorded:
             batch.access_recorded = True
             attempt._access_open -= 1
@@ -936,7 +938,14 @@ def _refuse_shared_destinations(groups: list[_GroupRows]) -> None:
         raise InvalidSubmission("two rows of a fetch write the same slot")
 
 
-def _faults(batch: _Batch, reason: str) -> _BatchResults:
+def _row_results(ready: np.ndarray, faults: Mapping[int, str]) -> _BatchResults:
+    """The rows of a driver operation that concluded. One that faulted every row failed as a whole:
+    a stalled store faults every row of each call, and the rest of a publish would only hold its
+    slots until it failed alike."""
+    return _BatchResults(ready, faults, whole_batch_failed=len(faults) == len(ready))
+
+
+def _whole_batch_failure(batch: _Batch, reason: str) -> _BatchResults:
     """``batch`` failed as a whole: no row READY, and its first row faulted for ``reason`` (the
     attempt reports the lowest faulted row)."""
     return _BatchResults(np.zeros(len(batch), dtype=bool), {0: reason}, whole_batch_failed=True)

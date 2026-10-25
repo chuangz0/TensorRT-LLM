@@ -134,11 +134,12 @@ _DECLINED = RowResult(RowStatus.DECLINED)
 # get -703: no complete replica, as while the object is written or once its replica's endpoint
 # went stale.
 _BEING_WRITTEN = "being_written"
-# A put session of this client holds the key: one the driver left open (it never puts that key
-# again, and the master shows no complete object), or, at put start -600, one a start that raised
-# opened. The master also answers -600 when it refuses the row (a cachelib master caps an object at
-# 16 MiB - 16 B); its log says which.
+# put start -600: the master refused the row (a cachelib master caps an object at 16 MiB - 16 B),
+# or the SDK's own record of this client's put sessions holds the key; the master's log says which.
 _OWN_SESSION_OPEN = "own_session_open"
+# A put session the driver left open holds the key: the driver never puts that key again, and the
+# master shows no complete object. Warned of once, when the session was left open.
+_SESSION_LEFT_OPEN = "session_left_open"
 # Another writer is still putting the object: put start -705 with the object uncommitted on the
 # master, or another put of this client holds the key (skipped without a store call: the SDK keys
 # put sessions per client). Normal traffic (two requests computing one prompt prefix at once), so
@@ -154,10 +155,11 @@ _POOL_FULL = "pool_full"
 _SKIPS = {
     _BEING_WRITTEN: _NOT_READY,
     _OWN_SESSION_OPEN: _NOT_READY,
+    _SESSION_LEFT_OPEN: _NOT_READY,
     _ANOTHER_WRITER: _NOT_READY,
     _POOL_FULL: _DECLINED,
 }
-_QUIET_SKIPS = (_ANOTHER_WRITER, _POOL_FULL)
+_QUIET_SKIPS = (_ANOTHER_WRITER, _POOL_FULL, _SESSION_LEFT_OPEN)
 _PUT_START_SKIPS = {
     _Code.NO_AVAILABLE_HANDLE: _POOL_FULL,
     _Code.INVALID_PARAMS: _OWN_SESSION_OPEN,
@@ -170,10 +172,10 @@ _END_OUTCOME_UNKNOWN = (_Code.RPC_FAIL, _Code.RPC_TIMEOUT, _Code.CALL_FAILED)
 
 
 class _LeftOpen(Enum):
-    """Who ends a put session the driver left open."""
+    """Who ends a put session the driver left open; the value is its log text."""
 
-    FOR_DRAIN = "for_drain"  # ``drain`` revokes it once no put runs
-    TO_MASTER = "to_master"  # a target may still write into its object: only the master frees it
+    FOR_DRAIN = "for the shutdown drain to revoke"  # once no put runs
+    TO_MASTER = "for the master to free"  # a target may still write into its object
 
 
 @dataclass(eq=False)
@@ -261,9 +263,10 @@ class MooncakeDriver:
 
     - for ``drain`` to revoke once no put runs: an end whose outcome is unknown
       (``_END_OUTCOME_UNKNOWN``), or a revoke that failed;
-    - to the master, which frees it after ``put_start_release_timeout_sec`` (600 s by default):
-      a row the target may still write into, answered TRANSFER_FAIL or in a scatter that raised
-      or miscounted.
+    - to the master, which frees it no earlier than ``put_start_release_timeout_sec`` (600 s by
+      default) after the put started, and on a store with room up to about twice that (it looks
+      every 600 s): a row the target may still write into, answered TRANSFER_FAIL or in a scatter
+      that raised or miscounted.
 
     Args:
         store: An SDK store whose ``setup`` returned 0.
@@ -281,7 +284,9 @@ class MooncakeDriver:
         self._registrations: list[_Registration] = []
         self._draining = False
         self._closed = False
-        self._sessions_left_open: dict[str, _LeftOpen] = {}  # by key, never put again
+        # By key, never put again; drain drops those it revokes (no put runs after a drain).
+        self._sessions_left_open: dict[str, _LeftOpen] = {}
+        self._left_open_counts: Counter[_LeftOpen] = Counter()  # sessions ever left open
         self._keys_being_put: set[str] = set()  # by puts that have not returned
         self._in_flight = 0  # put/get calls past admission and not yet returned
         self._unprovable = 0  # operations whose access never ended
@@ -346,13 +351,13 @@ class MooncakeDriver:
 
     def put(self, rows: Sequence[RowIO]) -> _Op:
         batch, started = self._admit(rows), time.monotonic()  # the only raise is in _admit
-        own, held_by_left_session = self._hold_keys_to_put(batch)
+        own, left_open_rows = self._hold_keys_to_put(batch)
         try:
-            if held_by_left_session:  # never put again, but the object may be complete
-                self._confirm_existing(batch, held_by_left_session, _OWN_SESSION_OPEN)
+            if left_open_rows:  # never put again, but the object may be complete
+                self._confirm_existing(batch, left_open_rows, _SESSION_LEFT_OPEN)
             ended = self._put_rows(batch, own) if own else True
         except Exception as error:  # a bug, not an SDK answer: a transfer may still be running
-            batch.fault(own, f"put failed: {error!r}")
+            batch.fault(own + left_open_rows, f"put failed: {error!r}")
             ended = False
         finally:
             with self._lock:
@@ -428,33 +433,33 @@ class MooncakeDriver:
     def stats(self) -> dict[str, int]:
         """A snapshot for logs and tests; not part of the driver protocol."""
         with self._lock:
-            left_open = Counter(self._sessions_left_open.values())
             return {
                 **{
                     f"rows_{r.status.value}_{reason}": self._skipped_rows[reason]
                     for reason, r in _SKIPS.items()
                 },
                 "ops_unprovable": self._unprovable,
-                **{f"put_sessions_left_{by.value}": left_open[by] for by in _LeftOpen},
+                "put_sessions_left_for_drain": self._left_open_counts[_LeftOpen.FOR_DRAIN],
+                "put_sessions_left_to_master": self._left_open_counts[_LeftOpen.TO_MASTER],
             }
 
     # Put: start, one scatter, end what was written whole, revoke the rest.
 
     def _hold_keys_to_put(self, batch: _Batch) -> tuple[list[int], list[int]]:
-        """The rows to put, whose key no other put of this driver holds, now held until this put
-        returns; then the rows whose key a session the driver left open holds. The others are
-        skipped as another writer's."""
-        own, held_by_left_session = [], []
+        """Splits the batch's rows: those to put, whose keys are now held until this put returns,
+        and those whose key's session the driver left open, which are only checked for existence.
+        A row whose key another put of this driver holds is skipped as another writer's."""
+        own, left_open_rows = [], []
         with self._lock:
             for row, row_key in enumerate(batch.keys):
                 if row_key in self._sessions_left_open:
-                    held_by_left_session.append(row)
+                    left_open_rows.append(row)
                 elif row_key in self._keys_being_put:
                     batch.skip(row, _ANOTHER_WRITER)
                 else:
                     self._keys_being_put.add(row_key)
                     own.append(row)
-        return own, held_by_left_session
+        return own, left_open_rows
 
     def _put_rows(self, batch: _Batch, rows: list[int]) -> bool:
         """Puts ``rows`` of the batch; returns whether access ended."""
@@ -535,11 +540,16 @@ class MooncakeDriver:
             failed = [key for key, code in zip(keys, codes) if not _gone(code)]
             self._leave_open(failed, _LeftOpen.FOR_DRAIN)
 
-    def _leave_open(self, keys: list[str], by: _LeftOpen) -> None:
+    def _leave_open(self, keys: list[str], kind: _LeftOpen) -> None:
         if keys:
-            _warn_left_open(keys, by)
+            _warn_left_open(keys, kind)
             with self._lock:
-                self._sessions_left_open.update(dict.fromkeys(keys, by))
+                self._record_left_open(keys, kind)
+
+    def _record_left_open(self, keys: Sequence[str], kind: _LeftOpen) -> None:
+        """Under the lock."""
+        self._sessions_left_open.update(dict.fromkeys(keys, kind))
+        self._left_open_counts[kind] += len(keys)
 
     def _confirm_existing(self, batch: _Batch, rows: list[int], reason_if_absent: str) -> None:
         """Marks READY the rows whose object the master shows complete; skips the others for
@@ -652,14 +662,16 @@ class MooncakeDriver:
         the master discards it. Sessions left to the master are never revoked here."""
         with self._lock:
             quiet = not (self._in_flight or self._unprovable)
-            left = self._sessions_left_open.items()
-            for_drain = sorted(k for k, by in left if by is _LeftOpen.FOR_DRAIN) if quiet else []
+            for_drain = []
+            if quiet:
+                left = self._sessions_left_open.items()
+                for_drain = sorted(k for k, kind in left if kind is _LeftOpen.FOR_DRAIN)
         if for_drain:
             codes = self._metadata_call(self._store.batch_put_session_revoke, for_drain)
             with self._lock:
                 for k, code in zip(for_drain, codes):
                     if _gone(code):
-                        del self._sessions_left_open[k]
+                        self._sessions_left_open.pop(k, None)
         return quiet
 
     def _mark_closed(self) -> bool:
@@ -871,8 +883,8 @@ def _describe(code: int) -> str:
         return f"code({code})"
 
 
-def _warn_left_open(keys: Sequence[str], by: _LeftOpen) -> None:
-    logger.warning(f"mooncake: {len(keys)} put sessions left open ({by.value}), first {keys[0]}")
+def _warn_left_open(keys: Sequence[str], kind: _LeftOpen) -> None:
+    logger.warning(f"mooncake: {len(keys)} put sessions left open {kind.value}, first {keys[0]}")
 
 
 def _warn_store_full() -> None:
@@ -887,8 +899,9 @@ def _report(
     direction: str, *, rows: int, failed: int, first: str | None, ended: bool, seconds: float
 ) -> None:
     """One warning per operation that failed or skipped a row (``first`` names the first, with
-    why) or left access open; none otherwise. Cancelled rows, and puts of objects another writer
-    is still putting or the full store declined, count as neither."""
+    why) or left access open; none otherwise. Cancelled rows count as neither, nor do puts of
+    objects another writer is still putting, the full store declined, or whose session this
+    driver left open (warned of when it was left)."""
     if ended and not failed:
         return
     detail = f"; first {first}" if first else ""

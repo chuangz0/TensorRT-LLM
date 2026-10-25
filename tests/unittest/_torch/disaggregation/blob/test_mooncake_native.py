@@ -3,8 +3,9 @@
 """The native Mooncake driver's own rules, over the fake SDK through the store worker's test client:
 gets go before puts and puts leave a thread for gets, operations are cut into store calls, a cancel
 or a drain concludes the calls not started CANCELLED, a fault stops the rest of a get and of its
-attempt, rows as arrays are admitted by column, and an operation naming one object twice is
-refused. What both drivers share is pinned in ``test_mooncake_driver.py``."""
+attempt, a put call that faulted every row stops the rest of its put, rows as arrays are admitted
+by column, and an operation naming one object twice is refused. What both drivers share is pinned
+in ``test_mooncake_driver.py``."""
 
 from __future__ import annotations
 
@@ -119,25 +120,44 @@ def test_a_cancelled_fetch_never_reaches_the_store_and_leaves_its_slots_alone(
     reader.close()
 
 
-@pytest.mark.parametrize("direction", ["get", "put"])
-def test_a_faulted_call_drops_the_rest_of_a_get_but_not_of_a_put(direction: str) -> None:
-    """A get serves one fetch, which a fault stops: its request computes instead. A put's rows
-    stand alone: the other blocks of a prompt are still worth storing."""
+def test_a_faulted_call_drops_the_calls_of_its_get_not_started_yet() -> None:
+    """A get serves one fetch, which a fault stops: its request computes instead."""
     fake = FakeMooncakeStore()
     driver = native_driver(fake, threads=1, put_threads=1, rows_per_call=1)
     buffer = HostBuffer(3 * SLOT, fill=0x2D)
     driver.register(buffer.address, buffer.nbytes, RegionLayout(SLOT, 3))
+    for name in "ABC":
+        fake.pool.objects[key(name)] = name.encode() * SLOT
+    fake.script(GET, [-900])  # RPC_FAIL for A: a fault
     rows = [RowIO(key(name), (buffer.span(i * SLOT, SLOT),)) for i, name in enumerate("ABC")]
-    if direction == "get":
-        for name in "ABC":
-            fake.pool.objects[key(name)] = name.encode() * SLOT
-        fake.script(GET, [-900])  # RPC_FAIL for A: a fault
-        assert statuses(driver, driver.get(rows)) == ["fault", "cancelled", "cancelled"]
-        assert [call.args[0] for call in fake.calls_to(GET)] == [[key("A")]]
-    else:
-        fake.script(PUT_START, [-900])
-        assert statuses(driver, driver.put(rows)) == ["fault", "ready", "ready"]
-        assert sorted(fake.pool.objects) == [key("B"), key("C")]
+    assert statuses(driver, driver.get(rows)) == ["fault", "cancelled", "cancelled"]
+    assert [call.args[0] for call in fake.calls_to(GET)] == [[key("A")]]
+
+
+PUT_CALL_FAULTS = {
+    # the session-start answers of the first call, A and B: the put's row statuses
+    "a_row_faulted": ([-900, None], ["fault", "ready", "ready", "ready"]),
+    "every_row_faulted": ([-900, -900], ["fault", "fault", "cancelled", "cancelled"]),
+}
+
+
+@pytest.mark.parametrize("case", PUT_CALL_FAULTS)
+def test_only_a_put_call_whose_every_row_faulted_drops_the_calls_not_started_yet(
+    case: str,
+) -> None:
+    """A put's rows stand alone: the other blocks of a prompt are still worth storing. A call
+    whose every row faulted drops the rest: a stalled master times out each call's session start,
+    and the calls after it would only hold their slots that long."""
+    starts, expected = PUT_CALL_FAULTS[case]
+    fake = FakeMooncakeStore()
+    driver = native_driver(fake, threads=1, put_threads=1, rows_per_call=2)
+    buffer = HostBuffer(4 * SLOT, fill=0x2D)
+    driver.register(buffer.address, buffer.nbytes, RegionLayout(SLOT, 4))
+    fake.script(PUT_START, starts)
+    rows = [RowIO(key(name), (buffer.span(i * SLOT, SLOT),)) for i, name in enumerate("ABCD")]
+    assert statuses(driver, driver.put(rows)) == expected
+    stored = [key(name) for name, status in zip("ABCD", expected) if status == "ready"]
+    assert sorted(fake.pool.objects) == stored
 
 
 def test_an_operation_that_names_one_object_twice_is_refused_before_the_store() -> None:

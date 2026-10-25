@@ -30,10 +30,10 @@ from tensorrt_llm.logger import logger
 from .mooncake import (
     _ANOTHER_WRITER,
     _BEING_WRITTEN,
-    _OWN_SESSION_OPEN,
     _POOL_FULL,
     _PUT_START_SKIPS,
     _QUIET_SKIPS,
+    _SESSION_LEFT_OPEN,
     AllocationRange,
     MooncakeDriver,
     _Code,
@@ -127,7 +127,7 @@ class _NativeOp:
     cancelled: np.ndarray | None = None  # bool [rows]; None when no row was cancelled
     first_failure: str | None = None  # the first row in other_statuses, with why, for the log
     call_errors: list[str] = field(default_factory=list)  # metadata calls' raises, for the log
-    sessions_left_open: dict[_LeftOpen, list[str]] = field(default_factory=dict)
+    left_open_by_kind: dict[_LeftOpen, list[str]] = field(default_factory=dict)  # session keys
     results: tuple[RowResult, ...] | None = None  # built for the first poll that wants them
 
     def key(self, row: int) -> str:
@@ -349,14 +349,14 @@ class NativeMooncakeDriver(MooncakeDriver):
             op.first_failure = op.first_failure or f"{op.key(row)}: {why}"
         op.cancelled = done.cancelled
         op.call_errors = [error for call, error in errors.items() if call in _METADATA_CALLS]
-        op.sessions_left_open = {
+        op.left_open_by_kind = {
             _LeftOpen.FOR_DRAIN: done.sessions_left_for_drain,
             _LeftOpen.TO_MASTER: done.sessions_left_to_master,
         }
         op.finished = FinishedOp(op, done.ready, faults, done.access_ended)
         self._release(op.regions, done.access_ended, skip_reasons)
-        for by, keys in op.sessions_left_open.items():
-            self._sessions_left_open.update(dict.fromkeys(keys, by))
+        for kind, keys in op.left_open_by_kind.items():
+            self._record_left_open(keys, kind)
         self._untaken.append(op)
         return op
 
@@ -380,9 +380,9 @@ class NativeMooncakeDriver(MooncakeDriver):
 def _log_finished(op: _NativeOp) -> None:
     for error in op.call_errors:
         logger.warning(f"mooncake: {error}")
-    for by, keys in op.sessions_left_open.items():
+    for kind, keys in op.left_open_by_kind.items():
         if keys:
-            _warn_left_open(keys, by)
+            _warn_left_open(keys, kind)
     if op.store_full:
         _warn_store_full()
     _report(
@@ -421,7 +421,7 @@ def _skip_reason(call: _StoreCall, code: int) -> str:
     if call is _StoreCall.EXISTENCE:
         return _ANOTHER_WRITER
     if call is _StoreCall.LEFT_OPEN_EXISTENCE:
-        return _OWN_SESSION_OPEN
+        return _SESSION_LEFT_OPEN
     if call is _StoreCall.GET:  # REPLICA_IS_NOT_READY
         return _BEING_WRITTEN
     raise AssertionError(f"no row skips on {call!r}")
