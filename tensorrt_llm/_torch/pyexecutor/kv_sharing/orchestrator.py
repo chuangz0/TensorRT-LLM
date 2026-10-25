@@ -559,7 +559,7 @@ class SharedKvOrchestrator:
         """One line per round, equal on every rank of a tensor-parallel group: what it covered,
         the page counts every rank must share, and the decisions."""
         used, total = self._kv_cache_manager.get_primary_block_counts()
-        deferred = sum(self._lender.deferred_close_page_counts().values())
+        deferred = sum(self._lender.held_page_counts().deduct.values())
         actions = ",".join(
             d.action.value if d.op is None else f"{d.action.value}:{d.op.seq}" for d in decisions
         )
@@ -810,7 +810,7 @@ class SharedKvOrchestrator:
                 if op.kind is OpKind.PUBLISH and op.request_id in holders
             }
             pinned += sum(self._pages_of(request.prompt_len) for request in locked.values())
-        return pinned + sum(self._lender.deferred_close_page_counts().values())
+        return pinned + sum(self._lender.held_page_counts().deduct.values())
 
     def _pages_of(self, prompt_len: int) -> int:
         """The pages of a whole prompt of ``prompt_len`` tokens and one step."""

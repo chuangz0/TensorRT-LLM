@@ -82,7 +82,7 @@ class Lease:
                 groups.append(
                     LentLayerGroupRows(lg, ordinals, keys, slots=ordinals, region_indices=(1,))
                 )
-        self.view = LeaseView(tuple(groups))
+        self.view = LeaseView(tuple(groups), 0, max(rows, default=0) * TPB)
         self.failure = failure
         self.ready_event = ready_event
         self.released = False
@@ -129,7 +129,7 @@ class Lender:
     lend_read = lend_write = _lend
 
     def return_writes(self, entries):
-        for _, lease, _ in entries:
+        for lease, _, _ in entries:
             lease.release()
         return [None] * len(entries)
 
@@ -141,8 +141,8 @@ class Lender:
             return None
         return ResumeBounds(max_position=request.py_store_hit_tokens, min_position=0)
 
-    def deferred_close_page_counts(self) -> dict[int, int]:
-        return {}
+    def held_page_counts(self) -> SimpleNamespace:
+        return SimpleNamespace(deduct={})
 
 
 class Store:

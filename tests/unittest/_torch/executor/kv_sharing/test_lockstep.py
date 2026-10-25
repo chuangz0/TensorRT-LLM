@@ -131,7 +131,7 @@ class Lease:
             group = LentLayerGroupRows(0, ordinals, keys, addresses, 0)
         else:
             group = LentLayerGroupRows(0, ordinals, keys, slots=ordinals, region_indices=(1,))
-        self.view = LeaseView((group,))
+        self.view = LeaseView((group,), start, end)
         self.failure = None
         lender.lent[self.key] = ordinals.tolist()
         self._lender, self._request_id, self._end = lender, request.py_request_id, end
@@ -185,7 +185,7 @@ class Lender:
         return Lease(self, request, start, end, memory_kind, OpKind.PUBLISH)
 
     def return_writes(self, entries):
-        for _, lease, masks in entries:
+        for lease, masks, _ in entries:
             lease.release(settles=all(mask.all() for mask in masks))
         return [None] * len(entries)
 
@@ -197,8 +197,8 @@ class Lender:
         end, left = self.settling.get(request.py_request_id, (0, 1))
         return ResumeBounds(max_position=end, min_position=0) if left == 0 else None
 
-    def deferred_close_page_counts(self) -> dict[int, int]:
-        return dict(self.manager.deferred)
+    def held_page_counts(self) -> SimpleNamespace:
+        return SimpleNamespace(deduct=dict(self.manager.deferred))
 
 
 class Manager:
