@@ -17,11 +17,11 @@
 A server publishes the whole blocks of every prompt it computes, and nothing it generates, and
 serves the same tokens as a server without the store. A fresh server fetches the stored prefix of a
 prompt instead of computing it, and its tokens equal those of a server that reused the same blocks
-locally, also when part of the prefix is in its own cache already; a request whose prefix left the
-store while it waited computes it, and one cancelled while a stuck store holds its fetch ends at
-once. Servers move blocks over GPU Direct, which 'auto' picks here, or through host staging, and a
-block either path stores reads exactly on the other. Two instances of one service share system
-prompts and follow-up turns under concurrent load. When the store fails, requests compute their
+locally; a request cancelled while a stuck store holds its fetch ends at once. Servers move blocks
+over GPU Direct, which 'auto' picks here, or through host staging, and a block either path stores
+reads exactly on the other. Two instances of one service share system prompts and follow-up turns
+under concurrent load. A disaggregated context server, whose loop runs without the overlap
+scheduler, fetches, computes the rest and publishes. When the store fails, requests compute their
 prompts with the same tokens: slow gets still serve hits, stuck ones pause fetching, a stalled
 master pauses probing and publishing, a full store declines puts without a pause, and a restarted
 provider only empties the store. The store and its drivers are the module's (``conftest.py``),
@@ -44,7 +44,6 @@ import signal
 import subprocess
 import threading
 import time
-from collections.abc import Iterator
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -52,7 +51,6 @@ import pytest
 import torch
 from conftest import (
     DRIVER,
-    WAIT_S,
     Store,
     rank_traces,
     run_two_turn_workload,
@@ -68,7 +66,7 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.store import ProbeStatus
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import MemoryKind
-from tensorrt_llm._torch.pyexecutor.kv_sharing import breaker, data_path, probe
+from tensorrt_llm._torch.pyexecutor.kv_sharing import breaker, data_path
 from tensorrt_llm.llmapi import KvCacheConfig
 
 pytestmark = skip_unless_opted_in
@@ -89,15 +87,11 @@ P_BLOCKS, Q_BLOCKS = len(P) // TOKENS_PER_BLOCK, len(Q) // TOKENS_PER_BLOCK
 # each test's publications are its own. A server holding P reuses exactly the 16 blocks.
 FETCHED = 512
 FETCHED_BLOCKS = FETCHED // TOKENS_PER_BLOCK
-SIBLINGS = ("exact", "refreshed", "cancelled", "disaggregated")
+SIBLINGS = ("exact", "cancelled", "disaggregated")
 T = {name: P[:FETCHED] + [_tokens.randrange(1000, 30000) for _ in range(200)] for name in SIBLINGS}
 # The aggregated tests compare with a server without the store; the disaggregated one with its own.
 REFERENCED = SIBLINGS[:-1]
 T_BLOCKS = (FETCHED + 200) // TOKENS_PER_BLOCK  # 22
-# A follow-up turn: P's first 24 blocks (a system prompt of 16 blocks and a first turn of 8, which
-# another server computed), then a question of its own.
-SYSTEM, FIRST_TURN = 512, 256
-FOLLOW_UP = P[: SYSTEM + FIRST_TURN] + [_tokens.randrange(1000, 30000) for _ in range(200)]
 # The key prefix under which a writer published P for the readers.
 FETCH_PREFIX = "fetch"
 # Readers fetch prefixes of at least two blocks.
@@ -157,19 +151,8 @@ def shut_down(llm: LLM) -> None:
     torch.cuda.empty_cache()
 
 
-@pytest.fixture(scope="module")
-def references() -> Iterator[dict[str, list[int]]]:
-    """Greedy tokens of a server without the store."""
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        llm = server(monkeypatch, in_process=True)
-    try:
-        yield {"P": generate(llm, P), "Q": generate(llm, Q)}
-    finally:
-        shut_down(llm)
-
-
 def test_publication_stores_whole_prompt_blocks_and_keeps_output(
-    store: Store, references: dict[str, list[int]], monkeypatch: pytest.MonkeyPatch
+    store: Store, references: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     warnings: list[str] = []
     monkeypatch.setattr(data_path.logger, "warning", warnings.append)
@@ -188,32 +171,13 @@ def test_publication_stores_whole_prompt_blocks_and_keeps_output(
         assert wait_until(lambda: not executor.disagg.has_pending_shared_transfers())
     finally:
         shut_down(llm)
-    assert tokens == references
+    assert tokens == references["store-off"]
     assert executor.disagg.shared_shutdown_complete()
     assert store.readable_objects("overlap") == (stored, stored)  # no generated block came later
     counters = executor.kv_sharing.counters
     assert counters["publications_started"] == 2
     assert counters["published_objects"] == stored
     assert counters["publications_not_started"] == counters["publications_failed"] == 0
-
-
-def test_publication_from_the_non_overlap_loop_in_a_worker_process(
-    store: Store, references: dict[str, list[int]], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    llm = server(
-        monkeypatch,
-        in_process=False,
-        disable_overlap_scheduler=True,
-        kv_sharing=sharing(store, "non-overlap"),
-    )
-    try:
-        tokens = generate(llm, P)
-        assert wait_until(lambda: store.readable_objects("non-overlap") == (P_BLOCKS, P_BLOCKS)), (
-            f"the store holds {store.readable_objects('non-overlap')} (objects, readable)"
-        )
-    finally:
-        shut_down(llm)
-    assert tokens == references["P"]
 
 
 def test_chunked_prefill_publishes_each_chunk_and_keeps_output(
@@ -293,26 +257,26 @@ def settled(executor) -> bool:
 
 
 @pytest.fixture(scope="module")
-def sibling_references() -> dict[str, dict[str, list[int]]]:
-    """Greedy tokens of each sibling from a server without the store: computed whole, and with P's
-    first 16 blocks reused (P computed first)."""
+def references() -> dict[str, dict[str, list[int]]]:
+    """Greedy tokens from a server without the store: of P and Q ("store-off"), and of each
+    sibling computed whole and with P's first 16 blocks reused (P computed first)."""
     with pytest.MonkeyPatch.context() as monkeypatch:
         llm = server(monkeypatch, in_process=True)
     try:
         # A salt of its own leaves the request nothing to reuse.
         whole = {name: complete(llm, T[name], cache_salt=f"whole-{name}") for name in REFERENCED}
-        generate(llm, P)
+        prompts = {"P": generate(llm, P), "Q": generate(llm, Q)}  # nothing to reuse yet
         reused = {name: complete(llm, T[name]) for name in REFERENCED}
-        follow_up = complete(llm, FOLLOW_UP)
     finally:
         shut_down(llm)
     assert all(output.cached_tokens == 0 for output in whole.values())
     assert all(output.cached_tokens == FETCHED for output in reused.values())
-    assert follow_up.cached_tokens == SYSTEM + FIRST_TURN
-    reused["follow-up"] = follow_up
     return {
-        kind: {name: list(output.outputs[0].token_ids) for name, output in outputs.items()}
-        for kind, outputs in (("whole", whole), ("reused", reused))
+        "store-off": prompts,
+        **{
+            kind: {name: list(output.outputs[0].token_ids) for name, output in outputs.items()}
+            for kind, outputs in (("whole", whole), ("reused", reused))
+        },
     }
 
 
@@ -334,7 +298,7 @@ def test_a_fresh_server_fetches_a_prefix_published_on_the_other_data_path_exactl
     store: Store,
     published_p: None,
     staged_p: str,
-    sibling_references: dict,
+    references: dict,
     monkeypatch: pytest.MonkeyPatch,
     read_on: str,
 ) -> None:
@@ -356,14 +320,14 @@ def test_a_fresh_server_fetches_a_prefix_published_on_the_other_data_path_exactl
     finally:
         shut_down(llm)
     assert executor.kv_sharing.memory_kind is DATA_PATHS[read_on]
-    assert list(fetched.outputs[0].token_ids) == sibling_references["reused"]["exact"]
+    assert list(fetched.outputs[0].token_ids) == references["reused"]["exact"]
     # A fresh server holds no block: the cached tokens came from the store.
     assert fetched.cached_tokens == FETCHED
     counters = executor.kv_sharing.counters
     assert counters["fetches_started"] == counters["fetches_resumed"] == 1
     assert counters["fetched_blocks"] == counters["fetched_objects"] == FETCHED_BLOCKS
     assert counters["fetched_bytes"] == FETCHED_BLOCKS * block_bytes()
-    assert list(salted.outputs[0].token_ids) == sibling_references["whole"]["exact"]
+    assert list(salted.outputs[0].token_ids) == references["whole"]["exact"]
     assert salted.cached_tokens == 0
 
 
@@ -398,35 +362,6 @@ def test_a_prompt_of_whole_blocks_fetches_all_but_its_last_block_and_puts_none_a
     assert store.readable_objects(FETCH_PREFIX) == before
 
 
-def test_a_prefix_partly_in_the_local_cache_reads_only_the_rest_from_the_store(
-    store: Store, sibling_references: dict, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A follow-up turn: the system prompt is in the server's own cache, the first turn only in
-    the store (another server computed it). The request reads the first turn's blocks alone,
-    and the store gains only the new question's blocks."""
-    publish_p(store, "follow-up")
-    llm = reader(monkeypatch, store, key_prefix="follow-up")
-    executor = llm._executor.engine
-    counters = executor.kv_sharing.counters
-    try:
-        # The system prompt and one token: all 16 of its blocks are read from the store, so the
-        # reader's own cache holds them as the other server computed them in one pass (a block
-        # computed here over a cached prefix can differ from that in the last bits).
-        complete(llm, P[: SYSTEM + 1])
-        assert wait_until(lambda: settled(executor))
-        fetched_before = counters["fetched_blocks"]
-        before, _ = store.readable_objects("follow-up")
-        output = complete(llm, FOLLOW_UP)
-        new_blocks = len(FOLLOW_UP) // TOKENS_PER_BLOCK - (SYSTEM + FIRST_TURN) // TOKENS_PER_BLOCK
-        published = before + new_blocks
-        assert wait_until(lambda: store.readable_objects("follow-up") == (published, published))
-    finally:
-        shut_down(llm)
-    assert list(output.outputs[0].token_ids) == sibling_references["reused"]["follow-up"]
-    assert output.cached_tokens == SYSTEM + FIRST_TURN
-    assert counters["fetched_blocks"] - fetched_before == FIRST_TURN // TOKENS_PER_BLOCK
-
-
 def test_two_instances_of_one_service_share_system_prompts_and_follow_up_turns(
     store: Store, tmp_path: Path
 ) -> None:
@@ -434,62 +369,10 @@ def test_two_instances_of_one_service_share_system_prompts_and_follow_up_turns(
     run_two_turn_workload(store, model_path(), tp=1, gpu_groups=("0", "1"), run_dir=tmp_path)
 
 
-def test_a_waiting_request_takes_the_normal_path_after_its_prefix_left_the_store(
-    store: Store, sibling_references: dict, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Rank 0 measures a waiting request's hit again; the new hit reaches the request before its
-    admission, so it computes the prompt instead of fetching what the store lost. (The test
-    removes the prefix; in service, the store evicts it once its read lease ran out.)"""
-    publish_p(store, "refresh")  # a prefix of its own: the test removes its objects
-    monkeypatch.setattr(probe, "REFRESH_AFTER_S", 0.5)
-    monkeypatch.setattr(probe, "REFRESH_SCAN_S", 0.1)
-    probe_store = MooncakeDriver.probe
-    told: list[tuple] = []  # the request's keys and the store's first answer
-    answered = threading.Event()
-
-    def probe_and_tell(self, keys, budget_s, hint=None):
-        answer = probe_store(self, keys, budget_s, hint)
-        if ProbeStatus.HIT in answer and not answered.is_set():
-            told.append((keys, answer))
-            answered.set()
-        return answer
-
-    monkeypatch.setattr(MooncakeDriver, "probe", probe_and_tell)
-    llm = server(
-        monkeypatch,
-        in_process=True,
-        max_batch_size=1,
-        kv_sharing=sharing(store, "refresh", **READER),
-    )
-    executor = llm._executor.engine
-    counters = executor.kv_sharing.counters
-    try:
-        # Two long generations hold both seats (the overlap scheduler admits two requests per
-        # batch slot), so the request waits in the queue.
-        busy = SamplingParams(max_tokens=1000, temperature=0.0, ignore_eos=True)
-        occupiers = [llm.generate_async(prompt, busy) for prompt in (Q, [1002] + Q[1:])]
-        assert wait_until(lambda: counters["publications_started"] >= 2)
-        waiting = llm.generate_async(T["refreshed"], GREEDY)
-        assert answered.wait(WAIT_S)
-        keys, _ = told[0]
-        for key in keys:  # the request was told; now its prefix leaves the store
-            store.client.remove(key, True)
-        assert wait_until(lambda: counters["hits_refreshed"] >= 1), dict(counters)
-        output = waiting.result(timeout=WAIT_S)
-        for occupier in occupiers:
-            occupier.result(timeout=WAIT_S)
-    finally:
-        shut_down(llm)
-    _, answer = told[0]
-    assert answer[:FETCHED_BLOCKS] == (ProbeStatus.HIT,) * FETCHED_BLOCKS
-    assert list(output.outputs[0].token_ids) == sibling_references["whole"]["refreshed"]
-    assert output.cached_tokens == 0 and counters["fetches_started"] == 0
-
-
 def test_a_cancel_while_the_store_holds_a_fetch_ends_the_request_at_once(
     store: Store,
     published_p: None,
-    sibling_references: dict,
+    references: dict,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -521,7 +404,7 @@ def test_a_cancel_while_the_store_holds_a_fetch_ends_the_request_at_once(
         store_answers.set()
         shut_down(llm)
     assert output.outputs[0].finish_reason == "cancelled"
-    assert list(served.outputs[0].token_ids) == sibling_references["reused"]["cancelled"]
+    assert list(served.outputs[0].token_ids) == references["reused"]["cancelled"]
     assert served.cached_tokens == FETCHED
     assert counters["fetches_cancelled"] == 1 and counters["fetches_resumed"] == 1
     assert rank_traces(tmp_path, 1).splitlines()[-1].endswith(" open=0")

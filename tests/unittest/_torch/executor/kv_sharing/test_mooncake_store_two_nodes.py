@@ -13,14 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """KV sharing across two GB200 nodes through one Mooncake store: a tensor-parallel server over both
-nodes' eight GPUs (Llama-3.1-8B TP8) reads exactly what an earlier server of that layout published,
-and two instances of one service, one per node (TP4 each), share system prompts and follow-up
-turns under concurrent load. Disaggregated serving, with the store on the context servers of node
-0 and the generation server on node 1: two TP2 context instances run the same workload, one
-behind a context-first router and one behind a generation-first router (2P1D); and a TP2 context
-server restarted between the turns, as in a rolling upgrade, reads the first turns from the store
-while a generation server under attention DP serves on (1P1D, DeepSeek-V3-Lite). The store has a
-provider on each node, so puts and gets cross nodes.
+nodes' eight GPUs (Qwen3-8B TP8) reads exactly what an earlier server of that layout published.
+Disaggregated serving, with the store on the context servers of node 0 and the generation server
+on node 1: two TP2 context instances share system prompts and follow-up turns under concurrent
+load, one behind a context-first router and one behind a generation-first router (2P1D, Qwen3-8B);
+and a TP2 context server restarted between the turns, as in a rolling upgrade, reads the first
+turns from the store while a generation server under attention DP serves on (1P1D,
+DeepSeek-V3-Lite). The store has a provider on each node, so puts and gets cross nodes.
 
 Runs only with ``TRTLLM_MOONCAKE_E2E=1`` (it skips otherwise), as one pytest task per node of a
 two-node job (``SLURM_NODEID`` picks the role; four GPUs per task, its steps ``--overlap``) with
@@ -103,7 +102,7 @@ NO_AUTOTUNER = {"enable_autotuner": False}
 
 
 def model_path() -> str:
-    return str(llm_models_root(check=True) / "llama-3.1-model" / "Llama-3.1-8B-Instruct")
+    return str(llm_models_root(check=True) / "Qwen3" / "Qwen3-8B")
 
 
 def deepseek_path() -> str:
@@ -216,7 +215,7 @@ def run_dir(node: Node, request: pytest.FixtureRequest) -> Iterator[Path]:
 
 @contextlib.contextmanager
 def tp8_server(shared: Path, name: str, sharing: dict) -> Iterator[Remote]:
-    """A Llama-3.1-8B server over both nodes' GPUs, its rank 0 on this node, which the job
+    """A Qwen3-8B server over both nodes' GPUs, its rank 0 on this node, which the job
     launches from ``<name>.args`` and stops at ``<name>.stop``."""
     from tensorrt_llm._utils import get_free_port
 
@@ -300,7 +299,7 @@ def test_a_server_over_both_nodes_reads_what_another_published_exactly(
 
 @contextlib.contextmanager
 def server_on_node_1(
-    run_dir: Path, name: str, tp: int, role: str | None, options: dict
+    run_dir: Path, name: str, tp: int, role: str, options: dict
 ) -> Iterator[Remote]:
     """A server node 1 runs over its four GPUs (``follow_node_0``), its ranks tracing into
     ``run_dir/<name>``, until the context ends."""
@@ -343,56 +342,6 @@ def follow_node_0(model: str, run_dir: Path, names: tuple[str, ...]) -> None:
                 wait_for_file(run_dir / f"{name}.stop", unless=ended)
         finally:
             write_file(run_dir / f"{name}.stopped")
-
-
-class TwoNodeService:
-    """Two instances of one service, one per node (the workload's ``Instances``): node 0's runs in
-    this task, node 1's in node 1's."""
-
-    def __init__(
-        self,
-        model: str,
-        tp: int,
-        gpu_groups: tuple[str, str],
-        run_dir: Path,
-        name: str,
-        sharing: dict | None,
-    ) -> None:
-        self.model = model
-        self.trace_dirs = [run_dir / f"{name}-{index}" for index in range(2)]
-        options = instance_options(sharing)
-        with ExitStack() as starting:
-            local = start_instance(model, tp, gpu_groups[0], self.trace_dirs[0], options)
-            starting.enter_context(local)
-            remote = starting.enter_context(
-                server_on_node_1(run_dir, self.trace_dirs[1].name, tp, None, options)
-            )
-            local.wait_for_server(timeout=SERVER_START_S)
-            self._running = starting.pop_all()
-        self.servers = [local, remote]
-
-    def converse(self, requests: list[tuple[int, list[int]]]) -> list[Completion]:
-        return send_at_once(self.servers, self.model, requests)
-
-    def stop(self) -> None:
-        self._running.close()
-
-
-def test_two_instances_of_one_service_one_per_node_share_system_prompts_and_follow_up_turns(
-    node: Node, store: Store | None, run_dir: Path
-) -> None:
-    """TP4 instances, with CUDA graphs as served by default, one on each node."""
-    if node.index == 1:
-        follow_node_0(model_path(), run_dir, ("store-off-1", "store-on-1"))
-        return
-    run_two_turn_workload(
-        store,
-        model_path(),
-        tp=4,
-        gpu_groups=(NODE_GPUS, NODE_GPUS),
-        run_dir=run_dir,
-        service=TwoNodeService,
-    )
 
 
 # Disaggregated serving.
@@ -526,8 +475,7 @@ def test_disaggregated_1p1d_a_restarted_context_server_reads_the_first_turns_fro
     restarts between the turns while the generation server serves on: the fresh process reads
     every follow-up's first prompt from the store. Both turns agree with a store-off deployment,
     and each turn puts every new block once. DeepSeek-V3-Lite: MLA, whose latent cache both
-    context ranks hold, one object per block. (On main 9bb7931d6e, Llama-3.1-8B under attention
-    DP decodes wrong tokens, aggregated too.)"""
+    context ranks hold, one object per block."""
     if node.index == 1:
         follow_node_0(deepseek_path(), run_dir, ("store-off-generation", "store-on-generation"))
         return

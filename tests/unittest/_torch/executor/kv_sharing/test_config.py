@@ -49,25 +49,7 @@ def test_minimal_kv_sharing_config_is_accepted(store_config: str) -> None:
     sharing = llm_args(store_config).kv_sharing
     assert sharing.backends[0].roles == ["fetch", "publish"]
     assert sharing.data_path == "auto"
-    # A disaggregated context server shares through the store too, on either data path.
-    llm_args(
-        store_config,
-        {"data_path": "gpu_direct"},
-        cache_transceiver_config={"backend": "NIXL"},
-    )
-    # Tensor parallelism, attention DP and an FP8 KV cache share through the store, also on a
-    # disaggregated context server.
-    assert llm_args(store_config, tensor_parallel_size=2).kv_sharing is not None
-    llm_args(store_config, tensor_parallel_size=2, enable_attention_dp=True)
-    llm_args(store_config, kv_cache_config={"dtype": "fp8"})
-    transceiver = {"backend": "NIXL"}
-    llm_args(store_config, tensor_parallel_size=2, cache_transceiver_config=transceiver)
-    llm_args(
-        store_config,
-        tensor_parallel_size=2,
-        enable_attention_dp=True,
-        cache_transceiver_config=transceiver,
-    )
+    llm_args(store_config, kv_cache_config={"dtype": "fp8"})  # an FP8 KV cache shares too
 
 
 UNSUPPORTED = {

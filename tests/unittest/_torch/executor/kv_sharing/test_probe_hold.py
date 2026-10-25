@@ -320,36 +320,6 @@ def test_failures_in_a_row_pause_probing_and_new_requests_leave_unprobed(monkeyp
         service.stop(wait_s=WAIT_S)
 
 
-def test_requests_held_past_the_limit_by_a_slow_store_do_not_pause_probing(monkeypatch):
-    """A burst of long prompts outlasts the hold on a healthy store: each late request leaves
-    unanswered, and probing goes on."""
-    monkeypatch.setattr(breaker_module, "FAILURES_TO_PAUSE", 1)
-    now = [0.0]
-    driver = Driver()
-    service = probe_service(driver, clock=lambda: now[0])
-    try:
-        late = [request_item(request_id) for request_id in range(3)]
-        for item in late:
-            service.submit(item)
-        assert driver.entered.wait(WAIT_S)
-        assert service.hold_until_probed(late) == []
-        now[0] += HOLD_S
-        assert service.hold_until_probed([]) == late
-        driver.answer.set()
-        wait_for(lambda: len(driver.probed) == 1)  # the slow call returned
-        driver.entered.clear()
-        answered = request_item(9)
-        service.submit(answered)
-        assert driver.entered.wait(WAIT_S)  # its own call started
-        if service.hold_until_probed([answered]) != [answered]:
-            leave_with_answer(service, answered)
-        assert answered.store_hit_tokens == STORED_BLOCKS * TPB
-        assert service.counters["held_past_limit"] == 3 and service.counters["probe_pauses"] == 0
-    finally:
-        driver.answer.set()
-        service.stop(wait_s=WAIT_S)
-
-
 def test_each_store_call_answers_its_own_requests_as_soon_as_it_returns(monkeypatch):
     """Requests queued together are asked in calls of at most PROBE_KEYS_PER_CALL keys, in
     arrival order: the first call's requests leave while the second call is still out."""
@@ -390,8 +360,10 @@ def test_a_request_holds_from_its_own_store_call_and_a_slow_call_releases_every_
     monkeypatch,
 ):
     """Queued behind another request's call, a request keeps its whole hold for its own call. A
-    call that runs longer than one hold (a slow store) releases every held request."""
+    call that runs longer than one hold (a slow store) releases every held request; once it does
+    answer it is no failure, and probing goes on."""
     monkeypatch.setattr(probe_module, "PROBE_KEYS_PER_CALL", 6)  # one 6-block prompt per call
+    monkeypatch.setattr(breaker_module, "FAILURES_TO_PAUSE", 1)
     now = [0.0]
 
     class GatedCalls(Driver):
@@ -400,11 +372,13 @@ def test_a_request_holds_from_its_own_store_call_and_a_slow_call_releases_every_
             self.calls = 0
             self.started = [threading.Event() for _ in range(4)]
             self.gates = [threading.Event() for _ in range(4)]
+            self.returned = 0
 
         def probe(self, keys, budget_s, hint=None):
             call, self.calls = self.calls, self.calls + 1
             self.started[call].set()
             assert self.gates[call].wait(WAIT_S)
+            self.returned += 1
             return tuple(ProbeStatus.HIT if k in self.stored else ProbeStatus.MISS for k in keys)
 
     driver = GatedCalls()
@@ -435,6 +409,18 @@ def test_a_request_holds_from_its_own_store_call_and_a_slow_call_releases_every_
         assert service.hold_until_probed([]) == [third, fourth]
         assert third.store_hit_tokens is None and fourth.store_hit_tokens is None
         assert service.counters["held_past_limit"] == 2
+
+        # The slow call answers (fourth's prompt, released, is not asked), and the thread records
+        # it at its return, before the fifth request's call.
+        driver.gates[2].set()
+        wait_for(lambda: driver.returned == 3)
+        fifth = request_item(5)
+        service.submit(fifth)
+        assert service.hold_until_probed([fifth]) == []  # its own call waits at its gate
+        driver.gates[3].set()
+        leave_with_answer(service, fifth)
+        assert fifth.store_hit_tokens == STORED_BLOCKS * TPB
+        assert service.counters["probe_pauses"] == 0
     finally:
         for gate in driver.gates:
             gate.set()

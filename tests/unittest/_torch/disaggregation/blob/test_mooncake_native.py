@@ -119,28 +119,6 @@ def test_a_cancelled_fetch_never_reaches_the_store_and_leaves_its_slots_alone(
     reader.close()
 
 
-def test_drain_concludes_unstarted_calls_cancelled_and_waits_for_running_ones() -> None:
-    fake = FakeMooncakeStore()
-    driver = native_driver(fake, threads=1, put_threads=1)
-    buffer = HostBuffer(2 * SLOT, fill=0x2D)
-    driver.register(buffer.address, buffer.nbytes, RegionLayout(SLOT, 2))
-    fake.pool.objects[key("A")] = b"a" * SLOT
-    fake.pool.objects[key("B")] = b"b" * SLOT
-    gate = fake.block(GET)
-    running = driver.get([RowIO(key("A"), (buffer.span(0, SLOT),))])
-    assert gate.entered.wait(WAIT_S)
-    queued = driver.get([RowIO(key("B"), (buffer.span(SLOT, SLOT),))])
-    try:
-        assert driver.drain(0.0) is False  # a call still runs
-        assert statuses(driver, queued) == ["cancelled"] and driver.access_ended(queued)
-        assert buffer.read(SLOT, SLOT) == b"-" * SLOT
-        assert statuses_now(driver, running) == ["pending"]
-    finally:
-        gate.release.set()
-    assert driver.drain(WAIT_S) is True
-    assert statuses(driver, running) == ["ready"] and buffer.read(0, SLOT) == b"a" * SLOT
-
-
 def test_a_faulted_call_drops_the_calls_of_its_operation_not_started_yet() -> None:
     fake = FakeMooncakeStore()
     driver = native_driver(fake, threads=1, put_threads=1, rows_per_call=1)

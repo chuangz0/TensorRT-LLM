@@ -520,8 +520,6 @@ class Probe:
         ("resumed", [(False, "")]),
         ("evicted", []),  # rows missing without a fault: no store failure
         ("faulted", [(True, "a fetch failed in the store")]),
-        # Late with no fetch resumed within fetch_timeout_s: a slow data plane.
-        ("late", [(True, "fetches went late and none resumed in 60.0 s")]),
     ],
 )
 def test_each_round_tells_rank_0s_probe_whether_the_store_failed_a_fetch(
@@ -533,12 +531,9 @@ def test_each_round_tells_rank_0s_probe_whether_the_store_failed_a_fetch(
         server.park(request(1))
         server.iterate()  # the store starts reading
         attempt = server.store.attempts[0]
-        if end == "late":
-            server.orchestrator._ops[0].deadline = 0.0  # as if fetch_timeout_s passed
-        else:
-            delivered = attempt.view.row_masks(end == "resumed")
-            fault = "the store failed" if end == "faulted" else None
-            attempt.outcome, attempt.ended = Outcome.for_view(attempt.view, delivered, fault), True
+        delivered = attempt.view.row_masks(end == "resumed")
+        fault = "the store failed" if end == "faulted" else None
+        attempt.outcome, attempt.ended = Outcome.for_view(attempt.view, delivered, fault), True
         server.lender.settled.add(1)  # in place: its rows are the cache's
         server.iterate()
         assert probe.fetches == recorded

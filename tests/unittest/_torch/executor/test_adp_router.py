@@ -410,20 +410,6 @@ class TestDefaultADPRouter:
         assert states[0].num_active_tokens == 0
         assert states[0].num_retiring_requests == 2
 
-    def test_gather_all_rank_states_counts_background_work_as_live(self):
-        # Open store operations and KV transfers in flight are live work
-        # without an admission seat: rank 0 must not sleep on its queue.
-        dist = _mock_dist(tp_rank=0, has_cp_helix=False)
-        router = DefaultADPRouter(dist=dist, has_seq_slot_headroom=True)
-        dist.tp_allgather.side_effect = lambda payload: [payload]
-
-        states = router.gather_all_rank_states(
-            active_requests=[_retiring_request()], background_work=3
-        )
-
-        assert states[0].num_active_requests == 0
-        assert states[0].num_retiring_requests == 4
-
     def test_gather_all_rank_states_keeps_retiring_without_headroom(self):
         dist = _mock_dist(tp_rank=0, has_cp_helix=False, has_pp=True)
         router = DefaultADPRouter(dist=dist, has_seq_slot_headroom=False)

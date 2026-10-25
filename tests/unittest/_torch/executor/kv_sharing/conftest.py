@@ -349,7 +349,8 @@ class Service:
 
 
 class Instances(Protocol):
-    """What the workload needs of a service's two instances (``Service``, or two on two nodes)."""
+    """What the workload needs of a service's two instances (``Service``, or a disaggregated
+    service's two context instances)."""
 
     trace_dirs: list[Path]  # each instance's; its log is ``<trace dir>.log``
 

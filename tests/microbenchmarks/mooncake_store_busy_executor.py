@@ -18,7 +18,7 @@ thread keeping at least 99% of the loop rate it has alone.
 
 The rows live in host memory (the lender's staging slots) or, with ``--memory device``, in one CUDA
 allocation the driver registers as GPU Direct does (the KV cache pages); ``--row-kib`` sets a row's
-size (a serving row is one block of one layer group: 4096 KiB for Llama-3.1-8B at TP1).
+size (a serving row is one block of one layer group: 4608 KiB for Qwen3-8B at TP1).
 
 Needs a running ``mooncake_master``, a client giving the pool its memory, and a store config whose
 ``mooncake`` section points at the master::
