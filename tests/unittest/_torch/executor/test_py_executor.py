@@ -4484,7 +4484,6 @@ def test_a_parked_requests_cancel_responds_in_the_pass_it_arrives():
     the pass's response flush. Any other cancel is left to the response pass."""
     parked, computing = Mock(py_request_id=1, py_decoding_iter=0), Mock(py_request_id=2)
     executor = object.__new__(PyExecutor)
-    executor.dist = types.SimpleNamespace(rank=0)
     executor.kv_sharing = Mock()
     executor.kv_sharing.cancel_fetch.side_effect = lambda request: request is parked
     executor.active_requests = [parked, computing]
@@ -4498,6 +4497,7 @@ def test_a_parked_requests_cancel_responds_in_the_pass_it_arrives():
     computing.finish_by_reason.assert_not_called()
     assert executor.active_requests == [computing]
     assert executor.canceled_req_ids == [2]
+    parked.create_response.assert_called_once_with()
     assert executor._pending_transfer_responses == [(1, parked.create_response.return_value)]
     assert executor._pending_response_terminations == [parked]
 

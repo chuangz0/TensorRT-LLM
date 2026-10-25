@@ -9398,7 +9398,7 @@ class PyExecutor:
             request.decoding_iter = request.py_decoding_iter
             self.active_requests.remove(request)
             self.canceled_req_ids.remove(request.py_request_id)
-            response = request.create_response(False, self.dist.rank)
+            response = request.create_response()
             if response:
                 response.result.cached_tokens = request.cached_tokens
                 self._pending_transfer_responses.append(
