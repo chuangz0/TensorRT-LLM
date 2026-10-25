@@ -121,3 +121,31 @@ def test_unattached_shared_hooks_preserve_no_native_behavior() -> None:
     coordinator.pace_idle()
     assert not coordinator.has_pending_shared_transfers()
     assert coordinator.shared_shutdown_complete()
+
+
+@pytest.mark.parametrize(
+    "connector_state,expected",
+    [("none", False), ("empty", False), ("loads", True), ("inflight", True)],
+)
+def test_pending_transfer_predicate_reads_only_connector_work(
+    connector_state: str, expected: bool
+) -> None:
+    """Stop, idle and control-drain checks wait only for a KV connector's loads and sends.
+
+    Pending shared work does not count: it drains after the loop.
+    """
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = None
+    executor.async_transfer_manager = None
+    if connector_state != "none":
+        executor.kv_connector_manager = Mock()
+        executor.kv_connector_manager.has_pending_loads.return_value = connector_state == "loads"
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.has_any_inflight_requests.return_value = (
+            connector_state == "inflight"
+        )
+    coordinator = NoopDisaggCoordinator()
+    coordinator.attach_shared_transfer_manager(_holder())  # its work is pending
+    executor._disagg_coordinator = coordinator
+
+    assert executor._has_pending_connector_transfers() is expected
