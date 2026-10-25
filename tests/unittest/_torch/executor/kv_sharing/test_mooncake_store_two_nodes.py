@@ -605,7 +605,8 @@ def test_disaggregated_1p1d_the_generation_server_lends_the_store_all_of_its_mem
     memory. Sixteen conversations at once through a TP2 context server on node 0, which fetches,
     publishes and lends nothing, and restarts between the turns: the fresh process reads every
     follow-up's first prompt from the generation node's memory. Both turns agree with a store-off
-    deployment; the generation server's TPOT with and without lending is printed. Qwen3-8B."""
+    deployment; the generation server's TPOT with and without lending goes to
+    ``generation_tpot_ms.json``. Qwen3-8B."""
     if node.index == 1:
         follow_node_0(model_path(), run_dir, ("store-off-generation", "store-on-generation"))
         return
@@ -656,7 +657,7 @@ def test_disaggregated_1p1d_the_generation_server_lends_the_store_all_of_its_mem
                 answers_second = converse(entry, second, logprobs=False)
                 own.assert_readable(key_prefix, CONTEXT_TP * len(whole_blocks(first + second)))
             tpot["store-on"] = mean_tpot_ms(generation)
-    print(f"generation server TPOT (ms): {tpot}")
+    (run_dir / "generation_tpot_ms.json").write_text(json.dumps(tpot))  # kept after the run
     assert len(on_node_1(own, lent)) == len(lent) == GENERATION_TP, lent
     assert all(s["allocator_used_bytes"] > 0 for s in lent), lent
     assert_agree(reference_first + reference_second, answers_first + answers_second, model)
