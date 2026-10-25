@@ -24,7 +24,7 @@ under concurrent load. A disaggregated context server, whose loop runs without t
 scheduler, fetches, computes the rest and publishes. When the store fails, requests compute their
 prompts with the same tokens: slow gets still serve hits, stuck ones pause fetching, a stalled
 master pauses probing and publishing, a full store declines puts without a pause, and a restarted
-provider only empties the store. Where two servers lend the store all of its memory, one that
+provider only empties the store. Where two servers provide all of the store's memory, one that
 stops normally while the other reads from it ends no reader. The store and its drivers are the
 module's (``conftest.py``), except where a test needs a store of its own.
 
@@ -775,17 +775,17 @@ def test_a_restarted_provider_empties_the_store_and_serving_goes_on(
     assert fetched.cached_tokens == FETCHED
 
 
-# Servers that lend the store all of its memory.
-LENT_BYTES = 4 << 30
-LENDING_PROMPTS = 40
-# The reader gets one request this often, from four clients, over about 30 s; the lender stops
-# LENDER_STOPS_AFTER_S into them.
+# Servers that provide all of the store's memory.
+SEGMENT_BYTES = 4 << 30
+DISTINCT_PROMPTS = 40
+# The reader gets one request this often, from four clients, over about 30 s; the other server
+# stops STOP_AFTER_S into them.
 REQUEST_EVERY_S = 0.75
-LENDER_STOPS_AFTER_S = 5.0
+STOP_AFTER_S = 5.0
 
 
-def lending_prompts(model: str) -> list[list[int]]:
-    """LENDING_PROMPTS prompts, each a system prompt of 16 blocks and a user message of 4:
+def distinct_prompts(model: str) -> list[list[int]]:
+    """DISTINCT_PROMPTS prompts, each a system prompt of 16 blocks and a user message of 4:
     consecutive pieces of the docs."""
     from transformers import AutoTokenizer
 
@@ -793,36 +793,37 @@ def lending_prompts(model: str) -> list[list[int]]:
         deployment_text(), add_special_tokens=False
     )
     length = SYSTEM_TOKENS + FIRST_MESSAGE_TOKENS
-    prompts = [tokens[i * length : (i + 1) * length] for i in range(LENDING_PROMPTS)]
+    prompts = [tokens[i * length : (i + 1) * length] for i in range(DISTINCT_PROMPTS)]
     assert len(prompts[-1]) == length, "the docs are too short for the prompts"
     return prompts
 
 
-def test_a_lending_server_that_stops_normally_ends_no_server_reading_its_memory(
+def test_a_server_providing_memory_that_stops_normally_ends_no_server_reading_it(
     tmp_path: Path,
 ) -> None:
-    """Two one-GPU instances, A and B, both fetch, publish and lend the store 4 GiB each; there is
-    no provider. A computes 40 system prompts, whose blocks the master places in A's memory or B's.
-    Then four clients send B one request on each system prompt, one every 0.75 s, while A stops
-    normally 5 s in. B reads A's blocks before and during A's grace; afterwards those blocks miss
-    and B computes them. A's stop waits until Mooncake freed its memory, and its memory leaves the
-    store. B's answers agree with a store-off server's, and B leaves no store access unproven."""
+    """Two one-GPU instances, A and B, both fetch, publish and provide the store 4 GiB each; there
+    is no provider. A computes 40 system prompts, whose blocks the master places in A's memory or
+    B's. Then four clients send B one request on each system prompt, one every 0.75 s, while A
+    stops normally 5 s in. B reads A's blocks before and during A's grace; afterwards those blocks
+    miss and B computes them. A's stop waits until Mooncake freed its memory, and its segment
+    leaves the store. B's answers agree with a store-off server's, and B leaves no store access
+    unproven."""
     require_environment()
     model = model_path()
-    prompts = lending_prompts(model)
+    prompts = distinct_prompts(model)
     systems = [prompt[:SYSTEM_TOKENS] for prompt in prompts]
     with start_instance(model, 1, "0", tmp_path / "store-off", instance_options(None)) as off:
         off.wait_for_server(timeout=RemoteOpenAIServer.MAX_SERVER_START_WAIT_S)
         references = send_at_once([off], model, [(0, prompt) for prompt in prompts])
 
     with running_store(tmp_path / "store", provider_bytes=0) as own, ExitStack() as servers:
-        lending = workload_sharing(own, "lending")
-        lending["backends"][0].update(
-            roles=["fetch", "publish", "provide"], segment_size=LENT_BYTES
+        providing = workload_sharing(own, "providing")
+        providing["backends"][0].update(
+            roles=["fetch", "publish", "provide"], segment_size=SEGMENT_BYTES
         )
         a, b = (
             servers.enter_context(
-                start_instance(model, 1, gpu, tmp_path / name, instance_options(lending))
+                start_instance(model, 1, gpu, tmp_path / name, instance_options(providing))
             )
             for gpu, name in (("0", "a"), ("1", "b"))
         )
@@ -830,7 +831,7 @@ def test_a_lending_server_that_stops_normally_ends_no_server_reading_its_memory(
             instance.wait_for_server(timeout=RemoteOpenAIServer.MAX_SERVER_START_WAIT_S)
         assert len(own.segments()) == 2
         send_at_once([a], model, [(0, system) for system in systems], (False,))
-        own.assert_readable("lending", len(whole_blocks(systems)))
+        own.assert_readable("providing", len(whole_blocks(systems)))
 
         started = time.monotonic()
 
@@ -839,8 +840,8 @@ def test_a_lending_server_that_stops_normally_ends_no_server_reading_its_memory(
             return ask(b, model, prompts[index])
 
         with ThreadPoolExecutor(4) as clients:
-            answers = clients.map(ask_b, range(LENDING_PROMPTS))
-            time.sleep(LENDER_STOPS_AFTER_S)
+            pending = clients.map(ask_b, range(DISTINCT_PROMPTS))
+            time.sleep(STOP_AFTER_S)
             a_stopping = time.monotonic()
             a.proc.terminate()  # a normal stop
             statuses = set()
@@ -849,18 +850,20 @@ def test_a_lending_server_that_stops_normally_ends_no_server_reading_its_memory(
                 time.sleep(0.2)
             a_stop_s = time.monotonic() - a_stopping
             assert a.proc.poll() is not None, f"A did not stop within {SERVER_STOP_S:.0f} s"
-            answers = list(answers)
+            answers = list(pending)
         assert wait_until(lambda: len(own.segments()) == 1), own.segments()
         stop_server(b)
     print(f"A stopped in {a_stop_s:.1f} s; the store's segments went through {statuses}")
     assert "GRACEFULLY_UNMOUNTING" in statuses
     assert a_stop_s >= UNMOUNT_GRACE_S + MOONCAKE_UNMOUNT_CLEANUP_S
     assert_agree(references, answers, model)
-    whole_system_prompt = [answer.cached_tokens >= SYSTEM_TOKENS for answer in answers]
-    # Read whole from both lenders' memory, then partly once A's blocks left.
-    assert any(whole_system_prompt) and not all(whole_system_prompt), whole_system_prompt
+    read_whole_system_prompt = [answer.cached_tokens >= SYSTEM_TOKENS for answer in answers]
+    # Read whole from both servers' memory, then partly once A's blocks left.
+    assert any(read_whole_system_prompt) and not all(read_whole_system_prompt), (
+        read_whole_system_prompt
+    )
     (counters,) = instance_counters(tmp_path / "b")
     assert counters["driver_ops_unprovable"] == 0 and counters["fetches_resumed"] > 0, counters
     assert rank_traces(tmp_path / "b", 1).splitlines()[-1].endswith(" open=0")
     b_log = Path(f"{tmp_path / 'b'}.log").read_text(errors="replace")
-    assert "still held KV cache memory" not in b_log
+    assert "still held KV cache memory" not in b_log  # the store access watchdog's message

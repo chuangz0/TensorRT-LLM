@@ -21,7 +21,7 @@ and a TP2 context server restarted between the turns, as in a rolling upgrade, r
 turns from the store while a generation server under attention DP serves on (1P1D,
 DeepSeek-V3-Lite). The store has a provider on each Grace socket of both nodes, as deployments run
 them, so puts and gets cross nodes. In one more 1P1D deployment (Qwen3-8B) the store has no
-provider: the generation server lends it all of its memory.
+provider: the generation server provides all of its memory.
 
 Runs only with ``TRTLLM_MOONCAKE_E2E=1`` (it skips otherwise), as one pytest task per node of a
 two-node job (``SLURM_NODEID`` picks the role; four GPUs per task, its steps ``--overlap``) with
@@ -54,6 +54,7 @@ import requests
 from conftest import (
     PROTOCOL,
     PROVIDER_BYTES,
+    SERVER_STOP_S,
     TOKENS_PER_BLOCK,
     Completion,
     Store,
@@ -102,8 +103,10 @@ TRANSCEIVER = {"cache_transceiver_config": {"backend": "DEFAULT"}}
 # With the autotuner on, each DeepSeek server process picks its own MoE kernels, and two processes'
 # outputs differ in the last bits.
 NO_AUTOTUNER = {"enable_autotuner": False}
-# Host memory each rank of a generation server lends the store when it holds all of the store.
-GENERATION_LENT_BYTES = 4 << 30
+# Host memory each rank of a generation server provides when it holds all of the store's memory.
+GENERATION_SEGMENT_BYTES = 4 << 30
+# A generation server reports its TPOT with this.
+REPORTS_TPOT = {"return_perf_metrics": True}
 
 
 def model_path() -> str:
@@ -217,6 +220,7 @@ def store(node: Node) -> Iterator[Store | None]:
     """Node 0: the master, its providers and a client; node 1: its providers, until node 0 is
     done."""
     master_file, done = node.shared / "master.json", node.shared / "node0.done"
+    stopped = node.shared / "provider1.stopped"
     if node.index == 0:
         try:
             run_dir = node.shared / "store"
@@ -228,18 +232,25 @@ def store(node: Node) -> Iterator[Store | None]:
                 write_file(master_file, json.dumps({"master": store.master}))
                 wait_for_file(node.shared / "provider1.ready")
                 yield store
+                # Node 1's providers unmount their memory while the master still answers, after
+                # node 1 stopped its last server.
+                write_file(done)
+                wait_for_file(stopped, timeout=SERVER_STOP_S + 60)
         finally:
             write_file(done)
         return
     master = json.loads(wait_for_file(master_file))["master"]
-    with providers_per_socket(master, node.shared / "provider1"):
-        write_file(node.shared / "provider1.ready")
-        yield None
-        wait_for_file(done)
+    try:
+        with providers_per_socket(master, node.shared / "provider1"):
+            write_file(node.shared / "provider1.ready")
+            yield None
+            wait_for_file(done)
+    finally:
+        write_file(stopped)
 
 
 def on_node_1(store: Store, segments: list[dict]) -> list[dict]:
-    """The ``segments`` of lending processes on node 1: the master runs on node 0."""
+    """The ``segments`` of processes on node 1: the master runs on node 0."""
     master_host = store.master.rsplit(":", 1)[0]
     return [s for s in segments if s["segment_name"].rsplit(":", 1)[0] != master_host]
 
@@ -382,7 +393,7 @@ def follow_node_0(model: str, run_dir: Path, names: tuple[str, ...]) -> None:
                 instance.wait_for_server(timeout=SERVER_START_S)
                 write_file(run_dir / f"{name}.address", f"{instance.host}:{instance.port}")
                 wait_for_file(run_dir / f"{name}.stop", unless=ended)
-                stop_server(instance)  # a server that lends the store memory stops 13 s later
+                stop_server(instance)  # a server providing the store memory stops 13 s later
         finally:
             write_file(run_dir / f"{name}.stopped")
 
@@ -396,10 +407,11 @@ def context_options(sharing: dict | None) -> dict:
     return {**instance_options(sharing), **TRANSCEIVER, "disable_overlap_scheduler": True}
 
 
-def generation_options() -> dict:
-    """A generation server of the workload's service, without the store: production defaults
-    (block reuse, the overlap scheduler, CUDA graphs) and the cache transceiver."""
-    return {**instance_options(None), **TRANSCEIVER}
+def generation_options(sharing: dict | None = None) -> dict:
+    """A generation server of the workload's service, with ``sharing`` as its kv_sharing:
+    production defaults (block reuse, the overlap scheduler, CUDA graphs) and the cache
+    transceiver."""
+    return {**instance_options(sharing), **TRANSCEIVER}
 
 
 # On main 9bb7931d6e a generation-first completion that asks for logprobs fails: the generation
@@ -478,8 +490,7 @@ def test_disaggregated_2p1d_two_context_instances_share_system_prompts_and_follo
     """The two-turn workload on two TP2 context instances and a TP4 generation server. Turn 2
     crosses instances, so both the context-first and the generation-first instance fetch. The
     master places each object in a random provider, so every provider on node 1, the generation
-    node, holds objects afterwards, and nearly every follow-up reads some of them: of its 80 or so
-    objects, each lies on node 1 with odds of one half."""
+    node, holds objects afterwards."""
     if node.index == 1:
         follow_node_0(model_path(), run_dir, ("store-off-generation", "store-on-generation"))
         return
@@ -494,6 +505,33 @@ def test_disaggregated_2p1d_two_context_instances_share_system_prompts_and_follo
     generation_node = on_node_1(store, store.segments())
     assert len(generation_node) == len(infiniband_by_socket()), generation_node
     assert all(s["allocator_used_bytes"] > 0 for s in generation_node), generation_node
+
+
+# The context server a 1P1D deployment restarts between the turns, as in a rolling upgrade.
+RESTARTED = "store-on-restarted"
+
+
+def converse(
+    entry: RemoteDisaggOpenAIServer, model: str, prompts: list[list[int]], logprobs: bool
+) -> list[Completion]:
+    """Sends every prompt through ``entry`` at once."""
+    return send_at_once([entry], model, [(0, prompt) for prompt in prompts], (logprobs,))
+
+
+def assert_the_restarted_context_server_read_the_first_turns(
+    run_dir: Path, first: list[list[int]], answers_second: list[Completion]
+) -> None:
+    """The restarted context server held nothing: each follow-up read its first prompt's blocks
+    from the store. Both context servers ended with no store work open and no failed
+    publication."""
+    for prompt, answer in zip(first, answers_second):
+        assert answer.cached_tokens >= len(prompt) // TOKENS_PER_BLOCK * TOKENS_PER_BLOCK
+    for name in ("store-on", RESTARTED):
+        trace = rank_traces(run_dir / name, CONTEXT_TP)
+        assert trace.splitlines()[-1].endswith(" open=0"), f"{name} left store work open"
+        counters = instance_counters(run_dir / name)
+        assert counters and not any(c.get("publications_failed") for c in counters), counters
+    assert decisions(rank_traces(run_dir / RESTARTED, CONTEXT_TP), "resume"), "nothing fetched"
 
 
 @contextlib.contextmanager
@@ -532,21 +570,15 @@ def test_disaggregated_1p1d_a_restarted_context_server_reads_the_first_turns_fro
     first, questions = conversations(model)
     attention_dp = {**generation_options(), **NO_AUTOTUNER, "enable_attention_dp": True}
     generation_server = (GENERATION_TP, "generation", attention_dp)
-
-    def converse(
-        entry: RemoteDisaggOpenAIServer, prompts: list[list[int]], logprobs: bool
-    ) -> list[Completion]:
-        return send_at_once([entry], model, [(0, prompt) for prompt in prompts], (logprobs,))
-
     with server_on_node_1(run_dir, "store-off-generation", *generation_server) as generation:
         options = {**context_options(None), **NO_AUTOTUNER}
         with context_behind_router(
             model, run_dir, "store-off", options, generation, CONTEXT_FIRST, 0
         ) as entry:
-            reference_first = converse(entry, first, logprobs=True)
+            reference_first = converse(entry, model, first, logprobs=True)
             # From the store-off answers: both deployments send the same second prompts.
             second = [p + a.token_ids + q for p, a, q in zip(first, reference_first, questions)]
-            reference_second = converse(entry, second, logprobs=True)
+            reference_second = converse(entry, model, second, logprobs=True)
 
     key_prefix = "disaggregated-1p1d"
     options = {**context_options(workload_sharing(store, key_prefix)), **NO_AUTOTUNER}
@@ -557,31 +589,22 @@ def test_disaggregated_1p1d_a_restarted_context_server_reads_the_first_turns_fro
             model, run_dir, "store-on", options, generation, GENERATION_FIRST, 0
         ) as entry:
             before = store.master_metrics()
-            answers_first = converse(entry, first, logprobs=False)
+            answers_first = converse(entry, model, first, logprobs=False)
             store.assert_readable(key_prefix, len(whole_blocks(first)))
             puts.append(puts_since(store, before))
         # A rolling upgrade: a fresh context process, the same generation server.
-        restarted = "store-on-restarted"
         with context_behind_router(
-            model, run_dir, restarted, options, generation, GENERATION_FIRST, 1
+            model, run_dir, RESTARTED, options, generation, GENERATION_FIRST, 1
         ) as entry:
             before = store.master_metrics()
-            answers_second = converse(entry, second, logprobs=False)
+            answers_second = converse(entry, model, second, logprobs=False)
             store.assert_readable(key_prefix, len(whole_blocks(first + second)))
             puts.append(puts_since(store, before))
     print(f"keys put/refused per turn: {puts}")
     assert_agree(reference_first + reference_second, answers_first + answers_second, model)
     new_blocks = [whole_blocks(first), whole_blocks(first + second) - whole_blocks(first)]
     assert [asked - refused for asked, refused in puts] == [len(b) for b in new_blocks]
-    for prompt, answer in zip(first, answers_second):
-        # The restarted process held nothing: it read the first prompt's blocks from the store.
-        assert answer.cached_tokens >= len(prompt) // TOKENS_PER_BLOCK * TOKENS_PER_BLOCK
-    for name in ("store-on", restarted):
-        trace = rank_traces(run_dir / name, CONTEXT_TP)
-        assert trace.splitlines()[-1].endswith(" open=0"), f"{name} left store work open"
-        counters = instance_counters(run_dir / name)
-        assert counters and not any(c.get("publications_failed") for c in counters), counters
-    assert decisions(rank_traces(run_dir / restarted, CONTEXT_TP), "resume"), "nothing fetched"
+    assert_the_restarted_context_server_read_the_first_turns(run_dir, first, answers_second)
 
 
 def mean_tpot_ms(server: Remote) -> float | None:
@@ -597,78 +620,66 @@ def mean_tpot_ms(server: Remote) -> float | None:
     return 1000 * totals["sum"] / totals["count"] if totals["count"] else None
 
 
-def test_disaggregated_1p1d_the_generation_server_lends_the_store_all_of_its_memory(
+def test_disaggregated_1p1d_the_generation_server_provides_all_of_the_stores_memory(
     node: Node, run_dir: Path
 ) -> None:
-    """A store with no provider: the TP4 generation server on node 1 lends each rank's 4 GiB and
-    does nothing else with the store (roles [provide]), so every object lives in generation-node
-    memory. Sixteen conversations at once through a TP2 context server on node 0, which fetches,
-    publishes and lends nothing, and restarts between the turns: the fresh process reads every
-    follow-up's first prompt from the generation node's memory. Both turns agree with a store-off
-    deployment; the generation server's TPOT with and without lending goes to
-    ``generation_tpot_ms.json``. Qwen3-8B."""
+    """A store with no provider: the TP4 generation server on node 1 provides each rank's 4 GiB
+    and does nothing else with the store (roles [provide]), so every object lives in
+    generation-node memory. Sixteen conversations at once through a TP2 context server on node 0,
+    which fetches, publishes and provides nothing, and restarts between the turns: the fresh
+    process reads every follow-up's first prompt from the generation node's memory. Both turns
+    agree with a store-off deployment; the generation server's TPOT with and without the store
+    segment goes to ``generation_tpot_ms.json``. Qwen3-8B."""
     if node.index == 1:
         follow_node_0(model_path(), run_dir, ("store-off-generation", "store-on-generation"))
         return
     model = model_path()
     first, questions = conversations(model)
-
-    def converse(
-        entry: RemoteDisaggOpenAIServer, prompts: list[list[int]], logprobs: bool
-    ) -> list[Completion]:
-        return send_at_once([entry], model, [(0, prompt) for prompt in prompts], (logprobs,))
-
-    def generation_server(sharing: dict | None) -> tuple[int, str, dict]:
-        """A TP4 generation server that reports its TPOT; with ``sharing``, its kv_sharing."""
-        options = {**instance_options(sharing), **TRANSCEIVER, "return_perf_metrics": True}
-        return GENERATION_TP, "generation", options
-
     tpot = {}
-    with server_on_node_1(run_dir, "store-off-generation", *generation_server(None)) as generation:
+    store_off_generation = {**generation_options(), **REPORTS_TPOT}
+    with server_on_node_1(
+        run_dir, "store-off-generation", GENERATION_TP, "generation", store_off_generation
+    ) as generation:
         with context_behind_router(
             model, run_dir, "store-off", context_options(None), generation, CONTEXT_FIRST, 0
         ) as entry:
-            reference_first = converse(entry, first, logprobs=True)
+            reference_first = converse(entry, model, first, logprobs=True)
             # From the store-off answers: both deployments send the same second prompts.
             second = [p + a.token_ids + q for p, a, q in zip(first, reference_first, questions)]
-            reference_second = converse(entry, second, logprobs=True)
+            reference_second = converse(entry, model, second, logprobs=True)
         tpot["store-off"] = mean_tpot_ms(generation)
 
-    key_prefix = "generation-lends"
-    restarted = "store-on-restarted"
+    key_prefix = "generation-provides"
     with running_store(run_dir / "store", provider_bytes=0) as own:
-        backend = {"type": "mooncake", "config": own.config(key_prefix), "roles": ["provide"]}
-        lend_only = {"backends": [{**backend, "segment_size": GENERATION_LENT_BYTES}]}
+        backend = {
+            "type": "mooncake",
+            "config": own.config(key_prefix),
+            "roles": ["provide"],
+            "segment_size": GENERATION_SEGMENT_BYTES,
+        }
+        store_on_generation = {**generation_options({"backends": [backend]}), **REPORTS_TPOT}
         options = context_options(workload_sharing(own, key_prefix))
         # The generation server is up first: a context server's startup check puts an object.
         with server_on_node_1(
-            run_dir, "store-on-generation", *generation_server(lend_only)
+            run_dir, "store-on-generation", GENERATION_TP, "generation", store_on_generation
         ) as generation:
             with context_behind_router(
                 model, run_dir, "store-on", options, generation, GENERATION_FIRST, 0
             ) as entry:
-                answers_first = converse(entry, first, logprobs=False)
+                answers_first = converse(entry, model, first, logprobs=False)
                 own.assert_readable(key_prefix, CONTEXT_TP * len(whole_blocks(first)))
-            lent = own.segments()
+            segments = own.segments()
             # A rolling upgrade: a fresh context process, the same generation server.
             with context_behind_router(
-                model, run_dir, restarted, options, generation, GENERATION_FIRST, 1
+                model, run_dir, RESTARTED, options, generation, GENERATION_FIRST, 1
             ) as entry:
-                answers_second = converse(entry, second, logprobs=False)
+                answers_second = converse(entry, model, second, logprobs=False)
                 own.assert_readable(key_prefix, CONTEXT_TP * len(whole_blocks(first + second)))
             tpot["store-on"] = mean_tpot_ms(generation)
     (run_dir / "generation_tpot_ms.json").write_text(json.dumps(tpot))  # kept after the run
-    assert len(on_node_1(own, lent)) == len(lent) == GENERATION_TP, lent
-    assert all(s["allocator_used_bytes"] > 0 for s in lent), lent
+    assert len(on_node_1(own, segments)) == len(segments) == GENERATION_TP, segments
+    assert all(s["allocator_used_bytes"] > 0 for s in segments), segments
     assert_agree(reference_first + reference_second, answers_first + answers_second, model)
-    for prompt, answer in zip(first, answers_second):
-        # The restarted process held nothing: it read the first prompt's blocks from node 1.
-        assert answer.cached_tokens >= len(prompt) // TOKENS_PER_BLOCK * TOKENS_PER_BLOCK
-    for name in ("store-on", restarted):
-        trace = rank_traces(run_dir / name, CONTEXT_TP)
-        assert trace.splitlines()[-1].endswith(" open=0"), f"{name} left store work open"
-        counters = instance_counters(run_dir / name)
-        assert counters and not any(c.get("publications_failed") for c in counters), counters
-    assert decisions(rank_traces(run_dir / restarted, CONTEXT_TP), "resume"), "nothing fetched"
+    assert_the_restarted_context_server_read_the_first_turns(run_dir, first, answers_second)
     generation_log = (run_dir / "store-on-generation.log").read_text(errors="replace")
     assert "this server neither fetches nor publishes" in generation_log
