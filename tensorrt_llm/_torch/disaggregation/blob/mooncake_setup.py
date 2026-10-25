@@ -9,7 +9,9 @@ threads that never hold the GIL, wherever it can run, or the Python one.
 Mooncake reads its own environment variables, some once per process (``MOONCAKE_STORE_CHECKSUM``),
 some per client (``MC_STORE_MEMCPY``) and ``MC_TCP_PROTO`` on every transfer; this module logs them
 before setup and sets the two RPC timeouts (the call timeout from the config, the connect timeout
-to RPC_CONNECT_TIMEOUT_MS) and, unless set, ``MC_HANDSHAKE_MAX_LENGTH``.
+to RPC_CONNECT_TIMEOUT_MS) and, unless set, ``MC_HANDSHAKE_MAX_LENGTH``. ``open_sdk`` refuses what
+the drivers' rules do not cover: TCP's legacy framing, the local hot cache, the newer transfer
+engine and any SDK build other than the pinned ones.
 
 ``StoreSegment`` is host memory a process gives the store: a segment that holds any process's
 objects.
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import os
+import pathlib
 import socket
 import sys
 import time
@@ -47,7 +50,14 @@ __all__ = [
     "open_sdk",
 ]
 
-SDK_DISTRIBUTION = "mooncake-transfer-engine-cuda13"
+SDK_DISTRIBUTION = "mooncake-transfer-engine-cuda13"  # the one TensorRT-LLM installs
+# The builds of SDK_VERSION the drivers' rules were read for: one source tree, built with CUDA 13,
+# CUDA 12 or no CUDA. All three compile the client class the store worker mirrors alike.
+PINNED_SDK_DISTRIBUTIONS = (
+    SDK_DISTRIBUTION,
+    "mooncake-transfer-engine",
+    "mooncake-transfer-engine-non-cuda",
+)
 SDK_VERSION = "0.3.13"
 IB_SYSFS_ROOT = "/sys/class/infiniband"
 MASTER_WAIT_S = 60.0
@@ -188,30 +198,27 @@ def open_sdk(config: MooncakeConfig) -> Any:
     reads it.
 
     Raises:
-        ValueError: TCP would use its legacy framing, or the local hot cache is on.
-        ImportError: ``mooncake.store`` does not import.
+        ValueError: TCP would use its legacy framing, the local hot cache is on, or the newer
+            transfer engine is selected.
+        ImportError: ``mooncake.store`` does not import, or is not a pinned build of SDK_VERSION.
         TimeoutError: The master does not accept connections.
         RuntimeError: ``setup`` failed; the half-open client is closed.
     """
     _refuse_legacy_tcp_framing(config.protocol)
     _refuse_hot_cache()
+    _refuse_newer_transfer_engine()
     # Mooncake reads both when a client is created; unset, each is 30 s.
     os.environ["MC_RPC_TIMEOUT_MS"] = str(config.rpc_timeout_ms)
     os.environ["MC_RPC_CONNECT_TIMEOUT_MS"] = str(RPC_CONNECT_TIMEOUT_MS)
     os.environ.setdefault("MC_HANDSHAKE_MAX_LENGTH", str(HANDSHAKE_MAX_BYTES))
     _log_environment()
     try:
-        from mooncake.store import MooncakeDistributedStore
+        import mooncake.store as sdk
     except ImportError as error:
         raise ImportError(_sdk_missing(error)) from error
-    version = _installed_sdk_version()
-    if version != SDK_VERSION:
-        logger.warning(
-            f"mooncake: {SDK_DISTRIBUTION} is {version}; the driver's code mapping and access-end "
-            f"rule follow {SDK_VERSION}"
-        )
+    _require_pinned_sdk(sdk)
     _wait_for_master(config.master_server_address)
-    store = MooncakeDistributedStore()
+    store = sdk.MooncakeDistributedStore()
     code = store.setup(
         config.local_hostname or _local_address(config.master_server_address),
         config.metadata_server,
@@ -296,8 +303,9 @@ def make_store_driver(
     *,
     allocation_range: AllocationRange | None = None,
 ) -> MooncakeDriver:
-    """The serving driver over a set-up ``store``, as ``config.driver`` asks: the native driver
-    with ``blob.workers`` store threads where it can run, else the Python driver.
+    """The serving driver over a set-up ``store`` from ``open_sdk``, which admits only the pinned
+    SDK builds, as ``config.driver`` asks: the native driver with ``blob.workers`` store threads
+    where it can run, else the Python driver.
 
     Raises:
         RuntimeError: The driver ``native`` was asked for and cannot run here.
@@ -322,12 +330,6 @@ def make_store_driver(
 
 def _start_store_worker(store: Any, blob: BlobConfig) -> Any:
     """A store worker over ``store``'s client; raises saying why not."""
-    version = _installed_sdk_version()
-    if version != SDK_VERSION:
-        raise _NativeDriverUnavailable(
-            f"the store worker mirrors the client of {SDK_DISTRIBUTION} {SDK_VERSION}; this is "
-            f"{version}"
-        )
     try:
         import tensorrt_llm.mooncake_store_worker as store_worker
     except ImportError as error:
@@ -367,6 +369,17 @@ def _refuse_hot_cache() -> None:
         raise ValueError("MC_STORE_LOCAL_HOT_CACHE_SIZE turns on a cache that can serve torn reads")
 
 
+def _refuse_newer_transfer_engine() -> None:
+    """Either variable, set to any value, makes the SDK build its transfer engine on TENT, whose
+    completion rules the drivers were not read against (``mooncake`` module docstring). The SDK
+    reads them when a client is set up."""
+    selected = [name for name in ("MC_USE_TENT", "MC_USE_TEV1") if name in os.environ]
+    if selected:
+        raise ValueError(
+            f"{', '.join(selected)} selects a transfer engine the driver does not cover"
+        )
+
+
 def _log_environment() -> None:
     values = ", ".join(f"{name}={os.environ.get(name, '<unset>')}" for name in _LOGGED_ENVIRONMENT)
     logger.info(f"mooncake: environment at setup: {values}")
@@ -380,11 +393,32 @@ def _sdk_missing(error: ImportError) -> str:
     return f"cannot import mooncake.store ({error}). {hint}"
 
 
-def _installed_sdk_version() -> str:
-    try:
-        return importlib.metadata.version(SDK_DISTRIBUTION)
-    except importlib.metadata.PackageNotFoundError:
-        return "not an installed distribution"
+def _require_pinned_sdk(sdk: Any) -> None:
+    """The drivers' code mapping and access-end rules were read from SDK_VERSION; on another version
+    a put could return before its transfer ended, and a revoke then free space a transfer still
+    writes. So the imported ``mooncake.store`` must be a file of one of PINNED_SDK_DISTRIBUTIONS at
+    SDK_VERSION, not of another version, a source tree or a shadowing package."""
+    file = getattr(sdk, "__file__", None)
+    found = []
+    for name in PINNED_SDK_DISTRIBUTIONS:
+        try:
+            build = importlib.metadata.distribution(name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        if file is not None and _lists_file(build, file):
+            if build.version == SDK_VERSION:
+                return
+            found.append(f"{name}=={build.version}")
+    raise ImportError(
+        f"mooncake.store ({file}) comes from {', '.join(found) or 'no pinned distribution'}; the "
+        f"driver follows {SDK_VERSION} of {', '.join(PINNED_SDK_DISTRIBUTIONS)} only. Install "
+        f"{SDK_DISTRIBUTION}=={SDK_VERSION}."
+    )
+
+
+def _lists_file(build: importlib.metadata.Distribution, file: str) -> bool:
+    path = pathlib.Path(file).resolve()
+    return any(pathlib.Path(build.locate_file(f)).resolve() == path for f in build.files or ())
 
 
 # Three deployment helpers, with the same rules as the Mooncake connector's

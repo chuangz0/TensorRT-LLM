@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Store config, opening the Mooncake SDK and driver, and the blob package's layering.
 
-The SDK is a fake module put into ``sys.modules``, the master probe and the route probe are
-replaced, and the InfiniBand sysfs tree is a temporary directory, so nothing here needs a network
-or a GPU. The store worker tests need the built store worker, and the slot check the installed
-Mooncake wheel, without a server.
+The SDK is a fake module put into ``sys.modules`` and listed by a fake installed distribution,
+the master probe and the route probe are replaced, and the InfiniBand sysfs tree is a temporary
+directory, so nothing here needs a network or a GPU. The store worker tests need the built store
+worker, and the slot check the installed Mooncake wheel, without a server.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from tensorrt_llm._torch.disaggregation.blob import mooncake_setup
 from tensorrt_llm._torch.disaggregation.blob.backend import BlobConfig
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
+    SDK_DISTRIBUTION,
     UNMOUNT_GRACE_S,
     MooncakeConfig,
     StoreSegment,
@@ -68,6 +69,23 @@ class Sdk:
         return store
 
 
+def install_sdk_build(
+    site: pathlib.Path, module: types.ModuleType, version: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Makes ``module`` a file of SDK_DISTRIBUTION at ``version`` installed in ``site``, as pip
+    would, ahead of every other installed build."""
+    info = site / f"{SDK_DISTRIBUTION.replace('-', '_')}-{version}.dist-info"
+    info.mkdir(parents=True)
+    metadata = f"Metadata-Version: 2.1\nName: {SDK_DISTRIBUTION}\nVersion: {version}\n"
+    (info / "METADATA").write_text(metadata)
+    (info / "RECORD").write_text("mooncake/store.so,,\n")
+    module_file = site / "mooncake" / "store.so"
+    module_file.parent.mkdir()
+    module_file.touch()  # a distribution lists only the files that exist
+    module.__file__ = str(module_file)
+    monkeypatch.syspath_prepend(str(site))
+
+
 @pytest.fixture
 def sdk(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Sdk:
     sdk = Sdk()
@@ -78,11 +96,12 @@ def sdk(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Sdk:
     package.store = module
     monkeypatch.setitem(sys.modules, "mooncake", package)
     monkeypatch.setitem(sys.modules, "mooncake.store", module)
+    install_sdk_build(tmp_path / "site", module, mooncake_setup.SDK_VERSION, monkeypatch)
     monkeypatch.setattr(mooncake_setup, "_wait_for_master", sdk.masters.append)
     monkeypatch.setattr(mooncake_setup, "_local_address", lambda master: ROUTED_ADDRESS)
     monkeypatch.setattr(mooncake_setup, "IB_SYSFS_ROOT", str(tmp_path / "no-infiniband"))
-    monkeypatch.delenv("MC_TCP_PROTO", raising=False)
-    monkeypatch.delenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", raising=False)
+    for name in ("MC_TCP_PROTO", "MC_STORE_LOCAL_HOT_CACHE_SIZE", "MC_USE_TENT", "MC_USE_TEV1"):
+        monkeypatch.delenv(name, raising=False)
     return sdk
 
 
@@ -235,6 +254,33 @@ def test_local_hot_cache_is_refused(sdk: Sdk, monkeypatch: pytest.MonkeyPatch) -
     assert len(sdk.stores) == 1
 
 
+@pytest.mark.parametrize("name", ["MC_USE_TENT", "MC_USE_TEV1"])
+def test_the_newer_transfer_engine_is_refused(
+    sdk: Sdk, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    monkeypatch.setenv(name, "")  # any value selects it
+    with pytest.raises(ValueError, match=name):
+        open_sdk(MooncakeConfig(MASTER, 0, "rdma", device_name="mlx5_0"))
+    assert sdk.stores == []
+
+
+@pytest.mark.parametrize("build", ["older_version", "source_tree"])
+def test_an_sdk_other_than_a_pinned_build_of_0_3_13_is_refused(
+    sdk: Sdk, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, build: str
+) -> None:
+    """Under every driver choice, ``auto`` included: the access-end rules were read from 0.3.13."""
+    module = sys.modules["mooncake.store"]
+    if build == "older_version":
+        install_sdk_build(tmp_path / "older", module, "0.3.12", monkeypatch)
+        found = f"{SDK_DISTRIBUTION}==0.3.12"
+    else:
+        module.__file__ = str(tmp_path / "Mooncake" / "build" / "mooncake" / "store.so")
+        found = "no pinned distribution"
+    with pytest.raises(ImportError, match=f"comes from {re.escape(found)}; .* 0.3.13 of"):
+        open_sdk(MooncakeConfig(MASTER, 0, "tcp"))
+    assert sdk.stores == []
+
+
 def test_a_client_the_store_worker_does_not_mirror_is_refused_by_slot_and_auto_falls_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -260,9 +306,6 @@ def test_a_store_worker_built_from_other_sources_is_refused_before_it_runs(
 ) -> None:
     from tensorrt_llm import mooncake_store_worker
 
-    monkeypatch.setattr(
-        mooncake_setup, "_installed_sdk_version", lambda: mooncake_setup.SDK_VERSION
-    )
     needed = mooncake_setup.STORE_WORKER_API_VERSION
     monkeypatch.setattr(mooncake_store_worker, "API_VERSION", needed - 1)
     with pytest.raises(RuntimeError, match=f"API version {needed - 1}, this code needs {needed}"):

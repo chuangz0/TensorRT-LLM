@@ -35,7 +35,7 @@
 //
 // sharedClientOfCapsule() refuses a client, before any call, unless the symbol each called slot points to
 // (dladdr) is RealClient's method of that name. Parameter types are not compared: the Python side
-// requires the exact wheel version first. ReplicateConfig (replica.h:104-125), passed by reference to
+// (open_sdk) admits only the pinned 0.3.13 builds first. ReplicateConfig (replica.h:104-125), passed by reference to
 // session start, is mirrored the same way and has no runtime check; the version pin and the
 // conformance suite's put round trips cover it.
 //
