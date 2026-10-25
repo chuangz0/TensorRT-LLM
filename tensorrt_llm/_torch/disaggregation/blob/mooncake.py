@@ -543,6 +543,8 @@ class MooncakeDriver:
             else:
                 batch.results[i] = _get_result(answer, batch.sizes[i])
         # A TRANSFER_FAIL future may give up while its RDMA still runs (module docstring).
+        # TODO(mooncake): a failure that says every transfer it posted ended (a peer that died
+        # mid-get, say) would let the reader count a miss instead of ending.
         ended = _Code.TRANSFER_FAIL not in answers
         expired = [i for i, answer in zip(indices, answers) if answer == _Code.LEASE_EXPIRED]
         if expired and may_reread:

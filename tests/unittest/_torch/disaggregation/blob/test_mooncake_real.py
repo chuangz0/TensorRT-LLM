@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The blob backend over a real Mooncake pool: a master, and a separate process holding objects.
+"""The blob backend over a real Mooncake pool: a master, and a separate process holding objects;
+and memory a client lends the pool, which leaves gracefully.
 
 The tested clients give the pool no segment (``global_segment_size`` 0), so every object sits in
 the other process's segment and every transfer goes through the transfer engine; their
@@ -18,10 +19,13 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import json
 import os
 import secrets
 import shutil
 import threading
+import time
+import urllib.request
 from dataclasses import replace
 
 import numpy as np
@@ -36,6 +40,8 @@ from tensorrt_llm._torch.disaggregation.blob.backend import BlobConfig
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.mooncake_native import NativeMooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
+    LEAVE_GRACE_S,
+    LentMemory,
     MooncakeConfig,
     make_store_driver,
     open_sdk,
@@ -386,3 +392,59 @@ def test_real_concurrent_publishes_of_the_same_keys_from_one_client(clients, req
     assert all(reader.read(name) == rows[name] for name in names)
     writer.close()
     reader.close()
+
+
+def segments(master: str, run_dir: str) -> list[dict]:
+    """The segments of the master at ``master`` (``/get_segments_detail`` on its metrics port)."""
+    with open(os.path.join(run_dir, "pool.json")) as file:
+        metrics_port = json.load(file)["metrics_port"]
+    url = f"http://{master.rsplit(':', 1)[0]}:{metrics_port}/get_segments_detail"
+    with urllib.request.urlopen(url, timeout=10) as reply:
+        return json.load(reply)["segments"]
+
+
+def test_real_lent_memory_that_leaves_serves_reads_for_the_grace_then_misses_cleanly(
+    tmp_path, request
+) -> None:
+    """A client lends the pool's only memory and puts 8 objects there. Once it begins leaving, the
+    objects read whole for the grace and a new put is declined; after it, gets miss and no access
+    is left unproven; once Mooncake freed the memory, the master lists no segment."""
+    from test_common.mooncake_utils import running_master_on_free_ports
+
+    _require_mooncake()
+    run_dir = str(tmp_path)
+    names = [f"{request.node.name}-{i}" for i in range(8)]
+    late = f"{request.node.name}-late"
+    with running_master_on_free_ports(run_dir, protocol=PROTOCOL, eviction_ratio=0.0) as master:
+        lent = LentMemory.lend(open_sdk(client_config(master.address)), 256 << 20, PROTOCOL)
+        clients = Clients(master.address)
+        writer = clients.endpoint(names + [late])
+        rows = random_rows(writer, seed=12)
+        # Every endpoint is open before the grace starts: a client takes about a second to open.
+        readers = [clients.endpoint(names, fill=0x2D) for _ in range(2)]
+        assert masks(finish(writer, writer.backend.publish, *names)) == [[True] * 8]
+        (segment,) = segments(master.address, run_dir)
+        assert segment["allocator_used_bytes"] > 0
+
+        lent.begin_leaving()
+        left_at = time.monotonic() + LEAVE_GRACE_S
+        during = finish(readers[0], readers[0].backend.fetch, *names)
+        declined = finish(writer, writer.backend.publish, late)
+        assert time.monotonic() < left_at, "the reads took longer than the grace"
+        assert during.fault is None and masks(during) == [[True] * 8]
+        assert all(readers[0].read(name) == rows[name] for name in names)
+        assert declined.fault is None and masks(declined) == [[False]]
+        assert writer.driver.inner.stats()["rows_declined_pool_full"] == 1
+
+        time.sleep(left_at + 1 - time.monotonic())
+        after = finish(readers[1], readers[1].backend.fetch, *names)
+        assert after.fault is None and masks(after) == [[False] * 8]
+        assert readers[1].driver.inner.stats()["ops_unprovable"] == 0
+        lent.wait_until_left()
+        # The master drops the segment's record shortly after Mooncake freed the memory.
+        deadline = time.monotonic() + 10
+        while segments(master.address, run_dir) and time.monotonic() < deadline:
+            time.sleep(0.5)
+        assert segments(master.address, run_dir) == []
+        lent.store.close()  # it lends nothing any more
+        clients.close()  # while the master still answers

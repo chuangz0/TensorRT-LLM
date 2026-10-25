@@ -26,6 +26,9 @@ from tensorrt_llm._torch.disaggregation.blob import mooncake_setup
 from tensorrt_llm._torch.disaggregation.blob.backend import BlobConfig
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
+    LEAVE_GRACE_S,
+    MOONCAKE_LEAVE_CLEANUP_S,
+    LentMemory,
     MooncakeConfig,
     load_store_config,
     make_store_driver,
@@ -159,10 +162,12 @@ def test_open_passes_setup_arguments_in_order(
     monkeypatch.setattr(mooncake_setup, "IB_SYSFS_ROOT", str(sysfs))
     for name in ("MC_RPC_TIMEOUT_MS", "MC_RPC_CONNECT_TIMEOUT_MS"):
         monkeypatch.setenv(name, "1")  # records the value to restore: open_sdk sets them
+    monkeypatch.delenv("MC_HANDSHAKE_MAX_LENGTH", raising=False)  # set only where unset
     blob, mooncake = load_store_config(store_config("rdma"))
     driver = make_store_driver(open_sdk(mooncake), mooncake, blob)
     assert os.environ["MC_RPC_TIMEOUT_MS"] == "10000"
     assert os.environ["MC_RPC_CONNECT_TIMEOUT_MS"] == "5000"
+    assert os.environ["MC_HANDSHAKE_MAX_LENGTH"] == str(64 << 20)
     (store,) = sdk.stores
     (setup,) = store.calls_to("setup")
     assert setup.args == (
@@ -271,6 +276,61 @@ def test_setup_failure_closes_the_half_open_client(sdk: Sdk) -> None:
         open_sdk(MooncakeConfig(MASTER, 0, "tcp"))
     (store,) = sdk.stores
     assert len(store.calls_to("close")) == 1
+
+
+# Lent memory.
+
+
+class Clock:
+    """``time`` as ``mooncake_setup`` sees it: ``sleep`` moves ``monotonic`` on."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.slept: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def test_lent_memory_stays_until_its_grace_and_mooncakes_cleanup_have_passed(
+    sdk: Sdk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = Clock()
+    monkeypatch.setattr(mooncake_setup, "time", clock)
+    store = open_sdk(MooncakeConfig(MASTER, 0, "rdma", device_name="mlx5_0"))
+    lent = LentMemory.lend(store, 1 << 30, "rdma")
+    (mount,) = store.calls_to("allocate_and_mount_segment")
+    assert mount.args == (1 << 30, "rdma", "*")
+    lent.begin_leaving()
+    (leave,) = store.calls_to("unmount_and_free_segment")
+    assert leave.args == (lent.segment_ids, LEAVE_GRACE_S)
+    clock.now += 5.0  # the executor's own shutdown
+    lent.wait_until_left()
+    assert clock.slept == [LEAVE_GRACE_S + MOONCAKE_LEAVE_CLEANUP_S + 1 - 5.0]
+    assert store.calls_to("close") == []  # closing would free the memory at once
+
+
+def test_a_failed_mount_raises_and_a_leave_the_master_refused_waits_for_nothing(
+    sdk: Sdk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = Clock()
+    monkeypatch.setattr(mooncake_setup, "time", clock)
+    store = open_sdk(MooncakeConfig(MASTER, 0, "tcp"))
+    store.mount_answer = -1
+    with pytest.raises(RuntimeError, match="lending 1073741824 bytes of host memory failed"):
+        LentMemory.lend(store, 1 << 30, "tcp")
+    store.mount_answer, store.leave_answer = 0, -900
+    lent = LentMemory.lend(store, 1 << 30, "tcp")
+    errors: list[str] = []
+    monkeypatch.setattr(mooncake_setup.logger, "error", errors.append)
+    lent.begin_leaving()
+    lent.wait_until_left()
+    assert clock.slept == []  # the memory goes when the process exits
+    assert errors == ["mooncake: lent memory did not begin leaving (code -900)"]
 
 
 # Layering.

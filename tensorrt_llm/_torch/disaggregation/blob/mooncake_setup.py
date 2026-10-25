@@ -8,8 +8,11 @@ threads that never hold the GIL, wherever it can run, or the Python one.
 
 Mooncake reads its own environment variables, some once per process (``MOONCAKE_STORE_CHECKSUM``),
 some per client (``MC_STORE_MEMCPY``) and ``MC_TCP_PROTO`` on every transfer; this module logs them
-before setup and sets only the two RPC timeouts: the call timeout from the config, the connect
-timeout to RPC_CONNECT_TIMEOUT_MS.
+before setup and sets the two RPC timeouts (the call timeout from the config, the connect timeout
+to RPC_CONNECT_TIMEOUT_MS) and, unless set, ``MC_HANDSHAKE_MAX_LENGTH``.
+
+``LentMemory`` is host memory a process lends the store: a segment that holds other processes'
+objects too.
 
 Over RDMA, a process that used ibverbs before its first Mooncake client (importing
 ``tensorrt_llm`` does) logs ``RDMA context setup failed: fork compatibility: Invalid argument``
@@ -25,8 +28,8 @@ import socket
 import sys
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 import yaml
 
@@ -37,6 +40,7 @@ from .mooncake import AllocationRange, MooncakeDriver
 from .mooncake_native import NativeMooncakeDriver
 
 __all__ = [
+    "LentMemory",
     "MooncakeConfig",
     "load_store_config",
     "make_store_driver",
@@ -56,11 +60,28 @@ DRIVERS = ("auto", "native", "python")
 # The tensorrt_llm.mooncake_store_worker API this code speaks (its API_VERSION, bindings.cpp
 # kApiVersion): a module built from other sources is refused at startup.
 STORE_WORKER_API_VERSION = 4
+# The longest handshake message a process accepts. A process's first transfer with another sends
+# its transfer descriptor, which lists every buffer it registered: under GPU Direct thousands of KV
+# cache pieces. Mooncake drops a longer message than MC_HANDSHAKE_MAX_LENGTH (1 MiB unless set, at
+# most 128 MiB), which it reads once per process.
+HANDSHAKE_MAX_BYTES = 64 << 20
+# How long memory that leaves stays readable (LentMemory.begin_leaving): a get that misses after it
+# costs a request its fetch, nothing more.
+LEAVE_GRACE_S = 2
+# Mooncake frees memory that left gracefully this long after its grace ended, once the master
+# confirms (client_service.cpp, Client::StartGracefulUnmountTimer): a get that found the memory
+# before the grace ended has that long to finish.
+MOONCAKE_LEAVE_CLEANUP_S = 10
+# For that confirmation and the free.
+_LEAVE_MARGIN_S = 1
+# Lent memory's location hint: Mooncake reads the NUMA node from the memory itself.
+_ANY_LOCATION = "*"
 
 # Logged before setup, as Mooncake will read them.
 _LOGGED_ENVIRONMENT = (
     "MC_RPC_TIMEOUT_MS",
     "MC_RPC_CONNECT_TIMEOUT_MS",
+    "MC_HANDSHAKE_MAX_LENGTH",
     "MC_STORE_MEMCPY",
     "MOONCAKE_STORE_CHECKSUM",
     "WITH_NVIDIA_PEERMEM",
@@ -162,7 +183,9 @@ def load_store_config(config: str | os.PathLike | Mapping) -> tuple[BlobConfig, 
 def open_sdk(config: MooncakeConfig) -> Any:
     """Opens a set-up ``MooncakeDistributedStore``, on the builder thread: ``setup`` holds the GIL
     while it mounts this process's segment. Sets the process's ``MC_RPC_TIMEOUT_MS`` from
-    ``config`` and ``MC_RPC_CONNECT_TIMEOUT_MS`` first.
+    ``config``, ``MC_RPC_CONNECT_TIMEOUT_MS`` and, unless set, ``MC_HANDSHAKE_MAX_LENGTH`` first:
+    every process may receive another's descriptor, a lending one from each process that reads its
+    memory.
 
     Raises:
         ValueError: TCP would use its legacy framing, or the local hot cache is on.
@@ -175,6 +198,7 @@ def open_sdk(config: MooncakeConfig) -> Any:
     # Mooncake reads both when a client is created; unset, each is 30 s.
     os.environ["MC_RPC_TIMEOUT_MS"] = str(config.rpc_timeout_ms)
     os.environ["MC_RPC_CONNECT_TIMEOUT_MS"] = str(RPC_CONNECT_TIMEOUT_MS)
+    os.environ.setdefault("MC_HANDSHAKE_MAX_LENGTH", str(HANDSHAKE_MAX_BYTES))
     _log_environment()
     try:
         from mooncake.store import MooncakeDistributedStore
@@ -204,6 +228,60 @@ def open_sdk(config: MooncakeConfig) -> Any:
             f"protocol {config.protocol})"
         )
     return store
+
+
+@dataclass
+class LentMemory:
+    """Host memory this process lends the store: a segment of fresh, pinned memory that the
+    master places objects in and other clients read and write directly.
+
+    Leaving takes two calls. ``begin_leaving``: no new object lands here, and the objects here stay
+    readable for LEAVE_GRACE_S; after that the master drops them and gets miss. Mooncake keeps the
+    memory registered MOONCAKE_LEAVE_CLEANUP_S longer for gets already under way, then frees it.
+    ``wait_until_left`` returns after that; then the process may exit.
+
+    Rules: never ``close()`` the client of lent memory, nor end the process before
+    ``wait_until_left`` returns: either frees the memory while other processes may read it, and a
+    reader whose get then fails cannot prove the get ended, which ends it. Lend at most once per
+    process: memory lent later would go by the same segment name (the client's address), where a
+    peer's retried read of an old object could land.
+    """
+
+    store: Any  # the MooncakeDistributedStore that mounted the memory
+    segment_ids: list[str]
+    _left_by: Optional[float] = field(default=None, init=False)  # monotonic time, once freed
+
+    @classmethod
+    def lend(cls, store: Any, nbytes: int, protocol: str) -> LentMemory:
+        """Mounts ``nbytes`` of fresh host memory as a segment of ``store``, a client opened with
+        no segment of its own (``global_segment_size`` 0). Mooncake rounds the size up to whole
+        allocator slabs.
+
+        Raises:
+            RuntimeError: Mooncake did not mount it.
+        """
+        mounted = store.allocate_and_mount_segment(nbytes, protocol, _ANY_LOCATION)
+        if mounted["ret"] != 0:
+            raise RuntimeError(
+                f"mooncake: lending {nbytes} bytes of host memory failed with {mounted['ret']}"
+            )
+        return cls(store, list(mounted["segment_ids"]))
+
+    def begin_leaving(self) -> None:
+        """Stops new objects landing in the memory; the old ones stay readable for LEAVE_GRACE_S.
+        If the master does not take the leave, the memory goes when the process exits."""
+        code = self.store.unmount_and_free_segment(self.segment_ids, LEAVE_GRACE_S)
+        if code != 0:
+            logger.error(f"mooncake: lent memory did not begin leaving (code {code})")
+            return
+        self._left_by = (
+            time.monotonic() + LEAVE_GRACE_S + MOONCAKE_LEAVE_CLEANUP_S + _LEAVE_MARGIN_S
+        )
+
+    def wait_until_left(self) -> None:
+        """Returns once Mooncake freed the memory that began leaving, at once if none did."""
+        if self._left_by is not None:
+            time.sleep(max(0.0, self._left_by - time.monotonic()))
 
 
 class _NativeDriverUnavailable(Exception):

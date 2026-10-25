@@ -143,7 +143,7 @@ def running_segment_provider(
             time.sleep(0.1)
         yield process
     finally:
-        process.terminate()  # the provider unmounts its segment on SIGTERM
+        process.terminate()  # the provider leaves the pool gracefully, in about 13 s
         try:
             process.wait(timeout=30)
         except subprocess.TimeoutExpired:
