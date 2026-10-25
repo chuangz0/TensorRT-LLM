@@ -138,7 +138,7 @@ def test_the_role_provide_and_segment_size_go_together(store_config: str) -> Non
         llm_args(store_config, providing(store_config, ["provide", "provide"]))
 
 
-def test_a_server_that_only_provides_memory_is_refused_only_for_a_kv_connector_or_ray(
+def test_a_server_that_only_provides_memory_is_refused_only_without_mpi_or_with_a_kv_connector(
     store_config: str,
 ) -> None:
     """A generation server leaves its KV cache alone, so the setups that refuse a server that
@@ -148,8 +148,12 @@ def test_a_server_that_only_provides_memory_is_refused_only_for_a_kv_connector_o
         llm_args(store_config, provide_only, **UNSUPPORTED[setup][0])
     with pytest.raises(ValueError, match="does not support: kv_connector_config: [^;]*$"):
         llm_args(store_config, provide_only, **UNSUPPORTED["a KV cache connector"][0])
-    with pytest.raises(ValueError, match=r"does not support: orchestrator_type='ray' \["):
-        llm_args(store_config, provide_only, orchestrator_type="ray")
+    for orchestrator in ("ray", "rpc"):
+        only_reason = (
+            f"does not support: orchestrator_type='{orchestrator}': only the MPI orchestrator ["
+        )
+        with pytest.raises(ValueError, match=re.escape(only_reason)):
+            llm_args(store_config, provide_only, orchestrator_type=orchestrator)
 
 
 # Each algorithm of the sparse attention config union.

@@ -2795,8 +2795,9 @@ class KvSharingBackendConfig(StrictBaseModel):
         "on a server that fetches or publishes, must fit in the available "
         "memory less 32 GiB. Such a server takes about 13 s longer to stop, "
         "while reads of its memory finish: stop it with SIGTERM to "
-        "trtllm-serve, or to trtllm-llmapi-launch under Slurm, not to all of "
-        "its processes.")
+        "trtllm-serve or to rank 0's trtllm-llmapi-launch (under Slurm, "
+        "scancel of the whole job), never with SIGKILL or a signal to mpirun "
+        "or to all of its processes.")
 
     @field_validator("config")
     @classmethod
@@ -8063,7 +8064,8 @@ class TorchLlmArgs(BaseLlmArgs):
         """Refuse setups kv_sharing cannot serve yet, naming every reason.
 
         A server that only provides the store memory (roles: [provide])
-        leaves its KV cache alone: only a KV connector or Ray refuses it.
+        leaves its KV cache alone: only a KV connector or an orchestrator
+        other than MPI refuses it.
 
         Model facts (sliding windows, MLA, the KV cache dtype and sparse
         attention a checkpoint resolves to) are checked when the executor
@@ -8075,7 +8077,10 @@ class TorchLlmArgs(BaseLlmArgs):
         checks = [
             ("kv_connector_config: one way per server to share KV cache "
              "through a store", has_connector),
-            ("orchestrator_type='ray'", self.orchestrator_type == "ray"),
+            # Under 'rpc' the ranks other than 0 never shut their executor
+            # down, so the memory they provide would leave abruptly.
+            (f"orchestrator_type={self.orchestrator_type!r}: only the MPI "
+             "orchestrator", self.orchestrator_type is not None),
         ]
         if not self.kv_sharing.only_provides:
             checks += self._kv_sharing_checks_for_fetch_and_publish()

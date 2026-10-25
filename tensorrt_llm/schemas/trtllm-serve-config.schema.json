@@ -3340,7 +3340,7 @@
             }
           ],
           "default": 0,
-          "description": "Host memory each rank gives the store under the role 'provide', as a binary size ('32GiB') or a byte count; required with 'provide' and 0 without it. Startup refuses a size the node cannot give: its ranks' segments, plus up to 8 GiB of host staging per rank on a server that fetches or publishes, must fit in the available memory less 32 GiB. Such a server takes about 13 s longer to stop, while reads of its memory finish: stop it with SIGTERM to trtllm-serve, or to trtllm-llmapi-launch under Slurm, not to all of its processes.",
+          "description": "Host memory each rank gives the store under the role 'provide', as a binary size ('32GiB') or a byte count; required with 'provide' and 0 without it. Startup refuses a size the node cannot give: its ranks' segments, plus up to 8 GiB of host staging per rank on a server that fetches or publishes, must fit in the available memory less 32 GiB. Such a server takes about 13 s longer to stop, while reads of its memory finish: stop it with SIGTERM to trtllm-serve or to rank 0's trtllm-llmapi-launch (under Slurm, scancel of the whole job), never with SIGKILL or a signal to mpirun or to all of its processes.",
           "title": "Segment Size"
         },
         "type": {
