@@ -656,6 +656,12 @@ class SharedKvOrchestrator:
                 self._unpublished.clear()
         if masks is None:
             self.counters["publications_failed"] += 1
+            # The rows it stored before failing are in the store all the same.
+            outcome = self._transfers.operations[op.operation_id].outcome
+            if outcome is not None:
+                self.counters["published_objects"] += sum(
+                    int(mask.sum()) for mask in outcome.delivered_masks
+                )
             return
         stored = sum(int(mask.sum()) for mask in masks)
         self.counters["published_objects"] += stored

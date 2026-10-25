@@ -451,7 +451,7 @@ def test_blocks_another_server_is_still_putting_are_skipped_not_failed(server):
     assert server.counters["publications_failed"] == 0
 
 
-def test_a_publication_the_store_faulted_counts_as_failed(server):
+def test_a_publication_the_store_faulted_counts_as_failed_and_its_stored_rows_as_published(server):
     server.manager.kv_cache_map[1] = object()
     server.orchestrator.publish_committed_blocks(computed(1))
     server.iterate()  # the store starts writing
@@ -462,7 +462,7 @@ def test_a_publication_the_store_faulted_counts_as_failed(server):
     server.iterate()
     assert server.lender.leases[0].released
     assert server.counters["publications_failed"] == 1
-    assert server.counters["published_objects"] == 0
+    assert server.counters["published_objects"] == 1
     assert server.counters["publication_objects_skipped"] == 0
 
 
