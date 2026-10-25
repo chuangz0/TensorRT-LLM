@@ -126,8 +126,9 @@ def start_child(name="task_child", ignore_term=False):
 if role == "server":
     if mode == "follower":
         (root / "worker-ready").touch()
-        while True:
-            signal.pause()
+        while not (root / "worker-exit").exists():
+            time.sleep(0.01)
+        sys.exit(3)
     if mode.startswith("owner_dies"):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     send("server_ready")
@@ -792,7 +793,12 @@ def test_launcher_task_sees_eof_with_terminal_stdin(tmp_path: Path) -> None:
     _assert_exited(tmp_path)
 
 
-def test_follower_launcher_responds_to_sigterm(tmp_path: Path) -> None:
+def test_follower_launcher_waits_through_sigterm_for_its_worker(tmp_path: Path) -> None:
+    """A follower keeps waiting after SIGTERM and exits with its worker's status.
+
+    Slurm with proctrack/cgroup signals only each rank's launcher and kills the rest of the step
+    once it exits, so the worker must run until it ends, when rank 0's task stops.
+    """
     env = _launcher_env(tmp_path, "follower")
     env["PMI_RANK"] = "1"
     with subprocess.Popen(  # nosec B603
@@ -809,7 +815,10 @@ def test_follower_launcher_responds_to_sigterm(tmp_path: Path) -> None:
                 assert time.monotonic() < deadline, "Follower worker did not start"
                 time.sleep(0.01)
             process.send_signal(signal.SIGTERM)
-            assert process.wait(timeout=2) == -signal.SIGTERM
+            with pytest.raises(subprocess.TimeoutExpired):
+                process.wait(timeout=1)
+            (tmp_path / "worker-exit").touch()
+            assert process.wait(timeout=5) == 3
         finally:
             # The foreground worker belongs to this test's isolated session.
             _cleanup_owned_processes(process, tmp_path)
