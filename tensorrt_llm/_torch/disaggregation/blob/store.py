@@ -392,9 +392,9 @@ class StoreDriver(Protocol):
 
         Keys the store did not answer in time are UNKNOWN, never MISS; the call returns within the
         budget whatever the store does, and a driver with no capacity to ask answers UNKNOWN at
-        once. A caller may count any UNKNOWN as a failed probe (kv_sharing pauses probing after
-        several in a row). A key held by an unfinished write is NOT_READY, as a get would report, or MISS where
-        the store cannot tell it from an absent key. Called only when ``capabilities.probe`` is
+        once. A caller may count any UNKNOWN as a failed probe. A key held by an unfinished write
+        is NOT_READY, as a get would report, or MISS where the store cannot tell it from an absent
+        key. Called only when ``capabilities.probe`` is
         set, and with a hint only when ``capabilities.hints`` is. Raises on a store error rather
         than answering MISS.
         """

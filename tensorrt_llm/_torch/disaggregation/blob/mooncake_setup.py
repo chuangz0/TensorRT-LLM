@@ -39,7 +39,6 @@ __all__ = [
     "MooncakeConfig",
     "load_store_config",
     "make_store_driver",
-    "open_mooncake_driver",
     "open_sdk",
 ]
 
@@ -48,6 +47,8 @@ SDK_VERSION = "0.3.13"
 IB_SYSFS_ROOT = "/sys/class/infiniband"
 MASTER_WAIT_S = 60.0
 MASTER_RETRY_S = 0.5
+# How long one connection to the master may take; setup runs once the master accepts connections.
+RPC_CONNECT_TIMEOUT_MS = 5_000
 SECTIONS = ("blob", "mooncake")
 DRIVERS = ("auto", "native", "python")
 # The tensorrt_llm.mooncake_store_worker API this code speaks (its API_VERSION, bindings.cpp
@@ -89,7 +90,6 @@ class MooncakeConfig:
             allowed, and the default is the SDK's.
         rpc_timeout_ms: How long one call to the master may take. It bounds the store calls
             that take no deadline of their own, an existence check say.
-        rpc_connect_timeout_ms: How long connecting to the master may take.
         driver: ``native``: store calls run on C++ threads that never hold the GIL, and the server
             refuses to start where they cannot; ``python``: on the blob backend's Python threads,
             where each call's return waits for the GIL; ``auto``: native where it can run.
@@ -103,7 +103,6 @@ class MooncakeConfig:
     metadata_server: str = "P2PHANDSHAKE"
     local_buffer_size: int = 16 << 20
     rpc_timeout_ms: int = 10_000
-    rpc_connect_timeout_ms: int = 5_000
     driver: str = "auto"
 
     def __post_init__(self) -> None:
@@ -118,20 +117,17 @@ class MooncakeConfig:
             ("global_segment_size", 0),
             ("local_buffer_size", 0),
             ("rpc_timeout_ms", 1),
-            ("rpc_connect_timeout_ms", 1),
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < least:
                 raise ValueError(f"{name} must be an int of at least {least}, got {value!r}")
 
 
-def load_store_config(
-    config: str | os.PathLike | Mapping,
-) -> tuple[Mapping[str, object], MooncakeConfig]:
+def load_store_config(config: str | os.PathLike | Mapping) -> tuple[BlobConfig, MooncakeConfig]:
     """Reads a store config: a YAML file, or the mapping parsed from one.
 
     Returns:
-        The ``blob`` section as given (empty when absent) and the ``mooncake`` section.
+        The ``blob`` section (defaults when absent) and the ``mooncake`` section.
 
     Raises:
         ValueError: An unknown section or key, a missing ``mooncake`` section or required key, or
@@ -150,15 +146,19 @@ def load_store_config(
     if not isinstance(blob, Mapping) or not isinstance(section, Mapping):
         raise ValueError("store config: 'mooncake' is a required mapping, 'blob' an optional one")
     try:
-        return blob, MooncakeConfig(**section)
+        mooncake = MooncakeConfig(**section)
     except (TypeError, ValueError) as error:  # an unknown or missing key, or a bad value
         raise ValueError(f"store config section 'mooncake': {error}") from error
+    try:
+        return BlobConfig(**blob), mooncake
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"store config section 'blob': {error}") from error
 
 
 def open_sdk(config: MooncakeConfig) -> Any:
     """Opens a set-up ``MooncakeDistributedStore``, on the builder thread: ``setup`` holds the GIL
-    while it mounts this process's segment. Sets the process's ``MC_RPC_TIMEOUT_MS`` and
-    ``MC_RPC_CONNECT_TIMEOUT_MS`` from ``config`` first.
+    while it mounts this process's segment. Sets the process's ``MC_RPC_TIMEOUT_MS`` from
+    ``config`` and ``MC_RPC_CONNECT_TIMEOUT_MS`` first.
 
     Raises:
         ValueError: TCP would use its legacy framing, or the local hot cache is on.
@@ -170,7 +170,7 @@ def open_sdk(config: MooncakeConfig) -> Any:
     _refuse_hot_cache()
     # Mooncake reads both when a client is created; unset, each is 30 s.
     os.environ["MC_RPC_TIMEOUT_MS"] = str(config.rpc_timeout_ms)
-    os.environ["MC_RPC_CONNECT_TIMEOUT_MS"] = str(config.rpc_connect_timeout_ms)
+    os.environ["MC_RPC_CONNECT_TIMEOUT_MS"] = str(RPC_CONNECT_TIMEOUT_MS)
     _log_environment()
     try:
         from mooncake.store import MooncakeDistributedStore
@@ -200,18 +200,6 @@ def open_sdk(config: MooncakeConfig) -> Any:
             f"protocol {config.protocol})"
         )
     return store
-
-
-def open_mooncake_driver(config: object) -> tuple[MooncakeDriver, Mapping[str, object]]:
-    """Opens the Mooncake driver a store config describes: the driver, and the config's ``blob``
-    section as given, from which the backend's ``BlobConfig`` is built."""
-    blob_section, mooncake_config = load_store_config(config)
-    try:
-        blob_config = BlobConfig(**blob_section)
-    except TypeError as error:  # an unknown key
-        raise ValueError(f"store config section 'blob': {error}") from error
-    store = open_sdk(mooncake_config)
-    return make_store_driver(store, mooncake_config, blob_config), blob_section
 
 
 class _NativeDriverUnavailable(Exception):

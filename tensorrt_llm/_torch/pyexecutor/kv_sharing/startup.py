@@ -312,16 +312,13 @@ def _store_config(path: str) -> tuple[MooncakeConfig, BlobConfig]:
     Raises:
         ValueError: The config is invalid or lends the store memory.
     """
-    blob_section, mooncake = load_store_config(path)
+    blob, mooncake = load_store_config(path)
     if mooncake.global_segment_size != 0:
         raise ValueError(
             "kv_sharing servers lend no memory to the store: set mooncake.global_segment_size to 0 "
             f"in {path} and run 'trtllm-serve mooncake_provider'"
         )
-    try:
-        return mooncake, BlobConfig(**blob_section)
-    except TypeError as error:  # an unknown key
-        raise ValueError(f"store config {path}, section 'blob': {error}") from error
+    return mooncake, blob
 
 
 def _attach(

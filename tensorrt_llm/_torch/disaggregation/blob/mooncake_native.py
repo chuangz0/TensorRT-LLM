@@ -29,6 +29,7 @@ from tensorrt_llm.logger import logger
 
 from .mooncake import (
     _ANOTHER_WRITER,
+    _BEING_WRITTEN,
     _POOL_FULL,
     _PUT_START_SKIPS,
     _QUIET_SKIPS,
@@ -157,10 +158,10 @@ class NativeMooncakeDriver(MooncakeDriver):
     # The backend's path: rows as arrays.
 
     def put_rows(self, rows: RowArrays) -> _NativeOp:
-        return self._queue_rows(True, rows)
+        return self._queue_rows(rows, is_put=True)
 
     def get_rows(self, rows: RowArrays) -> _NativeOp:
-        return self._queue_rows(False, rows)
+        return self._queue_rows(rows, is_put=False)
 
     def take_finished(self) -> list[FinishedOp]:
         self._take()
@@ -178,12 +179,12 @@ class NativeMooncakeDriver(MooncakeDriver):
     # The StoreDriver protocol's path: rows as RowIO.
 
     def put(self, rows: Sequence[RowIO]) -> _NativeOp:
-        return self._queue_row_ios(True, rows)
+        return self._queue_row_ios(rows, is_put=True)
 
     def get(self, rows: Sequence[RowIO], hint: Hint = None) -> _NativeOp:
         if hint is not None:
             raise DriverRejected("this driver reads no hints")
-        return self._queue_row_ios(False, rows)
+        return self._queue_row_ios(rows, is_put=False)
 
     def poll(self, op: _NativeOp) -> tuple[RowResult, ...]:
         op = self._op(op)
@@ -236,14 +237,14 @@ class NativeMooncakeDriver(MooncakeDriver):
 
     # Queueing and collecting.
 
-    def _queue_rows(self, is_put: bool, rows: RowArrays) -> _NativeOp:
+    def _queue_rows(self, rows: RowArrays, *, is_put: bool) -> _NativeOp:
         # One bounding span per column: a column is one pool or one staging region.
         span_bytes = np.array(rows.span_bytes, dtype=np.int64)
         lows, highs = rows.starts.min(0), rows.starts.max(0) + span_bytes
         holders = self._reserve([Span(int(low), int(high - low)) for low, high in zip(lows, highs)])
         regions = list(dict.fromkeys(holders))
         return self._queue(
-            is_put,
+            is_put=is_put,
             stem=rows.stem,
             names=rows.names,
             hex_names=True,
@@ -254,7 +255,7 @@ class NativeMooncakeDriver(MooncakeDriver):
             regions=regions,
         )
 
-    def _queue_row_ios(self, is_put: bool, rows: Sequence[RowIO]) -> _NativeOp:
+    def _queue_row_ios(self, rows: Sequence[RowIO], *, is_put: bool) -> _NativeOp:
         """The RowIO path: rows admitted as ``MooncakeDriver`` admits them and named by their raw
         keys; the worker cuts their spans at registration pieces, as on the array path."""
         batch = self._admit(rows)
@@ -265,7 +266,7 @@ class NativeMooncakeDriver(MooncakeDriver):
             starts[i, : len(row.spans)] = [span.address for span in row.spans]
             lengths[i, : len(row.spans)] = [span.nbytes for span in row.spans]
         return self._queue(
-            is_put,
+            is_put=is_put,
             stem="",
             names=names.reshape(len(rows), -1),
             hex_names=False,
@@ -278,8 +279,8 @@ class NativeMooncakeDriver(MooncakeDriver):
 
     def _queue(
         self,
-        is_put: bool,
         *,
+        is_put: bool,
         stem: str,
         names: np.ndarray,
         hex_names: bool,
@@ -411,5 +412,5 @@ def _skip_reason(call: _StoreCall, code: int) -> str:
     if call is _StoreCall.EXISTENCE:
         return _ANOTHER_WRITER
     if call is _StoreCall.GET:  # REPLICA_IS_NOT_READY
-        return "being_written"
+        return _BEING_WRITTEN
     raise AssertionError(f"no row skips on {call!r}")

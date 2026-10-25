@@ -15,9 +15,8 @@ Read top down; a fetch or publish flows ``BlobBackend`` -> ``StoreDriver`` -> st
   directly.
 - ``mooncake_native``: ``NativeMooncakeDriver``, the same driver with its store calls on the C++
   store worker's threads (``tensorrt_llm.mooncake_store_worker``), which never hold the GIL.
-- ``mooncake_setup``: reads a store config, opens the SDK client and picks the driver
-  (``make_store_driver``); ``open_mooncake_driver`` returns the driver and the config's ``blob``
-  section, from which ``BlobConfig`` is built.
+- ``mooncake_setup``: reads a store config (``load_store_config``), opens the SDK client
+  (``open_sdk``) and picks the driver (``make_store_driver``).
 
 No module imports torch, ``tensorrt_llm._torch.pyexecutor`` or a store SDK at import time; only
 ``mooncake_setup.open_sdk`` imports ``mooncake.store``, and ``mooncake_setup`` the store worker,

@@ -283,8 +283,7 @@ def main() -> None:
     cpu = reserve_executor_cpu() if args.pin_executor else None
     poll_interval_s = args.poll_ms / 1e3
 
-    blob_section, mooncake = load_store_config(args.store_config)
-    blob = BlobConfig(**blob_section)
+    blob, mooncake = load_store_config(args.store_config)
     if args.workers is not None:
         blob = replace(blob, workers=args.workers)
     if args.batch_mib is not None:

@@ -127,34 +127,35 @@ _MISS = RowResult(RowStatus.MISS)
 _NOT_READY = RowResult(RowStatus.NOT_READY)
 _DECLINED = RowResult(RowStatus.DECLINED)
 
-# Why a row was skipped (nothing moved and nothing went wrong), and the result it gets; ``stats()``
-# counts skipped rows by both.
-_SKIPS = {
-    # get -703: no complete replica, as while the object is written or once its replica's
-    # endpoint went stale
-    "being_written": _NOT_READY,
-    # put start -600: this client already holds a put session for the key, one left open (which
-    # keeps the key NOT_READY here until ``drain``), or the master refused the row with the same
-    # -600 (a cachelib master caps an object at 16 MiB - 16 B); the master's log says which
-    "own_session_open": _NOT_READY,
-    # another writer is still putting the object: put start -705 with the object uncommitted on
-    # the master, or another put of this client holds the key (skipped without a store call: the
-    # SDK keys put sessions per client)
-    "another_writer": _NOT_READY,
-    "pool_full": _DECLINED,  # put start -200: no space for the object
-}
-# Normal traffic (two requests computing one prompt prefix at once), so no failure to warn about.
-# That writer normally completes the object. If its put fails, nobody retries: the object stays
-# missing until a server computes the prefix again without local reuse.
+# Why a row was skipped (nothing moved and nothing went wrong); ``stats()`` counts skipped rows by
+# reason and result.
+# get -703: no complete replica, as while the object is written or once its replica's endpoint
+# went stale.
+_BEING_WRITTEN = "being_written"
+# put start -600: this client already holds a put session for the key, one left open (which keeps
+# the key NOT_READY here until ``drain``), or the master refused the row with the same -600 (a
+# cachelib master caps an object at 16 MiB - 16 B); the master's log says which.
+_OWN_SESSION_OPEN = "own_session_open"
+# Another writer is still putting the object: put start -705 with the object uncommitted on the
+# master, or another put of this client holds the key (skipped without a store call: the SDK keys
+# put sessions per client). Normal traffic (two requests computing one prompt prefix at once), so
+# no failure to warn about. That writer normally completes the object. If its put fails, nobody
+# retries: the object stays missing until a server computes the prefix again without local reuse.
 _ANOTHER_WRITER = "another_writer"
-# The skip of a put the store declined for lack of space. A full store is a cache's normal state:
-# the master evicts within milliseconds to make room (Mooncake 0.3.13), so it is warned about once
-# per process, not per operation.
+# put start -200: no space for the object. A full store is a cache's normal state: the master
+# evicts within milliseconds to make room (Mooncake 0.3.13), so it is warned about once per
+# process, not per operation.
 _POOL_FULL = "pool_full"
+_SKIPS = {
+    _BEING_WRITTEN: _NOT_READY,
+    _OWN_SESSION_OPEN: _NOT_READY,
+    _ANOTHER_WRITER: _NOT_READY,
+    _POOL_FULL: _DECLINED,
+}
 _QUIET_SKIPS = (_ANOTHER_WRITER, _POOL_FULL)
 _PUT_START_SKIPS = {
     _Code.NO_AVAILABLE_HANDLE: _POOL_FULL,
-    _Code.INVALID_PARAMS: "own_session_open",
+    _Code.INVALID_PARAMS: _OWN_SESSION_OPEN,
     _Code.PUT_IN_FLIGHT_HERE: _ANOTHER_WRITER,
 }
 
@@ -386,10 +387,8 @@ class MooncakeDriver:
 
     def drain(self, budget_s: float) -> bool:
         """Refuses new work for good and waits up to ``budget_s`` for the calls in progress;
-        False at once while an operation is unprovable. When it returns True it also revokes the
-        put sessions left open, once: no put runs any more, so none is in use. They hold no lender
-        memory, so they never change the answer, and one whose revocation fails stays open until
-        the master discards it."""
+        False at once while an operation is unprovable. A True return also revokes the put
+        sessions left open (``_end_drain``)."""
         with self._lock:
             self._require_open()
             self._draining = True
@@ -540,7 +539,7 @@ class MooncakeDriver:
             elif answer == _Code.OBJECT_NOT_FOUND:
                 batch.results[i] = _MISS
             elif answer == _Code.REPLICA_IS_NOT_READY:
-                batch.skip(i, "being_written")
+                batch.skip(i, _BEING_WRITTEN)
             else:
                 batch.results[i] = _get_result(answer, batch.sizes[i])
         # A TRANSFER_FAIL future may give up while its RDMA still runs (module docstring).

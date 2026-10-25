@@ -29,7 +29,6 @@ from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
     MooncakeConfig,
     load_store_config,
     make_store_driver,
-    open_mooncake_driver,
     open_sdk,
 )
 
@@ -127,25 +126,19 @@ BAD_VALUES = {
 
 
 @pytest.mark.parametrize("case", BAD_VALUES)
-def test_unknown_keys_and_values_of_the_wrong_type_are_rejected(sdk: Sdk, case: str) -> None:
+def test_unknown_keys_and_values_of_the_wrong_type_are_rejected(case: str) -> None:
     section, name, value = BAD_VALUES[case]
     config = store_config()
     config[section][name] = value
-    if section == "mooncake":
-        with pytest.raises(ValueError, match=f"section 'mooncake'.*{name}"):
-            open_mooncake_driver(config)
-        assert sdk.stores == []  # refused before the SDK was set up
-        return
-    blob_section, _ = load_store_config(config)  # handed back as given, for BlobConfig to check
-    with pytest.raises((TypeError, ValueError), match=name):
-        BlobConfig(**blob_section)
+    with pytest.raises(ValueError, match=f"section '{section}'.*{name}"):
+        load_store_config(config)
 
 
 def test_store_config_reads_a_yaml_file(tmp_path: pathlib.Path) -> None:
     path = tmp_path / "store.yaml"
     path.write_text(yaml.safe_dump(store_config(local_buffer_size=0)))
     blob, mooncake = load_store_config(path)
-    assert blob == {"key_prefix": "t", "rows_per_batch": 4}
+    assert blob == BlobConfig(key_prefix="t", rows_per_batch=4)
     assert mooncake == MooncakeConfig(MASTER, 0, protocol="tcp", local_buffer_size=0)
 
 
@@ -161,7 +154,8 @@ def test_open_passes_setup_arguments_in_order(
     monkeypatch.setattr(mooncake_setup, "IB_SYSFS_ROOT", str(sysfs))
     for name in ("MC_RPC_TIMEOUT_MS", "MC_RPC_CONNECT_TIMEOUT_MS"):
         monkeypatch.setenv(name, "1")  # records the value to restore: open_sdk sets them
-    driver, blob = open_mooncake_driver(store_config("rdma"))
+    blob, mooncake = load_store_config(store_config("rdma"))
+    driver = make_store_driver(open_sdk(mooncake), mooncake, blob)
     assert os.environ["MC_RPC_TIMEOUT_MS"] == "10000"
     assert os.environ["MC_RPC_CONNECT_TIMEOUT_MS"] == "5000"
     (store,) = sdk.stores
@@ -178,7 +172,6 @@ def test_open_passes_setup_arguments_in_order(
     assert setup.kwargs == {}
     assert sdk.masters == [MASTER]
     assert isinstance(driver, MooncakeDriver)
-    assert blob == {"key_prefix": "t", "rows_per_batch": 4}
 
     open_sdk(MooncakeConfig(MASTER, 1 << 30, "tcp", "eth9", "10.9.9.9", "etcd://m:2379", 0))
     assert sdk.stores[1].calls_to("setup")[0].args == (
@@ -212,14 +205,12 @@ def test_missing_sdk_reports_install_and_shadow_hint(sdk: Sdk, monkeypatch) -> N
     message = str(missing.value)
     assert "mooncake-transfer-engine-cuda13==0.3.13" in message
     assert "/opt/nixl/" in message and "shadows" in message
-    with pytest.raises(ImportError, match="mooncake-transfer-engine-cuda13"):
-        open_mooncake_driver(store_config())
 
 
 def test_tcp_legacy_framing_is_refused(sdk: Sdk, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MC_TCP_PROTO", "1")
     with pytest.raises(ValueError, match="MC_TCP_PROTO"):
-        open_mooncake_driver(store_config("tcp"))
+        open_sdk(MooncakeConfig(MASTER, 0, "tcp"))
     assert sdk.stores == []
     open_sdk(MooncakeConfig(MASTER, 0, "rdma", device_name="mlx5_0"))  # RDMA does not frame
     assert len(sdk.stores) == 1
@@ -228,7 +219,7 @@ def test_tcp_legacy_framing_is_refused(sdk: Sdk, monkeypatch: pytest.MonkeyPatch
 def test_local_hot_cache_is_refused(sdk: Sdk, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "64")
     with pytest.raises(ValueError, match="MC_STORE_LOCAL_HOT_CACHE_SIZE"):
-        open_mooncake_driver(store_config())
+        open_sdk(MooncakeConfig(MASTER, 0, "tcp"))
     assert sdk.stores == []
     monkeypatch.setenv("MC_STORE_LOCAL_HOT_CACHE_SIZE", "0")  # off
     open_sdk(MooncakeConfig(MASTER, 0, "tcp"))
@@ -272,7 +263,7 @@ def test_a_store_worker_built_from_other_sources_is_refused_before_it_runs(
 def test_setup_failure_closes_the_half_open_client(sdk: Sdk) -> None:
     sdk.setup_answer = -1
     with pytest.raises(RuntimeError, match="setup failed with -1"):
-        open_mooncake_driver(store_config())
+        open_sdk(MooncakeConfig(MASTER, 0, "tcp"))
     (store,) = sdk.stores
     assert len(store.calls_to("close")) == 1
 
