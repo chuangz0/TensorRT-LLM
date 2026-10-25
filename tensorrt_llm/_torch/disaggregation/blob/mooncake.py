@@ -240,6 +240,7 @@ class _Batch:
     def fault(self, indices: Sequence[int], reason: str) -> None:
         for row in indices:
             self.results[row] = faulted(reason)
+            self.skip_reasons.pop(row, None)
 
     def pick(
         self, indices: Sequence[int]
@@ -499,7 +500,8 @@ class MooncakeDriver:
             # to another object while the scatter may still write into it).
             self._leave_open(keys, _LeftOpen.TO_MASTER)
             return False
-        written, to_revoke, to_master = started, [], []
+        written = started
+        keys_to_revoke, keys_to_master = [], []
         if answers != sizes:  # rare: some row was not written whole
             written = []
             for i, answer, size in zip(started, answers, sizes):
@@ -508,13 +510,13 @@ class MooncakeDriver:
                     continue
                 batch.fault([i], _put_ranges_fault(answer, size))  # never to be marked complete
                 if answer == _Code.TRANSFER_FAIL:  # a TCP target may still write (module docstring)
-                    to_master.append(batch.keys[i])
+                    keys_to_master.append(batch.keys[i])
                 else:
-                    to_revoke.append(batch.keys[i])
+                    keys_to_revoke.append(batch.keys[i])
         refused, end_outcome_unknown = self._end_put_sessions(batch, written)
-        revoke_failed = self._revoke_put_sessions(to_revoke + refused)
+        revoke_failed = self._revoke_put_sessions(keys_to_revoke + refused)
         self._leave_open(end_outcome_unknown + revoke_failed, _LeftOpen.FOR_DRAIN)
-        self._leave_open(to_master, _LeftOpen.TO_MASTER)
+        self._leave_open(keys_to_master, _LeftOpen.TO_MASTER)
         return True
 
     def _end_put_sessions(self, batch: _Batch, written: list[int]) -> tuple[list[str], list[str]]:

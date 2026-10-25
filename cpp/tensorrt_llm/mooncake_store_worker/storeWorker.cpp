@@ -91,7 +91,8 @@ struct CallOutcome
     std::vector<std::string> sessionsLeftToMaster;
 };
 
-//! The rows whose session end did not end the session: refused (to revoke), or with an outcome unknown.
+//! The written rows whose session the end call did not end: refused (revoke them), or with an unknown
+//! outcome (leave them for drain).
 struct UnendedSessions
 {
     std::vector<size_t> refused;
@@ -797,9 +798,10 @@ struct StoreWorker::State
         auto const first = op.states.begin() + call.begin;
         auto const last = op.states.begin() + call.end;
         auto const isFault = [](int8_t state) { return state == static_cast<int8_t>(RowState::kFault); };
-        // As BlobBackend stops an attempt: any fault fails a get. A put's rows stand alone, but a put
-        // call that faulted every row (a stalled master times out each call) fails its operation: the
-        // calls not started yet would fail alike, holding their slots meanwhile.
+        // Any fault ends a get (as BlobBackend stops a fetch). A put's rows stand alone, but a put call
+        // that faulted every row (a stalled master times out each call) ends the rest of its operation,
+        // one layer group of a publication: the calls not started yet would fail alike, holding their
+        // slots meanwhile.
         bool const dropRestOfOp = op.isPut ? std::all_of(first, last, isFault) : std::any_of(first, last, isFault);
         if (--op.callsLeft == 0)
         {
