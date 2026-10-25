@@ -84,33 +84,11 @@ T = {
 # another server computed), then a question of its own.
 SYSTEM, FIRST_TURN = 512, 256
 FOLLOW_UP = P[: SYSTEM + FIRST_TURN] + [_tokens.randrange(1000, 30000) for _ in range(200)]
-# The sibling every other model class's reader fetches.
+# The sibling each model class's reader fetches.
 SIBLING = P[:FETCHED] + [_tokens.randrange(1000, 30000) for _ in range(200)]
 # A follow-up of P, the prompt windows serve: P's whole blocks, then 200 tokens of its own.
 P_END = P_BLOCKS * TOKENS_PER_BLOCK
 EXTENDS_P = P[:P_END] + [_tokens.randrange(1000, 30000) for _ in range(200)]
-
-
-@dataclass(frozen=True)
-class Prompts:
-    """A prompt a writer publishes, and a sibling that shares its first ``fetched`` tokens."""
-
-    prompt: list[int]
-    sibling: list[int]
-    fetched: int
-
-
-SHORT_PROMPTS = Prompts(P, SIBLING, FETCHED)
-# DeepSeek-V3.2's prompts pass its indexer's top-k (2048 tokens), so the sparse path runs: its
-# reader's queries pick their 2048 keys among fetched indexer keys. The prompt is 96 blocks, its
-# sibling shares the first 80.
-_long_prompt = [1000] + [_tokens.randrange(1000, 30000) for _ in range(96 * TOKENS_PER_BLOCK - 1)]
-_long_fetched = 80 * TOKENS_PER_BLOCK
-LONG_PROMPTS = Prompts(
-    _long_prompt,
-    _long_prompt[:_long_fetched] + [_tokens.randrange(1000, 30000) for _ in range(512)],
-    _long_fetched,
-)
 
 
 DEEPSEEK = "DeepSeek-V3-Lite/bf16"
@@ -392,13 +370,11 @@ def check_a_reader_fetches_exactly_and_each_object_is_put_once(
     monkeypatch: pytest.MonkeyPatch,
     name: str,
     cell: Cell,
-    prompts: Prompts = SHORT_PROMPTS,
     **llm_args,
 ) -> None:
-    """A writer publishes the prompt, every object once, then serves its sibling reusing their
-    shared tokens locally; a fresh reader fetches those from the store, serves the same tokens and
-    puts only its own new blocks."""
-    prompt, sibling, fetched = prompts.prompt, prompts.sibling, prompts.fetched
+    """A writer publishes P, every object once, then serves SIBLING reusing their first FETCHED
+    tokens locally; a fresh reader fetches those from the store, serves the same tokens and puts
+    only its own new blocks."""
     pinned = {"scheduling_params": ON_RANK_1} if cell.attention_dp else {}
     with pytest.MonkeyPatch.context() as writer_env:
         writer = cell_server(
@@ -408,32 +384,32 @@ def check_a_reader_fetches_exactly_and_each_object_is_put_once(
             sharing(store, name, data_path=cell.writer_path),
             **llm_args,
         )
-    stored = cell.objects_per_block * (len(prompt) // TOKENS_PER_BLOCK)
+    stored = cell.objects_per_block * P_BLOCKS
     try:
         before = store.master_metrics()
-        complete(writer, prompt, **pinned)
+        complete(writer, P, **pinned)
         store.assert_readable(name, stored)
         assert puts_since(store, before) == (stored, 0)
-        complete(writer, prompt, cache_salt="reused", **pinned)
-        reference = complete(writer, sibling, cache_salt="reused", **pinned)
-        assert reference.cached_tokens == fetched
+        complete(writer, P, cache_salt="reused", **pinned)
+        reference = complete(writer, SIBLING, cache_salt="reused", **pinned)
+        assert reference.cached_tokens == FETCHED
     finally:
         shut_down(writer)
     cell_trace(tmp_path / "writer", cell)
 
-    new_blocks = len(sibling) // TOKENS_PER_BLOCK - fetched // TOKENS_PER_BLOCK
+    new_blocks = len(SIBLING) // TOKENS_PER_BLOCK - FETCHED_BLOCKS
     new_objects = cell.objects_per_block * new_blocks
     reader = cell_server(monkeypatch, cell, tmp_path / "reader", sharing(store, name), **llm_args)
     try:
         held, _ = store.readable_objects(name)  # the writer's salted prompts too
         before = store.master_metrics()
-        output = complete(reader, sibling, **pinned)
+        output = complete(reader, SIBLING, **pinned)
         store.assert_readable(name, held + new_objects)
         puts = puts_since(store, before)
     finally:
         shut_down(reader)
     assert tokens(output) == tokens(reference)
-    assert output.cached_tokens == fetched
+    assert output.cached_tokens == FETCHED
     assert puts == (new_objects, 0)
     trace = cell_trace(tmp_path / "reader", cell)
     assert len(decisions(trace, "resume")) == 1, trace
@@ -460,8 +436,11 @@ def test_a_reader_with_deepseek_sparse_attention_fetches_its_mla_and_indexer_cac
     store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """DeepSeek-V3.2 with an FP8 KV cache under attention DP and expert parallelism on four GPUs:
-    a writer, then a reader in its place. Each object holds a block's MLA latent and indexer keys,
-    and the reader's queries select their top-k among the fetched indexer keys."""
+    a writer, then a reader in its place. Each object holds a block's MLA latent and indexer keys.
+
+    The prompts stay shorter than the indexer's top-k (2048 tokens): past it the server's own
+    top-k selection differs from run to run, so no two runs give the same tokens. The blob backend
+    round trip checks the indexer keys' bytes."""
     cell = Cell(DEEPSEEK_V32, 1, attention_dp=True, kv_dtype="fp8", tp=4)
     check_a_reader_fetches_exactly_and_each_object_is_put_once(
         store,
@@ -469,7 +448,6 @@ def test_a_reader_with_deepseek_sparse_attention_fetches_its_mla_and_indexer_cac
         monkeypatch,
         "deepseek-v32-attention-dp4",
         cell,
-        LONG_PROMPTS,
         moe_expert_parallel_size=4,
         max_seq_len=4096,
     )
