@@ -390,6 +390,7 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
             return 1
         fi
         started_guard_pid=$guard_pid
+        started_payload_pgid=$payload_pgid
     }
 
     # Guards stay direct children; each owns a separate workload process group.
@@ -399,6 +400,14 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
     server_pid=$started_guard_pid
     start_guarded_command task "${task_with_command[@]}" || exit $?
     task_pid=$started_guard_pid
+    # Slurm with proctrack/cgroup (scancel, a time limit) sends SIGTERM to this
+    # script alone and kills the rest of the step once it exits. So from here on
+    # SIGTERM goes on to the task, which stops as an operator would stop it and
+    # ends every rank in order, and this script waits for it; the other ranks
+    # wait too. A server that gives a KV store host memory needs this to release
+    # it gracefully. Slurm's SIGKILL after KillWait still ends whatever hangs.
+    task_pgid=$started_payload_pgid
+    trap 'kill -TERM -- "-$task_pgid" 2>/dev/null' TERM
 
     while command_running "$task_pid"; do
         if ! command_running "$server_pid"; then
@@ -486,6 +495,9 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
 else
     # Turn off "exit on error" so the following lines always run
     set +e
+    # On SIGTERM keep waiting: the worker node ends when rank 0's task stops.
+    # (bash runs a trap only after the foreground child ended.)
+    trap ':' TERM
 
     log_stderr "Rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_world_size) ..."
     run_child_command python3 -m tensorrt_llm.llmapi.mgmn_worker_node
