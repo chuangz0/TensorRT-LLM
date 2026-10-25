@@ -8029,8 +8029,8 @@ class TorchLlmArgs(BaseLlmArgs):
             (f"kv_cache_config.dtype={kv_cache.dtype!r}: BF16, FP8 or NVFP4 KV "
              "caches only", kv_cache.dtype
              not in ("auto", "bfloat16", "fp8", "nvfp4")),
-            (f"kv_cache_compression_config ({compression})", compression
-             is not None),
+            (f"kv_cache_compression_config ({compression}): stored blocks "
+             "would carry compressed or evicted KV", compression is not None),
             ("pipeline or context parallelism", self.pipeline_parallel_size > 1
              or self.context_parallel_size > 1),
             ("speculative decoding", self.speculative_config is not None),

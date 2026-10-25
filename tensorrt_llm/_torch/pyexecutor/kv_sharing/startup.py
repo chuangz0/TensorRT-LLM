@@ -27,6 +27,7 @@ from tensorrt_llm.math_utils import ceil_div
 
 from ...disaggregation._assembly import (
     SPARSE_ALGORITHMS,
+    SUPPORTED_CACHES,
     FactoryRejected,
     OwnerCleanupFn,
     ProfileSpec,
@@ -130,10 +131,9 @@ def start_kv_sharing(
     (backend,) = config.backends
     manager = py_executor.kv_cache_manager
     dist = py_executor.dist
-    if not isinstance(manager, KVCacheManagerV2) or not manager.enable_block_reuse:
+    if not isinstance(manager, KVCacheManagerV2):
         raise ValueError(
-            "kv_sharing needs KV cache manager v2 with block reuse; this executor built "
-            f"{type(manager).__name__} (block reuse {getattr(manager, 'enable_block_reuse', None)})"
+            f"kv_sharing needs KV cache manager v2; this executor built {type(manager).__name__}"
         )
     if not isinstance(py_executor.scheduler, KVCacheV2Scheduler):
         raise ValueError(
@@ -142,9 +142,11 @@ def start_kv_sharing(
         )
     # Every rank reads these model facts alike, so each refuses on its own, before any collective,
     # checkpoint read or store work.
-    model_config = py_executor.model_engine.model.model_config
     unserved: list[str] = []
-    sparse = model_config.sparse_attention_config
+    layout, cache_dtype = _stored_cache(py_executor)
+    if (layout, cache_dtype) not in SUPPORTED_CACHES:
+        unserved.append(f"a KV cache of layout {layout} and dtype {cache_dtype}")
+    sparse = py_executor.model_engine.model.model_config.sparse_attention_config
     if sparse is not None and sparse.algorithm not in SPARSE_ALGORITHMS:
         unserved.append(f"{sparse.algorithm} sparse attention")
     if isinstance(manager, MambaHybridCacheManagerV2):
@@ -152,6 +154,11 @@ def start_kv_sharing(
     if unserved:
         raise ValueError(
             f"{SUPPORTED_MODELS}; this server is refused: the model has {' and '.join(unserved)}"
+        )
+    if not manager.enable_block_reuse:
+        raise ValueError(
+            "kv_sharing needs block reuse, which TensorRT-LLM turned off for this model; a warning "
+            "in its log says why"
         )
     checkpoint = checkpoint_dir or llm_args.model
 
@@ -459,6 +466,7 @@ def _profile(
     that computed the bytes, the writer layout and the cache dtype."""
     manager = py_executor.kv_cache_manager
     model_config = py_executor.model_engine.model.model_config
+    layout, cache_dtype = _stored_cache(py_executor)
     mapping = model_config.mapping
     dp_size = mapping.tp_size if mapping.enable_attention_dp else 1
     major, minor = torch.cuda.get_device_capability()
@@ -473,13 +481,13 @@ def _profile(
             model_config, artifact_identity=artifact_identity
         ),
         compatibility_id=compatibility,
-        model_layout=MLA_LAYOUT if is_mla(model_config.pretrained_config) else MHA_LAYOUT,
-        dtype=_CACHE_DTYPES.get(manager.dtype, str(manager.dtype)),
+        model_layout=layout,
+        dtype=cache_dtype,
         # Under attention DP each tensor-parallel rank is a data-parallel rank of its own.
         topology=(mapping.tp_size, dp_size, mapping.pp_size, mapping.cp_size),
         state_kinds=(CacheKind.PAGED,) * manager.num_pools,
         attention_windows=_attention_windows(manager),
-        sparse_attention=scoped_sparse_config(model_config.sparse_attention_config),
+        sparse_attention=_scoped_sparse_config(model_config.sparse_attention_config),
         sink_token_length=llm_args.kv_cache_config.sink_token_length or 0,
         lora_enabled=False,
         pool_count=len(manager.impl.pool_group_descs),
@@ -491,7 +499,15 @@ def _profile(
     )
 
 
-def scoped_sparse_config(config: Optional[BaseSparseAttentionConfig]) -> Optional[dict]:
+def _stored_cache(py_executor: PyExecutor) -> tuple[str, str]:
+    """The attention writer layout and the cache dtype of the blocks this server stores."""
+    manager = py_executor.kv_cache_manager
+    pretrained_config = py_executor.model_engine.model.model_config.pretrained_config
+    layout = MLA_LAYOUT if is_mla(pretrained_config) else MHA_LAYOUT
+    return layout, _CACHE_DTYPES.get(manager.dtype, str(manager.dtype))
+
+
+def _scoped_sparse_config(config: Optional[BaseSparseAttentionConfig]) -> Optional[dict]:
     """The effective sparse attention config that names stored blocks, as JSON values; None for
     dense attention. Leaves out ``seq_len_threshold``: it only picks CUDA graphs, and DSA sets it to
     its top-k when they are captured."""
