@@ -90,37 +90,6 @@ class Rejected:
 SubmitResult = Accepted | Deferred | Rejected
 
 
-class Marking(Enum):
-    """How a fetch's write lease, once its view was polled, went back to the lender.
-
-    UNDECIDED until it is returned. DELIVERED returned it through ``return_writes``
-    with the Outcome's delivered rows, which a lender still lending counts; a stopped
-    lender counts nothing and its bounds come back empty. ABANDONED released it with
-    no row counted; LENDER_FAILED released it after its lender domain stopped.
-    """
-
-    UNDECIDED = "undecided"
-    DELIVERED = "delivered"
-    ABANDONED = "abandoned"
-    LENDER_FAILED = "lender_failed"
-
-
-@dataclass(frozen=True)
-class OperationObservation:
-    """Operation facts only; orchestration owns readiness and request recovery.
-
-    For a fetch, ``access_ended`` does not mean the lease went back: ``marking`` other
-    than UNDECIDED, or ``retired``, does.
-    """
-
-    operation_id: int
-    outcome: Outcome | None
-    fault: str | None
-    marking: Marking
-    access_ended: bool
-    retired: bool
-
-
 @dataclass(frozen=True)
 class DomainFailure:
     """Lender-wide stop notification; orchestration owns cache and request recovery."""
@@ -271,7 +240,6 @@ class OperationRecord:
     attempt: Attempt | None = None
     submission: Submission = Submission.NOT_CALLED
     outcome: Outcome | None = None
-    marking: Marking = Marking.UNDECIDED
     released: bool = False
     release_attempted: bool = False
     # Access ended and the Lifecycle settled; the lease waits for ``return_now``.
@@ -284,7 +252,6 @@ class OperationRecord:
     lifecycle: RetirementDeadline | None = None
     timeout: threading.Event = field(default_factory=threading.Event)
     fault: str | None = None
-    observed: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -343,8 +310,7 @@ class TransferManager:
     """Hold operations on one manager thread while backend I/O progresses independently.
 
     Orchestration (``pyexecutor.kv_sharing``) owns admission, readiness and fallback;
-    this class owns leases and backend Attempts. Scoped Lifecycle qualification and
-    general lender memory/row capabilities remain activation prerequisites.
+    this class owns leases and backend Attempts.
     """
 
     def __init__(
@@ -604,41 +570,23 @@ class TransferManager:
             except Exception as error:
                 self._stop_binding(record.intent.binding_id, f"backend cancel failed: {error}")
 
-    def advance(self, now: float) -> tuple[OperationObservation, ...]:
-        """Run lender progress, observe operation facts and perform bounded cleanup.
+    def advance(self, now: float) -> None:
+        """Run lender progress, progress operations and perform bounded cleanup.
 
         Call it once each executor iteration on the manager thread: the lenders'
         staging grants and copy completions advance only through it.
 
         Args:
             now: Monotonic observation timestamp; safety timing belongs to Lifecycle.
-
-        Returns:
-            Changed operation observations, including the final retirement update.
         """
         self._owner()
         for watchdog in {item.lifecycle_binding.watchdog for item in self.bindings.values()}:
             watchdog.progress()
         self._observe_shutdowns()
         self._progress_lenders()
-        updates: list[OperationObservation] = []
         for record in tuple(self.operations.values()):
             self._progress_operation(record)
-            retired = self._retire(record)
-            state = (id(record.outcome), record.fault, record.marking, record.access_ended, retired)
-            if state != record.observed:
-                record.observed = state
-                updates.append(
-                    OperationObservation(
-                        record.id,
-                        record.outcome,
-                        record.fault,
-                        record.marking,
-                        record.access_ended,
-                        retired,
-                    )
-                )
-        return tuple(updates)
+            self._retire(record)
 
     def start_submitted(self) -> None:
         """Hands the backend each accepted operation whose lease view is ready, and does nothing
@@ -895,13 +843,6 @@ class TransferManager:
             else:
                 record.lease.release()
         except Exception as error:
-            if deliver:
-                # A return refused before any change leaves the lease held; release is
-                # idempotent, so it returns the lease at most once with no row counted.
-                try:
-                    record.lease.release()
-                except Exception as release_error:
-                    logger.error(f"Shared KV lease release after a failed return: {release_error}")
             record.release_failed = True
             record.fault = record.fault or f"lease return failed: {error}"
             if record.lifecycle is not None:
@@ -910,25 +851,17 @@ class TransferManager:
             return
         record.released = True
         self._count("released")
-        if record.intent.direction is Direction.FETCH and record.lease_view is not None:
-            if deliver:
-                record.marking = Marking.DELIVERED
-            elif binding.domain_id in self._domain_faults:
-                record.marking = Marking.LENDER_FAILED
-            else:
-                record.marking = Marking.ABANDONED
 
-    def _retire(self, record: OperationRecord) -> bool:
+    def _retire(self, record: OperationRecord) -> None:
         """Keep final result observation even after abandonment and early release."""
         if not record.released or record.release_failed:
-            return False
+            return
         if record.submission is Submission.RETURNED and record.outcome is None:
-            return False
+            return
         if record.lifecycle is not None and not record.lifecycle.close():
-            return False
+            return
         del self.operations[record.id]
         self._count("retired")
-        return True
 
     def _binding_deadline(self, binding: BackendBinding, reason: str) -> None:
         """Retain uncertain construction and teardown through the bound Lifecycle."""

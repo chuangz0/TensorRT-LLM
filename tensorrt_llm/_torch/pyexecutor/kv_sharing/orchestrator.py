@@ -35,7 +35,6 @@ from .store_ops import Action, Decision, OpKind, OpState, StoreOp, decide, repor
 if TYPE_CHECKING:
     from ...disaggregation.blob.mooncake import MooncakeDriver
     from ...disaggregation.lifecycle.retirement import RetirementWatchdog
-    from ...disaggregation.orchestration.coordinator import DisaggTransferCoordinator
     from ..executor_request_queue import RequestQueueItem
     from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from ..llm_request import LlmRequest
@@ -193,7 +192,6 @@ class SharedKvOrchestrator:
         kv_cache_manager: The executor's KV cache manager.
         lender: The KV cache manager's lender.
         transfers: The transfer manager, holding leases until a decision returns them.
-        coordinator: The executor's coordinator, which advances the transfer manager.
         execution_stream: The stream the forward passes run on.
         watchdog: The watchdog of the transfer manager's store accesses, stopped at shutdown.
         driver: The store driver, whose stats join the counters at shutdown.
@@ -216,7 +214,6 @@ class SharedKvOrchestrator:
         kv_cache_manager: KVCacheManagerV2,
         lender: Lender,
         transfers: TransferManager,
-        coordinator: DisaggTransferCoordinator,
         execution_stream: torch.cuda.Stream,
         watchdog: RetirementWatchdog,
         driver: Optional[MooncakeDriver],
@@ -232,7 +229,6 @@ class SharedKvOrchestrator:
         self._kv_cache_manager = kv_cache_manager
         self._lender = lender
         self._transfers = transfers
-        self._coordinator = coordinator
         self._execution_stream = execution_stream
         self._watchdog = watchdog
         self._driver = driver
@@ -540,7 +536,7 @@ class SharedKvOrchestrator:
     def _store_failure(self) -> Optional[str]:
         """Why this rank's lender, its transfer-manager domain or its store binding stopped, or
         None."""
-        failures = self._coordinator.take_shared_domain_failures()
+        failures = self._transfers.take_domain_failures()
         if failures:
             return failures[0].fault
         if self._lender.stopped:

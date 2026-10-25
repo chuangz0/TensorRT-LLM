@@ -25,7 +25,6 @@ from tensorrt_llm._torch.disaggregation.transfer_manager import (
     Deferred,
     Direction,
     LifecycleBinding,
-    Marking,
     Rejected,
     Submission,
     TransferIntent,
@@ -263,9 +262,9 @@ class _Harness:
         assert isinstance(result, Accepted)
         return lease, result.operation_id
 
-    def tick(self) -> tuple:
+    def tick(self) -> None:
         """Run the actual owner-loop holder progress method."""
-        return self.manager.advance(self.now)
+        self.manager.advance(self.now)
 
     def complete(self, *, delivered: bool = True, fault: str | None = None) -> None:
         """Publish one fixed provider Outcome independently from access end."""
@@ -384,24 +383,23 @@ def test_delivery_and_access_end_are_independent(h: _Harness, outcome_first: boo
     with h:
         lease, operation = h.submit()
         h.tick()
+        record = h.manager.operations[operation]
         attempt = h.backend.attempts[0]
         if outcome_first:
             h.complete()
-            (update,) = h.tick()
-            assert update.marking is Marking.UNDECIDED and not update.access_ended
+            h.tick()
+            assert record.outcome is attempt.outcome and not record.access_ended
             attempt.ended = True
         else:
             attempt.ended = True
-            (update,) = h.tick()
-            assert update.access_ended and update.outcome is None
+            h.tick()
+            assert record.access_ended and record.outcome is None
             assert operation in h.manager.operations
             h.complete()
         assert not lease.released and not lease.marks
-        (update,) = h.tick()
-        assert update.retired and update.outcome is attempt.outcome
-        assert update.marking is Marking.DELIVERED
+        h.tick()
+        assert not h.manager.operations and record.outcome is attempt.outcome
         assert lease.released and lease.marks[0][0].all()
-        assert h.tick() == () and not h.manager.operations
 
 
 @pytest.mark.parametrize(
@@ -415,18 +413,17 @@ def test_late_result_survives_early_release_even_after_abandonment(
     with h:
         lease, operation = h.submit(direction=direction)
         h.tick()
+        record = h.manager.operations[operation]
         if abandoned:
             h.manager.abandon(operation, "caller no longer needs acquisition")
         h.backend.attempts[0].ended = True
         h.tick()
         assert lease.released and operation in h.manager.operations
         h.complete(fault="late provider fault")
-        (update,) = h.tick()
-        assert update.retired and update.outcome.fault == "late provider fault"
-        assert update.fault != "late provider fault"
-        assert update.marking is (
-            Marking.ABANDONED if direction is Direction.FETCH else Marking.UNDECIDED
-        )
+        h.tick()
+        assert operation not in h.manager.operations
+        assert record.outcome.fault == "late provider fault"
+        assert record.fault != "late provider fault"
         assert not lease.marks
 
 
@@ -435,8 +432,8 @@ def test_unseen_abandonment_needs_no_view_or_submission(h: _Harness) -> None:
     with h:
         lease, operation = h.submit(ready=False)
         h.manager.abandon(operation, "request cancelled")
-        (update,) = h.tick()
-        assert update.retired and update.marking is Marking.UNDECIDED
+        h.tick()
+        assert operation not in h.manager.operations
         assert lease.released and lease.polls == 0 and not lease.marks
         assert not h.backend.submissions
 
@@ -465,8 +462,8 @@ def test_submission_rejection_differs_from_uncertainty(
     with h:
         h.backend.error = error
         lease, operation = h.submit()
-        (update,) = h.tick()
-        assert update.retired is safe and lease.released is safe
+        h.tick()
+        assert (operation not in h.manager.operations) is safe and lease.released is safe
         assert not lease.marks
         if not safe:
             assert h.manager.operations[operation].submission is Submission.UNCERTAIN
@@ -484,17 +481,18 @@ def test_malformed_outcome_never_consumes_rows(h: _Harness) -> None:
         assert h.manager.operations[operation].outcome is None
 
 
-def test_timeout_committed_inside_poll_wins_before_marking(h: _Harness) -> None:
+def test_timeout_committed_inside_poll_wins_before_rows_are_counted(h: _Harness) -> None:
     """A poll crossing the exact exposure deadline cannot consume late rows."""
     with h:
-        lease, _ = h.submit()
+        lease, operation = h.submit()
         h.tick()
+        record = h.manager.operations[operation]
         h.complete()
         h.backend.attempts[0].ended = True
         h.backend.attempts[0].before_poll = lambda: setattr(h, "now", 15.0)
-        (update,) = h.tick()
-        assert update.marking is Marking.ABANDONED and update.retired
-        assert update.fault == "Lifecycle exposure timeout"
+        h.tick()
+        assert operation not in h.manager.operations
+        assert record.fault == "Lifecycle exposure timeout"
         assert lease.released and not lease.marks
 
 
@@ -551,10 +549,11 @@ def test_release_failure_retains_owner_and_closes_lender_domain(h: _Harness) -> 
 def test_documented_lease_failure_before_view_can_retire(h: _Harness) -> None:
     """A canonical failed lease has no backend exposure and goes back by release alone."""
     with h:
-        lease, _ = h.submit()
+        lease, operation = h.submit()
+        record = h.manager.operations[operation]
         lease.failure = "staging capacity unavailable"
-        (update,) = h.tick()
-        assert update.retired and update.fault == lease.failure
+        h.tick()
+        assert operation not in h.manager.operations and record.fault == lease.failure
         assert lease.released and not lease.marks
 
 
@@ -750,22 +749,15 @@ def test_shutdown_observes_final_outcome_after_early_lease_release(h: _Harness) 
     with h:
         lease, operation = h.submit(direction=Direction.PUBLISH)
         h.tick()
+        record = h.manager.operations[operation]
         h.backend.attempts[0].ended = True
         h.tick()
         assert lease.released and operation in h.manager.operations
         h.backend.labels = frozenset()
         h.manager.begin_shutdown(h.now + 5)
-        updates = []
-        stop = time.monotonic() + 1
-        while operation in h.manager.operations and time.monotonic() < stop:
-            updates.extend(h.tick())
-            h.wake.wait(0.001)
-            h.wake.clear()
-        final = next(
-            update for update in updates if update.operation_id == operation and update.retired
-        )
-        assert final.outcome is h.backend.attempts[0].outcome
-        assert final.outcome.fault == "shutdown"
+        h.tick_until(lambda: operation not in h.manager.operations)
+        assert record.outcome is h.backend.attempts[0].outcome
+        assert record.outcome.fault == "shutdown"
         assert {tid for name, tid in h.backend.calls if name == "poll"} == {
             threading.get_ident(),
             h.backend.shutdown_owner,
@@ -793,17 +785,8 @@ def test_lender_failure_stops_sibling_bindings_without_stopping_release(h: _Harn
         assert isinstance(h.manager.submit(untouched, h.intent), Deferred)
         assert untouched.polls == 0 and not untouched.released
         h.backend.attempts[0].ended = True
-        stop = time.monotonic() + 1
-        updates = []
-        while exposed_id in h.manager.operations and time.monotonic() < stop:
-            updates.extend(h.tick())
-            h.wake.wait(0.001)
-            h.wake.clear()
+        h.tick_until(lambda: exposed_id not in h.manager.operations)
         assert exposed.released and exposed.polls == polls and not exposed.marks
-        final = next(
-            update for update in updates if update.operation_id == exposed_id and update.retired
-        )
-        assert final.marking is Marking.LENDER_FAILED
         h.manager.stop_lender_domain("lender", "duplicate")
         assert len(h.manager.take_domain_failures()) == 1
 
@@ -829,9 +812,10 @@ def test_cumulative_shutdown_snapshot_preserves_proof_before_later_error(h: _Har
         while len(h.backend.shutdown_threads) < 3 and time.monotonic() < stop:
             time.sleep(0.001)
         assert len(h.backend.shutdown_threads) >= 3
-        updates = h.tick()
+        record = h.manager.operations[operation]
+        h.tick()
         assert lease.released and operation not in h.manager.operations
-        assert updates[0].outcome is h.backend.attempts[0].outcome
+        assert record.outcome is h.backend.attempts[0].outcome
         binding = h.manager.bindings["store"]
         assert binding.retained_labels == frozenset()
         assert "late shutdown failure" in binding.fault
@@ -1072,8 +1056,8 @@ def test_stop_holding_returns_held_leases_with_the_rows_their_outcomes_delivered
         assert h.manager.ended(operation) and not h.manager.ready(operation)
         assert not lease.released
         h.manager.stop_holding()
-        (update,) = h.tick()
-        assert update.retired and update.marking is Marking.DELIVERED
+        h.tick()
+        assert operation not in h.manager.operations
         assert lease.released and lease.marks[0][0].tolist() == [True, False]
 
 

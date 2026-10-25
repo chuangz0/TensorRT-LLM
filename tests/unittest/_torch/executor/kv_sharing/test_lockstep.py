@@ -400,7 +400,6 @@ def run_rank(
         kv_cache_manager=manager,
         lender=lender,
         transfers=transfers,
-        coordinator=SimpleNamespace(take_shared_domain_failures=transfers.take_domain_failures),
         execution_stream=None,
         watchdog=SimpleNamespace(stop=lambda: None),
         driver=None,

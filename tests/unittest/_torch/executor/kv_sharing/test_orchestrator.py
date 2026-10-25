@@ -257,9 +257,6 @@ class Server:
             lifecycle=LifecycleBinding(RetirementWatchdog(lambda event: None), 60.0),
             provider_cleanup_complete=lambda: True,
         )
-        coordinator = SimpleNamespace(
-            take_shared_domain_failures=self.transfers.take_domain_failures
-        )
         policy = SharingPolicy(
             memory_kind=memory_kind,
             fetch=True,
@@ -275,7 +272,6 @@ class Server:
             kv_cache_manager=self.manager,
             lender=self.lender,
             transfers=self.transfers,
-            coordinator=coordinator,
             execution_stream=None,
             watchdog=SimpleNamespace(stop=lambda: None),
             driver=None,

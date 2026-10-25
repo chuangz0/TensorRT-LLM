@@ -47,7 +47,6 @@ from tensorrt_llm._torch.disaggregation.transfer_manager import (
     Accepted,
     Direction,
     LifecycleBinding,
-    Marking,
     TransferIntent,
     TransferManager,
 )
@@ -237,9 +236,9 @@ class _Harness:
             provider_cleanup_complete=lambda: self.backend.finalizer_posted,
         )
 
-    def tick(self) -> tuple:
+    def tick(self) -> None:
         """Run one owner-loop iteration: lender progress, then the holder."""
-        return self.runtime.advance(_NOW)
+        self.runtime.advance(_NOW)
 
     def fetch(
         self, request: LlmRequest, *, ready_event: torch.cuda.Event | None = None
@@ -331,15 +330,14 @@ def test_outcome_waits_for_quiescence_to_count_real_bytes(
         attempt = harness.backend.attempts[0]
         attempt.complete()
         harness.tick()
-        assert record.marking is Marking.UNDECIDED and not record.released
+        assert not record.released
         assert harness.domain.lender.poll_resume_bounds(request) is None
 
         attempt.ended = True
-        updates = list(harness.tick())
+        harness.tick()
         manager._stream.synchronize()
-        updates.extend(harness.tick())
-        assert record.released and record.marking is Marking.DELIVERED
-        assert any(update.marking is Marking.DELIVERED for update in updates)
+        harness.tick()
+        assert record.released
         bounds = harness.domain.lender.poll_resume_bounds(request)
         assert bounds is not None and bounds.max_position == _END
         _assert_fetch_bytes(manager, request, kit)
@@ -386,15 +384,14 @@ def test_late_outcome_returns_real_lease_after_access_end(
         attempt = harness.backend.attempts[0]
         attempt.ended = True
         harness.tick()
-        assert not record.released and record.marking is Marking.UNDECIDED
+        assert not record.released
         assert record.id in harness.runtime.operations
 
         attempt.complete()
-        updates = list(harness.tick())
+        harness.tick()
         manager._stream.synchronize()
-        updates.extend(harness.tick())
-        assert record.released and record.marking is Marking.DELIVERED
-        assert any(update.marking is Marking.DELIVERED for update in updates)
+        harness.tick()
+        assert record.released
         bounds = harness.domain.lender.poll_resume_bounds(request)
         assert bounds is not None and bounds.max_position == _END
         _assert_fetch_bytes(manager, request, kit)

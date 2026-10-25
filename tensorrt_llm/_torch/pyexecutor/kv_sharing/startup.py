@@ -215,7 +215,6 @@ def start_kv_sharing(
         kv_cache_manager=manager,
         lender=attached.lender,
         transfers=attached.transfers,
-        coordinator=py_executor.disagg,
         execution_stream=py_executor.execution_stream,
         watchdog=attached.watchdog,
         driver=attached.driver,

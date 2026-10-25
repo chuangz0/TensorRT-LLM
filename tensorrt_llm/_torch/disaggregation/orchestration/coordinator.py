@@ -28,7 +28,7 @@ from .interfaces import ActiveRequestRegistry, ExecutorEffects
 if TYPE_CHECKING:
     import torch
 
-    from tensorrt_llm._torch.disaggregation.transfer_manager import DomainFailure, TransferManager
+    from tensorrt_llm._torch.disaggregation.transfer_manager import TransferManager
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
 
 
@@ -154,11 +154,6 @@ class DisaggTransferCoordinator:
         """Return whether shared work still needs owner-loop progress."""
         manager = self._shared_transfer_manager
         return manager is not None and manager.pending()
-
-    def take_shared_domain_failures(self) -> Tuple["DomainFailure", ...]:
-        """Drain lender-wide stops for orchestration to apply at its recovery boundary."""
-        manager = self._shared_transfer_manager
-        return () if manager is None else manager.take_domain_failures()
 
     def begin_shared_shutdown(self) -> None:
         """Close shared admission while keeping the owner loop alive for cleanup."""

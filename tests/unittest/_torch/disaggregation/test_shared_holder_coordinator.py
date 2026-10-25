@@ -54,18 +54,6 @@ def test_holder_attachment_cannot_replace_retained_resources() -> None:
         coordinator.attach_shared_transfer_manager(_holder())
 
 
-@pytest.mark.parametrize("native", [False, True])
-def test_lender_domain_faults_reach_orchestration_without_request_actions(native: bool) -> None:
-    """Recovery receives the opaque failed domain; the holder does not own requests."""
-    coordinator = CoordinatorHarness().coordinator if native else NoopDisaggCoordinator()
-    holder = _holder()
-    failure = object()
-    holder.take_domain_failures.return_value = (failure,)
-    coordinator.attach_shared_transfer_manager(holder)
-    assert coordinator.take_shared_domain_failures() == (failure,)
-    holder.take_domain_failures.assert_called_once_with()
-
-
 def test_shared_idle_uses_wake_and_bounded_heartbeat() -> None:
     """Shared-only idle progress delegates to the holder's notification wait."""
     coordinator = NoopDisaggCoordinator()
@@ -133,4 +121,3 @@ def test_unattached_shared_hooks_preserve_no_native_behavior() -> None:
     coordinator.pace_idle()
     assert not coordinator.has_pending_shared_transfers()
     assert coordinator.shared_shutdown_complete()
-    assert coordinator.take_shared_domain_failures() == ()
