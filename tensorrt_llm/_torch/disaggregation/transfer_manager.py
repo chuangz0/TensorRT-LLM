@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from tensorrt_llm.logger import logger
 
+from ..pyexecutor.kv_cache.sharing import ALL_ARRIVED
 from ._assembly import (
     BackendFactory,
     FactoryRejected,
@@ -833,13 +834,16 @@ class TransferManager:
             record.held = False
 
     def _give_back(self, record: OperationRecord, deliver: bool) -> None:
-        """Return the lease through ``return_writes`` with the rows its Outcome delivered, or
-        release it with none."""
+        """Return the lease through ``return_writes`` with the rows its Outcome delivered
+        (``ALL_ARRIVED`` when that is every row, which the lender returns without checking masks),
+        or release it with none."""
         binding = self.bindings[record.intent.binding_id]
         record.release_attempted = True
         try:
             if deliver:
-                binding.lender.return_writes([(record.lease, record.outcome.delivered_masks, True)])
+                masks = record.outcome.delivered_masks
+                arrived = ALL_ARRIVED if all(mask.all() for mask in masks) else masks
+                binding.lender.return_writes([(record.lease, arrived, True)])
             else:
                 record.lease.release()
         except Exception as error:

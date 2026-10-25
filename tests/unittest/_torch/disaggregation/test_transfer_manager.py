@@ -31,6 +31,7 @@ from tensorrt_llm._torch.disaggregation.transfer_manager import (
     TransferManager,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
+    ALL_ARRIVED,
     LeaseView,
     LentLayerGroupRows,
     MemoryKind,
@@ -49,7 +50,7 @@ class _Lease:
     failure: str | None = None
     released: bool = False
     polls: int = 0
-    marks: list[tuple[np.ndarray, ...]] = field(default_factory=list)
+    marks: list[object] = field(default_factory=list)  # each return's ALL_ARRIVED or masks
     actions: list[str] = field(default_factory=list)
     poll_error: Exception | None = None
     release_error: Exception | None = None
@@ -87,11 +88,13 @@ class _Lender:
         """Count one round of lender progress."""
         self.progress_rounds += 1
 
-    def return_writes(self, entries: list[tuple[_Lease, tuple[np.ndarray, ...], bool]]) -> list:
+    def return_writes(self, entries: list[tuple[_Lease, object, bool]]) -> list:
         """Record each lease's arrived rows once, then release it as the lender does."""
         for lease, arrived, reusable in entries:
             assert reusable and not lease.marks
-            lease.marks.append(tuple(mask.copy() for mask in arrived))
+            if arrived is not ALL_ARRIVED:
+                arrived = tuple(mask.copy() for mask in arrived)
+            lease.marks.append(arrived)
             lease.actions.append("mark")
             lease.release()
         return [None] * len(entries)
@@ -399,7 +402,7 @@ def test_delivery_and_access_end_are_independent(h: _Harness, outcome_first: boo
         assert not lease.released and not lease.marks
         h.tick()
         assert not h.manager.operations and record.outcome is attempt.outcome
-        assert lease.released and lease.marks[0][0].all()
+        assert lease.released and lease.marks == [ALL_ARRIVED]
 
 
 @pytest.mark.parametrize(
@@ -1072,7 +1075,7 @@ def test_shutdown_leaves_a_held_lease_ready_for_its_return() -> None:
         h.manager.begin_shutdown(h.now + 5)
         assert h.manager.ready(operation) and "abandoned" not in h.manager.counters
         h.manager.return_now(operation, deliver=True)
-        assert lease.released and lease.marks[0][0].all()
+        assert lease.released and lease.marks == [ALL_ARRIVED]
 
 
 def test_a_publication_puts_only_its_stripe_and_a_striped_fetch_is_refused() -> None:

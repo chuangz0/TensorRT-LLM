@@ -41,6 +41,7 @@ from tensorrt_llm._torch.disaggregation.base.backend import Capabilities, Outcom
 from tensorrt_llm._torch.disaggregation.lifecycle.retirement import RetirementWatchdog
 from tensorrt_llm._torch.disaggregation.transfer_manager import LifecycleBinding, TransferManager
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
+    ALL_ARRIVED,
     LeaseView,
     LentLayerGroupRows,
     MemoryKind,
@@ -185,8 +186,8 @@ class Lender:
         return Lease(self, request, start, end, memory_kind, OpKind.PUBLISH)
 
     def return_writes(self, entries):
-        for lease, masks, _ in entries:
-            lease.release(settles=all(mask.all() for mask in masks))
+        for lease, arrived, _ in entries:
+            lease.release(settles=arrived is ALL_ARRIVED or all(mask.all() for mask in arrived))
         return [None] * len(entries)
 
     def progress(self) -> None:
