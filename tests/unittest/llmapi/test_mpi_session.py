@@ -613,13 +613,15 @@ def test_llmapi_launch_aborts_when_no_workspace_is_available(
 
 
 @pytest.mark.cpu_only
-def test_llmapi_launch_passes_sigterm_on_to_the_task_and_waits_for_it(
-        tmp_path: Path) -> None:
-    """The launcher passes SIGTERM on to the task and exits after it.
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT],
+                         ids=["sigterm", "sigint"])
+def test_llmapi_launch_passes_a_stop_signal_on_to_the_task_and_waits_for_it(
+        tmp_path: Path, signum: signal.Signals) -> None:
+    """The launcher passes SIGTERM or SIGINT on to the task and exits after it.
 
-    Slurm (scancel, a time limit) signals only the launcher, each task's own
-    process, and kills the rest of the step once it exits; the task stops in
-    its own time.
+    The task gets SIGTERM either way. Slurm (scancel, a time limit, srun's
+    double Ctrl-C) signals only the launcher, each task's own process, and
+    kills the rest of the step once it exits; the task stops in its own time.
     """
     home = tmp_path / "home"
     home.mkdir()
@@ -643,7 +645,7 @@ def test_llmapi_launch_passes_sigterm_on_to_the_task_and_waits_for_it(
         text=True,
     )
     assert launcher.stdout.readline() == "serving\n"
-    launcher.send_signal(signal.SIGTERM)
+    launcher.send_signal(signum)
     assert launcher.wait(timeout=30) == 0
     assert stopped.exists()
 

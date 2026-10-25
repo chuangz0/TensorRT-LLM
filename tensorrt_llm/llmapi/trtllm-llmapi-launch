@@ -404,10 +404,13 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
     # script alone and kills the rest of the step once it exits. So from here on
     # SIGTERM goes on to the task, which stops as an operator would stop it and
     # ends every rank in order, and this script waits for it; the other ranks
-    # wait too. A server that gives a KV store host memory needs this to release
-    # it gracefully. Slurm's SIGKILL after KillWait still ends whatever hangs.
+    # wait too. SIGINT (Ctrl-C, srun's double Ctrl-C, scancel --signal=INT)
+    # does the same: the task runs in its own process group, so no Ctrl-C
+    # reaches it. A server that gives a KV store host memory needs this to
+    # release it gracefully. Slurm's SIGKILL after KillWait still ends whatever
+    # hangs.
     task_pgid=$started_payload_pgid
-    trap 'kill -TERM -- "-$task_pgid" 2>/dev/null' TERM
+    trap 'kill -TERM -- "-$task_pgid" 2>/dev/null' INT TERM
 
     while command_running "$task_pid"; do
         if ! command_running "$server_pid"; then
@@ -439,6 +442,9 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
     done
     wait "$task_pid"
     task_exit_code=$?
+    # The task's process group is gone and its ID free for reuse: a later
+    # signal reaches no process, and this script keeps waiting for the stop.
+    trap ':' INT TERM
     log_stderr "Rank${mpi_rank} Task exit code: $task_exit_code"
 
     # The wait covers the stop helper's imports, connection, send and queue
