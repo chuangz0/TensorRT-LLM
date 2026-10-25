@@ -917,12 +917,12 @@ def _named_window_case(monkeypatch, windows, prompt, **kwargs):
 
 
 def _fetch_by_name(monkeypatch, case, end):
-    """A named fetch [known, end) of ``case`` into a fresh cache: the fresh case (whose manager the
+    """A named fetch [0, end) of ``case`` into a fresh cache: the fresh case (whose manager the
     lender holds weakly), the lease, and per lent row whether the store holds it."""
-    tpb, windows, sinks, known, prompt, held = case
-    fresh = _named_window_case(monkeypatch, windows, prompt, tpb=tpb, sinks=sinks, known=known)
+    tpb, windows, sinks, prompt, held = case
+    fresh = _named_window_case(monkeypatch, windows, prompt, tpb=tpb, sinks=sinks)
     _owner, lender, _kv, req = fresh
-    lease = lender.lend_write(req, known, end, memory_kind=DEVICE, rows=NAMED, ready_event=READY)
+    lease = lender.lend_write(req, 0, end, memory_kind=DEVICE, rows=NAMED, ready_event=READY)
     view = lease.poll()
     assert view is not None, (end, lease.failure)
     return fresh, lease, [np.array(held[g.layer_group_index])[g.page_ordinals] for g in view.groups]
@@ -933,13 +933,13 @@ def test_usable_end_is_the_largest_end_a_fetch_of_the_held_rows_resumes_at(
     floor_follows_history, monkeypatch
 ):
     """Given the blocks the store holds of each layer group, the largest end at which a named
-    fetch from ``known`` resumes once every row it lends arrived; every later end lends a row the
-    store does not hold. Small exhaustive masks and seeded layouts, windows with sinks too."""
+    fetch of a prompt's start resumes once every row it lends arrived; every later end lends a row
+    the store does not hold. Small exhaustive masks and seeded layouts, windows with sinks too."""
     cases = []
     tpb = 4
-    for window, sink, known in itertools.product((None, 3, 4, 5, 8), (0, 1), (0, tpb)):
+    for window, sink in itertools.product((None, 3, 4, 5, 8), (0, 1)):
         for held in itertools.product((False, True), repeat=4):
-            cases.append((tpb, (window,), (sink,), known, 4 * tpb + 1, (held,)))
+            cases.append((tpb, (window,), (sink,), 4 * tpb + 1, (held,)))
     rng = random.Random(20261024)
     for _ in range(200):
         tpb = rng.choice((4, 8, 16))
@@ -949,17 +949,16 @@ def test_usable_end_is_the_largest_end_a_fetch_of_the_held_rows_resumes_at(
         )
         sinks = tuple(rng.randrange(3) for _ in windows)
         prompt = rng.randint(2 * tpb + 1, 8 * tpb + 1)
-        known = rng.choice((0, tpb, prompt // 2 // tpb * tpb))
         held = tuple(tuple(rng.random() < 0.8 for _ in range(prompt // tpb)) for _ in windows)
-        cases.append((tpb, windows, sinks, known, prompt, held))
+        cases.append((tpb, windows, sinks, prompt, held))
 
     for case in cases:
-        tpb, windows, sinks, known, prompt, held = case
+        tpb, windows, sinks, prompt, held = case
         limit = (prompt - 1) // tpb * tpb
         lender = _named_window_case(monkeypatch, windows, prompt, tpb=tpb, sinks=sinks)[1]
-        usable = lender.usable_end([np.array(h) for h in held], known=known, limit=limit)
-        assert known <= usable <= limit and usable % tpb == 0, (case, usable)
-        if usable > known:
+        usable = lender.usable_end([np.array(h) for h in held], limit=limit)
+        assert 0 <= usable <= limit and usable % tpb == 0, (case, usable)
+        if usable > 0:
             (_owner, lender, _kv, req), lease, masks = _fetch_by_name(monkeypatch, case, usable)
             assert all(mask.all() for mask in masks), (case, usable)
             bounds = return_write(lender, req, lease, masks)

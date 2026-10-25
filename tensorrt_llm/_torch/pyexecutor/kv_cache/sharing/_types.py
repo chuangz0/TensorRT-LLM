@@ -882,17 +882,15 @@ class Lender(Protocol):
         cache_salt: Optional[str],
         layer_group_index: int,
         num_blocks: int,
-        shares: Optional[Sequence[int]] = None,
+        shares: Sequence[int],
     ) -> np.ndarray:
-        """``uint8 (num_blocks, 54)``: the object keys a NAMED lease of this rank gives the first
-        ``num_blocks`` whole blocks of a text prompt in layer group ``layer_group_index``, for a
-        request with this ``cache_salt`` and no LoRA. Unlike the other methods it may run on any
-        thread at any time after attach: it reads only what attach fixed. Prompts with multimodal
-        content or a LoRA adapter are named by their leases alone.
-
-        ``shares`` names those shares of the layer group instead, as the ranks holding them name
-        them (the ranks of one server name a group alike but for the share):
-        ``uint8 (len(shares) * num_blocks, 54)``, share-major.
+        """``uint8 (len(shares) * num_blocks, 54)``, share-major: the object keys NAMED leases
+        give the first ``num_blocks`` whole blocks of a text prompt in each of ``shares`` of layer
+        group ``layer_group_index``, as the ranks holding those shares name them (the ranks of one
+        server name a group alike but for the share), for a request with this ``cache_salt`` and
+        no LoRA. Unlike the other methods it may run on any thread at any time after attach: it
+        reads only what attach fixed. Prompts with multimodal content or a LoRA adapter are named
+        by their leases alone.
 
         Raises:
             ValueError: The prompt has fewer whole blocks, the layer group is unknown, a share
@@ -900,15 +898,14 @@ class Lender(Protocol):
             RuntimeError: The lender's manager is gone."""
         ...
 
-    def usable_end(self, present: Sequence[np.ndarray], *, known: int, limit: int) -> int:
-        """The largest whole-block end ``E``, ``known < E <= limit``, at which a NAMED fetch
-        ``[known, E)`` resumes once its every lent row arrived, given the rows the store holds:
-        ``present[lg][b]`` says block ``b`` of layer group ``lg`` is held (``page_layout``'s
-        ``layer_groups`` order; blocks past an array's end are not). Every row ``lend_write`` lends
-        for ``[known, E)`` must be held: full attention needs every block from ``known`` to ``E``,
-        a window its sinks and the blocks it keeps at ``E``. ``known`` where no such end exists.
-        Without a window every end below a usable one is usable too; with one, in general only the
-        ends a publication reached are.
+    def usable_end(self, present: Sequence[np.ndarray], *, limit: int) -> int:
+        """The largest whole-block end ``E <= limit`` at which a NAMED fetch ``[0, E)`` resumes
+        once its every lent row arrived, given the rows the store holds: ``present[lg][b]`` says
+        block ``b`` of layer group ``lg`` is held (``page_layout``'s ``layer_groups`` order; blocks
+        past an array's end are not). Every row ``lend_write`` lends for ``[0, E)`` must be held:
+        full attention needs every block before ``E``, a window its sinks and the blocks it keeps
+        at ``E``. 0 where no such end exists. Without a window every end below a usable one is
+        usable too; with one, in general only the ends a publication reached are.
 
         Like ``prompt_object_keys`` it may run on any thread after attach.
 

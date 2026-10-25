@@ -61,7 +61,7 @@ class Lender:
     every block before it."""
 
     def __init__(self) -> None:
-        self.asked: list[tuple] = []  # (present, known, limit) of each usable_end
+        self.asked: list[tuple] = []  # (present, limit) of each usable_end
 
     def prompt_object_keys(self, tokens, *, cache_salt, layer_group_index, num_blocks, shares):
         assert cache_salt == "tenant"
@@ -70,8 +70,8 @@ class Lender:
             dtype=np.uint8,
         )
 
-    def usable_end(self, present, *, known, limit):
-        self.asked.append((np.array(present), known, limit))
+    def usable_end(self, present, *, limit):
+        self.asked.append((np.array(present), limit))
         held = np.logical_and.reduce(present, axis=0)[: limit // TPB]
         return (len(held) if held.all() else int(np.argmin(held))) * TPB
 
@@ -227,9 +227,9 @@ def test_the_probe_asks_the_lender_where_a_fetch_may_end_from_every_share_of_eac
         probe_until_answered(service, item)
     finally:
         service.stop(wait_s=WAIT_S)
-    ((present, known, limit),) = lender.asked
+    ((present, limit),) = lender.asked
     assert present.tolist() == [[True] * 6, [True, True, False, True, True, True]]
-    assert (known, limit) == (0, 5 * TPB)
+    assert limit == 5 * TPB
     assert item.store_hit_tokens == 2 * TPB
 
 

@@ -437,5 +437,5 @@ class ProbeService:
             offset += size
             # One mask per layer group: a block counts where every share of it is held.
             by_group = np.logical_and.reduceat(present, self._group_rows, axis=0)
-            answers.append(self._lender.usable_end(by_group, known=0, limit=prompt.answer_limit))
+            answers.append(self._lender.usable_end(by_group, limit=prompt.answer_limit))
         return answers

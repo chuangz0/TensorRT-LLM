@@ -1156,7 +1156,7 @@ class _ManagerLender:
         cache_salt: str | None,
         layer_group_index: int,
         num_blocks: int,
-        shares: Sequence[int] | None = None,
+        shares: Sequence[int],
     ) -> np.ndarray:
         """See ``Lender.prompt_object_keys``."""
         manager = self._manager_ref()
@@ -1169,13 +1169,11 @@ class _ManagerLender:
             self._tokens_per_block, scope, prompt_tokens, num_blocks
         )
         reuse_keys = np.frombuffer(b"".join(keys), dtype=np.uint8)
-        if shares is None:
-            return self._object_keys(layer_group_index, reuse_keys)
         return np.concatenate(
             [self._identity.object_keys(layer_group_index, reuse_keys, share) for share in shares]
         )
 
-    def usable_end(self, present: Sequence[np.ndarray], *, known: int, limit: int) -> int:
+    def usable_end(self, present: Sequence[np.ndarray], *, limit: int) -> int:
         """See ``Lender.usable_end``."""
         if self._no_names is not None:
             raise ValueError(f"this lender names no blocks: {self._no_names}")
@@ -1187,11 +1185,11 @@ class _ManagerLender:
                 f"{len(present)} masks of held blocks for {layout.num_layer_groups} layer groups"
             )
         tpb = self._tokens_per_block
-        first, last = int(known) // tpb, int(limit) // tpb
-        if last <= first:
-            return int(known)
-        # Candidate ends ``ends[i] * tpb``, every whole block in (known, limit].
-        ends = np.arange(first + 1, last + 1, dtype=np.int64)
+        last = int(limit) // tpb
+        if last <= 0:
+            return 0
+        # Candidate ends ``ends[i] * tpb``, every whole block in (0, limit].
+        ends = np.arange(1, last + 1, dtype=np.int64)
         usable = np.ones(len(ends), dtype=bool)
         for lg in range(layout.num_layer_groups):
             if lg in self._recurrent_groups or not self._named_groups[lg]:
@@ -1199,22 +1197,21 @@ class _ManagerLender:
             have = np.zeros(last, dtype=bool)
             mask = np.asarray(present[lg], dtype=bool)[:last]
             have[: len(mask)] = mask
-            have[:first] = True  # below ``known``: the request holds them
             # missing[b]: the blocks below b the store does not hold.
             missing = np.concatenate(([0], np.cumsum(~have)))
             window = layout.windows[lg]
-            if window is None:  # every block from ``known`` to the end
-                usable &= missing[ends] == missing[first]
+            if window is None:  # every block before the end
+                usable &= missing[ends] == 0
                 continue
             # lend_write lends the sinks [0, sinks_end) and the window [window_start, end) at each
             # end: the blocks around the stale range.
             sinks_end, window_start = _ranges._formula_stale_ranges(
                 int(window), int(layout.sink_blocks[lg]), tpb, ends * tpb
             )
-            usable &= missing[np.minimum(sinks_end, ends)] == missing[first]  # the sinks are held
-            usable &= missing[ends] == missing[np.clip(window_start, first, ends)]  # the window too
+            usable &= missing[np.minimum(sinks_end, ends)] == 0  # the sinks are held
+            usable &= missing[ends] == missing[np.clip(window_start, 0, ends)]  # the window too
         if not usable.any():
-            return int(known)
+            return 0
         return int(ends[np.flatnonzero(usable)[-1]]) * tpb
 
     def return_writes(
