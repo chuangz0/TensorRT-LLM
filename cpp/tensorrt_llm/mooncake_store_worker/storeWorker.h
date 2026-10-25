@@ -127,9 +127,8 @@ public:
     StoreWorker(StoreWorker const&) = delete;
     StoreWorker& operator=(StoreWorker const&) = delete;
 
-    //! Queues the rows and returns the operation's id. The caller names every row differently: the SDK
-    //! names put sessions and get targets by key, per client. Throws std::invalid_argument for bad rows
-    //! and std::runtime_error after drain; nothing is queued then.
+    //! Queues the rows and returns the operation's id. Throws std::invalid_argument for bad rows, a name
+    //! repeated included, and std::runtime_error after drain; nothing is queued then.
     uint64_t submit(bool isPut, Rows rows);
     //! Calls not started yet conclude their rows CANCELLED; running calls go on. Unknown ids are ignored.
     void cancel(uint64_t op);

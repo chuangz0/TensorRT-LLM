@@ -3,8 +3,8 @@
 """The native Mooncake driver's own rules, over the fake SDK through the store worker's test client:
 gets go before puts and puts leave a thread for gets, operations are cut into store calls, a cancel
 or a drain concludes the calls not started CANCELLED, a fault stops the rest of its operation and of
-its attempt, and rows as arrays are admitted by column. What both drivers share is pinned in
-``test_mooncake_driver.py``."""
+its attempt, rows as arrays are admitted by column, and an operation naming one object twice is
+refused. What both drivers share is pinned in ``test_mooncake_driver.py``."""
 
 from __future__ import annotations
 
@@ -130,6 +130,21 @@ def test_a_faulted_call_drops_the_calls_of_its_operation_not_started_yet() -> No
     rows = [RowIO(key(name), (buffer.span(i * SLOT, SLOT),)) for i, name in enumerate("ABC")]
     assert statuses(driver, driver.get(rows)) == ["fault", "cancelled", "cancelled"]
     assert [call.args[0] for call in fake.calls_to(GET)] == [[key("A")]]
+
+
+def test_an_operation_that_names_one_object_twice_is_refused_before_the_store() -> None:
+    """The SDK names get targets by key: a get of one key into two slots would answer READY for
+    both and fill one."""
+    fake = FakeMooncakeStore()
+    driver = native_driver(fake)
+    buffer = HostBuffer(2 * SLOT)
+    driver.register(buffer.address, buffer.nbytes, RegionLayout(SLOT, 2))
+    names = np.array([[0xA5], [0xA5]], dtype=np.uint8)
+    starts = np.array([[buffer.address], [buffer.address + SLOT]], dtype=np.int64)
+    with pytest.raises(DriverRejected, match="row 1 repeats an earlier row's key"):
+        driver.get_rows(RowArrays("t/v1/", names, starts, (SLOT,)))
+    assert [call for call in fake.calls if call.method.startswith("batch_")] == []
+    assert driver.drain(0.0) is True  # the refused operation holds nothing
 
 
 def test_rows_as_arrays_are_admitted_by_column_and_cut_where_a_registration_piece_begins() -> None:

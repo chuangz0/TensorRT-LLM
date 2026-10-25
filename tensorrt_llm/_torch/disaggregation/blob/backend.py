@@ -178,18 +178,25 @@ class RegionBinding:
 
         Raises:
             ConstructionRejected: Nothing is registered and the hold is released: there is no region
-                to register, or a registration failed with nothing escaping and the earlier ones
-                were revoked.
+                to register, a region's layout is refused, or a registration failed with nothing
+                escaping and the earlier ones were revoked.
             RuntimeError: A registration may be live; the hold is kept.
         """
         if not self.registered:  # a backend that could serve no row
             self._hold.release()
             raise ConstructionRejected("no region has slots in memory the store driver can access")
-        for index in sorted(self.registered):
+        layouts = {}
+        for index in sorted(self.registered):  # every layout is checked before any registration
             region = self.regions[index]
-            layout = RegionLayout(
-                region.slot_bytes, region.slot_count, region.layout_label, region.memory_kind
-            )
+            try:
+                layouts[index] = RegionLayout(
+                    region.slot_bytes, region.slot_count, region.layout_label, region.memory_kind
+                )
+            except ValueError as error:
+                self._hold.release()
+                raise ConstructionRejected(f"region:{index}: {error}") from error
+        for index, layout in layouts.items():
+            region = self.regions[index]
             try:
                 handle = self.driver.register(region.address, region.nbytes, layout)
             except Exception as error:

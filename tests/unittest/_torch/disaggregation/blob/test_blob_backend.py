@@ -945,6 +945,19 @@ def test_a_binding_with_no_region_to_register_is_rejected_and_lets_the_hold_go(
     assert hold.released and driver.live_registrations() == []
 
 
+def test_a_refused_region_layout_registers_nothing_and_lets_the_hold_go(
+    store: MemoryStore,
+) -> None:
+    """Every region's layout is checked before the first registration, so a bad later region
+    leaves nothing registered to revoke."""
+    bad = CpuRegion(SLOT_BYTES, 1)
+    bad.slot_bytes = 0  # a layout the store boundary refuses
+    driver, hold = MemoryDriver(store), FakeHold()
+    with pytest.raises(ConstructionRejected, match="region:1: bad layout"):
+        RegionBinding((CpuRegion(SLOT_BYTES, 1), bad), driver, hold).register()
+    assert hold.released and driver.live_registrations() == []
+
+
 @pytest.mark.parametrize(
     "failure", ["register_rejected", "register_overlaps", "register_escaped", "rollback_failed"]
 )
