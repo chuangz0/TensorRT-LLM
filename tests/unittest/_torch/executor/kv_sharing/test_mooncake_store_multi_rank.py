@@ -89,12 +89,28 @@ SIBLING = P[:FETCHED] + [_tokens.randrange(1000, 30000) for _ in range(200)]
 # A follow-up of P, the prompt windows serve: P's whole blocks, then 200 tokens of its own.
 P_END = P_BLOCKS * TOKENS_PER_BLOCK
 EXTENDS_P = P[:P_END] + [_tokens.randrange(1000, 30000) for _ in range(200)]
+
+
+@dataclass(frozen=True)
+class Prompts:
+    """A prompt a writer publishes, and a sibling that shares its first ``fetched`` tokens."""
+
+    prompt: list[int]
+    sibling: list[int]
+    fetched: int
+
+
+SHORT_PROMPTS = Prompts(P, SIBLING, FETCHED)
 # DeepSeek-V3.2's prompts pass its indexer's top-k (2048 tokens), so the sparse path runs: its
-# reader's queries pick their 2048 keys among fetched indexer keys. LONG_P is 96 blocks, its sibling
-# shares the first 80.
-LONG_P = [1000] + [_tokens.randrange(1000, 30000) for _ in range(96 * TOKENS_PER_BLOCK - 1)]
-LONG_FETCHED = 80 * TOKENS_PER_BLOCK
-LONG_SIBLING = LONG_P[:LONG_FETCHED] + [_tokens.randrange(1000, 30000) for _ in range(512)]
+# reader's queries pick their 2048 keys among fetched indexer keys. The prompt is 96 blocks, its
+# sibling shares the first 80.
+_long_prompt = [1000] + [_tokens.randrange(1000, 30000) for _ in range(96 * TOKENS_PER_BLOCK - 1)]
+_long_fetched = 80 * TOKENS_PER_BLOCK
+LONG_PROMPTS = Prompts(
+    _long_prompt,
+    _long_prompt[:_long_fetched] + [_tokens.randrange(1000, 30000) for _ in range(512)],
+    _long_fetched,
+)
 
 
 DEEPSEEK = "DeepSeek-V3-Lite/bf16"
@@ -376,14 +392,13 @@ def check_a_reader_fetches_exactly_and_each_object_is_put_once(
     monkeypatch: pytest.MonkeyPatch,
     name: str,
     cell: Cell,
-    prompt: list[int],
-    sibling: list[int],
-    fetched: int,
+    prompts: Prompts = SHORT_PROMPTS,
     **llm_args,
 ) -> None:
-    """A writer publishes ``prompt``, every object once, then serves ``sibling`` reusing their
-    first ``fetched`` tokens locally; a fresh reader fetches those from the store, serves the same
-    tokens and puts only its own new blocks."""
+    """A writer publishes the prompt, every object once, then serves its sibling reusing their
+    shared tokens locally; a fresh reader fetches those from the store, serves the same tokens and
+    puts only its own new blocks."""
+    prompt, sibling, fetched = prompts.prompt, prompts.sibling, prompts.fetched
     pinned = {"scheduling_params": ON_RANK_1} if cell.attention_dp else {}
     with pytest.MonkeyPatch.context() as writer_env:
         writer = cell_server(
@@ -429,7 +444,7 @@ def test_a_reader_of_each_model_class_and_layout_fetches_exactly_and_each_object
     store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
 ) -> None:
     check_a_reader_fetches_exactly_and_each_object_is_put_once(
-        store, tmp_path, monkeypatch, name, CELLS[name], P, SIBLING, FETCHED
+        store, tmp_path, monkeypatch, name, CELLS[name]
     )
 
 
@@ -454,9 +469,7 @@ def test_a_reader_with_deepseek_sparse_attention_fetches_its_mla_and_indexer_cac
         monkeypatch,
         "deepseek-v32-attention-dp4",
         cell,
-        LONG_P,
-        LONG_SIBLING,
-        LONG_FETCHED,
+        LONG_PROMPTS,
         moe_expert_parallel_size=4,
         max_seq_len=4096,
     )
