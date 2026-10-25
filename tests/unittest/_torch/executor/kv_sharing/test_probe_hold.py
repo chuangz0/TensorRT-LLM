@@ -356,13 +356,14 @@ def test_each_store_call_answers_its_own_requests_as_soon_as_it_returns(monkeypa
         service.stop(wait_s=WAIT_S)
 
 
-def test_a_request_holds_from_its_own_store_call_and_a_slow_call_releases_every_held_request(
+def test_a_request_holds_from_its_own_call_and_a_slow_call_releases_holds_without_a_pause(
     monkeypatch,
 ):
     """Queued behind another request's call, a request keeps its whole hold for its own call. A
     call that runs longer than one hold (a slow store) releases every held request; once it does
     answer it is no failure, and probing goes on."""
     monkeypatch.setattr(probe_module, "PROBE_KEYS_PER_CALL", 6)  # one 6-block prompt per call
+    # One failure would pause probing: the slow call must not count as one.
     monkeypatch.setattr(breaker_module, "FAILURES_TO_PAUSE", 1)
     now = [0.0]
 
@@ -410,8 +411,8 @@ def test_a_request_holds_from_its_own_store_call_and_a_slow_call_releases_every_
         assert third.store_hit_tokens is None and fourth.store_hit_tokens is None
         assert service.counters["held_past_limit"] == 2
 
-        # The slow call answers (fourth's prompt, released, is not asked), and the thread records
-        # it at its return, before the fifth request's call.
+        # The slow call answers; its outcome counts at its return, before the next call starts.
+        # The fourth left unprobed, so that next call is the fifth request's.
         driver.gates[2].set()
         wait_for(lambda: driver.returned == 3)
         fifth = request_item(5)

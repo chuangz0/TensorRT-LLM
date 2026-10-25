@@ -28,6 +28,10 @@ from tensorrt_llm._torch.disaggregation._assembly import RegionNamespace
 from tensorrt_llm._torch.disaggregation.base.backend import Capabilities, Outcome
 from tensorrt_llm._torch.disaggregation.lifecycle.retirement import RetirementWatchdog
 from tensorrt_llm._torch.disaggregation.transfer_manager import LifecycleBinding, TransferManager
+from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
+    STORE_UPDATE_REQUEST_ID,
+    RequestQueueItem,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     LeaseView,
     LentLayerGroupRows,
@@ -403,8 +407,8 @@ def test_a_refused_lend_drops_its_fetch_and_sharing_goes_on(server):
 
 @pytest.mark.parametrize("failure", ["a lend raises", "the lender stops on its own"])
 def test_a_stopped_lender_ends_a_one_gpu_server(server, failure):
-    """Also on one GPU, a lend that raises or a lender that stops ends the server: its KV cache
-    may no longer match its store operations."""
+    """A lend that raises or a lender that stops ends a one-GPU server: its KV cache may no longer
+    match its store operations."""
     if failure == "a lend raises":
         server.lender.lend_error = RuntimeError("the lender stopped")
         with pytest.raises(RuntimeError, match="a lend failed: the lender stopped; .* ends the"):
@@ -465,8 +469,8 @@ def test_a_publication_the_store_faulted_counts_as_failed(server):
 def test_faulted_publications_in_a_row_pause_publishing_and_a_refused_lend_is_no_failure(
     server, monkeypatch
 ):
-    """Alone, a server pauses its publications after failures in a row and publishes again once
-    the pause passed; a lend the lender refused never reached the store, so it counts no
+    """A server on its own table pauses its publications after failures in a row and publishes
+    again once the pause passed; a lend the lender refused never reached the store, so it counts no
     failure."""
     monkeypatch.setattr(breaker_module, "FAILURES_TO_PAUSE", 2)
     monkeypatch.setattr(breaker_module, "PAUSE_S", 0.2)
@@ -676,8 +680,8 @@ def test_a_gpu_direct_publication_that_can_never_fit_is_dropped_once_and_logged(
 def test_under_tensor_parallelism_a_stopped_store_binding_ends_the_server_before_the_round(
     monkeypatch,
 ):
-    """One rank's store binding stops: that rank's shares would go unread and unwritten, so the
-    server ends at the next round, before its collective."""
+    """One rank's store binding stops: the server ends at the next round, before its collective,
+    so no peer waits in it."""
 
     def collective(report):
         pytest.fail("the round entered its collective")
@@ -696,7 +700,8 @@ def test_under_tensor_parallelism_a_stopped_store_binding_ends_the_server_before
 
 def test_refreshed_hits_update_only_waiting_requests(server):
     waiting = [SimpleNamespace(id=1, store_hit_tokens=8), SimpleNamespace(id=2, store_hit_tokens=8)]
-    server.orchestrator.apply_store_update(waiting, ((1, 16), (9, 4)), None)  # 9 no longer waits
+    update = RequestQueueItem(STORE_UPDATE_REQUEST_ID, store_hits=((1, 16), (9, 4)))
+    server.orchestrator.apply_store_update(waiting, update)  # 9 no longer waits
     assert [item.store_hit_tokens for item in waiting] == [16, 8]
     assert server.counters["hits_refreshed"] == 1
 

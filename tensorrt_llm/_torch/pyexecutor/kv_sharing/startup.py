@@ -129,16 +129,14 @@ def start_kv_sharing(
             "kv_sharing fetches through the KV cache manager v2 scheduler; this executor built "
             f"{type(py_executor.scheduler).__name__}"
         )
-    # Facts of the model every rank reads alike: refused before any collective or store work.
+    # Every rank reads these model facts alike, so each refuses on its own, before any collective,
+    # checkpoint read or store work.
     model_config = py_executor.model_engine.model.model_config
-    unserved = [
-        fact
-        for fact, applies in (
-            ("sparse attention", model_config.sparse_attention_config is not None),
-            ("recurrent state", isinstance(manager, MambaHybridCacheManagerV2)),
-        )
-        if applies
-    ]
+    unserved: list[str] = []
+    if model_config.sparse_attention_config is not None:
+        unserved.append("sparse attention")
+    if isinstance(manager, MambaHybridCacheManagerV2):
+        unserved.append("recurrent state")
     if unserved:
         raise ValueError(
             f"{SUPPORTED_MODELS}; this server is refused: the model has {' and '.join(unserved)}"
@@ -166,7 +164,7 @@ def start_kv_sharing(
     tokens_per_block = manager.tokens_per_block
     fetch_tokens = max(config.max_fetch_tokens, max_num_tokens)
 
-    def attach() -> tuple[_Attached, _RankFacts]:
+    def attach() -> tuple[tuple[_Attached, Optional[TextIO]], _RankFacts]:
         driver = make_store_driver(
             store,
             mooncake,
@@ -174,9 +172,13 @@ def start_kv_sharing(
             allocation_range=allocation_range if memory_kind is MemoryKind.DEVICE else None,
         )
         profile_of = functools.partial(_profile, py_executor, llm_args, identity_by_rank[0])
-        return _attach(manager, profile_of, memory_kind, fetch_tokens, driver, blob_config)
+        attached, facts = _attach(
+            manager, profile_of, memory_kind, fetch_tokens, driver, blob_config
+        )
+        # Last, so a failed attach leaves no trace file behind.
+        return (attached, _open_trace(dist.rank)), facts
 
-    attached, facts_by_rank = _agree(dist, attach)
+    (attached, trace), facts_by_rank = _agree(dist, attach)
     if len({facts.scope for facts in facts_by_rank}) > 1:
         raise ValueError("kv_sharing: the ranks would name blocks differently")
     attention_dp = py_executor.enable_attention_dp
@@ -240,7 +242,7 @@ def start_kv_sharing(
         min_over_ranks=min_over_ranks,
         replicas=replicas,
         decides_publishing=min_over_ranks is None or dist.rank == 0,
-        trace=_open_trace(dist.rank),
+        trace=trace,
     )
     py_executor.kv_sharing = orchestrator
     py_executor.scheduler.store_fetches = orchestrator

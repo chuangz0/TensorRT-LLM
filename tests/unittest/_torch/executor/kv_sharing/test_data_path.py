@@ -108,27 +108,35 @@ def test_a_client_that_does_not_open_on_one_rank_refuses_the_server_on_every_ran
 
     monkeypatch.setattr(data_path, "open_sdk", unreachable)
     monkeypatch.setattr(data_path, "prepare_gpu_direct", lambda protocol: None)
+    # Rank 0 opened its store and can take GPU Direct: _agree gathers (error, shared result).
     rank_1 = SimpleNamespace(world_size=2, allgather=lambda own: [(None, None), own])
     with pytest.raises(ValueError, match="rank 1: kv_sharing: the store could not be opened"):
         startup._agree(rank_1, lambda: data_path.open_store("auto", CONFIG))
 
 
-@pytest.mark.parametrize("half", ["host", "device"])
-def test_a_half_of_the_check_that_does_not_answer_in_time_fails(store, monkeypatch, half) -> None:
-    """A stalled host half is the store's failure; a stalled device half only GPU Direct's."""
+def test_a_host_round_trip_that_does_not_answer_in_time_refuses_the_store(
+    store, monkeypatch
+) -> None:
+    monkeypatch.setattr(data_path, "STORE_CHECK_TIMEOUT_S", 0.2)
+    release = store.block("batch_put_session_start").release
+    timeout = "a round trip through host memory: no answer within 0.2 s"
+    try:
+        with pytest.raises(RuntimeError, match=re.escape(timeout)):
+            data_path.check_store(store, None)
+    finally:
+        release.set()
+    assert check_thread_ended()
+
+
+def test_a_device_round_trip_that_does_not_answer_in_time_rules_out_gpu_direct(
+    store, monkeypatch
+) -> None:
     monkeypatch.setattr(data_path, "STORE_CHECK_TIMEOUT_S", 0.2)
     release = threading.Event()
-    if half == "host":
-        release = store.block("batch_put_session_start").release
-    else:
-        monkeypatch.setattr(data_path, "_device_round_trip", lambda *args: release.wait(5))
-    timeout = f"a round trip through {half} memory: no answer within 0.2 s"
+    monkeypatch.setattr(data_path, "_device_round_trip", lambda *args: release.wait(5))
+    timeout = "a round trip through device memory: no answer within 0.2 s"
     try:
-        if half == "host":
-            with pytest.raises(RuntimeError, match=re.escape(timeout)):
-                data_path.check_store(store, None)
-        else:
-            assert data_path.check_store(store, None) == timeout
+        assert data_path.check_store(store, None) == timeout
     finally:
         release.set()
     assert check_thread_ended()

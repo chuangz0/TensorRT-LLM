@@ -34,6 +34,7 @@ pytestmark = pytest.mark.cpu_only
 
 FETCH, PUBLISH = OpKind.FETCH, OpKind.PUBLISH
 PARKED, SETTLING, OPEN = OpState.PARKED, OpState.SETTLING, OpState.OPEN
+GPU_DIRECT, HOST_STAGING = True, False
 DONE_READY = (1, 1, 1)
 NOT_DONE = (0, 0, 1)
 
@@ -61,65 +62,65 @@ def actions(decisions) -> list[str]:
 
 
 CASES = {
-    # (GPU Direct, entries as (seq, kind, state), rank 0's and rank 1's columns) -> decisions
+    # (data path, entries as (seq, kind, state), rank 0's and rank 1's columns) -> decisions
     "every row arrived in time, host staging: settle the copy first": (
-        False,
+        HOST_STAGING,
         [(1, FETCH, PARKED)],
         [DONE_READY],
         [DONE_READY],
         ["return_all 1", "settle 1"],
     ),
     "every row arrived in time, GPU Direct: resume at once": (
-        True,
+        GPU_DIRECT,
         [(1, FETCH, PARKED)],
         [DONE_READY],
         [DONE_READY],
         ["return_all 1", "resume 1"],
     ),
     "the copy settled on every rank: resume": (
-        False,
+        HOST_STAGING,
         [(1, FETCH, SETTLING)],
         [DONE_READY],
         [DONE_READY],
         ["resume 1"],
     ),
     "the copy settled on one rank only: wait": (
-        False,
+        HOST_STAGING,
         [(1, FETCH, SETTLING)],
         [DONE_READY],
         [(0, 1, 1)],
         [],
     ),
     "a short delivery, or a lend refused, on one rank: drop": (
-        False,
+        HOST_STAGING,
         [(1, FETCH, PARKED)],
         [DONE_READY],
         [(1, 0, 1)],
         ["return_none 1", "drop 1 short"],
     ),
     "one rank still reading: wait": (
-        False,
+        HOST_STAGING,
         [(1, FETCH, PARKED)],
         [DONE_READY],
         [NOT_DONE],
         [],
     ),
     "one rank late while another still reads: abandon, drop, keep the lease": (
-        False,
+        HOST_STAGING,
         [(1, FETCH, PARKED)],
         [(0, 0, 0)],
         [DONE_READY],
         ["abandon 1", "drop 1 late"],
     ),
     "late and done in one round: no resume": (
-        False,
+        HOST_STAGING,
         [(1, FETCH, PARKED)],
         [(1, 1, 0)],
         [DONE_READY],
         ["return_none 1", "drop 1 late"],
     ),
     "an open lease goes back once every rank's access ended": (
-        False,
+        HOST_STAGING,
         [(1, PUBLISH, OPEN), (2, FETCH, OPEN)],
         [DONE_READY, DONE_READY],
         [NOT_DONE, DONE_READY],

@@ -6662,15 +6662,14 @@ class PyExecutor:
             with self.hang_detector.pause():
                 fetched = self.executor_request_queue.get_from_request_queue(
                     timeout)
-            store_update = None
             if kv_sharing is not None:
                 fetched, store_update = kv_sharing.take_rank0_items(
                     fetched, waiting_queue)
+                if store_update is not None:
+                    # First, so a shutdown or control item ending the envelope
+                    # does not cut it off.
+                    new_requests.insert(0, store_update)
             new_requests.extend(fetched)
-            if store_update is not None:
-                # First, so a shutdown or control item ending the envelope
-                # does not cut it off.
-                new_requests.insert(0, store_update)
 
         if connector is not None and self.dist.rank == 0:
             completed = connector.take_finished_prefix_loads()
@@ -7002,9 +7001,7 @@ class PyExecutor:
                 finished_prefix_load_ids.extend(
                     req_item.finished_prefix_load_ids)
             elif req_item.is_store_update_request:
-                self.kv_sharing.apply_store_update(self.waiting_queue,
-                                                   req_item.store_hits,
-                                                   req_item.store_publishing)
+                self.kv_sharing.apply_store_update(self.waiting_queue, req_item)
             elif req_item.is_shutdown_request:
                 self.is_shutdown = True
                 if self.kv_sharing is not None:

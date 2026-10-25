@@ -55,8 +55,9 @@ NO_WAIT = datetime.timedelta(0)
 # last range is exempt: its request is freed soon after, and the range is then lost.
 MAX_OPEN_PUBLICATIONS = 8
 # Lends wait for an event recorded on the execution stream, and a lease in place waits for its
-# event's latest record. So each lending phase takes the next event of this ring (at most three
-# phases per iteration): an event is recorded again two iterations later at the earliest.
+# event's latest record: recording that event again would hold the lease behind a newer forward.
+# So each lending phase (at most three per iteration) takes the next event of this ring, and an
+# event is recorded again two iterations later at the earliest.
 READY_EVENTS = 8
 
 
@@ -171,14 +172,16 @@ class SharedKvOrchestrator:
     """Fetches stored prompt prefixes for new requests and publishes the whole prompt blocks each
     context step commits.
 
-    Publishing pauses after failed publications in a row (a ``Breaker``): on its own table, each
-    rank by its own; with a shared table, rank 0 decides and every rank applies its switch from
-    the store-update item before activation, so all ranks stop and start appending publications
-    in the same pass.
+    Publishing pauses after failed publications in a row (a ``Breaker``). A rank with a table of
+    its own decides by its own breaker; with a shared table, rank 0 decides and every rank applies
+    its switch from the store-update item before activation, so all ranks stop and start appending
+    publications in the same pass.
 
-    Every store operation is an entry of one table (``store_ops``); only
-    ``resolve_store_operations`` closes entries. Under attention DP each rank's table holds its
-    own requests' operations.
+    Every store operation is an entry of one table (``store_ops``). Entries are appended and
+    closed only where every rank runs the same code with the same inputs: the round
+    (``resolve_store_operations``) closes them by ``decide``, and a cancel or the shutdown request
+    closes a settling fetch at once. Under attention DP each rank's table holds its own requests'
+    operations.
 
     Args:
         policy: What the server does with the store.
@@ -275,16 +278,8 @@ class SharedKvOrchestrator:
         self._resume_window_pages = self._pages_held(
             kv_cache_manager.max_seq_len + self._tokens_per_block
         )
-        _, total_pages = kv_cache_manager.get_primary_block_counts()
-        # The shortest prompt that fetches: min_fetch_tokens before its last token, plus one step.
-        shortest_fetch = self._pages_held(policy.min_fetch_tokens + 1 + self._tokens_per_block)
-        if probe is not None and self._resume_room(total_pages) < shortest_fetch:
-            logger.warning(
-                "kv_sharing: no request can fetch from the store: max_util_for_resume "
-                f"({policy.max_util_for_resume}) of the KV cache's {total_pages} pages, less the "
-                f"resume of a max_seq_len ({kv_cache_manager.max_seq_len}) request, leaves no "
-                "room for one fetch; set max_seq_len lower or give the KV cache more memory"
-            )
+        if probe is not None:  # rank 0 of a server that fetches
+            self._warn_if_no_fetch_fits()
 
     @property
     def memory_kind(self) -> MemoryKind:
@@ -296,27 +291,25 @@ class SharedKvOrchestrator:
     def take_rank0_items(
         self, fetched: list[RequestQueueItem], waiting: Iterable[RequestQueueItem]
     ) -> tuple[list[RequestQueueItem], Optional[RequestQueueItem]]:
-        """Rank 0, after reading the request queue: the fetched items to broadcast now (new
-        requests wait for their probe's answer), and the store-update item, where the store hit of
-        a waiting request changed since its last probe or the publishing switch changed (a pause
-        began or ended); every rank applies it before activation. The hits are taken before the
-        hold releases requests: a released request joins the waiting queue only after the
-        broadcast, and a refresh scan forgets hits not in the waiting queue."""
+        """Rank 0, after reading the request queue: the fetched items to broadcast now (a new
+        request waits for its probe's answer), and the store-update item every rank applies before
+        activation, or None when no waiting request's hit and no publishing switch changed."""
         hits: tuple[tuple[int, int], ...] = ()
         if self._probe is not None:
+            # Hits first: the refresh forgets hits not in ``waiting``, and a request the hold
+            # releases joins ``waiting`` only after this broadcast.
             if self._admitting:
                 hits = self._probe.take_refreshed_hits(waiting)
             fetched = self._probe.hold_until_probed(fetched)
-        publishing = None
-        if self._shared_table:
+        switch = None
+        if self._shared_table:  # rank 0 of a shared table holds the publication breaker
             allowed = self._publication_breaker.allows(time.monotonic())
-            publishing = None if allowed == self._publishing else allowed
-        if not hits and publishing is None:
+            switch = None if allowed == self._publishing else allowed
+        if not hits and switch is None:
             return fetched, None
-        update = RequestQueueItem(
-            STORE_UPDATE_REQUEST_ID, store_hits=hits, store_publishing=publishing
+        return fetched, RequestQueueItem(
+            STORE_UPDATE_REQUEST_ID, store_hits=hits, store_publishing=switch
         )
-        return fetched, update
 
     def request_queue_wait(
         self, timeout: Optional[datetime.timedelta]
@@ -351,20 +344,18 @@ class SharedKvOrchestrator:
         self._announced = entries
 
     def apply_store_update(
-        self,
-        waiting: Iterable[RequestQueueItem],
-        hits: tuple[tuple[int, int], ...],
-        publishing: Optional[bool],
+        self, waiting: Iterable[RequestQueueItem], update: RequestQueueItem
     ) -> None:
-        """Sets the store hit of each waiting request rank 0 measured again, and switches
-        publishing as rank 0 decided (None: unchanged). Runs at the store-update item, before any
-        request of the broadcast is activated, so every rank admits from the same hit and appends
-        the same publications."""
-        by_id = dict(hits)
+        """Applies rank 0's store-update item: sets the store hit of each waiting request rank 0
+        measured again, and switches publishing as rank 0 decided (None: unchanged). Runs before
+        any request of the broadcast is activated, so every rank admits from the same hit and
+        appends the same publications."""
+        by_id = dict(update.store_hits)
         for item in waiting:
             if item.id in by_id:
                 item.store_hit_tokens = by_id[item.id]
                 self.counters["hits_refreshed"] += 1
+        publishing = update.store_publishing
         if publishing is not None:
             self._publishing = publishing
             if not publishing:  # the ranges waiting to be published are dropped
@@ -796,7 +787,7 @@ class SharedKvOrchestrator:
         """Whether the request's whole prompt plus one step fits in free pages, and the pages
         nothing may evict stay within the manager's resume budget with it."""
         used, total = self._kv_cache_manager.get_primary_block_counts()
-        need = self._pages_of(request)
+        need = self._pages_of(request.prompt_len)
         return need <= total - used and self._pinned_pages() + need <= self._resume_room(total)
 
     def _pinned_pages(self) -> int:
@@ -812,12 +803,12 @@ class SharedKvOrchestrator:
                 for op in self._ops
                 if op.kind is OpKind.PUBLISH and op.request_id in holders
             }
-            pinned += sum(self._pages_of(request) for request in locked.values())
+            pinned += sum(self._pages_of(request.prompt_len) for request in locked.values())
         return pinned + sum(self._lender.deferred_close_page_counts().values())
 
-    def _pages_of(self, request: LlmRequest) -> int:
-        """The request's whole prompt and one step."""
-        return self._pages_held(request.prompt_len + self._tokens_per_block)
+    def _pages_of(self, prompt_len: int) -> int:
+        """The pages of a whole prompt of ``prompt_len`` tokens and one step."""
+        return self._pages_held(prompt_len + self._tokens_per_block)
 
     def _pages_held(self, tokens: int) -> int:
         """The pages one request holding ``tokens`` tokens takes over every layer group: a
@@ -828,6 +819,22 @@ class SharedKvOrchestrator:
     def _resume_room(self, total_pages: int) -> int:
         """The pages the manager may hold pinned and still resume its largest request."""
         return int(self._policy.max_util_for_resume * total_pages) - self._resume_window_pages
+
+    def _warn_if_no_fetch_fits(self) -> None:
+        """At startup: where the resume room cannot hold the shortest fetch, no request ever
+        fetches."""
+        _, total_pages = self._kv_cache_manager.get_primary_block_counts()
+        room = self._resume_room(total_pages)
+        # The shortest prompt that fetches: min_fetch_tokens, then the last token it computes.
+        needed = self._pages_of(self._policy.min_fetch_tokens + 1)
+        if room < needed:
+            logger.warning(
+                f"kv_sharing: no request can fetch from the store: one fetch needs {needed} KV "
+                f"cache pages, and max_util_for_resume ({self._policy.max_util_for_resume}) of "
+                f"the {total_pages} pages leaves {max(room, 0)} beside the resume of one "
+                f"max_seq_len ({self._kv_cache_manager.max_seq_len}) request; set max_seq_len "
+                "lower or give the KV cache more memory"
+            )
 
     # Publication.
 
@@ -849,7 +856,7 @@ class SharedKvOrchestrator:
                     self.counters["publication_waits"] += 1
                     return  # staging frees in order: the ranges behind wait too
             else:  # under GPU Direct a range waits on its own
-                pages = self._pages_of(request)
+                pages = self._pages_of(request.prompt_len)
                 if pages > locks.room:  # even with nothing else pinned
                     request.py_published_end = request.prompt_len  # its later chunks too
                     del self._unpublished[request.py_request_id]
@@ -956,7 +963,7 @@ class SharedKvOrchestrator:
                 ready_event=ready,
             )
         except RuntimeError as error:  # the lender lends no more
-            self._store_failed(f"a lend failed: {error}")
+            self._store_failed(f"a lend failed: {error}", cause=error)
         if lease.failure is not None:
             lease.release()  # a lend refused at the call holds no lock, slot or fetch
             # One warning per kind of reason: positions and request ids do not make a new one.
@@ -974,6 +981,7 @@ class SharedKvOrchestrator:
         )
         result = self._transfers.submit(lease, intent)
         if not isinstance(result, Accepted):
+            lease.release()  # nothing else holds it
             self._store_failed(f"the transfer manager refused an operation: {result.reason}")
         op.operation_id = result.operation_id
         self._submitted_this_pass = True
@@ -988,15 +996,15 @@ class SharedKvOrchestrator:
             return start
         return [0 if windowed else start for windowed in self._windowed_groups]
 
-    def _store_failed(self, reason: str) -> NoReturn:
-        """This rank's lender or store binding stopped: the server ends, as this rank's KV cache
-        and locks may no longer follow its store operations, nor under tensor parallelism its
-        peers'. With several ranks the executor's rank-crash path then kills every rank
+    def _store_failed(self, reason: str, cause: Optional[Exception] = None) -> NoReturn:
+        """Raises, ending the server: this rank's lender or store binding stopped, so this rank's
+        KV cache and locks may no longer follow its store operations, nor under tensor parallelism
+        its peers'. With several ranks the executor's rank-crash path then kills every rank
         (``hard_kill_on_rank_crash``), so peers waiting in a collective do not hang."""
         raise RuntimeError(
             f"kv_sharing: {reason}; a store failure ends the server, as this rank's KV cache may no "
             "longer match its store operations"
-        )
+        ) from cause
 
     def _free_cache(self, request: LlmRequest) -> None:
         if request.py_request_id in self._kv_cache_manager.kv_cache_map:

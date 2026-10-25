@@ -2820,7 +2820,8 @@ class KvSharingConfig(StrictBaseModel):
         default=50.0,
         description="Longest a new request waits for the store to say how "
         "much of its prompt it holds before it is scheduled without fetching; "
-        "0 never makes a request wait for the store.")
+        "with 0 no request waits for the store, so a fresh request on an idle "
+        "server never fetches.")
     fetch_timeout_s: float = Field(
         default=5.0,
         gt=0,
@@ -7034,9 +7035,10 @@ class TorchLlmArgs(BaseLlmArgs):
     kv_sharing: Optional[KvSharingConfig] = Field(
         default=None,
         description="Share prompt KV cache blocks with other servers through "
-        "a KV store. In disaggregated serving, set it on context servers: a "
-        "generation server gains nothing unless conditional disaggregation "
-        "lets it prefill requests itself.",
+        "a KV store. Set it on aggregated and context servers, not on "
+        "generation servers: a generation server gains nothing unless "
+        "conditional disaggregation lets it prefill requests itself, and loses "
+        "the reuse of its generated blocks.",
         status="prototype",
     )
 

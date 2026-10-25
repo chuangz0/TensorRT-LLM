@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Which setups ``kv_sharing`` accepts: the LLM argument's checks where the user builds the args,
-and startup's refusal of model facts only the built executor knows."""
+startup's refusal of model facts only the built executor knows, and the store driver each data
+path gets."""
 
 import re
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_sharing import startup
 from tensorrt_llm._torch.pyexecutor.kv_sharing.startup import start_kv_sharing
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -96,13 +98,48 @@ def test_startup_refuses_a_model_with_sparse_attention_or_recurrent_state_before
     hybrid model's recurrent state shows in the manager built for it."""
     hybrid = fact == "recurrent state"
     manager = object.__new__(MambaHybridCacheManagerV2 if hybrid else KVCacheManagerV2)
+    sparse_attention_config = None if hybrid else object()
+    # No collective, store or checkpoint work may start.
+    built = executor(manager, sparse_attention_config, dist=None)
+    with pytest.raises(ValueError, match=f"this server is refused: the model has {fact}$"):
+        start_kv_sharing(built, llm_args(store_config), checkpoint_dir=None, max_num_tokens=64)
+
+
+@pytest.mark.parametrize(
+    "data_path, device_memory", [("host_staging", False), ("gpu_direct", True)]
+)
+def test_the_store_driver_registers_device_memory_only_under_gpu_direct(
+    store_config: str, tmp_path, monkeypatch, data_path: str, device_memory: bool
+) -> None:
+    """Under host staging the store reads and writes host memory only. One rank, a store that
+    opens and checks as the data path asks; startup stops at attach, past the driver it made."""
+    gpu_direct_error = None if data_path == "gpu_direct" else "host staging was asked for"
+    monkeypatch.setattr(startup, "open_store", lambda requested, mooncake: (None, gpu_direct_error))
+    monkeypatch.setattr(startup.ArtifactIdentity, "from_checkpoint", lambda checkpoint: None)
+    drivers = []
+
+    def stop_at_attach(manager, profile_of, memory_kind, fetch_tokens, driver, blob_config):
+        drivers.append(driver)
+        raise RuntimeError("stopped at attach")
+
+    monkeypatch.setattr(startup, "_attach", stop_at_attach)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.tokens_per_block = 32
+    built = executor(manager, None, dist=SimpleNamespace(rank=0, world_size=1))
+    args = llm_args(store_config, {"data_path": data_path})
+    with pytest.raises(RuntimeError, match="stopped at attach"):
+        start_kv_sharing(built, args, checkpoint_dir=str(tmp_path), max_num_tokens=64)
+    (driver,) = drivers
+    assert driver.capabilities.device_memory is device_memory
+
+
+def executor(manager: KVCacheManagerV2, sparse_attention_config, dist) -> SimpleNamespace:
+    """A built executor as startup reads it, with block reuse and the V2 scheduler."""
     manager.enable_block_reuse = True
-    model_config = SimpleNamespace(sparse_attention_config=None if hybrid else object())
-    executor = SimpleNamespace(
+    model_config = SimpleNamespace(sparse_attention_config=sparse_attention_config)
+    return SimpleNamespace(
         kv_cache_manager=manager,
         scheduler=object.__new__(KVCacheV2Scheduler),
         model_engine=SimpleNamespace(model=SimpleNamespace(model_config=model_config)),
-        dist=None,  # no collective, store or checkpoint work may start
+        dist=dist,
     )
-    with pytest.raises(ValueError, match=f"this server is refused: the model has {fact}$"):
-        start_kv_sharing(executor, llm_args(store_config), checkpoint_dir=None, max_num_tokens=64)

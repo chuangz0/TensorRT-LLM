@@ -4,10 +4,11 @@
 
 Every rank of a tensor-parallel group keeps the same ordered table: entries are appended only by
 code that runs alike on every rank with the same inputs, whatever this rank's own lend or submit
-did, and only a round removes them. Rank 0 announces how many entries a round covers; each rank
-reports on its first open ones, every report padded to that length, and the round reduces the
-reports (the minimum over ranks; the identity on one rank). Every rank turns the reduced report
-into the same decisions with ``decide``, which reads nothing but its arguments.
+did, and closed only where every rank acts alike (a round, a cancel, the shutdown request). Rank 0
+announces how many entries a round covers; each rank reports on its first open ones, every report
+padded to that length, and the round reduces the reports (the minimum over ranks; the identity on
+one rank). Every rank turns the reduced report into the same decisions with ``decide``, which
+reads nothing but its arguments.
 """
 
 from __future__ import annotations
@@ -72,7 +73,7 @@ class StoreOp:
     @property
     def request_waits(self) -> bool:
         """A parked or settling fetch: its request waits for it. Only fetches park or settle."""
-        return self.state is not OpState.OPEN
+        return self.state in (OpState.PARKED, OpState.SETTLING)
 
 
 class Action(enum.Enum):

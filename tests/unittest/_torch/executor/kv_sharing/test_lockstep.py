@@ -30,7 +30,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import pytest
@@ -109,7 +109,7 @@ class Group:
         assert len({len(v) for v in vectors}) == 1, f"reports of different lengths: {vectors}"
         return np.minimum.reduce(vectors)
 
-    def broadcast(self, rank: int, value: int) -> int:
+    def broadcast(self, rank: int, value: Any) -> Any:
         return self._exchange(rank, "broadcast", value)[0]
 
 
@@ -421,11 +421,10 @@ def run_rank(
         orchestrator.resolve_store_operations()
         record.parked.append({op.seq for op in orchestrator._ops if op.state is OpState.PARKED})
         orchestrator.round_announced(group.broadcast(rank, orchestrator.round_to_announce()))
-        switch = None
-        if rank == 0:
-            _, update = orchestrator.take_rank0_items([], [])
-            switch = None if update is None else update.store_publishing
-        orchestrator.apply_store_update([], (), group.broadcast(rank, switch))
+        update = orchestrator.take_rank0_items([], [])[1] if rank == 0 else None
+        update = group.broadcast(rank, update)
+        if update is not None:
+            orchestrator.apply_store_update([], update)
         if rank == 1 and diverge_at is not None and iteration >= diverge_at and orchestrator._ops:
             head = orchestrator._ops[0]
             extra = StoreOp(0, OpKind.PUBLISH, head.request, OpState.OPEN, 0, TPB)
