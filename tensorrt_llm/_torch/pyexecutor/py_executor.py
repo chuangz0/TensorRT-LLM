@@ -9071,6 +9071,13 @@ class PyExecutor:
 
         failed_requests = (list(self.active_requests)
                            if requests is None else requests)
+        if self.kv_sharing is not None:
+            # A request parked for a store fetch fails now, like any other: its
+            # fetch lets it go first, so it no longer reads as in transfer and
+            # the orchestrator forgets it (a GPU Direct lease's lock keeps the
+            # pages from reuse until a round returns the lease).
+            for request in failed_requests:
+                self.kv_sharing.cancel_fetch(request)
         if not is_fatal:
             # Async work enqueued before the failure -- the model engine's
             # input H2D copy in particular -- can still be reading the failed

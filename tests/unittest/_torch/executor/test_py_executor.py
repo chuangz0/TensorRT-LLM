@@ -4502,6 +4502,66 @@ def test_a_parked_requests_cancel_responds_in_the_pass_it_arrives():
     assert executor._pending_response_terminations == [parked]
 
 
+@pytest.mark.parametrize("disaggregated", [False, True], ids=["aggregated", "context_server"])
+def test_a_forward_error_while_a_fetch_is_parked_fails_the_request_at_once(disaggregated):
+    """kv_sharing: a forward error fails every active request, one parked for a store fetch
+    too. Its fetch lets it go first, so no store write lands in its pages afterwards and the
+    orchestrator forgets it; on a disaggregated context server the parked state no longer reads
+    as a KV transfer that owns the request's blocks, so its failure is not deferred."""
+    parked, computing = (
+        types.SimpleNamespace(
+            py_request_id=request_id,
+            py_client_id=100 + request_id,
+            context_remaining_length=0,
+            context_current_position=8,
+            state=state,
+        )
+        for request_id, state in (
+            (1, LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS),
+            (2, LlmRequestState.GENERATION_IN_PROGRESS),
+        )
+    )
+    order = []
+
+    def cancel_fetch(request):
+        order.append(("cancel_fetch", request.py_request_id))
+        if request is not parked:
+            return False
+        request.state = LlmRequestState.CONTEXT_INIT
+        return True
+
+    executor = object.__new__(PyExecutor)
+    executor._error_budget = Mock()
+    executor._error_budget.consume.return_value = False
+    executor._fatal_error = None
+    executor.enable_attention_dp = False
+    executor.dist = Mock(world_size=1)
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor._transfer_held_failures = {}
+    executor.kv_cache_transceiver = Mock() if disaggregated else None
+    if disaggregated:
+        executor.kv_cache_transceiver.has_inflight_transfer.return_value = False
+        executor.async_transfer_manager = Mock()
+        executor.async_transfer_manager.requests_in_transfer.return_value = {}
+    executor.kv_sharing = Mock()
+    executor.kv_sharing.cancel_fetch.side_effect = cancel_fetch
+    executor._enqueue_responses = Mock()
+    executor._terminate_request = Mock(
+        side_effect=lambda request: order.append(("terminate", request.py_request_id))
+    )
+    executor._wait_for_model_engine_input_copy = Mock()
+    executor.active_requests = [parked, computing]
+
+    executor._handle_errors("forward failed")
+
+    assert order[:2] == [("cancel_fetch", 1), ("cancel_fetch", 2)]
+    assert sorted(order[2:]) == [("terminate", 1), ("terminate", 2)]
+    assert not executor._transfer_held_failures and executor.active_requests == []
+    (responses,) = executor._enqueue_responses.call_args.args
+    assert sorted(request_id for request_id, _ in responses) == [1, 2]
+
+
 @pytest.mark.parametrize("sending", [True, False])
 def test_a_context_server_does_not_wait_for_requests_while_kv_sends_are_in_flight(sending):
     """After its last chunk a context-only request leaves the active requests while its KV cache
