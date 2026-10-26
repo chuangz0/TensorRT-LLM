@@ -55,7 +55,7 @@ sys.path[:0] = [str(TESTS), str(TESTS / "unittest")]
 from llmapi.apps.openai_server import RemoteDisaggOpenAIServer, RemoteOpenAIServer  # noqa: E402
 from test_common.mooncake_utils import (  # noqa: E402
     running_master_on_free_ports,
-    running_segment_provider,
+    running_providers_per_socket,
 )
 
 TOKENS_PER_BLOCK = 32
@@ -90,19 +90,6 @@ def percentile(values: list[float], q: float) -> float:
     return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
 
 
-def infiniband_by_socket() -> dict[int, list[str]]:
-    """The active InfiniBand devices of each NUMA node."""
-    found: dict[int, list[str]] = {}
-    for device in sorted(Path("/sys/class/infiniband").iterdir()):
-        port = device / "ports" / "1"
-        if (port / "link_layer").read_text().strip() != "InfiniBand":
-            continue
-        if "ACTIVE" in (port / "state").read_text():
-            node = int((device / "device" / "numa_node").read_text())
-            found.setdefault(node, []).append(device.name)
-    return found
-
-
 @contextmanager
 def running_store(run_dir: Path, segment_gib: int) -> Iterator[str]:
     """A master and one provider per socket; yields the master's address.
@@ -115,27 +102,17 @@ def running_store(run_dir: Path, segment_gib: int) -> Iterator[str]:
     )
 
     select_registration_path("rdma", registers_device_memory=True)
-    sockets = infiniband_by_socket()
-    with ExitStack() as stack:
-        master = stack.enter_context(running_master_on_free_ports(str(run_dir), protocol="rdma"))
-        for node, devices in sockets.items():
-            stack.enter_context(
-                running_segment_provider(
-                    master.address,
-                    str(run_dir / f"provider-{node}"),
-                    segment_size=(segment_gib << 30) // len(sockets),
-                    protocol="rdma",
-                    device_name=",".join(devices),
-                    launcher=("numactl", f"--cpunodebind={node}", f"--membind={node}"),
-                )
-            )
+    with (
+        running_master_on_free_ports(str(run_dir), protocol="rdma") as master,
+        running_providers_per_socket(master.address, str(run_dir), total_bytes=segment_gib << 30),
+    ):
         yield master.address
 
 
 def sharing(run_dir: Path, master: str, key_prefix: str, **knobs) -> dict:
     """``kv_sharing`` over the store at ``master``, its keys under ``key_prefix``."""
     config = run_dir / f"store-{key_prefix}.yaml"
-    mooncake = {"master_server_address": master, "global_segment_size": 0, "protocol": "rdma"}
+    mooncake = {"master_server_address": master, "protocol": "rdma"}
     config.write_text(yaml.safe_dump({"mooncake": mooncake, "blob": {"key_prefix": key_prefix}}))
     return {"backends": [{"type": "mooncake", "config": str(config)}], **knobs}
 
