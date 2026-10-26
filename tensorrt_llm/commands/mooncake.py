@@ -274,10 +274,11 @@ def mooncake_provider(config: str, segment_size: int, ready_file: Optional[str],
 
     Start it after the master and before the servers that share KV cache
     through the pool. On SIGTERM or SIGINT it unmounts its memory gracefully
-    and exits about 13 s later, ignoring further signals: no new object lands
-    in it, and servers read the old ones for a short grace, then miss them. So
-    it may restart while servers read from it; a provider killed outright can
-    end a server that was reading from it, about two minutes later.
+    and exits about 13 s later, ignoring a further SIGINT or SIGTERM: no new
+    object lands in it, and servers read the old ones for a short grace, then
+    miss them. So it may restart while servers read from it; a provider killed
+    outright can end a server that was reading from it, about two minutes
+    later.
     """
     _apply_cli_telemetry(telemetry)
 
