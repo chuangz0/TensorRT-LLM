@@ -99,10 +99,17 @@ class Store:
         readable = sum(answer == 1 for answer in self.client.batch_is_exist(keys)) if keys else 0
         return len(keys), readable
 
-    def assert_readable(self, key_prefix: str, objects: int) -> None:
-        """Waits until the store has ``objects`` objects under ``key_prefix``, all readable."""
-        assert wait_until(lambda: self.readable_objects(key_prefix) == (objects, objects)), (
-            f"the store holds {self.readable_objects(key_prefix)}; expected {objects}"
+    def assert_readable(self, key_prefix: str, objects: int | None = None) -> None:
+        """Waits until the store has ``objects`` objects under ``key_prefix`` (None: any number),
+        all readable."""
+
+        def settled() -> bool:
+            listed, readable = self.readable_objects(key_prefix)
+            return readable == listed and objects in (None, listed)
+
+        assert wait_until(settled), (
+            f"the store holds {self.readable_objects(key_prefix)} (objects, readable); expected "
+            f"{objects}"
         )
 
     def segments(self) -> list[dict]:
@@ -236,6 +243,12 @@ TOP_LOGPROBS = 5
 # The master's count of keys a put asked for, and of those it refused (a key that exists already).
 PUT_KEYS = "master_batch_put_start_items_total"
 PUT_KEYS_REFUSED = "master_batch_put_start_failed_items_total"
+# The kv_sharing counters of fetches and publications that found too few KV cache pages free.
+PAGE_PRESSURE_COUNTERS = (
+    "fetches_skipped_for_pages",
+    "publication_waits",
+    "publications_dropped_for_pages",
+)
 
 
 def deployment_text() -> str:
@@ -298,14 +311,14 @@ def workload_sharing(store: Store, key_prefix: str) -> dict:
     }
 
 
-def instance_options(sharing: dict | None) -> dict:
+def instance_options(sharing: dict | None, kv_cache_tokens: int | None = None) -> dict:
     """The LLM options of an instance of the workload's service; with ``sharing``, its
-    ``kv_sharing``."""
+    ``kv_sharing``; with ``kv_cache_tokens``, a KV cache of that many tokens."""
+    kv_cache_config = {"tokens_per_block": TOKENS_PER_BLOCK, "free_gpu_memory_fraction": 0.3}
+    if kv_cache_tokens is not None:
+        kv_cache_config["max_tokens"] = kv_cache_tokens
     return {
-        "kv_cache_config": {
-            "tokens_per_block": TOKENS_PER_BLOCK,
-            "free_gpu_memory_fraction": 0.3,
-        },
+        "kv_cache_config": kv_cache_config,
         "max_batch_size": 16,
         "max_seq_len": 2048,
         **({"kv_sharing": sharing} if sharing else {}),
@@ -347,7 +360,8 @@ def start_instance(
 class Service:
     """Two instances of one service, each over ``tp`` GPUs of its own group, in their own
     ``trtllm-serve`` processes; with ``sharing``, both fetch and publish through the store, and
-    every rank traces its rounds into ``run_dir/<name>-<instance>``."""
+    every rank traces its rounds into ``run_dir/<name>-<instance>``. ``kv_cache_tokens`` sizes
+    each instance's KV cache."""
 
     def __init__(
         self,
@@ -357,10 +371,11 @@ class Service:
         run_dir: Path,
         name: str,
         sharing: dict | None,
+        kv_cache_tokens: int | None = None,
     ) -> None:
         self.model = model
         self.trace_dirs = [run_dir / f"{name}-{index}" for index in range(len(gpu_groups))]
-        options = instance_options(sharing)
+        options = instance_options(sharing, kv_cache_tokens)
         self.servers: list[RemoteOpenAIServer] = []
         with ExitStack() as starting:
             for gpus, trace_dir in zip(gpu_groups, self.trace_dirs):
@@ -511,6 +526,7 @@ def run_two_turn_workload(
     gpu_groups: tuple[str, str],
     run_dir: Path,
     service: Callable[..., Instances] = Service,
+    kv_cache_tokens: int | None = None,
 ) -> None:
     """Two instances of one service on one store with concurrent two-turn conversations. Turn 1
     comes in two waves: system prompts 0 and 1 reach both instances at once, so both compute and
@@ -526,7 +542,16 @@ def run_two_turn_workload(
     already (some in the first wave); no publication failed (a put of an object the other instance
     was still putting is no failure); both instances shut down with nothing open, identical rank
     traces and fetches done. ``service`` starts the two instances, given ``Service``'s arguments.
+
+    With ``kv_cache_tokens`` (``Service`` only), each instance's KV cache holds that many tokens,
+    fewer than the workload keeps: requests wait for pages, and fetches and publications that find
+    none are skipped or wait, as designed. Then hits and the store's contents are what the cache
+    left room for: every object the store lists is readable, some request fetched, and some fetch
+    or publication met the pressure; the other assertions hold as they are.
     """
+    pressured = kv_cache_tokens is not None
+    if pressured:
+        service = functools.partial(service, kv_cache_tokens=kv_cache_tokens)
     first, questions = conversations(model)
     first_requests = [((user // SYSTEM_PROMPTS) % 2, p) for user, p in enumerate(first)]
     late_users = [
@@ -560,12 +585,13 @@ def run_two_turn_workload(
     sent: list[list[int]] = []  # every prompt the store-on service was sent
 
     def turn(requests: list[tuple[int, list[int]]]) -> list[Completion]:
-        """Sends ``requests``, waits until the store holds every whole block sent so far, and
-        records the keys the master was asked to put and refused meanwhile."""
+        """Sends ``requests``, waits until the store holds every whole block sent so far (under
+        pressure: until every object it lists is readable), and records the keys the master was
+        asked to put and refused meanwhile."""
         sent.extend(prompt for _, prompt in requests)
         before = store.master_metrics()
         answers = store_on.converse(requests)
-        store.assert_readable(key_prefix, tp * len(whole_blocks(sent)))
+        store.assert_readable(key_prefix, None if pressured else tp * len(whole_blocks(sent)))
         puts.append(puts_since(store, before))
         return answers
 
@@ -577,6 +603,17 @@ def run_two_turn_workload(
         store_on.stop()
     print(f"keys put/refused per wave and turn 2: {puts}")
     assert_agree(reference_first + reference_second, answers, model)
+    traces = [rank_traces(trace_dir, tp) for trace_dir in store_on.trace_dirs]
+    for trace_dir, trace in zip(store_on.trace_dirs, traces):
+        assert trace.splitlines()[-1].endswith(" open=0"), f"{trace_dir.name} left store work open"
+    counters = [c for trace_dir in store_on.trace_dirs for c in instance_counters(trace_dir)]
+    assert counters and not any(c.get("publications_failed") for c in counters), counters
+    if pressured:
+        met = {name: sum(c.get(name, 0) for c in counters) for name in PAGE_PRESSURE_COUNTERS}
+        print(f"KV cache pressure met: {met}")
+        assert any(met.values()), "no fetch or publication met the KV cache pressure"
+        assert any(decisions(trace, "resume") for trace in traces), "no request fetched"
+        return
     # Every distinct block was put once; each other put of it was refused as existing already.
     first_wave_blocks = whole_blocks([first[user] for user in waves[0]])
     new_blocks = [  # per wave of turn 1, then turn 2
@@ -592,9 +629,5 @@ def run_two_turn_workload(
         # The user's message blocks exist only where the first turn ran: covering them reads the
         # other instance's publications.
         assert answer.cached_tokens >= len(prompt) // TOKENS_PER_BLOCK * TOKENS_PER_BLOCK
-    for trace_dir in store_on.trace_dirs:
-        trace = rank_traces(trace_dir, tp)
-        assert trace.splitlines()[-1].endswith(" open=0"), f"{trace_dir.name} left store work open"
+    for trace_dir, trace in zip(store_on.trace_dirs, traces):
         assert decisions(trace, "resume"), f"{trace_dir.name} fetched nothing"
-        counters = instance_counters(trace_dir)
-        assert counters and not any(c.get("publications_failed") for c in counters), counters

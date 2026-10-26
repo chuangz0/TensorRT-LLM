@@ -20,13 +20,14 @@ prompt instead of computing it, and its tokens equal those of a server that reus
 locally, also when it computes the rest in chunks; a request cancelled while a stuck store holds its
 fetch ends at once. Servers move blocks over GPU Direct, which 'auto' picks here, or through host
 staging, and a block either path stores reads exactly on the other. Two instances of one service
-share system prompts and follow-up turns under concurrent load. A disaggregated context server,
-whose loop runs without the overlap scheduler, fetches, computes the rest and publishes. When the
-store fails, requests compute their prompts with the same tokens: slow gets still serve hits, stuck
-ones pause fetching, a stalled master pauses probing and publishing, a full store declines puts
-without a pause, and a restarted provider only empties the store. Where two servers provide all of
-the store's memory, one that stops normally while the other reads from it ends no reader. The store
-and its drivers are the module's (``conftest.py``), except where a test needs a store of its own.
+share system prompts and follow-up turns under concurrent load, with KV caches too small to hold it
+all. A disaggregated context server, whose loop runs without the overlap scheduler, fetches,
+computes the rest and publishes. When the store fails, requests compute their prompts with the same
+tokens: slow gets still serve hits, stuck ones pause fetching, a stalled master pauses probing and
+publishing, a full store declines puts without a pause, and a restarted provider only empties the
+store. Where two servers provide all of the store's memory, one that stops normally while the other
+reads from it ends no reader. The store and its drivers are the module's (``conftest.py``), except
+where a test needs a store of its own.
 
 Runs only with ``TRTLLM_MOONCAKE_E2E=1`` (it skips otherwise), from ``tests/unittest``:
 ``TRTLLM_MOONCAKE_E2E=1 pytest _torch/executor/kv_sharing/test_mooncake_store_e2e.py``. Then it
@@ -409,11 +410,25 @@ def test_a_prompt_of_whole_blocks_fetches_all_but_its_last_block_and_puts_none_a
     assert store.readable_objects(FETCH_PREFIX) == before
 
 
-def test_two_instances_of_one_service_share_system_prompts_and_follow_up_turns(
+# Each instance's KV cache in the workload under pressure: about 135 pages, of which about 63 may
+# be pinned beside the resume of one max_seq_len request, while a wave publishes eight first
+# prompts of 21 pages each at once over GPU Direct.
+KV_CACHE_PRESSURE_TOKENS = 4096
+
+
+def test_two_instances_share_system_prompts_and_follow_up_turns_under_kv_cache_pressure(
     store: Store, tmp_path: Path
 ) -> None:
-    """Two one-GPU instances of one service."""
-    run_two_turn_workload(store, model_path(), tp=1, gpu_groups=("0", "1"), run_dir=tmp_path)
+    """Two one-GPU instances of one service whose KV caches hold KV_CACHE_PRESSURE_TOKENS tokens
+    each, fewer than the workload keeps at once."""
+    run_two_turn_workload(
+        store,
+        model_path(),
+        tp=1,
+        gpu_groups=("0", "1"),
+        run_dir=tmp_path,
+        kv_cache_tokens=KV_CACHE_PRESSURE_TOKENS,
+    )
 
 
 def test_a_cancel_while_the_store_holds_a_fetch_ends_the_request_at_once(
