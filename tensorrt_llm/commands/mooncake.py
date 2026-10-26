@@ -274,10 +274,10 @@ def mooncake_provider(config: str, segment_size: int, ready_file: Optional[str],
 
     Start it after the master and before the servers that share KV cache
     through the pool. On SIGTERM or SIGINT it unmounts its memory gracefully
-    and exits about 13 s later: no new object lands in it, and servers read
-    the old ones for a short grace, then miss them. So it may restart while
-    servers read from it; a provider killed outright can end a server that
-    was reading from it, about two minutes later.
+    and exits about 13 s later, ignoring further signals: no new object lands
+    in it, and servers read the old ones for a short grace, then miss them. So
+    it may restart while servers read from it; a provider killed outright can
+    end a server that was reading from it, about two minutes later.
     """
     _apply_cli_telemetry(telemetry)
 
@@ -302,6 +302,13 @@ def mooncake_provider(config: str, segment_size: int, ready_file: Optional[str],
                 # The handler raises, so a signal ends this wait rather than resuming it.
                 time.sleep(1.0)
         finally:
+            # Ending before the unmount ran its course would free the memory under readers' gets.
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            logger.warning(
+                "mooncake-store: unmounting; exits in about 13 s and ignores SIGINT and SIGTERM "
+                "meanwhile (SIGKILL ends it at once)"
+            )
             segment.begin_unmount()
             segment.wait_until_freed()
 
