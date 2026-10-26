@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """KV sharing through a real Mooncake store on several GPUs of one node: Qwen3-8B at TP2 (BF16 KV
-cache), and one case per other layout: DeepSeek-V3-Lite (MLA) at TP2 and under attention DP, also
-with an FP8 KV cache, Qwen3-8B with an FP8 KV cache and an NVFP4 one at TP2, and the
-sliding-window models gemma-3-1b at TP1 and gpt-oss-20b at TP2, whose readers extend the writer's
-prompt. On request, DeepSeek-V3.2 (DeepSeek sparse attention, FP8 KV cache) under attention DP on
-the node's four GPUs.
+cache), and one case per other layout: DeepSeek-V3-Lite (MLA) under attention DP and, with an FP8
+KV cache, at TP2, Qwen3-8B with an FP8 KV cache and an NVFP4 one at TP2, and the sliding-window
+models gemma-3-1b at TP1 and gpt-oss-20b at TP2, whose readers extend the writer's prompt. On
+request, DeepSeek-V3.2 (DeepSeek sparse attention, FP8 KV cache) under attention DP on the node's
+four GPUs.
 
 Each stored object is put once: each rank puts its own share of every prompt block, and ranks
 holding the same bytes (MLA's latent cache) put one stripe each, or under host staging the first
@@ -40,7 +40,6 @@ its drivers are the module's (``conftest.py``). Servers run their ranks in worke
 
 from __future__ import annotations
 
-import gc
 import os
 import random
 import subprocess
@@ -48,7 +47,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-import torch
 from conftest import (
     TOKENS_PER_BLOCK,
     Store,
@@ -56,6 +54,7 @@ from conftest import (
     puts_since,
     rank_traces,
     run_two_turn_workload,
+    shut_down,
     skip_unless_opted_in,
 )
 from utils.llm_data import llm_models_root
@@ -113,7 +112,6 @@ def server(
     trace_dir: Path,
     *,
     model: str = QWEN3,
-    max_batch_size: int = 8,
     max_seq_len: int = 2048,
     kv_dtype: str = "auto",
     **kwargs,
@@ -129,7 +127,7 @@ def server(
             tokens_per_block=TOKENS_PER_BLOCK, free_gpu_memory_fraction=0.1, dtype=kv_dtype
         ),
         cuda_graph_config=None,
-        max_batch_size=max_batch_size,
+        max_batch_size=8,
         max_seq_len=max_seq_len,
         **kwargs,
     )
@@ -158,12 +156,6 @@ def complete(llm: LLM, prompt: list[int], **kwargs):
 
 def tokens(output) -> list[int]:
     return list(output.outputs[0].token_ids)
-
-
-def shut_down(llm: LLM) -> None:
-    llm.shutdown()
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def gpus_by_process() -> dict[int, set[str]]:
@@ -321,10 +313,11 @@ class Cell:
 
 
 CELLS = {
-    "deepseek-tp2-host-staging-writer": Cell(DEEPSEEK, 1, writer_path="host_staging"),
     "qwen3-fp8-tp2": Cell(QWEN3, 2, kv_dtype="fp8"),
     "deepseek-attention-dp2": Cell(DEEPSEEK, 1, attention_dp=True),
-    "deepseek-fp8-kv-tp2": Cell(DEEPSEEK_NVFP4_MOE, 1, kv_dtype="fp8"),
+    # The writer stages through host memory, so the first replica puts every block; the reader
+    # writes in place, so each replica puts its stripe.
+    "deepseek-fp8-kv-tp2": Cell(DEEPSEEK_NVFP4_MOE, 1, writer_path="host_staging", kv_dtype="fp8"),
     # NVFP4 block scales are a second pool, so each object is two spans; the writer stages them
     # through host memory, the reader writes them in place.
     "qwen3-nvfp4-kv-tp2": Cell(QWEN3_NVFP4, 2, writer_path="host_staging", kv_dtype="nvfp4"),

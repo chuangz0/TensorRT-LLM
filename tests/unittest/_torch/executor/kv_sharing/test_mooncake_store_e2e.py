@@ -30,14 +30,13 @@ module's (``conftest.py``), except where a test needs a store of its own.
 
 Runs only with ``TRTLLM_MOONCAKE_E2E=1`` (it skips otherwise), from ``tests/unittest``:
 ``TRTLLM_MOONCAKE_E2E=1 pytest _torch/executor/kv_sharing/test_mooncake_store_e2e.py``. Then it
-needs a GPU (four for the disaggregated test, two for the service), ``mooncake_master`` on the
-path, the ``mooncake.store`` SDK and, for the native driver, the built
+needs four GPUs (servers of one test start side by side, each on a GPU of its own),
+``mooncake_master`` on the path, the ``mooncake.store`` SDK and, for the native driver, the built
 ``tensorrt_llm.mooncake_store_worker``, and fails without them.
 """
 
 from __future__ import annotations
 
-import gc
 import json
 import os
 import random
@@ -50,12 +49,12 @@ from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
-import torch
 from conftest import (
     DRIVER,
     FIRST_MESSAGE_TOKENS,
     SERVER_STOP_S,
     SYSTEM_TOKENS,
+    TOKENS_PER_BLOCK,
     Store,
     ask,
     assert_agree,
@@ -68,6 +67,7 @@ from conftest import (
     running_provider,
     running_store,
     send_at_once,
+    shut_down,
     skip_unless_opted_in,
     start_instance,
     stop_server,
@@ -91,7 +91,6 @@ from tensorrt_llm.llmapi import KvCacheConfig
 
 pytestmark = skip_unless_opted_in
 
-TOKENS_PER_BLOCK = 32
 # Fills the last partial block of P and of Q: whole blocks then hold generated tokens.
 NEW_TOKENS = 32
 CHUNKED_PREFILL = {"enable_chunked_prefill": True, "max_num_tokens": 256}
@@ -117,22 +116,27 @@ FETCH_PREFIX = "fetch"
 # Readers fetch prefixes of at least two blocks.
 READER = {"min_fetch_tokens": 2 * TOKENS_PER_BLOCK}
 
+# The failure tests' prompts. Each prompt F[i] has a sibling S[i]: F[i]'s first 16 blocks, then
+# 200 tokens of its own; a server holding F[i] reuses exactly the 16 blocks.
+_failure_tokens = random.Random(20261024)
+F = [[2000 + i] + [_failure_tokens.randrange(1000, 30000) for _ in range(999)] for i in range(9)]
+S = [f[:FETCHED] + [_failure_tokens.randrange(1000, 30000) for _ in range(200)] for f in F]
+F_BLOCKS = len(F[0]) // TOKENS_PER_BLOCK  # 31, as P
 
-def server(
-    monkeypatch: pytest.MonkeyPatch, *, in_process: bool, max_batch_size: int = 8, **kwargs
-) -> LLM:
-    """A Qwen3-0.6B server. In process, a test reads its executor; otherwise the executor runs in a
-    worker process, as it does in production."""
-    if in_process:
-        monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
-    else:
-        monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
+
+def model_path() -> str:
+    return str(llm_models_root(check=True) / "Qwen3" / "Qwen3-0.6B")
+
+
+def server(monkeypatch: pytest.MonkeyPatch, **kwargs) -> LLM:
+    """A Qwen3-0.6B server whose executor runs in this process, for a test to read."""
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     return LLM(
-        model=str(llm_models_root(check=True) / "Qwen3" / "Qwen3-0.6B"),
+        model=model_path(),
         kv_cache_config=KvCacheConfig(
             tokens_per_block=TOKENS_PER_BLOCK, free_gpu_memory_fraction=0.3
         ),
-        max_batch_size=max_batch_size,
+        max_batch_size=8,
         max_seq_len=2048,
         **kwargs,
     )
@@ -165,10 +169,9 @@ def generate(llm: LLM, prompt: list[int], **kwargs) -> list[int]:
     return list(complete(llm, prompt, **kwargs).outputs[0].token_ids)
 
 
-def shut_down(llm: LLM) -> None:
-    llm.shutdown()
-    gc.collect()
-    torch.cuda.empty_cache()
+def settled(executor) -> bool:
+    """Whether every store operation of the in-process executor ended and its lease went back."""
+    return not executor.disagg.has_pending_shared_transfers()
 
 
 def test_publication_stores_whole_prompt_blocks_and_keeps_output(
@@ -176,19 +179,16 @@ def test_publication_stores_whole_prompt_blocks_and_keeps_output(
 ) -> None:
     warnings: list[str] = []
     monkeypatch.setattr(data_path.logger, "warning", warnings.append)
-    llm = server(monkeypatch, in_process=True, kv_sharing=sharing(store, "overlap"))
+    llm = server(monkeypatch, kv_sharing=sharing(store, "overlap"))
     executor = llm._executor.engine
     try:
         # 'auto' picks GPU Direct here.
         assert executor.kv_sharing.memory_kind is MemoryKind.DEVICE, warnings
         tokens = {"P": generate(llm, P), "Q": generate(llm, Q)}
         stored = P_BLOCKS + Q_BLOCKS
-        assert wait_until(lambda: store.readable_objects("overlap") == (stored, stored)), (
-            f"the store holds {store.readable_objects('overlap')} (objects, readable); "
-            f"expected {stored}"
-        )
+        store.assert_readable("overlap", stored)
         # The executor retires each publication once its store calls returned.
-        assert wait_until(lambda: not executor.disagg.has_pending_shared_transfers())
+        assert wait_until(lambda: settled(executor))
     finally:
         shut_down(llm)
     assert tokens == references["fresh"]
@@ -203,23 +203,19 @@ def test_publication_stores_whole_prompt_blocks_and_keeps_output(
 def test_chunked_prefill_publishes_each_chunk_and_keeps_output(
     store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    llm = server(monkeypatch, in_process=True, **CHUNKED_PREFILL)
+    llm = server(monkeypatch, **CHUNKED_PREFILL)
     try:
         reference = generate(llm, P)
     finally:
         shut_down(llm)
     # Each chunk's range is published once its commit lands, its pages locked while later chunks
     # compute.
-    llm = server(
-        monkeypatch, in_process=True, kv_sharing=sharing(store, "chunked"), **CHUNKED_PREFILL
-    )
+    llm = server(monkeypatch, kv_sharing=sharing(store, "chunked"), **CHUNKED_PREFILL)
     executor = llm._executor.engine
     try:
         tokens = generate(llm, P)
-        assert wait_until(lambda: store.readable_objects("chunked") == (P_BLOCKS, P_BLOCKS)), (
-            f"the store holds {store.readable_objects('chunked')} (objects, readable)"
-        )
-        assert wait_until(lambda: not executor.disagg.has_pending_shared_transfers())
+        store.assert_readable("chunked", P_BLOCKS)
+        assert wait_until(lambda: settled(executor))
     finally:
         shut_down(llm)
     assert tokens == reference
@@ -232,10 +228,6 @@ def test_chunked_prefill_publishes_each_chunk_and_keeps_output(
 # Fetch.
 
 
-def model_path() -> str:
-    return str(llm_models_root(check=True) / "Qwen3" / "Qwen3-0.6B")
-
-
 def block_bytes() -> int:
     """Bytes of one KV cache block of the model: K and V of every layer, in BF16."""
     config = json.loads((Path(model_path()) / "config.json").read_text())
@@ -243,20 +235,23 @@ def block_bytes() -> int:
     return per_token * TOKENS_PER_BLOCK * 2
 
 
-def publish_p(store: Store, key_prefix: str, *, gpu_direct_fails: bool = False) -> MemoryKind:
-    """A writer server, shut down once done, publishes P's whole blocks under ``key_prefix``; its
-    memory kind. With ``gpu_direct_fails`` its GPU Direct preparation fails, and 'auto' falls back
-    to host staging, logging why."""
+def publish(
+    store: Store, key_prefix: str, prompts: list[list[int]], *, gpu_direct_fails: bool = False
+) -> MemoryKind:
+    """A writer server, shut down once done, publishes the whole blocks of ``prompts`` under
+    ``key_prefix``; its memory kind. With ``gpu_direct_fails`` its GPU Direct preparation fails,
+    and 'auto' falls back to host staging, logging why."""
     warnings: list[str] = []
     with pytest.MonkeyPatch.context() as monkeypatch:
         if gpu_direct_fails:
             monkeypatch.setattr(data_path, "prepare_gpu_direct", lambda _: "forced by the test")
             monkeypatch.setattr(data_path.logger, "warning", warnings.append)
-        llm = server(monkeypatch, in_process=True, kv_sharing=sharing(store, key_prefix))
+        llm = server(monkeypatch, kv_sharing=sharing(store, key_prefix))
     executor = llm._executor.engine
     try:
-        generate(llm, P)
-        assert wait_until(lambda: store.readable_objects(key_prefix) == (P_BLOCKS, P_BLOCKS))
+        for prompt in prompts:
+            generate(llm, prompt)
+        store.assert_readable(key_prefix, len(whole_blocks(prompts)))
     finally:
         shut_down(llm)
     fell_back = [w for w in warnings if "host staging" in w and "forced by the test" in w]
@@ -266,28 +261,29 @@ def publish_p(store: Store, key_prefix: str, *, gpu_direct_fails: bool = False) 
 
 def reader(monkeypatch: pytest.MonkeyPatch, store: Store, key_prefix=FETCH_PREFIX, **knobs) -> LLM:
     """A fresh server, in process, that fetches what the writer of P published."""
-    return server(
-        monkeypatch, in_process=True, kv_sharing=sharing(store, key_prefix, **READER, **knobs)
-    )
-
-
-def settled(executor) -> bool:
-    """Whether every store operation of the in-process executor ended and its lease went back."""
-    return not executor.disagg.has_pending_shared_transfers()
+    return server(monkeypatch, kv_sharing=sharing(store, key_prefix, **READER, **knobs))
 
 
 @pytest.fixture(scope="module")
-def references() -> dict[str, dict[str, list[int]]]:
-    """Greedy tokens of a server without the store: "fresh" for P and Q (nothing to reuse),
+def references() -> dict:
+    """Greedy tokens of one server without the store: "fresh" for P and Q (nothing to reuse),
     "whole" for each sibling under a salt of its own, "reused" for each sibling with P's first 16
-    blocks reused (P computed before it)."""
+    blocks reused (P computed before it); and the failure tests' (``failure_references``)."""
     with pytest.MonkeyPatch.context() as monkeypatch:
-        llm = server(monkeypatch, in_process=True)
+        llm = server(monkeypatch)
+    failures: dict[str, list[list[int]]] = {"prompt": [], "whole": [], "reused": []}
     try:
         # A salt of its own leaves the request nothing to reuse.
         whole = {name: complete(llm, T[name], cache_salt=f"whole-{name}") for name in REFERENCED}
         prompts = {"P": generate(llm, P), "Q": generate(llm, Q)}  # nothing to reuse yet
         reused = {name: complete(llm, T[name]) for name in REFERENCED}
+        for f, s in zip(F, S):
+            sibling_whole = complete(llm, s, cache_salt=f"whole-{f[0]}")
+            failures["prompt"].append(generate(llm, f))
+            sibling_reused = complete(llm, s)
+            assert sibling_whole.cached_tokens == 0 and sibling_reused.cached_tokens == FETCHED
+            failures["whole"].append(list(sibling_whole.outputs[0].token_ids))
+            failures["reused"].append(list(sibling_reused.outputs[0].token_ids))
     finally:
         shut_down(llm)
     assert all(output.cached_tokens == 0 for output in whole.values())
@@ -298,19 +294,27 @@ def references() -> dict[str, dict[str, list[int]]]:
             kind: {name: list(output.outputs[0].token_ids) for name, output in outputs.items()}
             for kind, outputs in (("whole", whole), ("reused", reused))
         },
+        "failures": failures,
     }
+
+
+@pytest.fixture(scope="module")
+def failure_references(references: dict) -> dict[str, list[list[int]]]:
+    """The store-off server's tokens for the failure tests: each F[i] computed whole ("prompt"),
+    each S[i] computed whole ("whole") and with F[i]'s 16 blocks reused ("reused")."""
+    return references["failures"]
 
 
 @pytest.fixture(scope="module")
 def published_p(store: Store) -> None:
     """P published under FETCH_PREFIX by a writer over GPU Direct, which 'auto' picks here."""
-    assert publish_p(store, FETCH_PREFIX) is MemoryKind.DEVICE
+    assert publish(store, FETCH_PREFIX, [P]) is MemoryKind.DEVICE
 
 
 @pytest.fixture(scope="module")
 def staged_p(store: Store) -> str:
     """The key prefix under which a writer that fell back to host staging published P."""
-    assert publish_p(store, "fetch-staged", gpu_direct_fails=True) is MemoryKind.HOST
+    assert publish(store, "fetch-staged", [P], gpu_direct_fails=True) is MemoryKind.HOST
     return "fetch-staged"
 
 
@@ -516,53 +520,15 @@ def test_disaggregated_context_server_fetches_computes_the_rest_and_publishes(
     assert shared.usage.prompt_tokens_details.cached_tokens == FETCHED
 
 
-# Failures of the store. Each prompt F[i] has a sibling S[i]: F[i]'s first 16 blocks, then 200
-# tokens of its own; a server holding F[i] reuses exactly the 16 blocks.
+# Failures of the store, on the prompts F and their siblings S.
 
-_failure_tokens = random.Random(20261024)
-F = [[2000 + i] + [_failure_tokens.randrange(1000, 30000) for _ in range(999)] for i in range(9)]
-S = [f[:FETCHED] + [_failure_tokens.randrange(1000, 30000) for _ in range(200)] for f in F]
-F_BLOCKS = len(F[0]) // TOKENS_PER_BLOCK  # 31, as P
 # The breakers' limits in these tests.
 FAILURES_TO_PAUSE, PAUSE_S = 3, 5.0
-
-
-@pytest.fixture(scope="module")
-def failure_references() -> dict[str, list[list[int]]]:
-    """Greedy tokens from a server without the store: each F[i] computed whole ("prompt"), each
-    S[i] computed whole ("whole") and with F[i]'s 16 blocks reused ("reused")."""
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        llm = server(monkeypatch, in_process=True)
-    references: dict[str, list[list[int]]] = {"prompt": [], "whole": [], "reused": []}
-    try:
-        for f, s in zip(F, S):
-            # A salt of its own leaves the request nothing to reuse.
-            whole = complete(llm, s, cache_salt=f"whole-{f[0]}")
-            references["prompt"].append(generate(llm, f))
-            reused = complete(llm, s)
-            assert whole.cached_tokens == 0 and reused.cached_tokens == FETCHED
-            references["whole"].append(list(whole.outputs[0].token_ids))
-            references["reused"].append(list(reused.outputs[0].token_ids))
-    finally:
-        shut_down(llm)
-    return references
 
 
 def short_breakers(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(breaker, "FAILURES_TO_PAUSE", FAILURES_TO_PAUSE)
     monkeypatch.setattr(breaker, "PAUSE_S", PAUSE_S)
-
-
-def publish(store: Store, key_prefix: str, prompts: list[list[int]]) -> None:
-    """A writer server, shut down once done, publishes the whole blocks of ``prompts``."""
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        llm = server(monkeypatch, in_process=True, kv_sharing=sharing(store, key_prefix))
-    try:
-        for prompt in prompts:
-            generate(llm, prompt)
-        store.assert_readable(key_prefix, len(prompts) * F_BLOCKS)
-    finally:
-        shut_down(llm)
 
 
 def test_slow_gets_serve_hits_and_stuck_or_failing_ones_pause_fetches(
@@ -651,7 +617,7 @@ def test_a_stalled_master_pauses_probes_and_publications_and_serving_goes_on(
         monkeypatch.setenv("TRTLLM_KV_SHARING_TRACE_DIR", str(trace_dir))
         config = sharing(own, "stall", **READER)
         config["backends"][0]["config"] = own.config("stall", rpc_timeout_ms=STALL_RPC_TIMEOUT_MS)
-        llm = server(monkeypatch, in_process=True, kv_sharing=config)
+        llm = server(monkeypatch, kv_sharing=config)
         executor = llm._executor.engine
         counters = executor.kv_sharing.counters  # the probe's counts join it at shutdown
         stalled = []
@@ -701,7 +667,7 @@ def test_a_full_store_declines_puts_without_pausing(
         return probed[-1]
 
     with running_store(tmp_path / "store", eviction_ratio=0.05, provider_bytes=256 << 20) as own:
-        llm = server(monkeypatch, in_process=True, kv_sharing=sharing(own, "full"))
+        llm = server(monkeypatch, kv_sharing=sharing(own, "full"))
         executor = llm._executor.engine
         try:
             computed = [generate(llm, prompt) for prompt in F[:8]]
@@ -741,7 +707,7 @@ def test_a_restarted_provider_empties_the_store_and_serving_goes_on(
     run_dir = tmp_path / "store"
     with running_store(run_dir, provider_bytes=0) as own, ExitStack() as providers:
         old = providers.enter_context(running_provider(own.master, run_dir, 1 << 30))
-        llm = server(monkeypatch, in_process=True, kv_sharing=sharing(own, "restart", **READER))
+        llm = server(monkeypatch, kv_sharing=sharing(own, "restart", **READER))
         executor = llm._executor.engine
         try:
             computed = [generate(llm, F[0])]
@@ -812,23 +778,24 @@ def test_a_server_providing_memory_that_stops_normally_ends_no_server_reading_it
     model = model_path()
     prompts = distinct_prompts(model)
     systems = [prompt[:SYSTEM_TOKENS] for prompt in prompts]
-    with start_instance(model, 1, "0", tmp_path / "store-off", instance_options(None)) as off:
-        off.wait_for_server(timeout=RemoteOpenAIServer.MAX_SERVER_START_WAIT_S)
-        references = send_at_once([off], model, [(0, prompt) for prompt in prompts])
-
     with running_store(tmp_path / "store", provider_bytes=0) as own, ExitStack() as servers:
         providing = workload_sharing(own, "providing")
         providing["backends"][0].update(
             roles=["fetch", "publish", "provide"], segment_size=SEGMENT_BYTES
         )
-        a, b = (
-            servers.enter_context(
-                start_instance(model, 1, gpu, tmp_path / name, instance_options(providing))
+        # The store-off server for the references starts with A and B, on a GPU of its own.
+        off, a, b = (
+            servers.enter_context(start_instance(model, 1, gpu, tmp_path / name, options))
+            for gpu, name, options in (
+                ("2", "store-off", instance_options(None)),
+                ("0", "a", instance_options(providing)),
+                ("1", "b", instance_options(providing)),
             )
-            for gpu, name in (("0", "a"), ("1", "b"))
         )
-        for instance in (a, b):
+        for instance in (off, a, b):
             instance.wait_for_server(timeout=RemoteOpenAIServer.MAX_SERVER_START_WAIT_S)
+        references = send_at_once([off], model, [(0, prompt) for prompt in prompts])
+        off.terminate()
         assert len(own.segments()) == 2
         send_at_once([a], model, [(0, system) for system in systems], (False,))
         own.assert_readable("providing", len(whole_blocks(systems)))

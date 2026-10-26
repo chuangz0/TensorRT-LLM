@@ -28,6 +28,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import functools
+import gc
 import itertools
 import json
 import math
@@ -41,12 +42,15 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import pytest
 import torch
 import yaml
 from llmapi.apps.openai_server import RemoteOpenAIServer
+
+if TYPE_CHECKING:
+    from tensorrt_llm import LLM
 
 PROTOCOL = os.environ.get("TRTLLM_MOONCAKE_PROTOCOL", "rdma")
 DRIVER = os.environ.get("TRTLLM_MOONCAKE_E2E_DRIVER", "native")
@@ -74,7 +78,6 @@ class Store:
         section takes ``mooncake_options`` too."""
         mooncake = {
             "master_server_address": self.master,
-            "global_segment_size": 0,
             "protocol": PROTOCOL,
             "device_name": DEVICES,
             "driver": driver,
@@ -134,6 +137,13 @@ def require_environment() -> None:
     import mooncake.store  # noqa: F401
 
 
+def shut_down(llm: LLM) -> None:
+    """Shuts an in-process server down and frees its GPU memory for the next one."""
+    llm.shutdown()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def stop_server(server: RemoteOpenAIServer) -> None:
     """Stops ``server`` as an operator would (SIGTERM), waiting up to SERVER_STOP_S for it to
     exit."""
@@ -170,7 +180,7 @@ def running_store(
 ) -> Iterator[Store]:
     """A master and one provider of ``provider_bytes`` (none for 0) on this host, with servers'
     store configs in ``run_dir``. The module's store evicts nothing (``eviction_ratio`` 0)."""
-    from test_common.mooncake_utils import running_master_on_free_ports
+    from test_common.mooncake_utils import running_pool
 
     from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import MooncakeConfig, open_sdk
     from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.gpudirect import (
@@ -182,15 +192,17 @@ def running_store(
     select_registration_path(PROTOCOL, registers_device_memory=True)
     with ExitStack() as stack:
         master = stack.enter_context(
-            running_master_on_free_ports(
-                str(run_dir), protocol=PROTOCOL, eviction_ratio=eviction_ratio
+            running_pool(
+                str(run_dir),
+                provider_bytes,
+                protocol=PROTOCOL,
+                device_name=DEVICES,
+                eviction_ratio=eviction_ratio,
             )
         )
-        if provider_bytes:
-            stack.enter_context(running_provider(master.address, run_dir, provider_bytes))
         metrics_port = json.loads((run_dir / "pool.json").read_text())["metrics_port"]
         host = master.address.rsplit(":", 1)[0]
-        client = open_sdk(MooncakeConfig(master.address, 0, PROTOCOL, DEVICES, local_buffer_size=0))
+        client = open_sdk(MooncakeConfig(master.address, protocol=PROTOCOL, device_name=DEVICES))
         stack.callback(client.close)
         metrics_url = f"http://{host}:{metrics_port}"
         yield Store(master.address, metrics_url, run_dir, client, master.process.pid)
