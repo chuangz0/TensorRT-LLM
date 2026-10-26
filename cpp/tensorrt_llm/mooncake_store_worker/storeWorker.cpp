@@ -569,8 +569,8 @@ CallOutcome failedCall(Call const& call)
     return CallOutcome{.accessEnded = false, .errors = {{dataCall, "the store worker failed inside a store call"}}};
 }
 
-//! Throws unless every row names a different object: the SDK names put sessions and get targets by key,
-//! per client, so a get of one key into two places answers READY for both and fills one.
+//! Throws unless every row names a different object: the SDK names put sessions by key per client, and
+//! get targets by key per call, so a get of one key into two places answers READY for both and fills one.
 void refuseRepeatedNames(Rows const& rows)
 {
     // Nodes from one block, not one allocation per row: 1,024 rows take about 10 us on x86, not 30.

@@ -4,9 +4,11 @@
 
 Read top down; a fetch or publish flows ``BlobBackend`` -> ``StoreDriver`` -> store SDK:
 
-- ``backend``: ``BlobBackend``, the public ``base.backend.Backend``. It cuts each view into
-  batches and hands them to a ``store.StoreDriver`` on worker threads. ``RegionBinding``
-  registers the lender's regions the driver can access, under the lender's hold.
+- ``backend``: ``BlobBackend``, the public ``base.backend.Backend``. It checks each view and
+  hands its rows to a ``store.StoreDriver``: a queued driver (the native one) gets one batch per
+  layer group on the submitting thread and runs its own store calls; any other driver gets
+  batches cut by ``BlobConfig`` on the backend's worker threads. ``RegionBinding`` registers the
+  lender's regions the driver can access, under the lender's hold.
 - ``store`` and ``keys``: the private driver boundary, which shares only ``MemoryKind`` with the
   public contract, and the store key encoding. How an object is laid out in a store is its
   driver's private format.

@@ -31,11 +31,12 @@ answer comes after all futures finished or from a step that posted nothing. So a
 only when no answer is TRANSFER_FAIL. In both, a raise or a wrong answer count leaves access
 unproven. Session, existence and end calls touch only master and local metadata, never row
 memory. This holds for a wheel built without ``USE_TENT`` (the newer transfer engine), the default
-replicate config (one memory replica, no NoF SSD replica) and RDMA; the TCP transport's scatter
-completion was not checked line by line. Over TCP a put row answered TRANSFER_FAIL may also mean the
-initiator gave up on a slow target (no status within ``MC_TCP_STATUS_TIMEOUT_SEC``, or no progress
-within ``MC_TCP_PROGRESS_TIMEOUT_SEC``, 30 s each by default), which may still write what it
-received into the object's space; a revoke would free that space at once.
+replicate config (one memory replica, no NoF SSD replica) and RDMA or TCP (TCP reports a row's
+status only after its body transfer completed or was cancelled). Over TCP a put row answered
+TRANSFER_FAIL may also mean the initiator gave up on a slow target (no status within
+``MC_TCP_STATUS_TIMEOUT_SEC``, or no progress within ``MC_TCP_PROGRESS_TIMEOUT_SEC``, 30 s each by
+default), which may still write what it received into the object's space; a revoke would free that
+space at once.
 
 An operation whose access has not ended when its call returns never will by anything the driver
 can wait on: it is ``access_unprovable``, and it keeps its regions from being unregistered and the

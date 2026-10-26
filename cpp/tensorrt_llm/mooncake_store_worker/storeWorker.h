@@ -66,7 +66,8 @@ constexpr int64_t kPutInFlightHere = -100'001;
 struct WorkerOptions
 {
     int threads;         //!< Store calls at once.
-    int putThreads;      //!< At most this many of them puts, so a get always finds a thread.
+    int putThreads;      //!< At most this many of them puts: all but one when there are two or more,
+                         //!< so a get then always finds a thread.
     int getsPerPut;      //!< A waiting put goes after this many gets in a row.
     size_t rowsPerCall;  //!< Most rows in one store call.
     size_t bytesPerCall; //!< Most bytes in one store call; a call has at least one row.
