@@ -157,7 +157,7 @@ _instance_ids = itertools.count()  # names each driver's worker threads
 _SKIP_RESULTS = {
     # get -703: no complete replica, as while the object is written or once its replica's
     # endpoint went stale
-    "being_written": _NOT_READY,
+    "no_complete_replica": _NOT_READY,
     # put: a put of this driver is writing the key now, or a session it left open holds the key and
     # the master shows no complete object; no session is started
     "held_by_own_put": _NOT_READY,
@@ -198,8 +198,8 @@ class _Op:
     region: _Registration  # the registration every row lies in
     rows_per_part: int
     results: list[RowResult]  # per row; each part writes its slice when it ends
-    # Told once every row concluded (its access ends then too, unless unprovable) and once it
-    # turned unprovable.
+    # Called once every row concluded (its access ends then too, unless unprovable) and once
+    # the operation turned unprovable.
     on_change: OnChange | None
     # Rows from here on wait in the operation's queue; once every row was taken, or ended
     # untaken, it is ``len(rows)`` and the operation has left the queue.
@@ -644,7 +644,8 @@ class MooncakeDriver:
         try:
             ended = self._make_sdk_calls(part)
         finally:
-            if self._end_part(part, ended):
+            on_change_due = self._end_part(part, ended)
+            if on_change_due:
                 self._call_on_change(part.op)
 
     def _make_sdk_calls(self, part: _Part) -> _PartEnd:
@@ -755,7 +756,7 @@ class MooncakeDriver:
             access_ended = self._put_reserved(rows.only(reserved), results, closed, to_master)
             return results, access_ended
         finally:
-            self._release_keys(reserved, closed, to_master)
+            self._release_keys_and_record_left_open(reserved, closed, to_master)
 
     def _reserve_keys(self, keys: list[str], results: _PartResults) -> tuple[list[str], list[str]]:
         """Reserves every key that no put of this driver is writing and no session it left open
@@ -777,8 +778,11 @@ class MooncakeDriver:
             self._keys_being_put.update(reserved)
         return reserved, held_by_left_session
 
-    def _release_keys(self, reserved: list[str], closed: set[str], to_master: set[str]) -> None:
-        """Ends the reservation of ``reserved`` and leaves open each session not ``closed``."""
+    def _release_keys_and_record_left_open(
+        self, reserved: list[str], closed: set[str], to_master: set[str]
+    ) -> None:
+        """Ends the reservation of ``reserved`` and records each session not ``closed`` as left
+        open: for the master when its key is in ``to_master``, otherwise for ``drain``."""
         left: dict[str, _LeftOpen] = {}
         if not closed.issuperset(reserved):  # usually every session ended
             left = {
@@ -931,7 +935,7 @@ class MooncakeDriver:
             if answer == _Code.LEASE_EXPIRED and not is_reread:
                 expired.append(key)
             elif answer == _Code.REPLICA_IS_NOT_READY and not is_reread:
-                results.skip(key, "being_written")
+                results.skip(key, "no_complete_replica")
             else:
                 results.recorded[key] = _result_of_get(answer, rows.row_bytes, is_reread)
         # A TRANSFER_FAIL future may give up while its RDMA still runs (module docstring).

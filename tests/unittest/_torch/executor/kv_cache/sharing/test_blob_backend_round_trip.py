@@ -232,7 +232,7 @@ def test_publish_then_fetch_restores_pages(kit, real_manager, stores) -> None:
         binding.release_hold()
 
 
-def test_partial_fetch_marks_only_delivered_rows(kit, real_manager) -> None:
+def test_a_partial_fetch_resumes_only_up_to_its_first_undelivered_block(kit, real_manager) -> None:
     # Each row's call runs on a thread of its own, in any order. A later row's fault stops the
     # fetch, and the cancel it forwards could end the first row before its thread took it; the
     # driver ignores it, so the first row always lands.

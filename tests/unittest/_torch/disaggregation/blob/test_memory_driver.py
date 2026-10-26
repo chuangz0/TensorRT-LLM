@@ -171,7 +171,7 @@ class TestMemoryDriverConformance(DriverConformance):
     # Automatic mode runs each operation inside put/get, which the protocol forbids; the checks
     # that hold a put or a get inside the store skip it, and TestAsyncMemoryDriverConformance runs
     # them.
-    handles_before_completion = False
+    returns_before_the_store_answers = False
 
     def _driver(self, store: MemoryStore | None = None) -> MemoryDriver:
         # An empty store is falsy (it has a length), so test for None explicitly.
@@ -210,7 +210,7 @@ class TestMemoryDriverConformance(DriverConformance):
     def make_crash_after_record(self) -> StoreDriver:
         return self._driver(CrashingStore())
 
-    def make_driver_starting_nothing(self) -> StoreDriver:
+    def make_driver_leaving_operations_unstarted(self) -> StoreDriver:
         return self.driver_cls(MemoryStore(), controlled=True, capabilities=self.capabilities)
 
     def make_results_before_access_end(
@@ -258,7 +258,7 @@ class TestAsyncMemoryDriverConformance(TestMemoryDriverConformance):
     """The same driver returning handles before the store answers, as a real SDK does."""
 
     background = True
-    handles_before_completion = True
+    returns_before_the_store_answers = True
 
 
 SHARED_STORE = MemoryStore()
@@ -267,7 +267,7 @@ SHARED_STORE = MemoryStore()
 class TestSharedStoreConformance(DriverConformance):
     """Fresh clients of one persistent store: every check finds the previous checks' objects."""
 
-    handles_before_completion = False  # the in-memory driver's automatic mode
+    returns_before_the_store_answers = False  # the in-memory driver's automatic mode
 
     def make_driver(self) -> StoreDriver:
         return MemoryDriver(SHARED_STORE)
@@ -277,7 +277,7 @@ class TestPoolDriverConformance(DriverConformance):
     """A driver that registered its memory once, when built; endpoints are carved out of it."""
 
     registers_on_demand = False
-    handles_before_completion = False  # the in-memory driver's automatic mode
+    returns_before_the_store_answers = False  # the in-memory driver's automatic mode
     POOL_BYTES = 1 << 16
 
     def pool_driver(self) -> MemoryDriver:

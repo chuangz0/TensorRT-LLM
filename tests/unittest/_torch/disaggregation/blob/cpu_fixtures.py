@@ -3,9 +3,9 @@
 """CPU stand-ins for the lender side of a blob backend, and ways for a test to steer a driver.
 
 ``Endpoint`` is one side of a transfer: host slots in one registered region, a driver, a region
-binding, a backend and the waits a test lease holder needs. ``KeyGatedStore`` holds store calls
-until the test opens its gate. ``DriverSpy`` forwards to a real driver, records every call with its
-thread, and can hold a method on an event or make it raise. Every wait has an upper bound.
+binding, a backend and the waits a test lease holder needs. ``KeyGatedStore`` stops store calls
+at its gate until the test opens it. ``DriverSpy`` forwards to a real driver, records every call
+with its thread, and can gate a method on an event or make it raise. Every wait has an upper bound.
 """
 
 from __future__ import annotations
@@ -51,9 +51,9 @@ from tensorrt_llm._torch.disaggregation.testing.object_trailer import Checksum, 
 WAIT_S = 5.0
 """Upper bound of every wait in these tests; reached only when the code under test is wrong."""
 
-HELD_CALL_S = 10 * WAIT_S
-"""How long a held call waits for its gate: past any test wait, so a gate left shut fails the test's
-own wait first, yet a failed test never strands the thread."""
+GATED_CALL_S = 10 * WAIT_S
+"""How long a gated call waits for its gate: past any test wait, so a gate left shut fails the
+test's own wait first, yet a failed test never strands the thread."""
 
 PROMPT_S = 0.5
 """A call that must not wait on the driver returns well within this."""
@@ -221,15 +221,15 @@ class WakeCounter:
 
 
 class KeyGatedStore(MemoryStore):
-    """Holds ``get``s and/or ``commit``s of the chosen keys (all by default) until the test sets
-    ``gate``; ``waiting`` counts the calls that reached it."""
+    """Stops ``get``s and/or ``commit``s of the chosen keys (all by default) at ``gate`` until the
+    test sets it; ``calls_at_gate`` counts the calls that reached it."""
 
     def __init__(
         self, *, gets: bool = False, commits: bool = False, keys: Iterable[str] | None = None
     ) -> None:
         super().__init__()
         self.gate = threading.Event()
-        self.waiting = 0
+        self.calls_at_gate = 0
         self._gets = gets
         self._commits = commits
         self._keys = None if keys is None else set(keys)
@@ -237,26 +237,26 @@ class KeyGatedStore(MemoryStore):
 
     def get(self, key: str) -> StoredObject | None:
         if self._gets:
-            self._hold(key)
+            self._wait_at_gate(key)
         return super().get(key)
 
     def commit(self, key: str, payload: bytes, trailer: bytes) -> Commit:
         if self._commits:
-            self._hold(key)
+            self._wait_at_gate(key)
         return super().commit(key, payload, trailer)
 
-    def wait_for_waiting(self, count: int) -> None:
+    def wait_for_calls_at_gate(self, count: int) -> None:
         with self._arrived:
-            arrived = self._arrived.wait_for(lambda: self.waiting >= count, WAIT_S)
-            assert arrived, f"{self.waiting} of {count} store calls reached the gate"
+            arrived = self._arrived.wait_for(lambda: self.calls_at_gate >= count, WAIT_S)
+            assert arrived, f"{self.calls_at_gate} of {count} store calls reached the gate"
 
-    def _hold(self, key: str) -> None:
+    def _wait_at_gate(self, key: str) -> None:
         if self.gate.is_set() or (self._keys is not None and key not in self._keys):
             return
         with self._arrived:
-            self.waiting += 1
+            self.calls_at_gate += 1
             self._arrived.notify_all()
-        self.gate.wait(HELD_CALL_S)
+        self.gate.wait(GATED_CALL_S)
 
 
 class RollbackFailsDriver(MemoryDriver):
@@ -283,10 +283,10 @@ class Call:
 class DriverSpy:
     """A ``StoreDriver`` that forwards to ``inner`` and records every call with its thread name.
 
-    ``hold(method)`` makes calls of ``method`` wait until the returned event is set;
+    ``gate(method)`` makes calls of ``method`` wait until the returned event is set;
     ``fail(method, error, times)`` makes the next ``times`` calls raise ``error`` instead;
     ``answer(method, value, times)`` makes them return ``value`` without reaching the driver.
-    ``ops`` lists every operation ``put``/``get`` returned, with its rows; ``tell_changed(op)``
+    ``ops`` lists every operation ``put``/``get`` returned, with its rows; ``call_on_change(op)``
     calls the ``on_change`` that came with it again, as a driver may.
     """
 
@@ -296,13 +296,13 @@ class DriverSpy:
         self.ops: list[tuple[tuple[RowIO, ...], OpHandle]] = []
         self._on_changes: dict[OpHandle, OnChange | None] = {}
         self._changed = threading.Condition()
-        self._holds: dict[str, threading.Event] = {}
+        self._gates: dict[str, threading.Event] = {}
         self._failures: dict[str, list] = {}
         self._answers: dict[str, list] = {}
 
-    def hold(self, method: str) -> threading.Event:
-        self._holds[method] = threading.Event()
-        return self._holds[method]
+    def gate(self, method: str) -> threading.Event:
+        self._gates[method] = threading.Event()
+        return self._gates[method]
 
     def fail(self, method: str, error: Exception, times: int = 1) -> None:
         self._failures[method] = [error, times]
@@ -311,18 +311,19 @@ class DriverSpy:
         self._answers[method] = [value, times]
 
     def op_with(self, key: str) -> OpHandle:
-        """The latest operation carrying the row stored under ``key``, once one started."""
+        """The latest operation carrying the row stored under ``key``, once ``put`` or ``get``
+        returned it."""
         found: list[OpHandle] = []
 
-        def started() -> bool:
+        def returned() -> bool:
             found[:] = [op for rows, op in self.ops if any(row.key == key for row in rows)]
             return bool(found)
 
-        self.wait_for(started, f"an operation for {key}")
+        self.wait_for(returned, f"an operation for {key}")
         return found[-1]
 
-    def tell_changed(self, op: OpHandle) -> None:
-        """Calls ``op``'s ``on_change`` on this thread, as a driver telling of a change would."""
+    def call_on_change(self, op: OpHandle) -> None:
+        """Calls ``op``'s ``on_change`` on this thread, as a driver may."""
         with self._changed:
             on_change = self._on_changes[op]
         on_change(op)
@@ -349,7 +350,7 @@ class DriverSpy:
 
     def put(self, rows: RowBatch, *, on_change: OnChange | None = None) -> OpHandle:
         self._enter("put", rows=rows)
-        return self._started(rows, self.inner.put(rows, on_change=on_change), on_change)
+        return self._record_op(rows, self.inner.put(rows, on_change=on_change), on_change)
 
     def get(
         self, rows: RowBatch, hint: Hint = None, *, on_change: OnChange | None = None
@@ -359,7 +360,7 @@ class DriverSpy:
             op = self.inner.get(rows, on_change=on_change)
         else:
             op = self.inner.get(rows, hint, on_change=on_change)
-        return self._started(rows, op, on_change)
+        return self._record_op(rows, op, on_change)
 
     def poll(self, op: OpHandle) -> tuple[RowResult, ...]:
         self._enter("poll", op=op)
@@ -395,7 +396,9 @@ class DriverSpy:
             scripted[1] -= 1
             return scripted
 
-    def _started(self, rows: Sequence[RowIO], op: OpHandle, on_change: OnChange | None) -> OpHandle:
+    def _record_op(
+        self, rows: Sequence[RowIO], op: OpHandle, on_change: OnChange | None
+    ) -> OpHandle:
         with self._changed:
             self.ops.append((tuple(rows), op))
             self._on_changes[op] = on_change
@@ -411,9 +414,9 @@ class DriverSpy:
                 failure[1] -= 1
             else:
                 failure = None
-            hold = self._holds.get(method)
-        if hold is not None:
-            hold.wait(HELD_CALL_S)
+            gate = self._gates.get(method)
+        if gate is not None:
+            gate.wait(GATED_CALL_S)
         if failure is not None:
             raise failure[0]
 
@@ -469,7 +472,8 @@ class Endpoint:
         return attempt.poll()
 
     def op(self, name: str) -> OpHandle:
-        """The latest driver operation carrying the row ``name``, once one started."""
+        """The latest driver operation carrying the row ``name``, once ``put`` or ``get`` returned
+        it."""
         return self.driver.op_with(store_key(name))
 
     def wait_quiesced(self, attempt: BlobAttempt) -> None:

@@ -40,9 +40,9 @@ from .memory_store import (
     MemoryOp,
     MemoryStore,
     ObjectNotReady,
+    _cancellable,
     _Registration,
     _scatter,
-    _unstarted,
 )
 
 _MISS = RowResult(RowStatus.MISS)
@@ -172,7 +172,7 @@ class SecondUnregisterRaises(MemoryDriver):
         super().unregister(handle)
 
 
-class UnregistersAnUnprovableRegion(MemoryDriver):
+class UnregistersTheRegionOfAnUnprovableOperation(MemoryDriver):
     def _check_region_idle(self, registration: _Registration) -> None:
         if any(
             not op.access_ended
@@ -242,20 +242,20 @@ class CancelRewritesConcludedRows(MemoryDriver):
         self._settle_untouched(op)
 
 
-class CancelTellsNoOne(MemoryDriver):
+class CancelSkipsOnChange(MemoryDriver):
     def cancel(self, op: OpHandle) -> None:
         with self._lock:
             if self._cancel_effective:
                 self._cancel_unstarted(self._op(op))
 
 
-class DrainTellsNoOne(MemoryDriver):
+class DrainSkipsOnChange(MemoryDriver):
     def drain(self, budget_s: float) -> bool:
         with self._lock:
             self._require_not_closed()
             self._start_draining()
             for op in self._ops:
-                if any(_unstarted(row) for row in op.rows):
+                if any(_cancellable(row) for row in op.rows):
                     self._cancel_unstarted(op)
             self._lock.wait_for(self._drain_can_return, timeout=budget_s)
             return self._quiet()
@@ -317,9 +317,9 @@ class NeverEndsAccess(MemoryDriver):
             op.access_ended = False  # the evidence is lost again
 
 
-class TellsBeforeTheChangeShows(MemoryDriver):
+class CallsOnChangeBeforeTheChangeShows(MemoryDriver):
     def _run(self, op: MemoryOp, finished: threading.Event | None) -> None:
-        self._call_on_change(op)  # nothing has changed yet, and nothing is told afterwards
+        self._call_on_change(op)  # nothing has changed yet, and on_change is not called again
         try:
             self._before_execute(op)
             self._execute(op)
@@ -330,7 +330,7 @@ class TellsBeforeTheChangeShows(MemoryDriver):
                     self._lock.notify_all()
 
 
-class NeverTellsItTurnedUnprovable(MemoryDriver):
+class SkipsOnChangeWhenUnprovable(MemoryDriver):
     def mark_unprovable(self, op: MemoryOp) -> None:
         with self._lock:
             self._require_open(op)
@@ -338,7 +338,7 @@ class NeverTellsItTurnedUnprovable(MemoryDriver):
             self._lock.notify_all()
 
 
-class TellsOnlyOfAnAccessEnd(MemoryDriver):
+class SkipsOnChangeWhileAccessIsOpen(MemoryDriver):
     def _call_on_change(self, op: MemoryOp) -> None:
         if op.access_ended or op.unprovable:
             super()._call_on_change(op)
@@ -590,19 +590,19 @@ BROKEN_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities, str]
         "test_results_are_stable_and_access_ends_with_evidence",
     ),
     "on_change follows the change it tells of": (
-        TellsBeforeTheChangeShows,
+        CallsOnChangeBeforeTheChangeShows,
         DEFAULT_CAPABILITIES,
         "test_on_change_is_called_after_each_operation_settles",
     ),
     "on_change tells of rows concluded before access ends": (
-        TellsOnlyOfAnAccessEnd,
+        SkipsOnChangeWhileAccessIsOpen,
         DEFAULT_CAPABILITIES,
         "test_on_change_is_called_once_every_row_concluded_while_access_stays_open",
     ),
     "on_change tells of an access turned unprovable": (
-        NeverTellsItTurnedUnprovable,
+        SkipsOnChangeWhenUnprovable,
         DEFAULT_CAPABILITIES,
-        "test_an_unprovable_get_makes_drain_return_at_once_and_keeps_its_region",
+        "test_an_unprovable_get_calls_on_change_keeps_its_region_and_drain_returns_at_once",
     ),
     "capabilities are fixed": (
         ChangesItsCapabilities,
@@ -627,12 +627,12 @@ BROKEN_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities, str]
     "a blocked get delays nothing else": (
         HoldsTheLockAcrossTheStore,
         DEFAULT_CAPABILITIES,
-        "test_a_blocked_get_delays_neither_another_get_nor_the_non_blocking_calls",
+        "test_a_get_blocked_in_the_store_delays_nothing_and_keeps_its_memory",
     ),
     "a busy region is not unregistered": (
         UnregistersBusyRegions,
         DEFAULT_CAPABILITIES,
-        "test_a_blocked_get_delays_neither_another_get_nor_the_non_blocking_calls",
+        "test_a_get_blocked_in_the_store_delays_nothing_and_keeps_its_memory",
     ),
     "an unfinished write is not ready": (
         CallsNotReadyAFault,
@@ -652,7 +652,7 @@ BROKEN_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities, str]
     "drain returns at once on an unprovable operation": (
         DrainWaitsForEveryone,
         DEFAULT_CAPABILITIES,
-        "test_an_unprovable_get_makes_drain_return_at_once_and_keeps_its_region",
+        "test_an_unprovable_get_calls_on_change_keeps_its_region_and_drain_returns_at_once",
     ),
     "drain is one-way": (
         KeepsAcceptingWhileDraining,
@@ -667,12 +667,12 @@ BROKEN_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities, str]
     "unregister frees the range": (
         UnregisterKeepsTheRange,
         DEFAULT_CAPABILITIES,
-        "test_unregister_frees_the_range_for_a_new_registration",
+        "test_a_registered_range_cannot_be_registered_again_until_unregistered",
     ),
     "registrations never overlap": (
         AcceptsOverlappingRegistrations,
         DEFAULT_CAPABILITIES,
-        "test_unregister_frees_the_range_for_a_new_registration",
+        "test_a_registered_range_cannot_be_registered_again_until_unregistered",
     ),
     "every span is checked": (
         ChecksOnlyTheFirstSpan,
@@ -690,9 +690,9 @@ BROKEN_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities, str]
         "test_unregister_is_idempotent",
     ),
     "an unprovable operation keeps its region": (
-        UnregistersAnUnprovableRegion,
+        UnregistersTheRegionOfAnUnprovableOperation,
         DEFAULT_CAPABILITIES,
-        "test_an_unprovable_get_makes_drain_return_at_once_and_keeps_its_region",
+        "test_an_unprovable_get_calls_on_change_keeps_its_region_and_drain_returns_at_once",
     ),
     "a duplicate put is ready": (
         DuplicatePutIsAFault,
@@ -762,25 +762,25 @@ BROKEN_ASYNC_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities
     "access stays open while a row is in the store": (
         EndsAccessOnceARowStarted,
         DEFAULT_CAPABILITIES,
-        "test_a_blocked_get_delays_neither_another_get_nor_the_non_blocking_calls",
+        "test_a_get_blocked_in_the_store_delays_nothing_and_keeps_its_memory",
     ),
     "get never waits for the store": (
         GetWaitsForTheStore,
         DEFAULT_CAPABILITIES,
-        "test_a_blocked_get_delays_neither_another_get_nor_the_non_blocking_calls",
+        "test_a_get_blocked_in_the_store_delays_nothing_and_keeps_its_memory",
     ),
     "drain never forces an end": (
         DrainForcesAnEnd,
         DEFAULT_CAPABILITIES,
-        "test_a_blocked_get_delays_neither_another_get_nor_the_non_blocking_calls",
+        "test_a_get_blocked_in_the_store_delays_nothing_and_keeps_its_memory",
     ),
     "a cancel tells of the operation it ended": (
-        CancelTellsNoOne,
+        CancelSkipsOnChange,
         DEFAULT_CAPABILITIES,
         "test_a_cancel_that_ends_an_operation_calls_its_on_change",
     ),
     "a drain tells of the operations it ended": (
-        DrainTellsNoOne,
+        DrainSkipsOnChange,
         DEFAULT_CAPABILITIES,
         "test_a_drain_that_ends_an_operation_calls_its_on_change",
     ),

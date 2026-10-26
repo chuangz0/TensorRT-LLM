@@ -17,8 +17,8 @@ Unscripted calls follow SDK 0.3.13:
   -600 when the object is longer than its buffer).
 - A buffer outside every registration fails with TRANSFER_FAIL, as RDMA does.
 
-``CallsOfKeyWait`` holds one method's calls naming a key in front of any SDK client, this fake
-or a real one.
+``KeyGatedClient`` stops one method's calls naming a key at a gate, in front of any SDK client,
+this fake or a real one.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ REPLICA_IS_NOT_READY = -703
 OBJECT_NOT_FOUND = -704
 OBJECT_ALREADY_EXISTS = -705
 TRANSFER_FAIL = -800
-HELD_CALL_S = 50.0  # how long a blocked call waits for its gate: past any test's own wait
+GATED_CALL_S = 50.0  # how long a blocked call waits for its gate: past any test's own wait
 
 
 @dataclass
@@ -65,7 +65,7 @@ class Gate:
         self.release = threading.Event()
 
 
-class CallsOfKeyWait:
+class KeyGatedClient:
     """An SDK client whose ``method`` calls naming ``key`` wait inside the call until ``release`` is
     set; every other call goes straight through."""
 
@@ -81,14 +81,14 @@ class CallsOfKeyWait:
         if name != self.method:
             return call
 
-        def held(keys, *args):
+        def gated(keys, *args):
             if self.key in keys:
                 self.entered.set()
                 # Past the suite's timeout: only the check's unblock lets it go.
-                self.release.wait(HELD_CALL_S)
+                self.release.wait(GATED_CALL_S)
             return call(keys, *args)
 
-        return held
+        return gated
 
 
 class FakeMooncakeStore:
@@ -286,7 +286,7 @@ class FakeMooncakeStore:
             step = self._steps[method].popleft() if self._steps[method] else None
         if gate is not None:
             gate.entered.set()
-            gate.release.wait(HELD_CALL_S)
+            gate.release.wait(GATED_CALL_S)
         if isinstance(step, BaseException):
             raise step
         if isinstance(step, list):

@@ -37,7 +37,7 @@ from cpu_fixtures import (
     store_key,
     wait_until,
 )
-from fake_mooncake import CallsOfKeyWait, FakeMooncakeStore, FakePool
+from fake_mooncake import FakeMooncakeStore, FakePool, KeyGatedClient
 
 from tensorrt_llm._torch.disaggregation.base.backend import Attempt, Backend, Capabilities
 from tensorrt_llm._torch.disaggregation.blob import mooncake as mooncake_module
@@ -185,7 +185,7 @@ def test_the_driver_is_a_store_driver_with_mooncake_capabilities() -> None:
     )
 
 
-class DriverStartingNothing(MooncakeDriver):
+class DriverLeavingOperationsUnstarted(MooncakeDriver):
     """A Mooncake driver whose workers never take a part."""
 
     def _take(self):
@@ -201,11 +201,11 @@ class TestMooncakeDriverConformance(DriverConformance):
         return MooncakeDriver(FakeMooncakeStore(), rows_per_call=1)
 
     def make_blocked_get(self):
-        sdk = CallsOfKeyWait(FakeMooncakeStore(), GET, key("blocked"))
+        sdk = KeyGatedClient(FakeMooncakeStore(), GET, key("blocked"))
         return MooncakeDriver(sdk), key("blocked"), sdk.entered, sdk.release.set
 
     def make_blocked_put(self):
-        sdk = CallsOfKeyWait(FakeMooncakeStore(), PUT_RANGES, key("blocked"))
+        sdk = KeyGatedClient(FakeMooncakeStore(), PUT_RANGES, key("blocked"))
         return MooncakeDriver(sdk), key("blocked"), sdk.entered, sdk.release.set
 
     def make_held_key(self):
@@ -231,8 +231,8 @@ class TestMooncakeDriverConformance(DriverConformance):
         fake.script(GET, RuntimeError("the SDK crashed"))
         return MooncakeDriver(fake)
 
-    def make_driver_starting_nothing(self):
-        return DriverStartingNothing(FakeMooncakeStore())
+    def make_driver_leaving_operations_unstarted(self):
+        return DriverLeavingOperationsUnstarted(FakeMooncakeStore())
 
     def make_failing_get(self):
         fake = FakeMooncakeStore()
@@ -366,7 +366,7 @@ def test_puts_leave_one_worker_to_gets() -> None:
         assert summary(bench.settle(op)[0]) == [("ready", None)]
 
 
-class Told:
+class OnChangeRecorder:
     """An ``on_change`` that keeps the handle it is called with and what ``poll`` then shows."""
 
     def __init__(self, driver: MooncakeDriver) -> None:
@@ -388,22 +388,22 @@ def test_a_cancel_ends_only_the_rows_no_worker_took() -> None:
     bench = Bench(workers=1, bytes_per_call=SLOT)
     bench.store(A=b"aaaaaaaa", B=b"bbbbbbbb", C=b"cccccccc")
     gate = bench.fake.block(GET)
-    told = Told(bench.driver)
-    op = bench.driver.get(bench.rows("A", "B", "C"), on_change=told)
+    recorder = OnChangeRecorder(bench.driver)
+    op = bench.driver.get(bench.rows("A", "B", "C"), on_change=recorder)
     try:
         assert gate.entered.wait(WAIT_S)
         bench.driver.cancel(op)
         shown = summary(bench.driver.poll(op))
         assert shown == [("pending", None), ("cancelled", None), ("cancelled", None)]
         assert not bench.driver.access_ended(op)  # A's part is still in the SDK
-        assert told.shown == []  # A has not concluded, so there is nothing to act on yet
+        assert recorder.shown == []  # A has not concluded, so there is nothing to act on yet
     finally:
         gate.release.set()
     results, access_ended = bench.settle(op)
     assert summary(results) == [("ready", None), ("cancelled", None), ("cancelled", None)]
     assert access_ended and bench.keys_of(GET) == [key("A")]
-    wait_until(lambda: told.shown, "on_change once A's part ended")
-    assert told.shown_for(op) == [summary(results)]
+    wait_until(lambda: recorder.shown, "on_change once A's part ended")
+    assert recorder.shown_for(op) == [summary(results)]
     assert bench.read(1) == bench.read(2) == b"-" * SLOT
     bench.driver.cancel(op)  # nothing left to cancel
     assert bench.driver.drain(WAIT_S) is True
@@ -467,12 +467,12 @@ def test_a_warning_that_raises_leaves_the_part_as_it_ended(monkeypatch: pytest.M
 def test_the_driver_calls_on_change_once_the_operation_is_done() -> None:
     bench = Bench(workers=1, bytes_per_call=SLOT)  # a part per row, run one after the other
     bench.store(A=b"aaaaaaaa", B=b"bbbbbbbb")
-    told = Told(bench.driver)
-    op = bench.driver.get(bench.rows("A", "B"), on_change=told)
+    recorder = OnChangeRecorder(bench.driver)
+    op = bench.driver.get(bench.rows("A", "B"), on_change=recorder)
     bench.settle(op)
-    wait_until(lambda: told.shown, "on_change once B's part ended")
+    wait_until(lambda: recorder.shown, "on_change once B's part ended")
     # Not after A's part: a caller does nothing with some rows concluded.
-    assert told.shown_for(op) == [[("ready", None), ("ready", None)]]
+    assert recorder.shown_for(op) == [[("ready", None), ("ready", None)]]
 
 
 def get_into_slot(bench: Bench, name: str, slot: int) -> RowBatch:
@@ -559,7 +559,7 @@ def test_drain_waits_for_every_worker_thread_to_exit() -> None:
 
 def test_the_conformance_suite_runs_its_checks_of_a_get_held_inside_the_sdk() -> None:
     # put and get return before the SDK answers, so those checks must run rather than skip.
-    assert TestMooncakeDriverConformance.handles_before_completion
+    assert TestMooncakeDriverConformance.returns_before_the_store_answers
 
 
 def test_drain_calls_on_change_for_the_operations_it_ended_before_it_waits() -> None:
@@ -569,14 +569,14 @@ def test_drain_calls_on_change_for_the_operations_it_ended_before_it_waits() -> 
     rows = bench.rows("A", "B")
     running = bench.driver.get(rows[:1])
     assert gate.entered.wait(WAIT_S)
-    told = Told(bench.driver)
-    queued = bench.driver.get(rows[1:], on_change=told)
+    recorder = OnChangeRecorder(bench.driver)
+    queued = bench.driver.get(rows[1:], on_change=recorder)
     drained: list[bool] = []
     drainer = threading.Thread(target=lambda: drained.append(bench.driver.drain(WAIT_S)))
     drainer.start()
     try:
-        wait_until(lambda: told.shown, "on_change once B was cancelled")
-        assert told.shown_for(queued) == [[("cancelled", None)]]
+        wait_until(lambda: recorder.shown, "on_change once B was cancelled")
+        assert recorder.shown_for(queued) == [[("cancelled", None)]]
         assert not drained  # still waiting for A's part, which is in the SDK
     finally:
         gate.release.set()
@@ -638,10 +638,10 @@ def test_once_no_worker_is_left_queued_rows_fault_and_operations_are_rejected(
     bench = Bench(workers=1, bytes_per_call=SLOT)  # a part per row
     bench.store(A=b"aaaaaaaa", B=b"bbbbbbbb")
     bench.fake.script(GET, SystemExit())  # A's part ends the only worker thread
-    told = Told(bench.driver)
-    op = bench.driver.get(bench.rows("A", "B"), on_change=told)
-    wait_until(lambda: len(told.shown) == 2, "A's end, then B's")
-    assert told.shown_for(op)[-1] == [
+    recorder = OnChangeRecorder(bench.driver)
+    op = bench.driver.get(bench.rows("A", "B"), on_change=recorder)
+    wait_until(lambda: len(recorder.shown) == 2, "A's end, then B's")
+    assert recorder.shown_for(op)[-1] == [
         ("fault", "the worker stopped before the row was decided"),
         ("fault", "no worker thread is left to run the row"),  # B waited for a worker in vain
     ]
@@ -704,7 +704,7 @@ GET_ANSWERS = {
     "object_size": (None, "ready", None, None),  # unscripted
     "short_object": (5, "fault", "object is 5 bytes, expected 8", None),
     "OBJECT_NOT_FOUND": (-704, "miss", None, None),
-    "REPLICA_IS_NOT_READY": (-703, "not_ready", None, "rows_not_ready_being_written"),
+    "REPLICA_IS_NOT_READY": (-703, "not_ready", None, "rows_not_ready_no_complete_replica"),
     "INVALID_REPLICA": (-702, "fault", "batch_get_into: INVALID_REPLICA(-702)", None),
     "INVALID_PARAMS": (-600, "fault", "batch_get_into: INVALID_PARAMS(-600)", None),
     "RPC_FAIL": (-900, "fault", "batch_get_into: RPC_FAIL(-900)", None),
@@ -936,7 +936,7 @@ def test_sessions_left_open_are_revoked_only_in_drain() -> None:
     assert bench.fake.put_sessions == set()
 
 
-def test_the_sessions_of_a_put_its_worker_thread_left_stay_held(
+def test_a_put_whose_worker_thread_exits_leaves_its_session_open_for_drain(
     thread_escapes: list[BaseException],
 ) -> None:
     bench = Bench()
@@ -1017,7 +1017,7 @@ def test_close_needs_a_drain_that_returned_true() -> None:
     assert len(bench.fake.calls_to("close")) == 1
 
 
-def test_drain_leaves_sessions_alone_while_access_is_unproven() -> None:
+def test_drain_leaves_the_session_of_an_unprovable_put_to_the_master() -> None:
     bench = Bench()
     bench.fake.script(PUT_RANGES, RuntimeError("bad pointer"))
     _, access_ended = bench.run("put", "A")
@@ -1067,9 +1067,9 @@ def test_an_object_being_written_is_not_ready_for_put_and_get(monkeypatch) -> No
     results, access_ended = bench.run("put", "K")
     assert summary(results) == [("not_ready", None)] and access_ended
     stats = bench.driver.stats()
-    assert stats["rows_not_ready_being_written"] == stats["rows_not_ready_uncommitted"] == 1
+    assert stats["rows_not_ready_no_complete_replica"] == stats["rows_not_ready_uncommitted"] == 1
     # Each part logs once it ended, a moment after its operation settled.
-    for reason in ("being_written", "uncommitted"):
+    for reason in ("no_complete_replica", "uncommitted"):
         wait_until(
             lambda: any(key("K") in line and f"not_ready ({reason})" in line for line in warnings),
             f"the {reason} warning",
@@ -1176,7 +1176,7 @@ def test_a_part_whose_sdk_lists_cannot_be_built_faults_and_ends_its_access(
     ]
     assert access_ended and not bench.driver.access_unprovable(bench.last)
     assert bench.fake.calls_to(GET) == []
-    assert bench.driver.drain(WAIT_S) is True  # the region is not pinned
+    assert bench.driver.drain(WAIT_S) is True  # no operation turned unprovable
 
 
 def test_register_and_unregister_follow_the_protocol() -> None:
@@ -1305,7 +1305,7 @@ def test_hints_and_foreign_handles_are_programming_errors() -> None:
     assert [c for c in bench.fake.calls if c.method.startswith("batch_")] == []
 
 
-def test_a_shutdown_an_unprovable_get_pins_still_ends_the_worker_threads() -> None:
+def test_shutdown_ends_the_worker_threads_even_with_an_unprovable_get() -> None:
     pool = FakePool()
     fake = FakeMooncakeStore(pool)
     reader = Endpoint(MooncakeDriver(fake), ["A"])

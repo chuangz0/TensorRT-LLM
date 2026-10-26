@@ -4,16 +4,16 @@
 
 The backend translates and keeps the books; the driver owns how its store's work runs: its queue,
 the order in which gets and puts run, and its threads. A submission is checked and cut into calls,
-one per layer group (split only where the driver limits the rows of one call), and each call goes
-to the driver at once, on the caller's thread, as one ``put`` or ``get`` of a ``RowBatch``: the
-driver only records and queues it. The backend queues nothing, so it has no order of its own to
-keep.
+one per layer group (split only where the driver limits the rows of one call). A call is one
+driver operation, its ``OpHandle``; a driver may split it further. Each call goes to the driver at
+once, on the caller's thread, as one ``put`` or ``get`` of a ``RowBatch``: the driver only records
+and queues it. The backend queues nothing, so it has no order of its own to keep.
 
 Each call carries an ``on_change`` callback, which the driver calls once the operation's rows all
 concluded, once its access ended and once it turned unprovable; it is the backend's only news of
-the call. The callback looks at the operation through the driver's queries and records what they
-show, on the thread the driver called it from. Looks only ever add evidence (results, an access
-end, unprovability), so they may be recorded in any order, on any thread, more than once. All
+the call. The callback queries the operation through the driver and records what the queries
+show, on the thread the driver called it from. A record only ever adds evidence (results, an access
+end, unprovability), so records may come in any order, on any thread, more than once. All
 bookkeeping is under one lock; neither the driver nor ``wake`` is ever called under it.
 
 A call settles once its row results are recorded and its access end is recorded or can never be
@@ -59,7 +59,7 @@ from ..base.backend import (
     WakeFn,
 )
 from ..base.memory import MemoryKind
-from .keys import key_stem
+from .keys import check_key_prefix, key_stem
 from .store import (
     DriverRejected,
     OnChange,
@@ -114,7 +114,7 @@ class BlobConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.key_prefix, str):
             raise ValueError(f"key_prefix must be a str, got {self.key_prefix!r}")
-        key_stem(self.key_prefix)
+        check_key_prefix(self.key_prefix)
 
 
 class ConstructionRejected(RuntimeError):
@@ -196,7 +196,7 @@ class RegionBinding:
             try:
                 handle = self.driver.register(region.address, region.nbytes, layout)
             except Exception as error:
-                self._raise_for_failed_registration(index, error)
+                self._roll_back_if_possible_and_raise(index, error)
             else:
                 self._track_live_registration(index, handle)
 
@@ -237,7 +237,11 @@ class RegionBinding:
         with self._lock:
             return frozenset(f"region:{index}" for index in self._live_registrations)
 
-    def _raise_for_failed_registration(self, index: int, error: Exception) -> NoReturn:
+    def _roll_back_if_possible_and_raise(self, index: int, error: Exception) -> NoReturn:
+        """Raises for region ``index``'s failed registration. When nothing escaped, unregisters
+        every earlier region; once none is left, releases the lender's hold and raises
+        ``ConstructionRejected``. Otherwise (the failed registration may be live, or an earlier
+        region stays registered) keeps the hold and raises ``RuntimeError``."""
         handle = error.handle if isinstance(error, RegistrationError) else None
         nothing_escaped = isinstance(error, DriverRejected) or (
             isinstance(error, RegistrationError) and handle is None
@@ -276,7 +280,8 @@ class _GroupRows(NamedTuple):
 
 @dataclass(eq=False)
 class _Call:
-    """Rows ``[start, stop)`` of one group of an attempt, handed to the driver in one call."""
+    """Rows ``[start, stop)`` of one group of an attempt, handed to the driver as one operation: one
+    ``put`` or ``get``, one ``OpHandle``."""
 
     attempt: BlobAttempt
     group_position: int  # in ``View.groups``, not the group's ``layer_group_index``
@@ -377,7 +382,7 @@ class BlobAttempt:
         self._backend._cancel(self)
 
     @property
-    def _pinned(self) -> bool:
+    def _has_unprovable_call(self) -> bool:
         """A call can never prove its access ended, so the attempt never quiesces."""
         return any(call.unprovable for call in self._calls)
 
@@ -654,7 +659,7 @@ class BlobBackend:
             violation = self._protocol_violation
             if violation is not None:
                 reason = f"not handed over: the store driver broke its protocol ({violation})"
-                self._fail_call(call, reason, broke_protocol=False)
+                self._fail_call(call, reason, this_call_broke_protocol=False)
                 break
             op = self._hand_over_call(call, rows)
             if op is None:
@@ -673,7 +678,7 @@ class BlobBackend:
     def _hand_over_call(self, call: _Call, rows: RowBatch) -> OpHandle | None:
         """The driver's handle for ``call``, or None when the driver did not take it; the failure
         is then recorded."""
-        on_change: OnChange = functools.partial(self._look, call)
+        on_change: OnChange = functools.partial(self._query_and_record, call)
         attempt = call.attempt
         try:
             if not attempt.is_fetch:
@@ -683,53 +688,61 @@ class BlobBackend:
             else:
                 op = self._driver.get(rows, attempt._hint, on_change=on_change)
         except DriverRejected as error:  # certifies that nothing escaped
-            self._fail_call(call, f"refused: {error}", broke_protocol=False)
+            self._fail_call(call, f"refused: {error}", this_call_broke_protocol=False)
             return None
         except Exception as error:  # outside the driver protocol: the rows may be accessed for good
-            self._fail_call(call, f"the store driver raised {error!r}", broke_protocol=True)
+            self._fail_call(
+                call, f"the store driver raised {error!r}", this_call_broke_protocol=True
+            )
             return None
-        if op is None:  # outside the driver protocol too: nothing to look at or cancel
-            self._fail_call(call, "the store driver returned no handle", broke_protocol=True)
+        if op is None:  # outside the driver protocol too: nothing to query or cancel
+            self._fail_call(
+                call, "the store driver returned no handle", this_call_broke_protocol=True
+            )
         return op
 
     # Recording, on the thread that calls ``on_change``, or on the submitting one for a call the
     # driver did not take.
 
-    def _look(self, call: _Call, op: OpHandle) -> None:
-        """``call``'s ``on_change``: looks at its operation through the driver's queries and records
-        what they show."""
+    def _query_and_record(self, call: _Call, op: OpHandle) -> None:
+        """``call``'s ``on_change``: queries its operation through the driver and records what the
+        queries show. A record can stop the attempt, land its outcome and quiescence, and latch a
+        protocol violation."""
         try:
             results = self._driver.poll(op)
             access_ended = self._driver.access_ended(op)
             unprovable = not access_ended and self._driver.access_unprovable(op)
             count, all_concluded = len(results), concluded(results)
         except Exception as error:  # the queries never raise for a handle the driver issued
-            self._fail_call(call, f"a store driver query raised {error!r}", broke_protocol=True)
+            self._fail_call(
+                call, f"a store driver query raised {error!r}", this_call_broke_protocol=True
+            )
             return
         if count != len(call):
             reason = f"the store driver gave {count} results for {len(call)} rows"
-            self._fail_call(call, reason, broke_protocol=True)
+            self._fail_call(call, reason, this_call_broke_protocol=True)
             return
         # Read row by row here, outside the lock the submitting thread takes.
         call_results = _CallResults.of(results) if all_concluded else None
         self._record(call, call_results, access_ended, unprovable)
 
-    def _fail_call(self, call: _Call, reason: str, broke_protocol: bool) -> None:
+    def _fail_call(self, call: _Call, reason: str, this_call_broke_protocol: bool) -> None:
         """Records ``call`` as failed as a whole: every row faults with ``reason``.
 
-        A call the driver refused touched nothing, so its access ended. A call on which the driver
-        broke its protocol is held as unprovable (unless its access end was recorded already):
-        nothing the driver says about it later is taken as evidence. Calls already in the driver
-        keep being recorded from its answers, and every later submission is rejected."""
+        A call the driver refused, or never saw, touched nothing, so its access ended. A call on
+        which the driver broke its protocol is held as unprovable (unless its access end was
+        recorded already): nothing the driver says about it later is taken as evidence. Calls
+        already in the driver keep being recorded from its answers, and every later submission is
+        rejected."""
         with self._lock:
-            first_violation = broke_protocol and self._protocol_violation is None
+            first_violation = this_call_broke_protocol and self._protocol_violation is None
             if first_violation:
                 self._protocol_violation = reason
             recorded = self._record_locked(
                 call,
                 _CallResults.none_delivered(len(call), reason),
-                access_ended=not broke_protocol,
-                unprovable=broke_protocol,
+                access_ended=not this_call_broke_protocol,
+                unprovable=this_call_broke_protocol,
                 whole_call_failed=True,
             )
         if first_violation:
@@ -774,7 +787,7 @@ class BlobBackend:
         whole_call_failed: bool = False,
     ) -> _Recorded:
         """Records ``call``'s results (None while not all concluded), its access end and whether
-        that end can never be proven. Only adds evidence, so a stale or repeated look changes
+        that end can never be proven. Only adds evidence, so a stale or repeated record changes
         nothing; a recorded access end stands against a later claim that it can never be proven,
         and an unprovable call stays held whatever the driver says of it later. The caller passes
         what it returns to ``_after_record`` once it released the lock."""
@@ -782,7 +795,8 @@ class BlobBackend:
         if results is not None and not call.results_recorded:
             call.results_recorded = True
             attempt._calls_awaiting_results -= 1
-            if attempt._record_results(call, results, whole_call_failed):
+            fault_stops_attempt = attempt._record_results(call, results, whole_call_failed)
+            if fault_stops_attempt:
                 self._stop(attempt)
         if access_ended and not call.access_end_recorded and not call.unprovable:
             call.access_end_recorded = True
@@ -910,13 +924,13 @@ class BlobBackend:
 
     def _shutdown_answer_is_final(self) -> bool:
         """Under the lock, once closing: the progress thread finished, or the labels are final. An
-        attempt pinned by a call whose access can never be proven to end never quiesces, and the
+        attempt with a call whose access can never be proven to end never quiesces, and the
         registrations are revoked only once every attempt quiesced, so when every attempt not yet
-        quiesced is pinned, neither its label nor a region's can go any more."""
+        quiesced has such a call, neither its label nor a region's can go any more."""
         if self._teardown_done:
             return True
         unquiesced = [attempt for attempt in self._attempts if not attempt._quiesced]
-        return bool(unquiesced) and all(attempt._pinned for attempt in unquiesced)
+        return bool(unquiesced) and all(attempt._has_unprovable_call for attempt in unquiesced)
 
     def _still_accessible_labels(self) -> frozenset[str]:
         with self._lock:

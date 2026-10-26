@@ -226,8 +226,8 @@ class Harness:
         for i, data in enumerate(rows.values()):
             writer.fill_row(i, data)
         op = self.put(writer.rows())
-        assert [r.status for r in self.settle(op)] == [RowStatus.READY] * len(rows)
-        self.settle_access(op)
+        assert [r.status for r in self.wait_for_results(op)] == [RowStatus.READY] * len(rows)
+        self.wait_for_access_end(op)
         for i, data in enumerate(rows.values()):
             assert writer.memory.read(i * slot, len(data)) == data, "a put changed its source"
         assert writer.intact()
@@ -235,14 +235,14 @@ class Harness:
 
     # Waiting and asserting.
 
-    def settle(self, op: OpHandle) -> tuple[RowResult, ...]:
+    def wait_for_results(self, op: OpHandle) -> tuple[RowResult, ...]:
         """Waits for every row's result, not for access end."""
         wait_until(
             lambda: concluded(self.driver.poll(op)), "the operation to conclude", self.timeout
         )
         return self.driver.poll(op)
 
-    def settle_access(self, op: OpHandle) -> None:
+    def wait_for_access_end(self, op: OpHandle) -> None:
         wait_until(lambda: self.driver.access_ended(op), "access to end", self.timeout)
 
     def assert_absent(self, result: RowResult, endpoint: Endpoint, index: int) -> None:
@@ -368,7 +368,7 @@ class DriverConformance:
     # True when put/get return their handle before the store answers, as the driver protocol
     # asks. A driver that answers inside put/get, as the in-memory driver's automatic mode does,
     # sets False to skip the checks that hold a put or a get inside the store.
-    handles_before_completion = True
+    returns_before_the_store_answers = True
 
     def make_driver(self) -> StoreDriver:
         raise NotImplementedError
@@ -426,7 +426,7 @@ class DriverConformance:
         and every get."""
         return None
 
-    def make_driver_starting_nothing(self) -> StoreDriver | None:
+    def make_driver_leaving_operations_unstarted(self) -> StoreDriver | None:
         """A driver that starts no operation it takes: every row stays unstarted until a cancel or
         a drain ends it."""
         return None
@@ -473,7 +473,7 @@ class DriverConformance:
             writer.fill_row(0, b"xxxxxxxx")  # the source changes after the put concluded
 
             reader = h.endpoint(["A", "B"], fill=0x2D)
-            results = h.settle(h.get(reader.rows()))
+            results = h.wait_for_results(h.get(reader.rows()))
             assert [r.status for r in results] == [RowStatus.READY, RowStatus.READY]
             assert reader.read_row(0) == b"aaaaaaaa"
             assert reader.read_row(1) == b"bbbbbbbb"
@@ -484,7 +484,7 @@ class DriverConformance:
             h.needs(put=True, get=True, rows=3)
             h.publish({"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
             reader = h.endpoint(["A", "B", "C"], fill=0x2D)
-            results = h.settle(h.get(reader.rows()))
+            results = h.wait_for_results(h.get(reader.rows()))
             assert [r.status for r in results[:2]] == [RowStatus.READY, RowStatus.READY]
             h.assert_absent(results[2], reader, 2)
             assert reader.intact()
@@ -494,7 +494,7 @@ class DriverConformance:
             h.needs(put=True, get=True)
             h.publish({"A": b"aaaaaaaa"}, slot=8)
             reader = h.endpoint(["A"], slot=4, fill=0x2D)
-            (result,) = h.settle(h.get(reader.rows()))
+            (result,) = h.wait_for_results(h.get(reader.rows()))
             assert result.status is RowStatus.FAULT, result
             assert reader.intact()  # nothing lands outside the row
 
@@ -505,7 +505,7 @@ class DriverConformance:
             h.needs(put=True, get=True)
             h.publish({"A": b"aaaa"}, slot=4)
             reader = h.endpoint(["A"], slot=8, fill=0x2D)
-            (result,) = h.settle(h.get(reader.rows()))
+            (result,) = h.wait_for_results(h.get(reader.rows()))
             assert result.status is RowStatus.FAULT, result
             assert reader.intact()
 
@@ -515,7 +515,7 @@ class DriverConformance:
             h.publish({"A": b"aaaaaaaa"})
             h.publish({"A": b"aaaaaaaa"})  # a second writer, same content
             reader = h.endpoint(["A"])
-            (result,) = h.settle(h.get(reader.rows()))
+            (result,) = h.wait_for_results(h.get(reader.rows()))
             assert result.status is RowStatus.READY
             assert reader.read_row(0) == b"aaaaaaaa"
 
@@ -527,10 +527,10 @@ class DriverConformance:
             h.publish({"A": b"aaaaaaaa"})
             other = h.endpoint(["A"])
             other.fill_row(0, b"zzzzzzzz")
-            (result,) = h.settle(h.put(other.rows()))
+            (result,) = h.wait_for_results(h.put(other.rows()))
             assert result.status in (RowStatus.READY, RowStatus.FAULT)
             reader = h.endpoint(["A"], fill=0x2D)
-            (got,) = h.settle(h.get(reader.rows()))
+            (got,) = h.wait_for_results(h.get(reader.rows()))
             assert got.status is RowStatus.READY
             assert reader.read_row(0) == b"aaaaaaaa"
 
@@ -542,9 +542,9 @@ class DriverConformance:
             h.publish({"B": b"bbbbbbbb"})
             reader = h.endpoint(["A", "B", "C"], fill=0x2D)
             op = h.get([reader.rows()[1]])
-            (result,) = h.settle(op)
+            (result,) = h.wait_for_results(op)
             assert result.status is RowStatus.READY
-            h.settle_access(op)
+            h.wait_for_access_end(op)
             assert reader.read_row(1) == b"bbbbbbbb"
             assert reader.read_row(0) == b"-" * SLOT and reader.read_row(2) == b"-" * SLOT
             assert reader.intact()
@@ -557,11 +557,11 @@ class DriverConformance:
             writer.fill_row(1, b"----")
             writer.fill_row(2, b"cccc")
             row = RowIO(h.key("M"), (writer.span(0), writer.span(2)))  # 8 bytes, slots 0 and 2
-            (put,) = h.settle(h.put([row]))
+            (put,) = h.wait_for_results(h.put([row]))
             assert put.status is RowStatus.READY
 
             whole = h.endpoint(["M"], slot=8, fill=0x2D)
-            (got,) = h.settle(h.get(whole.rows()))
+            (got,) = h.wait_for_results(h.get(whole.rows()))
             assert got.status is RowStatus.READY
             assert whole.read_row(0) == b"aaaacccc"
 
@@ -572,7 +572,7 @@ class DriverConformance:
             )
             parts = h.endpoint(["X", "Y", "Z"], slot=4, fill=0x2D, memory_kind=kind)
             back = RowIO(h.key("M"), (parts.span(2), parts.span(0)))  # given order, not address
-            (got,) = h.settle(h.get([back]))
+            (got,) = h.wait_for_results(h.get([back]))
             assert got.status is RowStatus.READY
             assert parts.read_row(2) == b"aaaa" and parts.read_row(0) == b"cccc"
             assert parts.read_row(1) == b"----"
@@ -588,17 +588,17 @@ class DriverConformance:
             left.fill_row(0, b"-xyz----")
             right.fill_row(0, b"--UVWXY-")
             row = RowIO(h.key("P"), (left.span_at(1, 3), right.span_at(2, 5)))  # "xyz" + "UVWXY"
-            (put,) = h.settle(h.put([row]))
+            (put,) = h.wait_for_results(h.put([row]))
             assert put.status is RowStatus.READY
 
             whole = h.endpoint(["P"], slot=8, fill=0x2D)
-            (got,) = h.settle(h.get(whole.rows()))
+            (got,) = h.wait_for_results(h.get(whole.rows()))
             assert got.status is RowStatus.READY
             assert whole.read_row(0) == b"xyzUVWXY"
 
             split = h.endpoint(["S"], slot=16, fill=0x2D)
             back = RowIO(h.key("P"), (split.span_at(10, 5), split.span_at(3, 3)))  # 5 then 3
-            (got,) = h.settle(h.get([back]))
+            (got,) = h.wait_for_results(h.get([back]))
             assert got.status is RowStatus.READY
             assert split.read_row(0) == b"---WXY----xyzUV-"  # the first 5 bytes land first
             assert left.intact() and right.intact() and whole.intact() and split.intact()
@@ -609,7 +609,7 @@ class DriverConformance:
             h.publish({"A": b"aaaaaaaa"})
             parts = h.endpoint(["X", "Y"], slot=3, fill=0x2D)
             row = RowIO(h.key("A"), (parts.span(0), parts.span(1)))  # 6 bytes for an 8-byte object
-            (got,) = h.settle(h.get([row]))
+            (got,) = h.wait_for_results(h.get([row]))
             assert got.status is RowStatus.FAULT, got
             assert parts.intact()
 
@@ -623,10 +623,10 @@ class DriverConformance:
             h.needs(put=True, get=True)
             writer = h.endpoint(["F"])
             writer.fill_row(0, b"ffffffff")
-            (put,) = h.settle(h.put([RowIO(key, (writer.span(0),))]))
+            (put,) = h.wait_for_results(h.put([RowIO(key, (writer.span(0),))]))
             assert put.status is RowStatus.READY
             reader = h.endpoint(["F"], fill=0x2D)
-            (got,) = h.settle(h.get([RowIO(key, (reader.span(0),))]))
+            (got,) = h.wait_for_results(h.get([RowIO(key, (reader.span(0),))]))
             assert got.status is RowStatus.FAULT, got
             assert reader.intact()
 
@@ -643,7 +643,7 @@ class DriverConformance:
             with pytest.raises(DriverRejected):
                 h.put([RowIO(h.key("S"), (stray.span(),))])
             reader = h.endpoint(["S"], fill=0x2D)
-            (result,) = h.settle(h.get(reader.rows()))
+            (result,) = h.wait_for_results(h.get(reader.rows()))
             h.assert_absent(result, reader, 0)
 
     def test_a_span_leaving_or_outliving_its_registration_is_rejected(self) -> None:
@@ -661,7 +661,7 @@ class DriverConformance:
             with pytest.raises(DriverRejected):
                 h.put([RowIO(h.key("B"), (inside.span(0),))])
             reader = h.endpoint(["B"], fill=0x2D)
-            (result,) = h.settle(h.get(reader.rows()))
+            (result,) = h.wait_for_results(h.get(reader.rows()))
             h.assert_absent(result, reader, 0)
 
     def test_every_span_of_a_row_is_checked_against_the_registrations(self) -> None:
@@ -702,7 +702,7 @@ class DriverConformance:
             with pytest.raises(DriverRejected):
                 h.put(writer.rows())
             reader = h.endpoint(["R0"], fill=0x2D)
-            (result,) = h.settle(h.get(reader.rows()))
+            (result,) = h.wait_for_results(h.get(reader.rows()))
             h.assert_absent(result, reader, 0)
 
     def test_an_undeclared_direction_is_rejected(self) -> None:
@@ -729,10 +729,10 @@ class DriverConformance:
             h.publish({"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
             reader = h.endpoint(["A", "B"])
             op = h.get(reader.rows())
-            results = h.settle(op)
+            results = h.wait_for_results(op)
             assert [r.status for r in results] == [RowStatus.READY, RowStatus.READY]
             assert h.driver.poll(op) == results
-            h.settle_access(op)
+            h.wait_for_access_end(op)
             assert h.driver.access_ended(op)
             assert not h.driver.access_unprovable(op)
             assert h.driver.poll(op) == results
@@ -753,8 +753,8 @@ class DriverConformance:
                     seen.append((tuple(h.driver.poll(op)), h.driver.access_ended(op)))
 
                 op = start(rows, on_change=look)
-                settled = (tuple(h.settle(op)), True)
-                h.settle_access(op)
+                settled = (tuple(h.wait_for_results(op)), True)
+                h.wait_for_access_end(op)
                 wait_until(lambda: settled in seen, "on_change after the last change", h.timeout)
 
     def test_on_change_is_called_once_every_row_concluded_while_access_stays_open(self) -> None:
@@ -781,7 +781,9 @@ class DriverConformance:
             )
             end_access(op)
 
-    def test_an_unprovable_get_makes_drain_return_at_once_and_keeps_its_region(self) -> None:
+    def test_an_unprovable_get_calls_on_change_keeps_its_region_and_drain_returns_at_once(
+        self,
+    ) -> None:
         staged = self.make_unprovable_get()
         if staged is None:
             pytest.skip("this driver cannot stage an operation whose end it cannot prove")
@@ -795,7 +797,7 @@ class DriverConformance:
                 on_change=lambda op: told_unprovable.append(driver.access_unprovable(op)),
             )
             lose_the_evidence(op)
-            h.settle(op)
+            h.wait_for_results(op)
             wait_until(lambda: True in told_unprovable, "on_change once unprovable", h.timeout)
             assert not driver.access_ended(op)
             started = time.monotonic()
@@ -816,7 +818,7 @@ class DriverConformance:
     def _end_an_unstarted_get(
         self, how: str, end: Callable[[StoreDriver, OpHandle], object]
     ) -> None:
-        driver = self.make_driver_starting_nothing()
+        driver = self.make_driver_leaving_operations_unstarted()
         if driver is None:
             pytest.skip("this driver cannot hold an operation unstarted")
         with self.harness(driver) as h:
@@ -838,7 +840,7 @@ class DriverConformance:
             h.publish({"A": b"aaaaaaaa"})
             reader = h.endpoint(["A"], fill=0x2D)
             op = h.get(reader.rows())
-            results = h.settle(op)
+            results = h.wait_for_results(op)
             h.driver.cancel(op)
             assert h.driver.poll(op) == results
             assert reader.read_row(0) == b"aaaaaaaa"
@@ -846,7 +848,7 @@ class DriverConformance:
     def test_a_put_returns_its_handle_before_the_store_answers(self) -> None:
         """put runs on the caller's thread, the executor loop's: it hands the handle back while
         the store still holds the row, and never waits for the store."""
-        if not self.handles_before_completion:
+        if not self.returns_before_the_store_answers:
             pytest.skip("this driver answers inside put and get")
         staged = self.make_blocked_put()
         if staged is None:
@@ -875,7 +877,7 @@ class DriverConformance:
             finally:
                 unblock()
                 putter.join(h.timeout)
-            (result,) = h.settle(seen["op"])
+            (result,) = h.wait_for_results(seen["op"])
             assert result.status is RowStatus.READY
 
     def test_cancel_of_a_get_inside_the_store_neither_waits_nor_lies(self) -> None:
@@ -884,7 +886,7 @@ class DriverConformance:
         store. The hook guarantees that access cannot end before the gate opens, so the last
         holds whatever result the row carries. A driver that hands out the handle only once the
         store answered cannot be asked."""
-        if not self.handles_before_completion:
+        if not self.returns_before_the_store_answers:
             pytest.skip("this driver returns the handle of a get only once the store answered")
         staged = self.make_blocked_get()
         if staged is None:
@@ -936,7 +938,7 @@ class DriverConformance:
                     if thread.ident is not None:  # started
                         thread.join(h.timeout)
             assert not submitter.is_alive() and not canceller.is_alive()
-            (after,) = h.settle(op)
+            (after,) = h.wait_for_results(op)
             if during.concluded:
                 assert after == during
 
@@ -965,7 +967,7 @@ class DriverConformance:
                     op = start(rows)
                 except Exception as error:  # noqa: BLE001 - the check is that nothing escapes
                     pytest.fail(f"{direction} raised after the operation was recorded: {error!r}")
-                (result,) = h.settle(op)
+                (result,) = h.wait_for_results(op)
                 assert result.status is RowStatus.FAULT, (direction, result)
 
     def test_a_key_held_by_an_unfinished_write_is_not_ready_for_get_put_and_probe(self) -> None:
@@ -980,20 +982,20 @@ class DriverConformance:
             writer.fill_row(0, b"hhhhhhhh")
             write = [RowIO(key, (writer.span(0),))]
             try:
-                (got,) = h.settle(h.get([RowIO(key, (early.span(0),))]))
+                (got,) = h.wait_for_results(h.get([RowIO(key, (early.span(0),))]))
                 assert got.status is RowStatus.NOT_READY, got
                 assert early.read_row(0) == b"-" * SLOT
-                (put,) = h.settle(h.put(write))
+                (put,) = h.wait_for_results(h.put(write))
                 assert put.status is RowStatus.NOT_READY, put
                 if driver.capabilities.probe:
                     assert driver.probe([key], h.timeout) == (ProbeStatus.NOT_READY,)
             finally:
                 release()
-            (put,) = h.settle(h.put(write))
+            (put,) = h.wait_for_results(h.put(write))
             assert put.status is RowStatus.READY
             # Fresh memory: the spans of the early get stay its own until its access provably ended.
             later = h.endpoint(["H"], fill=0x2D)
-            (got,) = h.settle(h.get([RowIO(key, (later.span(0),))]))
+            (got,) = h.wait_for_results(h.get([RowIO(key, (later.span(0),))]))
             assert got.status is RowStatus.READY
             assert later.read_row(0) == b"hhhhhhhh"
 
@@ -1007,20 +1009,24 @@ class DriverConformance:
             writer.fill_row(0, b"aaaaaaaa")
             writer.fill_row(1, b"bbbbbbbb")
             op = h.put(writer.rows())
-            results = h.settle(op)
+            results = h.wait_for_results(op)
             assert sorted((r.status for r in results), key=lambda s: s.value) == [
                 RowStatus.DECLINED,
                 RowStatus.READY,
             ], results
-            h.settle_access(op)
+            h.wait_for_access_end(op)
             stored = [r.status for r in results].index(RowStatus.READY)
             reader = h.endpoint(["A", "B"], fill=0x2D)
-            got = h.settle(h.get(reader.rows()))
+            got = h.wait_for_results(h.get(reader.rows()))
             assert got[stored].status is RowStatus.READY
             assert reader.read_row(stored) == writer.read_row(stored)
             assert got[1 - stored].status is not RowStatus.READY
 
-    def test_a_blocked_get_delays_neither_another_get_nor_the_non_blocking_calls(self) -> None:
+    def test_a_get_blocked_in_the_store_delays_nothing_and_keeps_its_memory(self) -> None:
+        """A get blocked inside the store delays no other call, nor its own handle when the
+        driver returns handles before the store answers; until the store lets it go, its access
+        stays open, through a drain too, and its region refuses to unregister (for a driver that
+        registers on demand)."""
         staged = self.make_blocked_get()
         if staged is None:
             pytest.skip("this driver cannot stage a get blocked in the store")
@@ -1045,12 +1051,12 @@ class DriverConformance:
             def quick_calls() -> None:
                 try:
                     op = h.get(quick.rows())
-                    seen["quick"] = h.settle(op)
+                    seen["quick"] = h.wait_for_results(op)
                     seen["ended"] = h.driver.access_ended(op)
                     # A driver that returns the handle before the store answers is asked about
                     # the stalled operation itself; the answers must come at once. A suite that
                     # declares such a driver waits for the handle, so this branch always runs.
-                    if self.handles_before_completion:
+                    if self.returns_before_the_store_answers:
                         assert handle_back.wait(h.timeout), "the slow get kept its handle"
                     if handle_back.is_set():
                         slow_op = seen["slow_op"]
@@ -1094,7 +1100,7 @@ class DriverConformance:
                 assert seen["drain"] is False  # the slow get is still inside the store
                 if self.registers_on_demand:
                     assert seen["unregister"] == "refused", "a busy region was unregistered"
-                if self.handles_before_completion:
+                if self.returns_before_the_store_answers:
                     assert seen.get("slow_checked"), "the stalled get was never asked about"
                 if seen.get("slow_checked"):
                     assert seen["slow_ended"] is False and seen["slow_unprovable"] is False
@@ -1184,7 +1190,7 @@ class DriverConformance:
                 pytest.fail(f"a second unregister raised {error!r}")
             endpoint.released = True  # the harness must not give pool memory back twice
 
-    def test_unregister_frees_the_range_for_a_new_registration(self) -> None:
+    def test_a_registered_range_cannot_be_registered_again_until_unregistered(self) -> None:
         with self.harness() as h:
             h.needs(registers=True)
             endpoint = h.endpoint(["A"])

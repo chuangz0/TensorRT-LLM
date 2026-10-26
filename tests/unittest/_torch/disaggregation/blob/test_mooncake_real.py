@@ -33,7 +33,7 @@ from collections.abc import Sequence
 import numpy as np
 import pytest
 from cpu_fixtures import WAIT_S, Endpoint, masks, store_key
-from fake_mooncake import CallsOfKeyWait
+from fake_mooncake import KeyGatedClient
 
 from tensorrt_llm._torch.disaggregation.base.backend import Outcome
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
@@ -193,7 +193,7 @@ def clients(pool):
     opened.close()
 
 
-def random_rows(endpoint: Endpoint, seed: int) -> dict[str, bytes]:
+def write_random_rows(endpoint: Endpoint, seed: int) -> dict[str, bytes]:
     generator = np.random.default_rng(seed)
     rows = {name: generator.bytes(endpoint.region.slot_bytes) for name in endpoint.names}
     for name, data in rows.items():
@@ -219,7 +219,7 @@ def test_real_store_full_is_declined(tmp_path, request) -> None:
     with stack:
         names = [f"{request.node.name}-{i}" for i in range(512)]
         writer = clients.endpoint(names, workers=1)
-        random_rows(writer, seed=4)
+        write_random_rows(writer, seed=4)
         outcome = finish(writer, writer.backend.publish, *names)
         delivered = int(outcome.delivered_masks[0].sum())
         declined = writer.driver.inner.stats()["rows_declined_pool_full"]
@@ -229,14 +229,16 @@ def test_real_store_full_is_declined(tmp_path, request) -> None:
         clients.close()  # while the master still answers
 
 
-def test_real_get_lands_a_shorter_object_and_refuses_a_longer_one(clients, request) -> None:
+def test_real_get_faults_a_shorter_object_it_landed_and_refuses_a_longer_one(
+    clients, request
+) -> None:
     # batch_get_into reads an object shorter than the buffer into the buffer's head and answers
     # its size; it refuses a longer one before any transfer (INVALID_PARAMS).
     short, long = f"{request.node.name}-short", f"{request.node.name}-long"
     half = clients.endpoint([short], slot_bytes=SLOT_BYTES // 2)
     double = clients.endpoint([long], slot_bytes=2 * SLOT_BYTES)
-    head = random_rows(half, seed=9)[short]
-    random_rows(double, seed=10)
+    head = write_random_rows(half, seed=9)[short]
+    write_random_rows(double, seed=10)
     assert masks(finish(half, half.backend.publish, short)) == [[True]]
     assert masks(finish(double, double.backend.publish, long)) == [[True]]
     reader = clients.endpoint([short, long], fill=0x2D)
@@ -280,12 +282,12 @@ class TestRealMooncakeConformance(DriverConformance):
 
     def make_blocked_get(self):
         key = f"blocked{secrets.token_hex(4)}/v1/S"
-        sdk = CallsOfKeyWait(open_sdk(client_config(self.master)), "batch_get_into", key)
+        sdk = KeyGatedClient(open_sdk(client_config(self.master)), "batch_get_into", key)
         return MooncakeDriver(sdk), key, sdk.entered, sdk.release.set
 
     def make_blocked_put(self):
         key = f"blocked{secrets.token_hex(4)}/v1/P"
-        sdk = CallsOfKeyWait(
+        sdk = KeyGatedClient(
             open_sdk(client_config(self.master)), "batch_put_from_multi_buffer_ranges", key
         )
         return MooncakeDriver(sdk), key, sdk.entered, sdk.release.set
@@ -337,7 +339,7 @@ def test_real_four_workers_round_trip_2000_rows_without_crossed_bytes(clients, r
             fill=0x2D,
         )
     )
-    rows = random_rows(writer, seed=6)
+    rows = write_random_rows(writer, seed=6)
     outcome = finish(writer, writer.backend.publish, *names)
     assert outcome.fault is None and all(masks(outcome)[0])
     outcome = finish(reader, reader.backend.fetch, *names)
@@ -375,7 +377,9 @@ class FirstScatterWaits:
         return self.store.batch_put_from_multi_buffer_ranges(*args)
 
 
-def test_real_concurrent_publishes_of_the_same_keys_from_one_client(clients, request) -> None:
+def test_real_second_publish_of_keys_still_being_put_is_skipped_without_asking_the_sdk(
+    clients, request
+) -> None:
     # The first publish holds every key's put session while its scatter waits, so the driver
     # skips the second publish's rows without asking the SDK; then the first publish delivers
     # them all.
@@ -383,7 +387,7 @@ def test_real_concurrent_publishes_of_the_same_keys_from_one_client(clients, req
     sdk = FirstScatterWaits(clients.open_client())
     # Three workers: puts leave one to gets, so the two publishes run side by side.
     writer = clients.endpoint(names, sdk=sdk, workers=3)
-    rows = random_rows(writer, seed=8)
+    rows = write_random_rows(writer, seed=8)
     first = writer.backend.publish(writer.view(*names), None)
     try:
         assert sdk.entered.wait(WAIT_S)
@@ -421,7 +425,7 @@ def test_real_put_stuck_past_the_discard_timeout_keeps_its_keys(tmp_path, reques
         sdk = FirstScatterWaits(clients.open_client(), hold_s=DISCARD_S + WAIT_S)
         writer = clients.endpoint(names, sdk=sdk, workers=3)
         observer = clients.open_client()
-        rows = random_rows(writer, seed=11)
+        rows = write_random_rows(writer, seed=11)
         first = writer.backend.publish(writer.view(*names), None)
         try:
             assert sdk.entered.wait(WAIT_S)

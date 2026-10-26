@@ -7,7 +7,7 @@ either order, cancel and shutdown races) and the backend's own rules: one driver
 group, a submission returns while its operations run, only regions the driver can access are
 registered and rows elsewhere are refused, each operation's access end is counted once, a fault
 waits for every call, every call reaches the driver as it is submitted and a stopped attempt's
-calls are cancelled there once each, a call is looked at only when its driver tells of a change,
+calls are cancelled there once each, a call is queried only when its driver calls its on_change,
 a driver that breaks its protocol gets no more work, and shutdown never calls the driver. Every
 wait is bounded; a sleep of PROMPT_S only stands for "nothing happened meanwhile".
 """
@@ -85,7 +85,7 @@ def store() -> MemoryStore:
     return MemoryStore()
 
 
-def published(store: MemoryStore, rows: dict[str, bytes]) -> None:
+def commit_objects(store: MemoryStore, rows: dict[str, bytes]) -> None:
     """Commits ``rows`` straight into ``store`` under the keys the backend derives."""
     for name, data in rows.items():
         assert commit_object(store, name, data) is Commit.STORED
@@ -113,7 +113,7 @@ def test_not_ready_and_declined_rows_are_undelivered_without_a_fault(case: str) 
     store = MemoryStore(capacity=1 if case == "publish_declined" else None)
     endpoint = Endpoint(one_row_per_call(store), ["A", "B", "C"])
     if case == "fetch_not_ready":
-        published(store, {"B": b"bbbbbbbb", "C": b"cccccccc"})
+        commit_objects(store, {"B": b"bbbbbbbb", "C": b"cccccccc"})
         store.begin_write(store_key("A"))
         attempt = endpoint.backend.fetch(endpoint.view("A", "B", "C"), None)
         expected = [False, True, True]
@@ -130,7 +130,7 @@ def test_not_ready_and_declined_rows_are_undelivered_without_a_fault(case: str) 
 
 
 def test_masks_follow_view_group_order(store: MemoryStore) -> None:
-    published(store, {"A": b"aaaaaaaa", "C": b"cccccccc", "E": b"eeeeeeee"})
+    commit_objects(store, {"A": b"aaaaaaaa", "C": b"cccccccc", "E": b"eeeeeeee"})
     reader = Endpoint(MemoryDriver(store), ["A", "B", "C", "D", "E"])
     view = CpuView([reader.rows(["C", "D"], 2), reader.rows(["A"], 0), reader.rows(["E", "B"], 1)])
     attempt = reader.backend.fetch(view, None)
@@ -200,7 +200,7 @@ def test_blob_config_holds_only_the_key_prefix() -> None:
 
 
 def test_late_write_after_fault_changes_nothing(store: MemoryStore) -> None:
-    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
+    commit_objects(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
     driver = one_row_per_call(store, controlled=True)
     reader = Endpoint(driver, ["A", "B"], fill=0x2D)
     attempt = reader.backend.fetch(reader.view("A", "B"), None)
@@ -223,7 +223,7 @@ def test_late_write_after_fault_changes_nothing(store: MemoryStore) -> None:
 
 
 def test_access_end_before_result_without_touching_the_view(store: MemoryStore) -> None:
-    published(store, {"A": b"aaaaaaaa"})
+    commit_objects(store, {"A": b"aaaaaaaa"})
     driver = MemoryDriver(store, controlled=True)
     reader = Endpoint(driver, ["A"], fill=0x2D)
     view = reader.view("A")
@@ -247,14 +247,14 @@ def test_a_later_call_fault_waits_for_earlier_calls_and_the_first_recorded_is_re
 ) -> None:
     store = KeyGatedStore(gets=True, keys=[store_key("A")])
     a = b"aaaaaaaa" if first_row == "ready" else b"aaa"  # the wrong size: a second fault
-    published(store, {"A": a, "B": b"short"})
+    commit_objects(store, {"A": a, "B": b"short"})
     driver = one_row_per_call(store, background=True)
     # B's fault stops the fetch and forwards a cancel; ignoring it lets A still reach the gate.
     driver.set_cancel_effective(False)
     reader = Endpoint(driver, ["A", "B"])
     attempt = reader.backend.fetch(reader.view("A", "B"), None)
     try:
-        store.wait_for_waiting(1)
+        store.wait_for_calls_at_gate(1)
         # B's fault is recorded while A is still in the store.
         wait_until(lambda: reader.backend.stats()["calls_awaiting_results"] == 1, "B's fault")
         assert attempt.poll() is None
@@ -268,22 +268,22 @@ def test_a_later_call_fault_waits_for_earlier_calls_and_the_first_recorded_is_re
     reader.close()
 
 
-def three_rows(store: MemoryStore, fetched: bool, **options) -> Endpoint:
+def three_rows(store: MemoryStore, objects_in_store: bool, **options) -> Endpoint:
     """An endpoint whose rows A, B and C each go in a call of their own, handed over in that order,
-    with their bytes in the store when ``fetched`` and in the slots otherwise. ``options`` go to
-    the ``MemoryDriver``."""
+    with their bytes in the store when ``objects_in_store`` and in the slots otherwise. ``options``
+    go to the ``MemoryDriver``."""
     data = {name: name.encode() * SLOT_BYTES for name in "ABC"}
-    if fetched:
-        published(store, data)
+    if objects_in_store:
+        commit_objects(store, data)
     endpoint = Endpoint(one_row_per_call(store, **options), list(data))
-    if not fetched:
+    if not objects_in_store:
         for name, row in data.items():
             endpoint.write(name, row)
     return endpoint
 
 
 def test_a_row_fault_stops_a_fetch(store: MemoryStore) -> None:
-    reader = three_rows(store, fetched=True, controlled=True)
+    reader = three_rows(store, objects_in_store=True, controlled=True)
     driver = reader.driver.inner
     attempt = reader.backend.fetch(reader.view("A", "B", "C"), None)
     op_a, op_b, op_c = (reader.op(name) for name in "ABC")
@@ -303,7 +303,7 @@ def test_a_row_fault_stops_a_fetch(store: MemoryStore) -> None:
 
 
 def test_a_row_fault_leaves_the_rest_of_a_publish_to_go_on(store: MemoryStore) -> None:
-    writer = three_rows(store, fetched=False, controlled=True)
+    writer = three_rows(store, objects_in_store=False, controlled=True)
     driver = writer.driver.inner
     attempt = writer.backend.publish(writer.view("A", "B", "C"), None)
     op_a, op_b, op_c = (writer.op(name) for name in "ABC")
@@ -332,7 +332,7 @@ class RefusesItsSecondPut(MemoryDriver):
 
 
 def test_a_call_that_concludes_without_a_fault_stops_none_of_the_others(store: MemoryStore) -> None:
-    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
+    commit_objects(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
     driver = one_row_per_call(store, controlled=True)
     reader = Endpoint(driver, ["A", "B"])
     attempt = reader.backend.fetch(reader.view("A", "B"), None)
@@ -367,7 +367,7 @@ def test_a_refused_put_cancels_the_calls_of_its_publish_already_in_the_driver(
 
 
 def test_a_refused_put_stops_its_publish_but_not_the_backend(store: MemoryStore) -> None:
-    writer = three_rows(store, fetched=False)
+    writer = three_rows(store, objects_in_store=False)
     writer.driver.fail("put", DriverRejected("busy"))
     attempt = writer.backend.publish(writer.view("A", "B", "C"), None)
     outcome = writer.wait_outcome(attempt)
@@ -385,7 +385,7 @@ def test_a_refused_put_stops_its_publish_but_not_the_backend(store: MemoryStore)
 def test_an_outcome_waits_for_every_row_of_a_call_that_concludes_in_parts(
     store: MemoryStore,
 ) -> None:
-    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
+    commit_objects(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
     driver = MemoryDriver(store, controlled=True)
     reader = Endpoint(driver, ["A", "B"])
     attempt = reader.backend.fetch(reader.view("A", "B"), None)
@@ -403,7 +403,7 @@ def test_an_outcome_waits_for_every_row_of_a_call_that_concludes_in_parts(
 def test_results_and_access_end_are_each_recorded_once_per_call(
     store: MemoryStore, first_half: str
 ) -> None:
-    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
+    commit_objects(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
     driver = one_row_per_call(store, controlled=True)
     reader = Endpoint(driver, ["A", "B"])
     attempt = reader.backend.fetch(reader.view("A", "B"), None)
@@ -415,8 +415,8 @@ def test_results_and_access_end_are_each_recorded_once_per_call(
         driver.transfer(op_a)
         driver.end_access(op_a)
     for _ in range(5):
-        reader.driver.tell_changed(op_a)
-    # Recording A's half on every look would already have concluded the attempt (results_first)
+        reader.driver.call_on_change(op_a)
+    # Recording A's half on every on_change would already have concluded the attempt (results_first)
     # or quiesced it (access_end_first).
     assert attempt.poll() is None  # B has no result yet
     assert not attempt.quiesced()  # B's access is open
@@ -434,7 +434,7 @@ def test_results_and_access_end_are_each_recorded_once_per_call(
 @keeps_backend_threads
 @pytest.mark.parametrize("ending", ["access_ended", "unprovable"])
 def test_news_of_a_settled_operation_changes_nothing(store: MemoryStore, ending: str) -> None:
-    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
+    commit_objects(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
     driver = MemoryDriver(store, controlled=True)
     reader = Endpoint(driver, ["A", "B"], fill=0x2D)
     first = reader.backend.fetch(reader.view("A"), None)
@@ -450,7 +450,7 @@ def test_news_of_a_settled_operation_changes_nothing(store: MemoryStore, ending:
         assert "the store gave up" in reader.wait_outcome(first).fault
         wait_until(lambda: reader.backend.stats()["calls_unprovable"] == 1, "the count")
     outcome, wakes = first.poll(), reader.wake.count
-    reader.driver.tell_changed(op_a)  # a driver may tell of an operation more than once
+    reader.driver.call_on_change(op_a)  # a driver may call on_change more than once
     assert first.poll() is outcome and reader.wake.count == wakes
 
     second = reader.backend.fetch(reader.view("B"), None)  # the backend serves on
@@ -499,7 +499,7 @@ def test_the_progress_thread_retries_drain_and_revocation_and_the_hold_stays(
 
 @pytest.mark.parametrize("first", ["cancel_first", "complete_first"])
 def test_cancel_racing_completion_gives_one_outcome(store: MemoryStore, first: str) -> None:
-    published(store, {"A": b"aaaaaaaa"})
+    commit_objects(store, {"A": b"aaaaaaaa"})
     driver = MemoryDriver(store, controlled=True)
     reader = Endpoint(driver, ["A"])
     attempt = reader.backend.fetch(reader.view("A"), None)
@@ -531,7 +531,7 @@ def test_cancel_racing_completion_gives_one_outcome(store: MemoryStore, first: s
 
 
 def test_a_cancel_reaches_the_driver_promptly_and_once(store: MemoryStore) -> None:
-    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
+    commit_objects(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
     driver = MemoryDriver(store, controlled=True)
     driver.set_cancel_effective(False)  # the calls stay open
     reader = Endpoint(driver, ["A", "B"])
@@ -576,7 +576,7 @@ class FaultsItsFirstGetInside(MemoryDriver):
 def test_a_stop_during_the_hand_over_reaches_the_calls_handed_over_after_it(
     store: MemoryStore,
 ) -> None:
-    published(store, {name: name.encode() * SLOT_BYTES for name in "ABC"})
+    commit_objects(store, {name: name.encode() * SLOT_BYTES for name in "ABC"})
     driver = FaultsItsFirstGetInside(store, controlled=True, capabilities=ONE_ROW_PER_CALL)
     reader = Endpoint(driver, ["A", "B", "C"])
     attempt = reader.backend.fetch(reader.view("A", "B", "C"), None)
@@ -590,13 +590,13 @@ def test_a_stop_during_the_hand_over_reaches_the_calls_handed_over_after_it(
 def test_a_cancel_asked_while_the_progress_thread_is_cancelling_is_still_forwarded(
     store: MemoryStore,
 ) -> None:
-    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
+    commit_objects(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
     driver = MemoryDriver(store, controlled=True)
     reader = Endpoint(driver, ["A", "B"])
     first = reader.backend.fetch(reader.view("A"), None)
     second = reader.backend.fetch(reader.view("B"), None)
     op_b = reader.op("B")
-    gate = reader.driver.hold("cancel")
+    gate = reader.driver.gate("cancel")
     first.cancel()
     reader.driver.wait_for(lambda: reader.driver.calls_to("cancel"), "A's cancel")
     second.cancel()  # the progress thread is inside the driver's cancel of A's call
@@ -609,7 +609,7 @@ def test_a_cancel_asked_while_the_progress_thread_is_cancelling_is_still_forward
 
 
 def test_a_driver_without_cancel_is_never_asked_to(store: MemoryStore) -> None:
-    published(store, {"B": b"bbbbbbbb"})  # A is missing: the fetch stops at its fault
+    commit_objects(store, {"B": b"bbbbbbbb"})  # A is missing: the fetch stops at its fault
     capabilities = replace(DEFAULT_CAPABILITIES, cancel=False, max_rows_per_op=1)
     driver = MemoryDriver(store, controlled=True, capabilities=capabilities)
     reader = Endpoint(driver, ["A", "B"])
@@ -631,26 +631,26 @@ def test_a_driver_without_cancel_is_never_asked_to(store: MemoryStore) -> None:
 # The driver tells of changes through on_change.
 
 
-def test_a_call_is_looked_at_only_when_its_driver_tells_of_a_change(store: MemoryStore) -> None:
-    published(store, {"A": b"aaaaaaaa"})
+def test_a_call_is_queried_only_when_its_driver_calls_on_change(store: MemoryStore) -> None:
+    commit_objects(store, {"A": b"aaaaaaaa"})
     driver = MemoryDriver(store, controlled=True)
     reader = Endpoint(driver, ["A"])
     attempt = reader.backend.fetch(reader.view("A"), None)
     op = reader.op("A")
-    time.sleep(PROMPT_S)  # a polling backend would have looked several times by now
+    time.sleep(PROMPT_S)  # a polling backend would have queried several times by now
     assert reader.driver.calls_to("poll", op) == []
     driver.complete(op)  # tells
     assert masks(reader.wait_outcome(attempt)) == [[True]]
     driver.end_access(op)  # tells
     reader.wait_quiesced(attempt)
-    # Looked at on the thread that told of each change: here the test's own.
-    looks = reader.driver.calls_to("poll", op)
-    assert len(looks) == 2 and all(c.thread == threading.current_thread().name for c in looks)
+    # Queried on the thread that called on_change: here the test's own.
+    queries = reader.driver.calls_to("poll", op)
+    assert len(queries) == 2 and all(c.thread == threading.current_thread().name for c in queries)
     reader.close()
 
 
 def test_a_teardown_retries_the_drain_with_backoff(store: MemoryStore) -> None:
-    published(store, {"B": b"bbbbbbbb"})
+    commit_objects(store, {"B": b"bbbbbbbb"})
     driver = MemoryDriver(store, controlled=True)
     endpoint = Endpoint(driver, ["A", "B"])
     # An operation outside the backend, already started: no drain can end it.
@@ -672,7 +672,7 @@ def test_a_teardown_follows_the_last_attempt_to_quiesce(
     # Retries far apart: only the quiescing itself can bring the teardown on in time.
     monkeypatch.setattr(backend_module, "TEARDOWN_RETRY_MIN_S", 10 * WAIT_S)
     monkeypatch.setattr(backend_module, "TEARDOWN_RETRY_MAX_S", 10 * WAIT_S)
-    published(store, {"A": b"aaaaaaaa"})
+    commit_objects(store, {"A": b"aaaaaaaa"})
     driver = MemoryDriver(store, controlled=True)
     reader = Endpoint(driver, ["A"])
     attempt = reader.backend.fetch(reader.view("A"), None)
@@ -687,7 +687,7 @@ def test_a_teardown_follows_the_last_attempt_to_quiesce(
 
 
 def test_a_change_told_before_put_or_get_returns_is_not_lost(store: MemoryStore) -> None:
-    published(store, {"A": b"aaaaaaaa"})
+    commit_objects(store, {"A": b"aaaaaaaa"})
     # An automatic driver runs each operation, and tells of it, inside the put or get that takes
     # it: before the backend has the operation's handle.
     endpoint = Endpoint(MemoryDriver(store), ["A", "B"])
@@ -760,12 +760,12 @@ def test_a_put_that_returns_no_handle_holds_the_call_and_refuses_later_work(
 @keeps_backend_threads
 def test_a_protocol_violation_leaves_calls_already_in_the_driver_alone() -> None:
     store = KeyGatedStore(gets=True)
-    published(store, {"X": b"xxxxxxxx"})
+    commit_objects(store, {"X": b"xxxxxxxx"})
     endpoint = Endpoint(MemoryDriver(store, background=True), ["X", "Y"])
     endpoint.write("Y", b"yyyyyyyy")
     in_driver = endpoint.backend.fetch(endpoint.view("X"), None)
     try:
-        store.wait_for_waiting(1)  # its only call is inside the store
+        store.wait_for_calls_at_gate(1)  # its only call is inside the store
         endpoint.driver.fail("put", RuntimeError("lost"))
         broken = endpoint.backend.publish(endpoint.view("Y"), None)
         assert "the store driver raised" in endpoint.wait_outcome(broken).fault
@@ -779,7 +779,7 @@ def test_a_protocol_violation_leaves_calls_already_in_the_driver_alone() -> None
 
 @keeps_backend_threads
 def test_a_driver_raise_stops_the_rest_of_its_submission(store: MemoryStore) -> None:
-    writer = three_rows(store, fetched=False)
+    writer = three_rows(store, objects_in_store=False)
     writer.driver.fail("put", RuntimeError("lost"))
     broken = writer.backend.publish(writer.view("A", "B", "C"), None)
     outcome = writer.wait_outcome(broken)
@@ -807,9 +807,9 @@ class ShortPollDriver(MemoryDriver):
 def test_a_poll_with_the_wrong_row_count_faults_the_call_and_keeps_it_held(
     store: MemoryStore,
 ) -> None:
-    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
+    commit_objects(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
     driver = ShortPollDriver(store)
-    driver.short = True  # the first look at the operation, as get tells of it
+    driver.short = True  # the first query of the operation, as get calls on_change
     reader = Endpoint(driver, ["A", "B", "C"])
     reader.write("C", b"cccccccc")
     attempt = reader.backend.fetch(reader.view("A", "B"), None)
@@ -819,7 +819,7 @@ def test_a_poll_with_the_wrong_row_count_faults_the_call_and_keeps_it_held(
     # Later answers have the right length and say access ended; after the violation the call is
     # unprovable instead: counted, its slots held.
     assert reader.backend.stats()["calls_unprovable"] == 1
-    reader.driver.tell_changed(reader.op("A"))
+    reader.driver.call_on_change(reader.op("A"))
     assert not attempt.quiesced()
     # The backend survived the bad answer and refuses all later work, naming why.
     assert all(thread.is_alive() for thread in reader.threads)
@@ -856,7 +856,7 @@ def test_a_violation_told_during_the_hand_over_stops_the_rest_of_it(store: Memor
     writer = Endpoint(MemoryDriver(store, capabilities=capabilities), ["A", "B", "C"])
     for name in "ABC":
         writer.write(name, name.encode() * SLOT_BYTES)
-    # A's put runs inside put and tells of it there; that look's query raises.
+    # A's put runs inside put and calls on_change there; that query raises.
     writer.driver.fail("access_ended", RuntimeError("flaky"))
     attempt = writer.backend.publish(writer.view("A", "B", "C"), None)
     outcome = writer.wait_outcome(attempt)
@@ -893,7 +893,7 @@ class BreaksItsProtocolDuringAPut(MemoryDriver):
 
 
 @keeps_backend_threads
-def test_calls_another_attempts_violation_cut_off_end_their_access(store: MemoryStore) -> None:
+def test_calls_cut_off_by_another_attempts_violation_end_their_access(store: MemoryStore) -> None:
     driver = BreaksItsProtocolDuringAPut(store, capabilities=ONE_ROW_PER_CALL, controlled=True)
     writer = Endpoint(driver, ["X", "A", "B", "C"])
     for name in "XABC":
@@ -974,11 +974,13 @@ def test_a_protocol_violation_is_logged_once_and_never_under_the_lock(
     violator.start()
     try:
         assert logging_now.wait(WAIT_S)
-        looked: list[object] = []
-        reader = threading.Thread(target=lambda: looked.append(writer.backend.stats()), daemon=True)
+        stats_read: list[object] = []
+        reader = threading.Thread(
+            target=lambda: stats_read.append(writer.backend.stats()), daemon=True
+        )
         reader.start()
         reader.join(WAIT_S)
-        assert looked, "the backend's lock was held while a violation was logged"
+        assert stats_read, "the backend's lock was held while a violation was logged"
     finally:
         let_the_log_go.set()
         violator.join(WAIT_S)
@@ -988,7 +990,7 @@ def test_a_protocol_violation_is_logged_once_and_never_under_the_lock(
 def test_a_wrong_row_count_after_the_access_end_was_recorded_leaves_the_call_provable(
     store: MemoryStore,
 ) -> None:
-    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
+    commit_objects(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
     driver = ShortPollDriver(store, controlled=True)
     reader = Endpoint(driver, ["A", "B"])
     attempt = reader.backend.fetch(reader.view("A", "B"), None)
@@ -1017,7 +1019,7 @@ def test_a_query_that_fails_holds_the_call_and_refuses_later_work(
     if failure == "access_ended_raises":
         writer.driver.fail("access_ended", RuntimeError("flaky"))
     else:
-        writer.driver.answer("poll", None)  # the first look at the first operation
+        writer.driver.answer("poll", None)  # the first query of the first operation
     attempt = writer.backend.publish(writer.view("A"), None)
     outcome = writer.wait_outcome(attempt)
     assert masks(outcome) == [[False]] and "a store driver query raised" in outcome.fault
@@ -1083,7 +1085,7 @@ INVALID_SUBMISSIONS: dict[str, Callable[[Endpoint], tuple[CpuView, object]]] = {
 
 
 def test_object_keys_in_any_memory_order_are_taken(store: MemoryStore) -> None:
-    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
+    commit_objects(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
     reader = Endpoint(MemoryDriver(store), ["A", "B"])
     rows = reader.rows(["A", "B"])
     view = CpuView([Rows(0, np.asfortranarray(rows.object_keys), rows.addresses, 0)])
@@ -1105,7 +1107,7 @@ def test_invalid_submissions_are_rejected_before_the_driver(store: MemoryStore, 
 
 
 def test_a_fetch_hint_reaches_every_get_of_a_driver_that_reads_hints(store: MemoryStore) -> None:
-    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb", "C": b"cccccccc"})
+    commit_objects(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb", "C": b"cccccccc"})
     capabilities = replace(DEFAULT_CAPABILITIES, hints=True, max_rows_per_op=2)
     driver = MemoryDriver(store, capabilities=capabilities)
     reader = Endpoint(driver, ["A", "B", "C"])
@@ -1136,10 +1138,10 @@ def test_a_publish_may_read_one_slot_twice(store: MemoryStore) -> None:
     writer.close()
 
 
-def test_submissions_call_put_and_get_and_looks_run_on_the_driver_threads(
+def test_submissions_call_put_and_get_and_queries_run_on_the_driver_threads(
     store: MemoryStore,
 ) -> None:
-    published(store, {"A": b"aaaaaaaa"})
+    commit_objects(store, {"A": b"aaaaaaaa"})
     driver = MemoryDriver(store, capabilities=ONE_ROW_PER_CALL, background=True)
     endpoint = Endpoint(driver, ["A", "B"])
     endpoint.write("B", b"bbbbbbbb")
@@ -1150,22 +1152,22 @@ def test_submissions_call_put_and_get_and_looks_run_on_the_driver_threads(
         endpoint.wait_quiesced(attempt)
     submitter = threading.current_thread().name
     handed_over = [c for c in endpoint.driver.calls if c.method in ("put", "get")]
-    looks = [c for c in endpoint.driver.calls if c.method in ("poll", "access_ended")]
+    queries = [c for c in endpoint.driver.calls if c.method in ("poll", "access_ended")]
     assert len(handed_over) == 2 and all(c.thread == submitter for c in handed_over)
-    assert looks and all(c.thread == "memory-driver-op" for c in looks)
+    assert queries and all(c.thread == "memory-driver-op" for c in queries)
     endpoint.close()
 
 
 def test_submissions_return_while_the_driver_waits_on_the_store() -> None:
     store = KeyGatedStore(gets=True)
-    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
+    commit_objects(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
     driver = one_row_per_call(store, background=True)
     endpoint = Endpoint(driver, ["A", "B", "C", "D"])
     endpoint.write("C", b"cccccccc")
     blocked = endpoint.backend.fetch(endpoint.view("A", "B"), None)
     attempts = [blocked]
     try:
-        store.wait_for_waiting(2)
+        store.wait_for_calls_at_gate(2)
         for submit in (
             lambda: attempts.append(endpoint.backend.fetch(endpoint.view("D"), None)),
             lambda: attempts.append(endpoint.backend.publish(endpoint.view("C"), None)),
@@ -1188,7 +1190,7 @@ def test_submissions_return_while_the_driver_waits_on_the_store() -> None:
 
 
 def test_shutdown_forces_fault_outcomes_and_waits_out_its_budget(store: MemoryStore) -> None:
-    published(store, {"B": b"short"})
+    commit_objects(store, {"B": b"short"})
     driver = one_row_per_call(store, controlled=True)
     driver.set_cancel_effective(False)  # the forwarded cancels end no access
     reader = Endpoint(driver, ["A", "B"])
@@ -1219,22 +1221,22 @@ def test_shutdown_forces_fault_outcomes_and_waits_out_its_budget(store: MemorySt
 
 
 @keeps_backend_threads
-def test_shutdown_returns_once_every_open_attempt_is_pinned_by_an_unprovable_call(
+def test_shutdown_returns_once_every_open_attempt_has_an_unprovable_call(
     store: MemoryStore,
 ) -> None:
-    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb", "C": b"cccccccc"})
+    commit_objects(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb", "C": b"cccccccc"})
     driver = one_row_per_call(store, controlled=True)
     driver.set_cancel_effective(False)  # the forwarded cancels end no access
     reader = Endpoint(driver, ["A", "B", "C"])
-    pinned = reader.backend.fetch(reader.view("A", "B"), None)
+    never_quiesces = reader.backend.fetch(reader.view("A", "B"), None)
     other = reader.backend.fetch(reader.view("C"), None)
     op_a, op_b, op_c = reader.op("A"), reader.op("B"), reader.op("C")
     for op in (op_a, op_b, op_c):
         driver.transfer(op)  # running: the drain a shutdown starts cannot cancel them
     driver.mark_unprovable(op_a)  # its results still pending
     wait_until(lambda: reader.backend.stats()["calls_unprovable"] == 1, "the count")
-    # C's attempt can still quiesce, so a shutdown waits for it; B's call cannot unpin its
-    # attempt, so it does not.
+    # C's attempt can still quiesce, so a shutdown waits for it; A's unprovable call keeps its
+    # attempt from ever quiescing, whatever B does, so a shutdown does not wait for it.
     labels: list[frozenset[str]] = []
     shutter = threading.Thread(target=lambda: labels.append(reader.backend.shutdown(WAIT_S)))
     shutter.start()
@@ -1243,18 +1245,18 @@ def test_shutdown_returns_once_every_open_attempt_is_pinned_by_an_unprovable_cal
     driver.publish_results(op_c)
     driver.end_access(op_c)
     shutter.join(PROMPT_S)
-    assert labels == [frozenset({pinned.label, "region:0"})]
+    assert labels == [frozenset({never_quiesces.label, "region:0"})]
     assert other.quiesced() and not op_b.access_ended
     started = time.monotonic()
-    assert reader.backend.shutdown(WAIT_S) == frozenset({pinned.label, "region:0"})
+    assert reader.backend.shutdown(WAIT_S) == frozenset({never_quiesces.label, "region:0"})
     assert time.monotonic() - started < PROMPT_S
     # An unprovable call stays held whatever the driver says of it later, so the answer stands.
     for op in (op_a, op_b):
         driver.publish_results(op)
         driver.end_access(op)
     assert reader.backend.stats()["calls_awaiting_access_end"] == 1  # B's end, not A's
-    assert not pinned.quiesced()
-    assert reader.backend.shutdown(0) == frozenset({pinned.label, "region:0"})
+    assert not never_quiesces.quiesced()
+    assert reader.backend.shutdown(0) == frozenset({never_quiesces.label, "region:0"})
 
 
 @keeps_backend_threads
@@ -1280,7 +1282,7 @@ def test_shutdown_returns_once_a_call_in_the_driver_turns_unprovable(store: Memo
 def test_cancel_and_shutdown_ask_the_driver_to_cancel_the_open_calls(
     store: MemoryStore, stop: str
 ) -> None:
-    published(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb", "C": b"cccccccc"})
+    commit_objects(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb", "C": b"cccccccc"})
     driver = one_row_per_call(store, controlled=True)
     reader = Endpoint(driver, ["A", "B", "C"])
     attempt = reader.backend.fetch(reader.view("A", "B", "C"), None)
@@ -1331,7 +1333,7 @@ def test_clean_shutdown_returns_well_before_its_budget_and_rejects_later_submiss
 
 def test_shutdown_waits_out_an_unbounded_budget_without_raising() -> None:
     store = KeyGatedStore(gets=True)
-    published(store, {"A": b"aaaaaaaa"})
+    commit_objects(store, {"A": b"aaaaaaaa"})
     reader = Endpoint(MemoryDriver(store, background=True), ["A"])
     reader.backend.fetch(reader.view("A"), None)
     labels: list[frozenset[str]] = []
@@ -1340,7 +1342,7 @@ def test_shutdown_waits_out_an_unbounded_budget_without_raising() -> None:
         target=lambda: labels.append(reader.backend.shutdown(math.inf)), daemon=True
     )
     try:
-        store.wait_for_waiting(1)
+        store.wait_for_calls_at_gate(1)
         shutter.start()
         time.sleep(PROMPT_S)
         assert shutter.is_alive()  # waiting, since the call is still in the store
@@ -1355,7 +1357,7 @@ def test_shutdown_never_calls_the_driver_and_unregisters_in_the_background(
     store: MemoryStore,
 ) -> None:
     endpoint = Endpoint(MemoryDriver(store), ["A"])
-    revoke = endpoint.driver.hold("unregister")
+    revoke = endpoint.driver.gate("unregister")
     try:
         started = time.monotonic()
         assert endpoint.backend.shutdown(0) == frozenset({"region:0"})
@@ -1402,7 +1404,7 @@ class WakeProbe:
 
 
 def test_an_outcome_that_lands_before_access_ends_wakes_the_holder(store: MemoryStore) -> None:
-    published(store, {"A": b"aaaaaaaa"})
+    commit_objects(store, {"A": b"aaaaaaaa"})
     driver = MemoryDriver(store, controlled=True)
     reader = Endpoint(driver, ["A"])
     attempt = reader.backend.fetch(reader.view("A"), None)
@@ -1429,7 +1431,7 @@ def test_a_refused_call_wakes_the_holder(store: MemoryStore) -> None:
 def test_wake_runs_after_state_is_published_and_outside_the_lock_on_record(
     store: MemoryStore, settled: str
 ) -> None:
-    published(store, {"A": b"aaaaaaaa"})
+    commit_objects(store, {"A": b"aaaaaaaa"})
     probe = WakeProbe()
     # An automatic driver settles the operation inside ``get`` and tells of it there; a controlled
     # one settles it later, telling of each change as it comes.
@@ -1454,7 +1456,7 @@ def test_wake_runs_after_state_is_published_and_outside_the_lock_on_record(
 
 def test_wake_runs_after_state_is_published_and_outside_the_lock_on_forced_shutdown() -> None:
     store = KeyGatedStore(gets=True)
-    published(store, {"A": b"aaaaaaaa"})
+    commit_objects(store, {"A": b"aaaaaaaa"})
     probe = WakeProbe()
     reader = Endpoint(MemoryDriver(store, background=True), ["A"], on_wake=probe)
     probe.backend = reader.backend
@@ -1462,7 +1464,7 @@ def test_wake_runs_after_state_is_published_and_outside_the_lock_on_forced_shutd
     labels = []
     shutter = threading.Thread(target=lambda: labels.append(reader.backend.shutdown(WAIT_S)))
     try:
-        store.wait_for_waiting(1)
+        store.wait_for_calls_at_gate(1)
         shutter.start()
         reader.wake.wait_for(lambda: reader.wake.count >= 1, "a wake for the forced outcome")
         assert shutter.is_alive()  # it cannot return while the call is in the store

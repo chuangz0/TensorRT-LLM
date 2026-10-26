@@ -385,10 +385,10 @@ class MemoryDriver:
         with self._lock:
             self._require_not_closed()
             self._start_draining()
-            unstarted = [op for op in self._ops if any(_unstarted(row) for row in op.rows)]
-            for op in unstarted:
+            ops_to_cancel = [op for op in self._ops if any(_cancellable(row) for row in op.rows)]
+            for op in ops_to_cancel:
                 self._cancel_unstarted(op)
-        for op in unstarted:  # told only of the operations this drain changed, outside the lock
+        for op in ops_to_cancel:  # the operations this drain changed; outside the lock
             self._call_on_change(op)
         with self._lock:
             self._lock.wait_for(self._drain_can_return, timeout=budget_s)
@@ -740,7 +740,7 @@ class MemoryDriver:
 
     def _cancel_unstarted(self, op: MemoryOp) -> None:
         for row in op.rows:
-            if _unstarted(row):
+            if _cancellable(row):
                 row.published = _CANCELLED
         self._settle_untouched(op)
 
@@ -785,6 +785,6 @@ class MemoryDriver:
         return list(range(len(op.rows))) if rows is None else list(rows)
 
 
-def _unstarted(row: _Row) -> bool:
+def _cancellable(row: _Row) -> bool:
     """Neither taken by a transfer nor decided: a cancel or a drain may still cancel it."""
     return not row.started and not row.published.concluded
