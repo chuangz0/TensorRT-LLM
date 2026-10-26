@@ -646,26 +646,25 @@ class SharedKvOrchestrator:
         the store or transfer failed, which feeds the publication breaker. A pause it starts drops
         the ranges waiting to be published (with a shared table, at rank 0's broadcast switch
         instead)."""
-        masks = self._transfers.delivered_masks(op.operation_id)
+        failed = self._transfers.delivered_masks(op.operation_id) is None
+        # A failed publication's rows stored before it failed are in the store all the same.
+        outcome = self._transfers.operations[op.operation_id].outcome
+        masks = () if outcome is None else outcome.delivered_masks
+        if not failed and not any(len(mask) for mask in masks):
+            return  # this rank's stripe of the rows was empty: it put nothing
         if self._publication_breaker is not None:
             paused = self._publication_breaker.record(
-                time.monotonic(), failed=masks is None, why="a publication failed"
+                time.monotonic(), failed=failed, why="a publication failed"
             )
             self.counters["publication_pauses"] += int(paused)
             if paused and not self._shared_table:
                 self._unpublished.clear()
-        if masks is None:
-            self.counters["publications_failed"] += 1
-            # The rows it stored before failing are in the store all the same.
-            outcome = self._transfers.operations[op.operation_id].outcome
-            if outcome is not None:
-                self.counters["published_objects"] += sum(
-                    int(mask.sum()) for mask in outcome.delivered_masks
-                )
-            return
         stored = sum(int(mask.sum()) for mask in masks)
         self.counters["published_objects"] += stored
-        self.counters["publication_objects_skipped"] += sum(len(mask) for mask in masks) - stored
+        if failed:
+            self.counters["publications_failed"] += 1
+        else:
+            self.counters["publication_objects_skipped"] += sum(len(m) for m in masks) - stored
 
     def _count_fetched(self, op: StoreOp) -> None:
         """Counts the objects and bytes a fetch whose every row arrived read from the store: its

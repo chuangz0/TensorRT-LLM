@@ -51,6 +51,7 @@ from tensorrt_llm._torch.pyexecutor.kv_sharing.orchestrator import (
     SharingPolicy,
     StagingBudget,
 )
+from tensorrt_llm._torch.pyexecutor.kv_sharing.replicas import ReplicaSet
 from tensorrt_llm._torch.pyexecutor.kv_sharing.startup import _staging_budget
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 
@@ -481,6 +482,34 @@ def test_a_publication_the_store_faulted_counts_as_failed_and_its_stored_rows_as
     assert server.counters["publications_failed"] == 1
     assert server.counters["published_objects"] == 1
     assert server.counters["publication_objects_skipped"] == 0
+
+
+def test_a_publication_whose_stripe_on_this_rank_is_empty_counts_nothing(gpu_direct_server):
+    """Under GPU Direct every replica lends a publication and the first of two puts its even
+    blocks: a range of block 1 alone leaves it nothing to put, which feeds its publication breaker
+    neither a failure nor a success."""
+    server = gpu_direct_server
+    server.orchestrator._replicas = ReplicaSet(position=0, size=2)
+    lend = server.lender._lend
+
+    def lend_block_1(request, start, end, **kwargs):
+        lease = lend(request, start, end, **kwargs)
+        one = np.array([1], dtype=np.int64)
+        keys = np.zeros((1, 54), dtype=np.uint8)
+        group = LentLayerGroupRows(0, one, keys, slots=one, region_indices=(1,))
+        lease.view = LeaseView((group,), TPB, 2 * TPB)
+        return lease
+
+    server.lender.lend_read = lend_block_1
+    breaker = server.orchestrator._publication_breaker
+    breaker.failures_in_a_row = 7  # one more failure pauses publishing
+    server.manager.kv_cache_map[1] = object()
+    server.orchestrator.publish_committed_blocks([request(1, stored=TPB, computed=2 * TPB)])
+    server.iterate()  # the store gets the empty stripe
+    assert len(server.store.attempts[0].view.groups[0]) == 0
+    server.store.end(0)
+    server.iterate()
+    assert breaker.failures_in_a_row == 7 and server.counters["publications_failed"] == 0
 
 
 def test_faulted_publications_in_a_row_pause_publishing_and_a_refused_lend_is_no_failure(
