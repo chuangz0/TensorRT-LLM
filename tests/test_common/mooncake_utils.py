@@ -149,7 +149,9 @@ class _Provider:
             if process.poll() is not None or time.monotonic() > deadline:
                 with open(self.log_path, errors="replace") as log:
                     tail = log.read()[-4000:]
-                raise RuntimeError(f"the segment provider did not join {master_address}:\n{tail}")
+                raise RuntimeError(
+                    f"the segment provider in {self.run_dir} did not join {master_address}:\n{tail}"
+                )
             time.sleep(0.1)
 
 
@@ -174,10 +176,15 @@ def _running_providers(
         for process in processes:
             process.terminate()  # the provider unmounts its memory gracefully
         deadline = time.monotonic() + SEGMENT_PROVIDER_STOP_TIMEOUT
-        for process in processes:
+        for provider, process in zip(providers, processes):
             try:
                 process.wait(timeout=max(0.0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
+                print(
+                    f"mooncake-store: the segment provider in {provider.run_dir} did not leave the "
+                    f"pool within {SEGMENT_PROVIDER_STOP_TIMEOUT:.0f} s of its SIGTERM; killing it "
+                    "before it unmounted its segment."
+                )
                 process.kill()
                 process.wait()
 
