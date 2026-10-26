@@ -754,6 +754,33 @@ def test_ordinal_and_key_caches_are_cleared_on_free_reset_and_shutdown(sources):
     assert lender._ordinal_ranges == lender._prompt_keys == {} and lender._shut_down
 
 
+def test_a_requests_prompt_keys_are_hashed_once_for_its_cache_and_not_kept_past_the_prompt():
+    """A request's later leases reuse the keys its first one hashed over the prompt's whole
+    blocks; a cache re-created for the request hashes afresh, and a lease past the prompt hashes
+    its blocks without keeping them (beam search may still change generated tokens)."""
+    methods = _sources()
+    _load("_lender.py", "_key_rows", methods.ns)
+    block_key_chain = _load("_lender.py", "_ManagerLender._block_key_chain", methods.ns)
+    hashed = []
+
+    def block_keys(manager, request, kv, count):
+        hashed.append(count)
+        return [bytes([len(hashed), block]) * 16 for block in range(count)]
+
+    methods.manager.prompt_length = lambda request, manager: request.prompt
+    methods.manager.block_keys = block_keys
+    lender, manager = SimpleNamespace(_prompt_keys={}), SimpleNamespace(tokens_per_block=TPB)
+    request = SimpleNamespace(py_request_id=RID, prompt=3 * TPB + 1)  # three whole blocks
+    kv, recreated = object(), object()
+    first = block_key_chain(lender, manager, request, kv, 2)
+    assert block_key_chain(lender, manager, request, kv, 3) is first and hashed == [3]
+    again = block_key_chain(lender, manager, request, recreated, 3)
+    assert hashed == [3, 3] and again.tobytes() != first.tobytes()
+    assert lender._prompt_keys[RID][0] is recreated
+    past = block_key_chain(lender, manager, request, recreated, 4)
+    assert hashed == [3, 3, 4] and len(past) == 4 and lender._prompt_keys[RID][1] is again
+
+
 def _slow_object_keys(identity, group, keys):
     if not 0 <= group < len(identity._groups):
         raise ValueError(f"unknown layer group {group}")

@@ -2604,9 +2604,9 @@ class _ManagerLender:
         """``uint8 (n, 32)``, ``n >= count``: the reuse keys of the request's whole blocks from
         block 0; those of its prompt from ``_prompt_keys``."""
         request_id = int(request.py_request_id)
-        cached = self._prompt_keys.get(request_id)
-        if cached is not None and cached[0] is kv and count <= len(cached[1]):
-            return cached[1]
+        owner, keys = self._prompt_keys.get(request_id, (None, None))
+        if owner is kv and count <= len(keys):  # a cache re-created for the request hashes afresh
+            return keys
         prompt_blocks = _manager.prompt_length(request, manager) // int(manager.tokens_per_block)
         if count > prompt_blocks:  # past the prompt, beam search may still change tokens
             return _key_rows(_manager.block_keys(manager, request, kv, count))
