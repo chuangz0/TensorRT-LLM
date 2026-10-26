@@ -49,9 +49,7 @@ pytestmark = pytest.mark.cpu_only
 @pytest.fixture
 def store_config(tmp_path) -> str:
     path = tmp_path / "store.yaml"
-    path.write_text(
-        "mooncake:\n  master_server_address: 10.0.0.1:50051\n  global_segment_size: 0\n"
-    )
+    path.write_text("mooncake:\n  master_server_address: 10.0.0.1:50051\n")
     return str(path)
 
 

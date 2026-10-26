@@ -46,7 +46,6 @@ def store_config(protocol: str = "tcp", **mooncake) -> dict:
         "blob": {"key_prefix": "t", "rows_per_batch": 4},
         "mooncake": {
             "master_server_address": MASTER,
-            "global_segment_size": 0,
             "protocol": protocol,
             **mooncake,
         },
@@ -157,10 +156,10 @@ def test_unknown_keys_and_values_of_the_wrong_type_are_rejected(case: str) -> No
 
 def test_store_config_reads_a_yaml_file_and_names_it_in_errors(tmp_path: pathlib.Path) -> None:
     path = tmp_path / "store.yaml"
-    path.write_text(yaml.safe_dump(store_config(local_buffer_size=0)))
+    path.write_text(yaml.safe_dump(store_config()))
     blob, mooncake = load_store_config(path)
     assert blob == BlobConfig(key_prefix="t", rows_per_batch=4)
-    assert mooncake == MooncakeConfig(MASTER, 0, protocol="tcp", local_buffer_size=0)
+    assert mooncake == MooncakeConfig(MASTER, protocol="tcp")
     path.write_text(yaml.safe_dump({**store_config(), "blob": {"workers": 2.5}}))
     with pytest.raises(
         ValueError, match=f"store config {re.escape(str(path))}, section 'blob': .*workers"

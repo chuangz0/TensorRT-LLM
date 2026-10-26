@@ -26,7 +26,6 @@ gives it the memory its own config asks for. Servers that share KV cache through
 """
 
 import contextlib
-import dataclasses
 import pathlib
 import signal
 import tempfile
@@ -290,7 +289,7 @@ def mooncake_provider(config: str, segment_size: int, ready_file: Optional[str],
 
     _, mooncake = load_store_config(config)
     with _signal_handoff():
-        store = open_sdk(dataclasses.replace(mooncake, global_segment_size=0))
+        store = open_sdk(mooncake)
         segment = StoreSegment.mount(store, segment_size, mooncake.protocol)
         try:
             logger.warning(

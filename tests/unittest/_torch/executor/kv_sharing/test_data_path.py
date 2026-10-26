@@ -67,7 +67,7 @@ def store(monkeypatch: pytest.MonkeyPatch) -> FakeMooncakeStore:
     return fake
 
 
-CONFIG = MooncakeConfig("127.0.0.1:50051", 0)
+CONFIG = MooncakeConfig("127.0.0.1:50051")
 
 
 def check_thread_ended() -> bool:
