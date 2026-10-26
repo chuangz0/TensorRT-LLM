@@ -2878,8 +2878,9 @@ class KvSharingConfig(StrictBaseModel):
     fetch_timeout_s: float = Field(
         default=5.0,
         gt=0,
-        description="A fetch still running this long after it started is "
-        "abandoned and its request computes its prompt.")
+        description="A fetch still running this long after the server admitted "
+        "it (parked its request to wait for the store) is abandoned and its "
+        "request computes its prompt.")
 
     @property
     def only_provides(self) -> bool:
