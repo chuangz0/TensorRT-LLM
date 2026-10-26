@@ -360,6 +360,23 @@ def test_the_shutdown_drops_parked_and_settling_fetches_and_returns_their_leases
     assert server.lender.leases[0].released and not server.manager.resumed
 
 
+def test_after_a_round_raised_the_shutdown_still_returns_every_lease(monkeypatch):
+    """The executor's crash path: a round raised after it returned a fetch's lease, while a
+    publication's lease is held; the shutdown returns the held one and completes."""
+    server = Server(monkeypatch, MemoryKind.DEVICE)
+    server.park(request(1))
+    server.manager.kv_cache_map[2] = object()
+    server.orchestrator.publish_committed_blocks(computed(2))
+    server.iterate()  # the store starts both
+    server.store.end(0)
+    server.store.end(1)
+    # The fetch's lease goes back, then its resume raises: the lender settled no bounds for it.
+    with pytest.raises(RuntimeError, match="outside its resume bounds"):
+        server.iterate()
+    server.shut_down()
+    assert server.lender.leases[0].released and server.lender.leases[1].released
+
+
 def test_a_cancel_while_settling_closes_the_fetch_without_a_resume(server):
     cancelled = request(1)
     server.park(cancelled)

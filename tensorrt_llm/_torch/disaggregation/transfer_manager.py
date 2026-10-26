@@ -786,9 +786,8 @@ class TransferManager:
 
     def ended(self, operation_id: int) -> bool:
         """Whether the operation's backend access ended and its lease is held for
-        ``return_now`` (or was returned)."""
-        record = self.operations[operation_id]
-        return record.held or record.released
+        ``return_now``."""
+        return self.operations[operation_id].held
 
     def ready(self, operation_id: int) -> bool:
         """Whether the operation's Outcome delivered every row of its view without a fault,
