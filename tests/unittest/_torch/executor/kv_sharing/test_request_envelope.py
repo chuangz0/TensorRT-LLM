@@ -77,8 +77,8 @@ class Sharing:
     def round_to_announce(self) -> int:
         return ROUND_SIZE if self.rank == 0 else 0
 
-    def round_announced(self, entries: int) -> None:
-        self.announced = entries
+    def round_announced(self, round_size: int) -> None:
+        self.announced = round_size
 
     take_rank0_items = SharedKvOrchestrator.take_rank0_items
     apply_store_update = SharedKvOrchestrator.apply_store_update

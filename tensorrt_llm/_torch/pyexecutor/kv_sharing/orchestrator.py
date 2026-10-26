@@ -79,11 +79,11 @@ class _PublicationLocks:
     open: int
     locked: set[int]
 
-    def take(self, request_id: int, pages: int, past_cap: bool) -> bool:
+    def take(self, request_id: int, pages: int, *, exempt_from_cap: bool) -> bool:
         """Locks the request's ``pages`` if they fit, past the open-publication cap when
-        ``past_cap``; whether they did."""
+        ``exempt_from_cap``; whether they did."""
         pages = 0 if request_id in self.locked else pages
-        at_cap = self.open >= MAX_OPEN_PUBLICATIONS and not past_cap
+        at_cap = self.open >= MAX_OPEN_PUBLICATIONS and not exempt_from_cap
         if at_cap or self.pinned + pages > self.room:
             return False
         self.open += 1
@@ -146,8 +146,8 @@ class SharingPolicy:
         fetch: Whether requests read stored prompt prefixes.
         publish: Whether the server stores the prompt blocks it computes.
         min_fetch_tokens: Shorter stored prefixes are computed.
-        max_fetch_tokens: Longest prefix one fetch reads. With a sliding window a longer stored
-            prefix is computed instead of cut.
+        max_fetch_tokens: Most tokens one fetch reads past the local prefix. With a sliding window
+            a longer stored prefix is computed instead of cut.
         fetch_timeout_s: A fetch still running this long after admission is abandoned.
         staging: Under host staging, the rows open publications may hold: staging less one
             fetch, so publications never keep a fetch waiting for staging. None under GPU Direct.
@@ -322,7 +322,7 @@ class SharedKvOrchestrator:
         """How long rank 0 may wait on an empty request queue: not at all while store operations
         are open, since scheduling passes close them; 1 ms while requests wait for their probe;
         otherwise ``timeout`` (None waits for the next request)."""
-        if self.open_operations():
+        if self.has_store_work():
             return NO_WAIT
         if self._probe is not None and self._probe.holds_requests():
             return HELD_REQUEST_POLL if timeout is None else min(timeout, HELD_REQUEST_POLL)
@@ -334,19 +334,19 @@ class SharedKvOrchestrator:
         announcement."""
         return len(self._ops) if self._shared_table else 0
 
-    def open_operations(self) -> int:
-        """Nonzero while this rank has store work that needs executor passes: open entries, or
-        transfer manager work left after their decisions (counted as one). Under attention DP it
-        keeps rank 0 from sleeping on an empty request queue while another rank has some."""
-        return len(self._ops) + int(self._transfers.pending())
+    def has_store_work(self) -> bool:
+        """Whether this rank has store work only executor passes advance: open entries, or
+        transfer-manager work left after their decisions. Under attention DP it keeps rank 0 from
+        sleeping on an empty request queue while another rank has some."""
+        return bool(self._ops) or self._transfers.pending()
 
     # Every rank, around the request broadcast.
 
-    def round_announced(self, entries: int) -> None:
+    def round_announced(self, round_size: int) -> None:
         """Every rank, right after each request broadcast: rank 0's round size. The next
         ``resolve_store_operations`` enters the round's collective exactly when it is not zero,
         so every rank makes these two calls once per pass, in this order."""
-        self._announced = entries
+        self._announced = round_size
 
     def apply_store_update(
         self, waiting: Iterable[RequestQueueItem], update: RequestQueueItem
@@ -382,7 +382,7 @@ class SharedKvOrchestrator:
         self._submitted_this_pass = False
         failure = self._store_failure()
         if failure is not None:
-            self._store_failed(failure)
+            self._raise_store_failure(failure)
         announced, self._announced = self._announced, 0
         # With a shared table, rank 0's announcement (alike on every rank) decides whether all
         # enter the round; on its own table, a rank covers the whole table.
@@ -879,7 +879,8 @@ class SharedKvOrchestrator:
                         key="kv_sharing: a publication never fits",
                     )
                     continue
-                if not locks.take(request.py_request_id, pages, self._ends_context(request, end)):
+                exempt = self._ends_context(request, end)
+                if not locks.take(request.py_request_id, pages, exempt_from_cap=exempt):
                     self.counters["publication_waits"] += 1
                     continue
             if ready is None:
@@ -973,7 +974,7 @@ class SharedKvOrchestrator:
                 ready_event=ready,
             )
         except RuntimeError as error:  # the lender lends no more
-            self._store_failed(f"a lend failed: {error}", cause=error)
+            self._raise_store_failure(f"a lend failed: {error}", cause=error)
         if lease.failure is not None:
             lease.release()  # a lend refused at the call holds no lock, slot or fetch
             # One warning per kind of reason: positions and request ids do not make a new one.
@@ -992,7 +993,7 @@ class SharedKvOrchestrator:
         result = self._transfers.submit(lease, intent)
         if not isinstance(result, Accepted):
             lease.release()  # nothing else holds it
-            self._store_failed(f"the transfer manager refused an operation: {result.reason}")
+            self._raise_store_failure(f"the transfer manager refused an operation: {result.reason}")
         op.operation_id = result.operation_id
         self._submitted_this_pass = True
         return True
@@ -1006,7 +1007,7 @@ class SharedKvOrchestrator:
             return start
         return [0 if windowed else start for windowed in self._windowed_groups]
 
-    def _store_failed(self, reason: str, cause: Optional[Exception] = None) -> NoReturn:
+    def _raise_store_failure(self, reason: str, cause: Optional[Exception] = None) -> NoReturn:
         """Raises, ending the server: this rank's lender or store binding stopped, so this rank's
         KV cache and locks may no longer follow its store operations, nor under tensor parallelism
         its peers'. With several ranks the executor's rank-crash path then kills every rank

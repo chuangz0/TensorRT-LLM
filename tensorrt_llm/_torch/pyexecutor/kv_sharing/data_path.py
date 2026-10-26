@@ -67,13 +67,13 @@ def open_store(requested: str, mooncake: MooncakeConfig) -> tuple[Any, Optional[
         ValueError: The store did not open.
     """
     if requested == HOST_STAGING:
-        gpu_direct_error = "host staging was asked for"
+        why_not_gpu_direct = "host staging was asked for"
     else:
-        gpu_direct_error = prepare_gpu_direct(mooncake.protocol)
+        why_not_gpu_direct = prepare_gpu_direct(mooncake.protocol)
     try:
-        return open_sdk(mooncake), gpu_direct_error
+        return open_sdk(mooncake), why_not_gpu_direct
     except Exception as error:
-        raise ValueError(f"kv_sharing: the store could not be opened: {error}") from error
+        raise ValueError(f"the store could not be opened: {error}") from error
 
 
 def prepare_gpu_direct(protocol: str) -> Optional[str]:
@@ -99,10 +99,10 @@ def prepare_gpu_direct(protocol: str) -> Optional[str]:
     return None
 
 
-def check_store(store: Any, gpu_direct_error: Optional[str]) -> Optional[str]:
-    """A round trip of a random object through the store from host memory and, unless
-    ``gpu_direct_error`` already says why GPU Direct is out, into device memory and back out of
-    it: why GPU Direct cannot serve this rank, or None. Each half waits at most
+def check_store(store: Any, why_not_gpu_direct: Optional[str]) -> Optional[str]:
+    """Returns why GPU Direct cannot serve this rank: ``why_not_gpu_direct`` when given, else the
+    failure of a round trip of a random object from the store into device memory and back out of
+    it, or None. A round trip through host memory runs first. Each half waits at most
     STORE_CHECK_TIMEOUT_S: a timeout of the device half is GPU Direct's error, not the store's. The
     check runs on its own Python driver, before any store worker thread exists.
 
@@ -119,8 +119,8 @@ def check_store(store: Any, gpu_direct_error: Optional[str]) -> Optional[str]:
     )
     if store_error is not None:
         raise RuntimeError(store_error)
-    if gpu_direct_error is not None:
-        return gpu_direct_error
+    if why_not_gpu_direct is not None:
+        return why_not_gpu_direct
     device = torch.zeros(STORE_CHECK_BYTES, dtype=torch.uint8, device="cuda")
     _CHECK_MEMORY.append(device)
     torch.cuda.synchronize()  # the zeroing ran before the NIC writes
@@ -130,7 +130,9 @@ def check_store(store: Any, gpu_direct_error: Optional[str]) -> Optional[str]:
     )
 
 
-def choose_data_path(requested: str, gpu_direct_errors: Sequence[Optional[str]]) -> MemoryKind:
+def choose_data_path(
+    requested: str, why_not_gpu_direct_by_rank: Sequence[Optional[str]]
+) -> MemoryKind:
     """The path every rank takes, given why GPU Direct cannot serve each rank: the one requested,
     or for 'auto' GPU Direct (DEVICE) where every rank can take it and host staging (HOST)
     otherwise, logged with each rank's reason.
@@ -141,7 +143,9 @@ def choose_data_path(requested: str, gpu_direct_errors: Sequence[Optional[str]])
     if requested == HOST_STAGING:
         return MemoryKind.HOST
     reasons = "; ".join(
-        f"rank {rank}: {error}" for rank, error in enumerate(gpu_direct_errors) if error is not None
+        f"rank {rank}: {why}"
+        for rank, why in enumerate(why_not_gpu_direct_by_rank)
+        if why is not None
     )
     if not reasons:
         return MemoryKind.DEVICE

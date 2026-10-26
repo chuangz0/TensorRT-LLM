@@ -28,6 +28,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 
 from ...disaggregation._assembly import (
+    MHA_LAYOUT,
+    MLA_LAYOUT,
     SPARSE_ALGORITHMS,
     SUPPORTED_CACHES,
     FactoryRejected,
@@ -78,7 +80,11 @@ from .probe import ProbeService
 from .replicas import ReplicaSet, replica_set
 
 if TYPE_CHECKING:
-    from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, TorchLlmArgs
+    from tensorrt_llm.llmapi.llm_args import (
+        BaseSparseAttentionConfig,
+        KvSharingBackendConfig,
+        TorchLlmArgs,
+    )
 
     from ...distributed import Distributed
     from ..py_executor import PyExecutor
@@ -92,9 +98,6 @@ _Shared = TypeVar("_Shared")
 STORE_ACCESS_DEADLINE_S = 120.0
 # Pinned host memory each rank stages fetches and publications through, at most.
 HOST_STAGING_BYTES = 8 << 30
-# The attention writer layouts of the TRTLLM backend, which stored blocks carry.
-MHA_LAYOUT = "mha-trtllm-hnd"
-MLA_LAYOUT = "mla-trtllm-latent"
 # The cache dtypes stored blocks carry, by the KV cache manager's dtype.
 _CACHE_DTYPES = {
     DataType.BF16: "bfloat16",
@@ -102,12 +105,12 @@ _CACHE_DTYPES = {
     DataType.FP8: "fp8",
     DataType.NVFP4: "nvfp4",
 }
-# Prefixes the reason a model is refused.
-SUPPORTED_MODELS = (
-    "kv_sharing serves one GPU, tensor parallelism or attention DP, with multi-head "
-    "attention (BF16, FP16, FP8 or NVFP4 KV cache) with full attention or sliding windows, or MLA "
-    "(BF16 or FP8 KV cache) with full attention or DeepSeek sparse attention (DSA); no recurrent "
-    "state, other sparse attention or attention sink tokens; and under host staging one fetch of "
+# Follows the reason a model is refused.
+WHAT_KV_SHARING_SERVES = (
+    "one GPU, tensor parallelism or attention DP, with multi-head attention (BF16, FP16, FP8 or "
+    "NVFP4 KV cache) with full attention or sliding windows, or MLA (BF16 or FP8 KV cache) with "
+    "full attention or DeepSeek sparse attention (DSA); no recurrent state, other sparse "
+    "attention or attention sink tokens; and under host staging one fetch of "
     f"max(max_fetch_tokens, max_num_tokens) tokens within {HOST_STAGING_BYTES >> 30} GiB"
 )
 # Where each rank writes its round trace (rank<r>.txt), for multi-GPU tests to compare.
@@ -163,35 +166,7 @@ def _share_blocks(
     (backend,) = config.backends
     manager = py_executor.kv_cache_manager
     dist = py_executor.dist
-    if not isinstance(manager, KVCacheManagerV2):
-        raise ValueError(
-            f"kv_sharing needs KV cache manager v2; this executor built {type(manager).__name__}"
-        )
-    if not isinstance(py_executor.scheduler, KVCacheV2Scheduler):
-        raise ValueError(
-            "kv_sharing fetches through the KV cache manager v2 scheduler; this executor built "
-            f"{type(py_executor.scheduler).__name__}"
-        )
-    # Every rank reads these model facts alike, so each refuses on its own, before any collective,
-    # checkpoint read or store work.
-    unserved: list[str] = []
-    layout, cache_dtype = _stored_cache(py_executor)
-    if (layout, cache_dtype) not in SUPPORTED_CACHES:
-        unserved.append(f"a KV cache of layout {layout} and dtype {cache_dtype}")
-    sparse = py_executor.model_engine.model.model_config.sparse_attention_config
-    if sparse is not None and sparse.algorithm not in SPARSE_ALGORITHMS:
-        unserved.append(f"{sparse.algorithm} sparse attention")
-    if isinstance(manager, MambaHybridCacheManagerV2):
-        unserved.append("recurrent state")
-    if unserved:
-        raise ValueError(
-            f"{SUPPORTED_MODELS}; this server is refused: the model has {' and '.join(unserved)}"
-        )
-    if not manager.enable_block_reuse:
-        raise ValueError(
-            "kv_sharing needs block reuse, which TensorRT-LLM turned off for this model; a warning "
-            "in its log says why"
-        )
+    _refuse_unserved_executor(py_executor)
     checkpoint = checkpoint_dir or llm_args.model
 
     def prepare() -> tuple[tuple[MooncakeConfig, BlobConfig], Optional[ArtifactIdentity]]:
@@ -213,22 +188,22 @@ def _share_blocks(
         return (mooncake, blob_config), ArtifactIdentity.from_checkpoint(checkpoint)
 
     def open_and_check() -> tuple[Any, Optional[str]]:
-        store, gpu_direct_error = open_store(config.data_path, mooncake)
+        store, why_not_gpu_direct = open_store(config.data_path, mooncake)
         if backend.segment_size:
             # Before the check, whose object needs memory somewhere in the store, maybe only here.
             # Recorded at once: start_kv_sharing unmounts it if a later step fails.
             py_executor.store_segment = StoreSegment.mount(
                 store, backend.segment_size, mooncake.protocol
             )
-        return store, check_store(store, gpu_direct_error)
+        return store, check_store(store, why_not_gpu_direct)
 
     # Three collectives every rank reaches, whatever failed on it: prepare (which checks the node's
     # memory before any rank mounts its segment), opening and checking the store, attach. Every
     # check after them reads gathered facts, so it raises on every rank.
     (mooncake, blob_config), identity_by_rank = _agree(dist, prepare)
     # Before the lender pins its staging memory: an unreachable master fails here, within a minute.
-    store, gpu_direct_errors = _agree(dist, open_and_check)
-    memory_kind = choose_data_path(config.data_path, gpu_direct_errors)
+    store, why_not_gpu_direct_by_rank = _agree(dist, open_and_check)
+    memory_kind = choose_data_path(config.data_path, why_not_gpu_direct_by_rank)
 
     tokens_per_block = manager.tokens_per_block
     fetch_tokens = max(config.max_fetch_tokens, max_num_tokens)
@@ -259,7 +234,7 @@ def _share_blocks(
         try:
             replicas = replica_set([facts.shards for facts in facts_by_rank], dist.rank)
         except ValueError as error:  # alike on every rank: the shards are gathered
-            raise ValueError(f"{SUPPORTED_MODELS}; this server is refused: {error}") from error
+            raise ValueError(_refusal(error)) from error
         # Creating the TP communicator is itself a collective (MPI Create_group): do it here,
         # where every rank is, not lazily inside the first round.
         dist.tp_comm  # noqa: B018
@@ -315,6 +290,57 @@ def _share_blocks(
     )
     py_executor.kv_sharing = orchestrator
     py_executor.scheduler.store_fetches = orchestrator
+    _log_sharing_started(mooncake, backend, attached, memory_kind, fetch_tokens)
+
+
+def _refuse_unserved_executor(py_executor: PyExecutor) -> None:
+    """Refuses an executor or a model kv_sharing does not serve. Every rank reads these facts
+    alike, so each refuses on its own, before any collective, checkpoint read or store work.
+
+    Raises:
+        ValueError: The executor or the model is not one kv_sharing serves.
+    """
+    manager = py_executor.kv_cache_manager
+    if not isinstance(manager, KVCacheManagerV2):
+        raise ValueError(
+            f"kv_sharing needs KV cache manager v2; this executor built {type(manager).__name__}"
+        )
+    if not isinstance(py_executor.scheduler, KVCacheV2Scheduler):
+        raise ValueError(
+            "kv_sharing fetches through the KV cache manager v2 scheduler; this executor built "
+            f"{type(py_executor.scheduler).__name__}"
+        )
+    unserved: list[str] = []
+    layout, cache_dtype = _stored_cache(py_executor)
+    if (layout, cache_dtype) not in SUPPORTED_CACHES:
+        unserved.append(f"a KV cache of layout {layout} and dtype {cache_dtype}")
+    sparse = py_executor.model_engine.model.model_config.sparse_attention_config
+    if sparse is not None and sparse.algorithm not in SPARSE_ALGORITHMS:
+        unserved.append(f"{sparse.algorithm} sparse attention")
+    if isinstance(manager, MambaHybridCacheManagerV2):
+        unserved.append("recurrent state")
+    if unserved:
+        raise ValueError(_refusal(f"the model has {' and '.join(unserved)}"))
+    if not manager.enable_block_reuse:
+        raise ValueError(
+            "kv_sharing needs block reuse, which TensorRT-LLM turned off for this model; a warning "
+            "in its log says why"
+        )
+
+
+def _refusal(reason: object) -> str:
+    """The message refusing a model for ``reason``."""
+    return f"kv_sharing refuses this server: {reason}. It serves {WHAT_KV_SHARING_SERVES}"
+
+
+def _log_sharing_started(
+    mooncake: MooncakeConfig,
+    backend: KvSharingBackendConfig,
+    attached: _Attached,
+    memory_kind: MemoryKind,
+    fetch_tokens: int,
+) -> None:
+    """Logs the store, the roles and the data path this server shares blocks through."""
     if memory_kind is MemoryKind.DEVICE:
         path = f"GPU Direct, at most {MAX_OPEN_PUBLICATIONS} publications locking pages at once"
     else:
@@ -459,8 +485,8 @@ def _check_node_memory(segment_bytes: int, *, staging_bytes: int, ranks_on_node:
     gib = 1 << 30
     staging = f" and stage through up to {staging_bytes / gib:.1f} GiB" if staging_bytes else ""
     raise ValueError(
-        f"kv_sharing: this node cannot give the store the host memory asked for: {ranks_on_node} "
-        f"rank(s) here would provide {segment_bytes / gib:.1f} GiB each{staging}, "
+        f"this node cannot give the store the host memory asked for: {ranks_on_node} rank(s) "
+        f"here would provide {segment_bytes / gib:.1f} GiB each{staging}, "
         f"{claimed / gib:.1f} GiB in all, but {available / gib:.1f} GiB is available and "
         f"{NODE_BUDGET_RESERVE_BYTES // gib} GiB of it stays free. Lower segment_size, or set "
         "kv_cache_config.host_cache_size to leave room: unset, KV cache manager V2's host tier "
@@ -494,7 +520,7 @@ def _attach(
         domain = attach_domain(manager, profile, memory_kind=memory_kind)
     except (TypeError, ValueError) as error:
         # The lender may stay attached; startup fails, so nothing lends through it.
-        raise ValueError(f"{SUPPORTED_MODELS}; this server is refused: {error}") from error
+        raise ValueError(_refusal(error)) from error
     staging_budget = None
     if memory_kind is MemoryKind.HOST:
         staging_budget = _staging_budget(domain.lender, fetch_tokens, tokens_per_block)
@@ -528,9 +554,8 @@ def _open_trace(rank: int) -> Optional[TextIO]:
 
 
 def _staging_budget(lender: Lender, fetch_tokens: int, tokens_per_block: int) -> StagingBudget:
-    """The rows open publications may hold in each host staging region: its slots less one
-    fetch's. A block takes one slot of its pool group's region for each layer group the region
-    serves; a windowed group at most its sinks and window, whatever the range.
+    """The ``StagingBudget`` of the lender's host staging regions beside one fetch of
+    ``fetch_tokens``.
 
     Raises:
         ValueError: Host staging holds no publication beside one fetch.
@@ -556,7 +581,7 @@ def _staging_budget(lender: Lender, fetch_tokens: int, tokens_per_block: int) ->
     if not budget.fits(1, []):
         staged_gib = sum(region.nbytes for region in regions) / (1 << 30)
         raise ValueError(
-            f"kv_sharing: {staged_gib:.1f} GiB of host staging hold one fetch of {fetch_tokens} "
+            f"{staged_gib:.1f} GiB of host staging hold one fetch of {fetch_tokens} "
             "tokens, max(max_fetch_tokens, max_num_tokens), and no block for publications; "
             "lower max_fetch_tokens or max_num_tokens"
         )

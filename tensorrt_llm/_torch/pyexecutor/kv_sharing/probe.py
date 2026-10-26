@@ -142,11 +142,11 @@ class ProbeService:
         self._clock = clock
         # Guards the nine fields below and wakes the probe thread.
         self._cond = threading.Condition()
-        self._work: list[_Prompt] = []
+        self._new_prompts: list[_Prompt] = []
         self._deadlines: dict[int, float] = {}  # by request id, while held and unanswered
         # By request id: the prompt, the answer and when the store gave it.
         self._answers: dict[int, tuple[_Prompt, Optional[int], float]] = {}
-        self._refresh_work: list[_Prompt] = []
+        self._refresh_prompts: list[_Prompt] = []
         # By request id: a refresh's hit (None: the store call failed) and when the store gave it.
         self._refreshed: dict[int, tuple[Optional[int], float]] = {}
         self._call_started_at: Optional[float] = None  # of the store call in flight
@@ -172,7 +172,7 @@ class ProbeService:
             if self._stopped or self._paused(self._clock()):
                 return
             self._deadlines[item.id] = self._clock() + HOLDS_WHILE_QUEUED * self._hold_s
-            self._work.append(prompt)
+            self._new_prompts.append(prompt)
             self._cond.notify()
 
     def hold_until_probed(self, fetched: list[RequestQueueItem]) -> list[RequestQueueItem]:
@@ -185,8 +185,8 @@ class ProbeService:
         released, held = [], []
         with self._cond:
             for item in self._held + [item for item in fetched if item.is_normal_request]:
-                release = shutdown or item.id in cancelled
-                (released if self._leaves(item, now, release) else held).append(item)
+                forced = shutdown or item.id in cancelled
+                (released if self._release_if_due(item, now, forced=forced) else held).append(item)
         self._held = held
         return released + [item for item in fetched if not item.is_normal_request]
 
@@ -246,8 +246,8 @@ class ProbeService:
         with self._cond:
             self._stopped = True
             self._deadlines.clear()
-            self._work.clear()
-            self._refresh_work.clear()
+            self._new_prompts.clear()
+            self._refresh_prompts.clear()
             self._cond.notify()
         if wait_s > 0:
             self._thread.join(wait_s)
@@ -292,9 +292,11 @@ class ProbeService:
         prompt = np.asarray(tokens, dtype=np.int32)
         return _Prompt(item.id, prompt, request.cache_salt, num_blocks, answer_limit)
 
-    def _leaves(self, item: RequestQueueItem, now: float, release: bool) -> bool:
-        """Whether a request leaves the hold now, setting its answer if it came; a hit worth
-        fetching is then kept for refreshes while the request waits."""
+    def _release_if_due(self, item: RequestQueueItem, now: float, *, forced: bool) -> bool:
+        """Releases the request from the hold if its answer came, its hold passed, the store call
+        is slow, or ``forced`` (a cancel or a shutdown): sets ``store_hit_tokens`` to the answer
+        and keeps a hit worth fetching for refreshes while the request waits. Returns whether it
+        was released."""
         if item.id in self._answers:
             prompt, hit, probed_at = self._answers.pop(item.id)
             item.store_hit_tokens = hit
@@ -306,9 +308,9 @@ class ProbeService:
             return True
         started = self._call_started_at
         slow_store = started is not None and now - started >= self._hold_s
-        if release or now >= deadline or slow_store:
+        if forced or now >= deadline or slow_store:
             del self._deadlines[item.id]
-            if not release:
+            if not forced:
                 self.counters["held_past_limit"] += 1
             return True
         return False
@@ -324,7 +326,7 @@ class ProbeService:
             kept = self._waiting_hits.get(item.id)
             if paused or kept is None or kept.refreshing or now - kept.probed_at < REFRESH_AFTER_S:
                 continue
-            # One store call's worth of keys per round; the refreshes then fill what room new
+            # One store call's worth of keys per scan; the refreshes then fill what room new
             # requests leave in the thread's calls, or take calls of their own.
             if keys >= PROBE_KEYS_PER_CALL:
                 self.counters["refreshes_deferred"] += 1
@@ -336,50 +338,52 @@ class ProbeService:
             del self._waiting_hits[request_id]
         if due:
             with self._cond:
-                self._refresh_work += due
+                self._refresh_prompts += due
                 self._cond.notify()
 
     def _run(self) -> None:
         while True:
             with self._cond:
-                self._cond.wait_for(lambda: self._work or self._refresh_work or self._stopped)
+                self._cond.wait_for(
+                    lambda: self._new_prompts or self._refresh_prompts or self._stopped
+                )
                 if self._stopped:
                     return
-                first, refresh = self._take_store_call()
+                new, refreshes = self._take_store_call()
                 probed_at = self._call_started_at  # the store's read leases run from the call
-            if not first and not refresh:
+            if not new and not refreshes:
                 continue
-            answers, answered = self._probe(first + refresh)
+            answers, store_answered = self._probe(new + refreshes)
             with self._cond:
                 self._call_started_at = None
                 # At the call's return: a pause then lasts PAUSE_S whatever the call took.
                 why = "a store probe failed or timed out"
-                if self._probe_breaker.record(self._clock(), failed=not answered, why=why):
+                if self._probe_breaker.record(self._clock(), failed=not store_answered, why=why):
                     self.counters["probe_pauses"] += 1
-                for prompt, answer in zip(first, answers):
+                for prompt, answer in zip(new, answers):
                     if prompt.request_id in self._deadlines:
                         del self._deadlines[prompt.request_id]
                         self._answers[prompt.request_id] = (prompt, answer, probed_at)
-                for prompt, answer in zip(refresh, answers[len(first) :]):
+                for prompt, answer in zip(refreshes, answers[len(new) :]):
                     self._refreshed[prompt.request_id] = (answer, probed_at)
 
     def _take_store_call(self) -> tuple[list[_Prompt], list[_Prompt]]:
         """Under ``_cond``: the new requests and the refreshes of the next store call, at most
-        PROBE_KEYS_PER_CALL keys (one prompt at least), and the call's start; each new request's
-        hold now runs one hold from it. A request released meanwhile needs no answer. Refreshes
-        fill the room new requests leave: under a steady stream of long new prompts they wait, and
-        a hit whose read lease lapsed meanwhile fetches short and drops."""
-        self._work = [p for p in self._work if p.request_id in self._deadlines]
-        first = self._take_prompts(self._work, PROBE_KEYS_PER_CALL, at_least_one=True)
-        room = PROBE_KEYS_PER_CALL - sum(self._keys_of(p) for p in first)
-        refresh = self._take_prompts(self._refresh_work, room, at_least_one=not first)
-        if first or refresh:
+        PROBE_KEYS_PER_CALL keys (one prompt at least). Sets ``_call_started_at`` to the call's
+        start, from which each new request's hold now runs. A request released meanwhile needs no
+        answer. Refreshes fill the room new requests leave: under a steady stream of long new
+        prompts they wait, and a hit whose read lease lapsed meanwhile fetches short and drops."""
+        self._new_prompts = [p for p in self._new_prompts if p.request_id in self._deadlines]
+        new = self._take_prompts(self._new_prompts, PROBE_KEYS_PER_CALL, at_least_one=True)
+        room = PROBE_KEYS_PER_CALL - sum(self._keys_of(p) for p in new)
+        refreshes = self._take_prompts(self._refresh_prompts, room, at_least_one=not new)
+        if new or refreshes:
             self._call_started_at = now = self._clock()
-            for prompt in first:
+            for prompt in new:
                 self._deadlines[prompt.request_id] = now + self._hold_s
-        keys = sum(self._keys_of(p) for p in first + refresh)
+        keys = sum(self._keys_of(p) for p in new + refreshes)
         self.counters["probe_batch_keys_max"] = max(self.counters["probe_batch_keys_max"], keys)
-        return first, refresh
+        return new, refreshes
 
     def _take_prompts(self, queue: list[_Prompt], keys: int, at_least_one: bool) -> list[_Prompt]:
         """Removes and returns the head of ``queue`` whose keys fit in ``keys``; with

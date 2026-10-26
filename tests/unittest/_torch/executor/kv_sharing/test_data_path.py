@@ -33,7 +33,7 @@ GET = "batch_get_into_multi_buffers"
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "requested, gpu_direct_errors, chosen",
+    "requested, why_not_gpu_direct_by_rank, chosen",
     [
         ("auto", [None, None], MemoryKind.DEVICE),
         ("auto", [None, "no RDMA here"], MemoryKind.HOST),  # one rank keeps every rank off it
@@ -41,11 +41,11 @@ GET = "batch_get_into_multi_buffers"
     ],
 )
 def test_every_rank_takes_the_path_asked_for_or_the_one_auto_picks(
-    requested, gpu_direct_errors, chosen, monkeypatch
+    requested, why_not_gpu_direct_by_rank, chosen, monkeypatch
 ) -> None:
     warnings: list[str] = []
     monkeypatch.setattr(data_path.logger, "warning", warnings.append)
-    assert choose_data_path(requested, gpu_direct_errors) is chosen
+    assert choose_data_path(requested, why_not_gpu_direct_by_rank) is chosen
     if chosen is MemoryKind.HOST and requested == "auto":
         assert len(warnings) == 1 and "rank 1: no RDMA here" in warnings[0]
     else:
@@ -84,10 +84,10 @@ def test_auto_takes_host_staging_when_the_device_round_trip_fails(store, monkeyp
     monkeypatch.setattr(data_path.logger, "warning", warnings.append)
     store.script(GET, [None])  # the host get reads
     store.script(GET, [-600])  # the get into device memory fails
-    client, gpu_direct_error = data_path.open_store("auto", CONFIG)
+    client, why_not_gpu_direct = data_path.open_store("auto", CONFIG)
     assert client is store
-    gpu_direct_error = data_path.check_store(client, gpu_direct_error)
-    assert choose_data_path("auto", [gpu_direct_error]) is MemoryKind.HOST
+    why_not_gpu_direct = data_path.check_store(client, why_not_gpu_direct)
+    assert choose_data_path("auto", [why_not_gpu_direct]) is MemoryKind.HOST
     (fallback,) = [warning for warning in warnings if "through host staging" in warning]
     assert "a round trip through device memory" in fallback and "INVALID_PARAMS" in fallback
 
@@ -111,7 +111,7 @@ def test_a_client_that_does_not_open_on_one_rank_refuses_the_server_on_every_ran
     monkeypatch.setattr(data_path, "prepare_gpu_direct", lambda protocol: None)
     # Rank 0 opened its store and can take GPU Direct: _agree gathers (error, shared result).
     rank_1 = SimpleNamespace(world_size=2, allgather=lambda own: [(None, None), own])
-    with pytest.raises(ValueError, match="rank 1: kv_sharing: the store could not be opened"):
+    with pytest.raises(ValueError, match="rank 1: the store could not be opened"):
         startup._agree(rank_1, lambda: data_path.open_store("auto", CONFIG))
 
 

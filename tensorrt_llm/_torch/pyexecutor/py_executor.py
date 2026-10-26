@@ -6906,9 +6906,9 @@ class PyExecutor:
                     "timestampUnixNanos"]
             # Work that keeps rank 0 from sleeping on an empty request queue
             # while another rank still needs executor passes.
-            background_work = int(self._has_kv_transfers_in_flight()) + (
-                self.kv_sharing.open_operations()
-                if self.kv_sharing is not None else 0)
+            background_work = int(self._has_kv_transfers_in_flight()
+                                  or (self.kv_sharing is not None
+                                      and self.kv_sharing.has_store_work()))
             if getattr(self, "_enable_remote_tail_adp", False):
                 context_ids, generation_ids = self._snapshot_remote_tail_phase_work(
                     active_requests)

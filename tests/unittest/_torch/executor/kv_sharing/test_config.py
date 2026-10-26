@@ -205,7 +205,7 @@ def test_startup_refuses_a_model_it_cannot_serve_before_store_work(
     built_with, fact = REFUSED_MODELS[model]
     # No collective, store or checkpoint work may start.
     built = executor(dist=None, **built_with)
-    with pytest.raises(ValueError, match=f"this server is refused: the model has {fact}$"):
+    with pytest.raises(ValueError, match=f"refuses this server: the model has {fact}\\. It"):
         start_kv_sharing(built, llm_args(store_config), checkpoint_dir=None, max_num_tokens=64)
 
 
@@ -244,9 +244,9 @@ def test_the_store_driver_registers_device_memory_only_under_gpu_direct(
 ) -> None:
     """Under host staging the store reads and writes host memory only. One rank, a store that
     opens and checks as the data path asks; startup stops at attach, past the driver it made."""
-    gpu_direct_error = None if data_path == "gpu_direct" else "host staging was asked for"
+    why_not_gpu_direct = None if data_path == "gpu_direct" else "host staging was asked for"
     monkeypatch.setattr(startup, "open_store", lambda requested, mooncake: (None, None))
-    monkeypatch.setattr(startup, "check_store", lambda store, error: gpu_direct_error)
+    monkeypatch.setattr(startup, "check_store", lambda store, why: why_not_gpu_direct)
     monkeypatch.setattr(startup.ArtifactIdentity, "from_checkpoint", lambda checkpoint: None)
     drivers = []
 
