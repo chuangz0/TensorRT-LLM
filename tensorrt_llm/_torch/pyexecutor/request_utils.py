@@ -398,9 +398,7 @@ class RequestBroadcaster:
         """
         if self._single_round(prefer_cpu):
             # Only a communicator without MPI has the single round, and kv_sharing runs with MPI.
-            assert store_round_size == 0, "a store round rides only the request-count probe"
-            new_requests, py_request_objects = self._broadcast_single_round(new_requests)
-            return new_requests, py_request_objects, 0
+            return (*self._broadcast_single_round(new_requests), 0)
         request_count = len(new_requests) if self.dist.rank == 0 else 0
         # Idle non-root ranks can wait here while rank 0 blocks in the
         # pause-wrapped request queue fetch, so keep the probe pause-wrapped too.

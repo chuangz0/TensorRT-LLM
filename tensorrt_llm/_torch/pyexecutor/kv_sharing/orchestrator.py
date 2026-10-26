@@ -536,10 +536,6 @@ class SharedKvOrchestrator:
     def _close_ops(self, round_size: int) -> None:
         """Reports on the first ``round_size`` open operations (fewer where some closed since the
         announcement), reduces the reports over the ranks and applies the decisions."""
-        for op in self._ops:
-            if op.request_waits and op.request.is_finished:
-                self._let_go(op)  # the request ended while parked, as by an error
-        self._ops = [op for op in self._ops if not op.closed]
         # After closures this may cover entries appended since the announcement: every rank's
         # table changed alike, so every rank covers the same entries.
         entries = self._ops[:round_size]

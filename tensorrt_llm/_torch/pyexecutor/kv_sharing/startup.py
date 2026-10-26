@@ -44,7 +44,6 @@ from ...disaggregation.blob.backend import (
 )
 from ...disaggregation.blob.keys import key_stem
 from ...disaggregation.blob.mooncake import MooncakeDriver
-from ...disaggregation.blob.mooncake_native import NativeMooncakeDriver
 from ...disaggregation.blob.mooncake_setup import (
     MooncakeConfig,
     StoreSegment,
@@ -328,13 +327,12 @@ def _share_blocks(
             f"host staging of {staging_bytes >> 20} MiB: one fetch of {fetch_tokens} tokens and "
             f"publications of {blocks} blocks"
         )
-    store_calls = "native" if isinstance(attached.driver, NativeMooncakeDriver) else "python"
     providing = (
         f", providing {backend.segment_size >> 20} MiB per rank" if backend.segment_size else ""
     )
     logger.info(
         f"kv_sharing: store master {mooncake.master_server_address} over {mooncake.protocol}, "
-        f"roles {backend.roles}, {store_calls} store driver, {path}{providing}"
+        f"roles {backend.roles}, {path}{providing}"
     )
 
 
