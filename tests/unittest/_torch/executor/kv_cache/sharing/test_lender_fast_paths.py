@@ -719,9 +719,10 @@ def test_metadata_mutants_expose_writable_or_changing_old_views(mutant):
             _assert_frozen_view(view)
 
 
-def test_ordinal_cache_is_cleared_on_free_reset_and_shutdown(sources):
+def test_ordinal_and_key_caches_are_cleared_on_free_reset_and_shutdown(sources):
     lender = SimpleNamespace(
         _ordinal_ranges={7: {}, 8: {}},
+        _prompt_keys={7: (object(), None), 8: (object(), None)},
         _shrink_epochs={7: 2, 8: 1},
         _writes_at_end={},
         _state_unverified={7, 8},
@@ -737,10 +738,11 @@ def test_ordinal_cache_is_cleared_on_free_reset_and_shutdown(sources):
     )
     sources._on_free(lender, 7, object())
     assert lender._ordinal_ranges == {8: {}} and lender._shrink_epochs == {8: 1}
-    assert lender._state_unverified == {8}
+    assert lender._state_unverified == {8} and list(lender._prompt_keys) == [8]
     sources._on_reset(lender)
-    assert lender._ordinal_ranges == {} and lender._reuse_was_reset
+    assert lender._ordinal_ranges == lender._prompt_keys == {} and lender._reuse_was_reset
     lender._ordinal_ranges[7] = {}
+    lender._prompt_keys[7] = (object(), None)
     lender._shut_down = False
     lender._device_regions_of_pool_group = {}
     lender._leases_holding_slots = lender._waiting_for_slots = lender._open_leases = ()
@@ -748,7 +750,7 @@ def test_ordinal_cache_is_cleared_on_free_reset_and_shutdown(sources):
     lender._recycle = lambda: None
     lender._memory_ref = lambda: None
     sources._on_shutdown(lender)
-    assert lender._ordinal_ranges == {} and lender._shut_down
+    assert lender._ordinal_ranges == lender._prompt_keys == {} and lender._shut_down
 
 
 def _slow_object_keys(identity, group, keys):

@@ -412,6 +412,11 @@ def _fenced(
     return fence if ready_event is None else _BothDone(ready_event, fence)
 
 
+def _key_rows(keys: Sequence[bytes]) -> np.ndarray:
+    """32-byte reuse keys as the rows of one ``uint8 (n, 32)`` array."""
+    return np.frombuffer(b"".join(keys), dtype=np.uint8).reshape(-1, 32)
+
+
 def _frozen_array(values: np.ndarray) -> np.ndarray:
     """``values`` as contiguous ``int64`` on immutable bytes of their own."""
     return np.frombuffer(np.ascontiguousarray(values, dtype=np.int64).tobytes(), dtype=np.int64)
@@ -572,6 +577,7 @@ class _ManagerLender:
         "_parked_made",
         "_bad_row",
         "_writes_at_end",
+        "_prompt_keys",
         "_margin_groups",
         "__dict__",
         "__weakref__",
@@ -705,6 +711,11 @@ class _ManagerLender:
         # Open fast write leases whose return would resume at their end, by ``id`` of their cache,
         # at most one per cache; the hooks that can move a cache's history take them out.
         self._writes_at_end: dict[int, _InPlaceLease] = {}
+        # By request id: its cache and the reuse keys of its prompt's whole blocks, uint8 (n, 32),
+        # hashed at its first NAMED lease and kept while the cache lives. A key depends only on the
+        # cache's reuse scope and the tokens up to its block, and prompt tokens never change, so
+        # later leases of a long prompt do not hash it again from block 0.
+        self._prompt_keys: dict[int, tuple[_KVCache, np.ndarray]] = {}
         # Layer groups that keep a window wider than the one they read, whose margin rows a fetch
         # need not deliver.
         self._margin_groups = frozenset(
@@ -1497,6 +1508,7 @@ class _ManagerLender:
                 self._fail_waiting(request_id, "the request was freed")
             self._ledger._drop_records(request_id)
             self._ordinal_ranges.pop(request_id, None)
+            self._prompt_keys.pop(request_id, None)
             self._shrink_epochs.pop(request_id, None)
             self._state_unverified.discard(request_id)
             parked = self._parked.pop(request_id, None)
@@ -1643,6 +1655,7 @@ class _ManagerLender:
         frees removed waiting leases and fetches; granted publishes finish. Never raises."""
         self._reuse_was_reset = True
         self._ordinal_ranges.clear()
+        self._prompt_keys.clear()
         if self._writes_at_end:
             self._lose_end_resumes()
 
@@ -1665,6 +1678,7 @@ class _ManagerLender:
         if self._shut_down:
             return
         self._ordinal_ranges.clear()
+        self._prompt_keys.clear()
         if self._writes_at_end:
             self._lose_end_resumes()
         if self._device_regions_of_pool_group and self._open_holds:
@@ -2577,14 +2591,25 @@ class _ManagerLender:
         block_ordinals: Sequence[np.ndarray],
     ) -> list[np.ndarray]:
         """Per layer group, its block entries' reuse keys, ``uint8 (n, 32)``."""
-        # TODO: every lease hashes the request's whole prefix again from block 0, so a lease late in
-        # a long prompt costs time in proportion to the prompt.
         top = max((int(o.max()) + 1 for o in block_ordinals if len(o)), default=0)
-        reuse_keys = _manager.block_keys(manager, request, kv, top)
-        columns = [
-            b"".join(reuse_keys[int(o)] for o in lg_ordinals) for lg_ordinals in block_ordinals
-        ]
-        return [np.frombuffer(column, dtype=np.uint8).reshape(-1, 32) for column in columns]
+        keys = self._block_key_chain(manager, request, kv, top)
+        return [keys[np.asarray(lg_ordinals, dtype=np.int64)] for lg_ordinals in block_ordinals]
+
+    def _block_key_chain(
+        self, manager: KVCacheManagerV2, request: LlmRequest, kv: _KVCache, count: int
+    ) -> np.ndarray:
+        """``uint8 (n, 32)``, ``n >= count``: the reuse keys of the request's whole blocks from
+        block 0; those of its prompt from ``_prompt_keys``."""
+        request_id = int(request.py_request_id)
+        cached = self._prompt_keys.get(request_id)
+        if cached is not None and cached[0] is kv and count <= len(cached[1]):
+            return cached[1]
+        prompt_blocks = _manager.prompt_length(request, manager) // int(manager.tokens_per_block)
+        if count > prompt_blocks:  # past the prompt, beam search may still change tokens
+            return _key_rows(_manager.block_keys(manager, request, kv, count))
+        keys = _key_rows(_manager.block_keys(manager, request, kv, prompt_blocks))
+        self._prompt_keys[request_id] = (kv, keys)
+        return keys
 
     def _assign_staging_slots(self, entries: _LentBlockEntries, runs: SlotRuns | None) -> None:
         """Each pool group's run goes to its layer groups in order, so the entries of one pool group
