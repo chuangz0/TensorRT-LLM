@@ -491,7 +491,7 @@ class SharedKvOrchestrator:
         deadline = time.monotonic() + self._transfers.shutdown_timeout_s
         while not self._transfers.shutdown_status().complete and time.monotonic() < deadline:
             self._transfers.advance(time.monotonic())
-            self._transfers.wait_for_progress(0.001)
+            self._transfers.wait_for_progress()
         if self._probe is not None:
             self._probe.stop_and_wait()
             self.counters.update(self._probe.counters)

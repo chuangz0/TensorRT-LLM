@@ -372,6 +372,17 @@ def test_deferred_binding_leaves_caller_ownership(h: _Harness) -> None:
         assert lease.polls == 0 and not lease.actions and not h.manager.operations
 
 
+def test_an_accepted_operation_ends_the_idle_wait_at_once(h: _Harness) -> None:
+    """An idle executor pass waits for progress after it submitted: the operation starts at the
+    next ``advance``, not a heartbeat later."""
+    with h:
+        h.manager.wait_for_progress(0)  # the binding's assembly woke it
+        h.submit()
+        started = time.monotonic()
+        h.manager.wait_for_progress(5)
+        assert time.monotonic() - started < 1
+
+
 def test_same_lease_cannot_have_two_accepted_operations(h: _Harness) -> None:
     """A lease has one owner: a second submit of a lease already accepted is rejected."""
     with h:

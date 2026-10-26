@@ -353,11 +353,13 @@ class TransferManager:
         self._progress_wake.set()
         self._wake()
 
-    def wait_for_progress(self, timeout: float = 0.01) -> None:
+    def wait_for_progress(self, timeout: float = 0.001) -> None:
         """Wait for a backend wake or bounded heartbeat without gating collectives.
 
         Args:
-            timeout: Maximum idle delay in seconds.
+            timeout: Maximum idle delay in seconds. A backend may end a call without a
+                wake (the native store worker does), so the heartbeat bounds how late an
+                idle server sees an operation end.
         """
         self._progress_wake.wait(timeout)
         self._progress_wake.clear()
@@ -498,6 +500,8 @@ class TransferManager:
         record = OperationRecord(self._operation_id, intent, lease, self._clock())
         self.operations[record.id] = record
         self._count("accepted")
+        # The next idle wait returns at once: the operation starts at the next ``advance``.
+        self._progress_wake.set()
         return Accepted(record.id)
 
     def take_domain_failures(self) -> tuple[DomainFailure, ...]:

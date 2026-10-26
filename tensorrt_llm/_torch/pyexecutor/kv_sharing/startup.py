@@ -690,8 +690,8 @@ class _HoldReleasingBackend(BlobBackend):
 
 
 def _nothing_to_wake() -> None:
-    """The transfer manager's wake. Nothing sleeps on store work: while any is pending, the
-    executor loop polls the request queue instead of waiting on it."""
+    """The transfer manager's wake. Rank 0 does not wait on the request queue while store work is
+    pending, and an idle pass waits at most the transfer manager's 1 ms heartbeat."""
 
 
 def _end_process(event: QuiescenceFatalEvent) -> None:
