@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Ownership of acquired leases, backend Attempts and safe retirement."""
+"""Request-free ownership of acquired leases, backend Attempts and safe retirement."""
 
 from __future__ import annotations
 
@@ -230,7 +230,7 @@ class BackendBinding:
 
 @dataclass
 class OperationRecord:
-    """One accepted lease and one fixed-source Attempt."""
+    """One accepted lease and one fixed-source Attempt, independent of requests."""
 
     id: int
     intent: TransferIntent
@@ -523,8 +523,7 @@ class TransferManager:
             return
         self._domain_faults[domain_id] = fault
         self._domain_updates.append(DomainFailure(domain_id, fault))
-        # Publish the domain stop before abandoning any operation: cancellation
-        # can fail and start shutdown partway through this sweep.
+        # Publish the stop before abandonment can fail and start provider cleanup.
         for key, binding in self.bindings.items():
             if binding.domain_id == domain_id:
                 self._stop_binding(key, fault)
@@ -684,8 +683,8 @@ class TransferManager:
         binding = self.bindings[record.intent.binding_id]
         try:
             check_view_compatibility(record.lease_view, binding.namespace)
-        except (TypeError, ValueError) as error:
-            self._abandon(record, f"invalid lender view: {error}")
+        except ValueError as error:
+            self._abandon(record, f"incompatible lender view: {error}")
             return
         policy = binding.lifecycle_binding
         try:
@@ -745,8 +744,8 @@ class TransferManager:
         """Whether the lease goes back through ``return_writes`` with its delivered rows.
 
         That is a fetch's write lease whose view was polled, not abandoned, through
-        a lender that has not stopped. Any other lease is released, which counts no
-        rows of a write lease whose view was polled.
+        a lender domain this manager has not stopped. Any other lease is released,
+        which counts no rows of a write lease whose view was polled.
         """
         return (
             record.intent.direction is Direction.FETCH
