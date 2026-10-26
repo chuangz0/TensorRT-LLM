@@ -538,16 +538,18 @@ def run_two_turn_workload(
     Asserts every request completes and agrees with the same workload on a store-off service;
     every second-wave request reads its system prompt from the store and every second turn its
     whole first prompt from the local cache or the store; the store holds tp objects per distinct
-    whole prompt block, all readable, and the master refused every other put as a key that exists
-    already (some in the first wave); no publication failed (a put of an object the other instance
-    was still putting is no failure); both instances shut down with nothing open, identical rank
-    traces and fetches done. ``service`` starts the two instances, given ``Service``'s arguments.
+    whole prompt block, all readable, also once the service stopped, and the master refused every
+    other put as a key that exists already (some in the first wave); no publication failed (a put
+    of an object the other instance was still putting is no failure); both instances shut down
+    with nothing open, identical rank traces and their counters logged. ``service`` starts the two
+    instances, given ``Service``'s arguments.
 
     With ``kv_cache_tokens`` (``Service`` only), each instance's KV cache holds that many tokens,
     fewer than the workload keeps: requests wait for pages, and fetches and publications that find
     none are skipped or wait, as designed. Then hits and the store's contents are what the cache
-    left room for: every object the store lists is readable, some request fetched, and some fetch
-    or publication met the pressure; the other assertions hold as they are.
+    left room for: every object the store lists is readable, each instance's second turns read the
+    store at least once, and some fetch or publication met the pressure; the other assertions hold
+    as they are.
     """
     pressured = kv_cache_tokens is not None
     if pressured:
@@ -601,18 +603,40 @@ def run_two_turn_workload(
         answers += turn(second_requests)
     finally:
         store_on.stop()
+    # A put the stop cut short stays listed and never becomes readable.
+    store.assert_readable(key_prefix)
     print(f"keys put/refused per wave and turn 2: {puts}")
     assert_agree(reference_first + reference_second, answers, model)
     traces = [rank_traces(trace_dir, tp) for trace_dir in store_on.trace_dirs]
-    for trace_dir, trace in zip(store_on.trace_dirs, traces):
+    # Per instance, one dict per rank, logged at the end of its shutdown: the shutdown completed.
+    counters = [instance_counters(trace_dir) for trace_dir in store_on.trace_dirs]
+    met = {
+        name: sum(c.get(name, 0) for logged in counters for c in logged)
+        for name in PAGE_PRESSURE_COUNTERS
+    }
+    resumed = [len(decisions(trace, "resume")) for trace in traces]
+    # The user's message blocks exist only where the first turn ran: a second turn whose cached
+    # tokens cover them read the other instance's publications.
+    second_turns_read = [0] * len(traces)  # per instance
+    for (instance, _), prompt, answer in zip(second_requests, first, answers[len(first) :]):
+        whole_prompt = len(prompt) // TOKENS_PER_BLOCK * TOKENS_PER_BLOCK
+        second_turns_read[instance] += int(answer.cached_tokens >= whole_prompt)
+    print(
+        f"KV cache pressure met: {met}; per instance, fetches resumed {resumed} and second turns "
+        f"that read the store {second_turns_read}"
+    )
+    for instance, (trace_dir, trace) in enumerate(zip(store_on.trace_dirs, traces)):
         assert trace.splitlines()[-1].endswith(" open=0"), f"{trace_dir.name} left store work open"
-    counters = [c for trace_dir in store_on.trace_dirs for c in instance_counters(trace_dir)]
-    assert counters and not any(c.get("publications_failed") for c in counters), counters
+        logged = counters[instance]
+        assert logged and not any(c.get("publications_failed") for c in logged), (
+            trace_dir.name,
+            logged,
+        )
+        assert resumed[instance] and second_turns_read[instance], (
+            f"{trace_dir.name}'s second turns fetched nothing"
+        )
     if pressured:
-        met = {name: sum(c.get(name, 0) for c in counters) for name in PAGE_PRESSURE_COUNTERS}
-        print(f"KV cache pressure met: {met}")
         assert any(met.values()), "no fetch or publication met the KV cache pressure"
-        assert any(decisions(trace, "resume") for trace in traces), "no request fetched"
         return
     # Every distinct block was put once; each other put of it was refused as existing already.
     first_wave_blocks = whole_blocks([first[user] for user in waves[0]])
@@ -625,9 +649,4 @@ def run_two_turn_workload(
     assert puts[0][1] > 0, "wave 1's concurrent writers had no put refused"
     for user in late_users:  # instance 0 computed their system prompt
         assert answers[user].cached_tokens >= SYSTEM_TOKENS, (user, answers[user].cached_tokens)
-    for prompt, answer in zip(first, answers[len(first) :]):
-        # The user's message blocks exist only where the first turn ran: covering them reads the
-        # other instance's publications.
-        assert answer.cached_tokens >= len(prompt) // TOKENS_PER_BLOCK * TOKENS_PER_BLOCK
-    for trace_dir, trace in zip(store_on.trace_dirs, traces):
-        assert decisions(trace, "resume"), f"{trace_dir.name} fetched nothing"
+    assert sum(second_turns_read) == len(second), second_turns_read
