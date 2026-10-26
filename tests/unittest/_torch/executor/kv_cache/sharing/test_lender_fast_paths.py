@@ -89,6 +89,7 @@ def _sources(immutable_mutant=None):
     ns = dict(__name__=__name__, np=np, struct=struct, numbers=numbers, traceback=traceback)
     ns.update(dataclass=dataclass, field=field, _manager=manager, REUSE_KEY_BYTES=32)
     ns.update(_OBJECT_KEY_BYTES=54, OBJECT_KEY_BYTES=54, logger=SimpleNamespace(error=pytest.fail))
+    ns.update(_NAMESPACE_BYTES=16)
     for name in ("_immutable", "_frozen_int64", "_integer", "_entry_integers", "_region_indices"):
         _load("_types.py", name, ns)
     if immutable_mutant == "identity":

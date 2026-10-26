@@ -92,8 +92,12 @@ class Identity:
         else:
             ShardDesc(count, share)  # ValueError for a share outside the count
         suffix = _u16(index) + _u16(count) + _u16(share)
-        payload = b"".join(piece for key in reuse_keys for piece in (self.namespace, key, suffix))
-        return np.frombuffer(payload, dtype=np.uint8).reshape(-1, OBJECT_KEY_BYTES)
+        keys = np.empty((len(reuse_keys), OBJECT_KEY_BYTES), dtype=np.uint8)
+        keys[:, :_NAMESPACE_BYTES] = np.frombuffer(self.namespace, dtype=np.uint8)
+        keys[:, _NAMESPACE_BYTES : _NAMESPACE_BYTES + REUSE_KEY_BYTES] = reuse_keys
+        keys[:, _NAMESPACE_BYTES + REUSE_KEY_BYTES :] = np.frombuffer(suffix, dtype=np.uint8)
+        # On immutable bytes, which lease views keep without a copy.
+        return np.frombuffer(keys.tobytes(), dtype=np.uint8).reshape(keys.shape)
 
     def region_label(self, layer_group_indices: Iterable[int]) -> str:
         """The layout-derived label for a staging region serving ``layer_group_indices``:
