@@ -759,6 +759,17 @@ def test_a_windowed_fetch_longer_than_max_fetch_tokens_computes_instead_of_being
         server.shut_down()
 
 
+def test_a_max_fetch_tokens_off_the_block_grid_fetches_whole_blocks(monkeypatch):
+    """The lender lends named rows by whole blocks: a fetch longer than ``max_fetch_tokens`` ends
+    at the last block boundary within it."""
+    server = Server(monkeypatch, max_fetch_tokens=2 * TPB + 1)
+    try:
+        server.park(request(1, stored=3 * TPB))
+        assert server.lender.ranges == [(0, 2 * TPB)]
+    finally:
+        server.shut_down()
+
+
 def test_host_staging_holds_one_window_per_publication_beside_a_fetch():
     """Staging less one fetch's rows, per region. gemma-3's shape: a region of its windowed group
     (512 tokens, 16 blocks of 32) with two fetches' slots, and a region of its full group; a fetch

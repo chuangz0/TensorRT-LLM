@@ -746,8 +746,10 @@ class SharedKvOrchestrator:
         tpb = self._tokens_per_block
         claim = matched // tpb * tpb
         hit = request.py_store_hit_tokens
-        # A named fetch ends at the whole blocks before the last prompt token.
-        end = min(hit, claim + self._policy.max_fetch_tokens, (request.prompt_len - 1) // tpb * tpb)
+        # A named fetch reads whole blocks, at most max_fetch_tokens of them, and ends before the
+        # last prompt token.
+        longest = self._policy.max_fetch_tokens // tpb * tpb
+        end = min(hit, claim + longest, (request.prompt_len - 1) // tpb * tpb)
         if self._windowed and end != hit:
             # Window rows are held only at the ends publications reached: a cut fetch would miss
             # them, so the request computes its prompt.
