@@ -2771,10 +2771,10 @@ class KvSharingBackendConfig(StrictBaseModel):
     config: str = Field(
         description="Path to the store config, a YAML file every server and "
         "provider of the store reads: a 'mooncake' section (master address, "
-        "protocol, RDMA devices, RPC timeouts; global_segment_size must be 0: "
-        "servers give the store memory through the role 'provide', providers "
-        "through 'trtllm-serve mooncake_provider --segment_size') and an "
-        "optional 'blob' section (key prefix, store workers, rows and bytes "
+        "protocol, RDMA devices, RPC timeouts; global_segment_size stays 0, its "
+        "default: servers give the store memory through the role 'provide', "
+        "providers through 'trtllm-serve mooncake_provider --segment_size') and "
+        "an optional 'blob' section (key prefix, store workers, rows and bytes "
         "per store call).")
     roles: List[Literal["fetch", "publish", "provide"]] = Field(
         default_factory=lambda: ["fetch", "publish"],
@@ -2790,14 +2790,14 @@ class KvSharingBackendConfig(StrictBaseModel):
         0,
         description="Host memory each rank gives the store under the role "
         "'provide', as a binary size ('32GiB') or a byte count; required with "
-        "'provide' and 0 without it. Startup refuses a size the node cannot "
-        "give: its ranks' segments, plus up to 8 GiB of host staging per rank "
-        "on a server that fetches or publishes, must fit in the available "
-        "memory less 32 GiB. Such a server takes about 13 s longer to stop, "
-        "while reads of its memory finish: stop it with SIGTERM to "
+        "'provide', 0 without it. Startup refuses a size the node cannot give: "
+        "this server's segments, plus up to 8 GiB of host staging per rank if "
+        "it also fetches or publishes, must fit in the node's available memory "
+        "less 32 GiB. A server that provides memory takes about 13 s longer to "
+        "stop, while reads of its memory finish: stop it with SIGTERM to "
         "trtllm-serve or to rank 0's trtllm-llmapi-launch (under Slurm, "
-        "scancel of the whole job), never with SIGKILL or a signal to mpirun "
-        "or to all of its processes.")
+        "scancel the job), never with SIGKILL or a signal to mpirun or to all "
+        "of its processes.")
 
     @field_validator("config")
     @classmethod
@@ -2862,8 +2862,10 @@ class KvSharingConfig(StrictBaseModel):
         "it instead.")
     max_fetch_tokens: PositiveInt = Field(
         default=32768,
-        description="Longest prompt prefix one fetch reads. Under host "
-        "staging each rank pins at most 8 GiB of host memory: one fetch of "
+        description="Most prompt tokens one fetch reads past the prefix the "
+        "server reuses locally, in whole KV cache blocks; a longer stored "
+        "prefix is cut there or, with sliding windows, computed instead. Under "
+        "host staging each rank pins at most 8 GiB of host memory: one fetch of "
         "max(max_fetch_tokens, max_num_tokens) tokens of KV cache, and up to "
         "as much again for publications; the server refuses to start when one "
         "fetch and one publication do not fit.")
@@ -8109,9 +8111,10 @@ class TorchLlmArgs(BaseLlmArgs):
              or kv_cache.block_reuse_config.policy != "all_reusable"),
             ("kv_cache_config.enable_swa_scratch_reuse",
              kv_cache.enable_swa_scratch_reuse),
-            (f"kv_cache_config.dtype={kv_cache.dtype!r}: BF16, FP8 or NVFP4 KV "
-             "caches only", kv_cache.dtype
-             not in ("auto", "bfloat16", "fp8", "nvfp4")),
+            (f"kv_cache_config.dtype={kv_cache.dtype!r}: a packed sparse-MLA or "
+             "mixed-precision KV cache, which stored blocks do not carry",
+             kv_cache.dtype == "fp8_ds_mla"
+             or kv_cache.mixed_precision_kv is not None),
             (f"kv_cache_compression_config ({compression}): stored blocks "
              "would carry compressed or evicted KV", compression is not None),
             ("pipeline or context parallelism", self.pipeline_parallel_size > 1

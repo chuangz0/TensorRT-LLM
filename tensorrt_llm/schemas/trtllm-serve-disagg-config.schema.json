@@ -4896,7 +4896,7 @@
       "description": "A KV store that servers share prompt KV cache blocks through.\n\nServers may also give it host memory (the role 'provide').",
       "properties": {
         "config": {
-          "description": "Path to the store config, a YAML file every server and provider of the store reads: a 'mooncake' section (master address, protocol, RDMA devices, RPC timeouts; global_segment_size must be 0: servers give the store memory through the role 'provide', providers through 'trtllm-serve mooncake_provider --segment_size') and an optional 'blob' section (key prefix, store workers, rows and bytes per store call).",
+          "description": "Path to the store config, a YAML file every server and provider of the store reads: a 'mooncake' section (master address, protocol, RDMA devices, RPC timeouts; global_segment_size stays 0, its default: servers give the store memory through the role 'provide', providers through 'trtllm-serve mooncake_provider --segment_size') and an optional 'blob' section (key prefix, store workers, rows and bytes per store call).",
           "title": "Config",
           "type": "string"
         },
@@ -4924,7 +4924,7 @@
             }
           ],
           "default": 0,
-          "description": "Host memory each rank gives the store under the role 'provide', as a binary size ('32GiB') or a byte count; required with 'provide' and 0 without it. Startup refuses a size the node cannot give: its ranks' segments, plus up to 8 GiB of host staging per rank on a server that fetches or publishes, must fit in the available memory less 32 GiB. Such a server takes about 13 s longer to stop, while reads of its memory finish: stop it with SIGTERM to trtllm-serve or to rank 0's trtllm-llmapi-launch (under Slurm, scancel of the whole job), never with SIGKILL or a signal to mpirun or to all of its processes.",
+          "description": "Host memory each rank gives the store under the role 'provide', as a binary size ('32GiB') or a byte count; required with 'provide', 0 without it. Startup refuses a size the node cannot give: this server's segments, plus up to 8 GiB of host staging per rank if it also fetches or publishes, must fit in the node's available memory less 32 GiB. A server that provides memory takes about 13 s longer to stop, while reads of its memory finish: stop it with SIGTERM to trtllm-serve or to rank 0's trtllm-llmapi-launch (under Slurm, scancel the job), never with SIGKILL or a signal to mpirun or to all of its processes.",
           "title": "Segment Size"
         },
         "type": {
@@ -4975,7 +4975,7 @@
         },
         "max_fetch_tokens": {
           "default": 32768,
-          "description": "Longest prompt prefix one fetch reads. Under host staging each rank pins at most 8 GiB of host memory: one fetch of max(max_fetch_tokens, max_num_tokens) tokens of KV cache, and up to as much again for publications; the server refuses to start when one fetch and one publication do not fit.",
+          "description": "Most prompt tokens one fetch reads past the prefix the server reuses locally, in whole KV cache blocks; a longer stored prefix is cut there or, with sliding windows, computed instead. Under host staging each rank pins at most 8 GiB of host memory: one fetch of max(max_fetch_tokens, max_num_tokens) tokens of KV cache, and up to as much again for publications; the server refuses to start when one fetch and one publication do not fit.",
           "exclusiveMinimum": 0,
           "title": "Max Fetch Tokens",
           "type": "integer"

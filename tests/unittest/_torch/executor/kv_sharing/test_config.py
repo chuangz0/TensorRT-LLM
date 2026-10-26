@@ -86,7 +86,7 @@ UNSUPPORTED = {
     "PP2": ({"pipeline_parallel_size": 2}, "pipeline or context parallelism"),
     "the packed FP8 sparse-MLA KV cache": (
         {"kv_cache_config": {"dtype": "fp8_ds_mla"}},
-        "BF16, FP8 or NVFP4 KV caches only",
+        "a packed sparse-MLA or mixed-precision KV cache",
     ),
     "KV cache compression": (
         {"kv_cache_compression_config": {"algorithm": "quantization_for_cold_page"}},
