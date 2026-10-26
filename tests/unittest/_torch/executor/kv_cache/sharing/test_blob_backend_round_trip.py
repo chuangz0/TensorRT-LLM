@@ -118,7 +118,7 @@ class Stores:
 
 
 @pytest.fixture(scope="module")
-def mooncake_master(tmp_path_factory):
+def pool_address(tmp_path_factory):
     """A real Mooncake pool for the module's tests; its master's address. The caches' keys never
     collide: each cache's page layout names a namespace of its own."""
     if os.environ.get("TRTLLM_MOONCAKE_REAL") != "1":
@@ -135,7 +135,7 @@ def stores(request):
     if request.param == "memory":
         yield Stores()
         return
-    opened = Stores(master=request.getfixturevalue("mooncake_master"))
+    opened = Stores(master=request.getfixturevalue("pool_address"))
     yield opened
     opened.close()
 

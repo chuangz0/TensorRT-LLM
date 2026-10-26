@@ -219,29 +219,29 @@ def test_chunked_prefill_publishes_each_chunk_and_a_fetch_computes_the_rest_in_c
         shut_down(llm)
     assert reused.cached_tokens == FETCHED
     llm = server(monkeypatch, kv_sharing=sharing(store, "chunked"), **CHUNKED_PREFILL)
-    writer = llm._executor.engine
+    writer_engine = llm._executor.engine
     try:
         tokens = generate(llm, P)
         store.assert_readable("chunked", P_BLOCKS)
-        assert wait_until(lambda: settled(writer))
+        assert wait_until(lambda: settled(writer_engine))
     finally:
         shut_down(llm)
     llm = server(monkeypatch, kv_sharing=sharing(store, "chunked", **READER), **CHUNKED_PREFILL)
-    reader = llm._executor.engine
+    reader_engine = llm._executor.engine
     try:
         fetched = complete(llm, LONG_SIBLING)
         store.assert_readable("chunked", P_BLOCKS + LONG_SIBLING_NEW_BLOCKS)
-        assert wait_until(lambda: settled(reader))
+        assert wait_until(lambda: settled(reader_engine))
     finally:
         shut_down(llm)
     assert tokens == reference
-    counters = writer.kv_sharing.counters
+    counters = writer_engine.kv_sharing.counters
     assert counters["publications_started"] == 4  # [0, 256), [256, 512), [512, 768), [768, 992)
     assert counters["published_objects"] == P_BLOCKS
     assert counters["publications_not_started"] == counters["publications_failed"] == 0
     assert list(fetched.outputs[0].token_ids) == list(reused.outputs[0].token_ids)
     assert fetched.cached_tokens == FETCHED
-    counters = reader.kv_sharing.counters
+    counters = reader_engine.kv_sharing.counters
     assert counters["fetches_resumed"] == 1
     assert counters["publications_started"] == 3  # [512, 768), [768, 1024), [1024, 1088)
     assert counters["published_objects"] == LONG_SIBLING_NEW_BLOCKS
@@ -410,9 +410,10 @@ def test_a_prompt_of_whole_blocks_fetches_all_but_its_last_block_and_puts_none_a
     assert store.readable_objects(FETCH_PREFIX) == before
 
 
-# Each instance's KV cache in the workload under pressure: about 135 pages, of which about 63 may
-# be pinned beside the resume of one max_seq_len request, while a wave publishes eight first
-# prompts of 21 pages each at once over GPU Direct.
+# Each instance's KV cache in the workload under pressure. The manager sizes it as these tokens over
+# max_util_for_resume (0.95): about 135 pages of 32 tokens. Fetches and publications may pin 0.95 of
+# them less the 65 pages one max_seq_len request resumes in, about 63, while a wave publishes eight
+# first prompts of 21 pages each at once over GPU Direct.
 KV_CACHE_PRESSURE_TOKENS = 4096
 
 
