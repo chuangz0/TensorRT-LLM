@@ -17,16 +17,16 @@
 A server publishes the whole blocks of every prompt it computes, and nothing it generates, and
 serves the same tokens as a server without the store. A fresh server fetches the stored prefix of a
 prompt instead of computing it, and its tokens equal those of a server that reused the same blocks
-locally; a request cancelled while a stuck store holds its fetch ends at once. Servers move blocks
-over GPU Direct, which 'auto' picks here, or through host staging, and a block either path stores
-reads exactly on the other. Two instances of one service share system prompts and follow-up turns
-under concurrent load. A disaggregated context server, whose loop runs without the overlap
-scheduler, fetches, computes the rest and publishes. When the store fails, requests compute their
-prompts with the same tokens: slow gets still serve hits, stuck ones pause fetching, a stalled
-master pauses probing and publishing, a full store declines puts without a pause, and a restarted
-provider only empties the store. Where two servers provide all of the store's memory, one that
-stops normally while the other reads from it ends no reader. The store and its drivers are the
-module's (``conftest.py``), except where a test needs a store of its own.
+locally, also when it computes the rest in chunks; a request cancelled while a stuck store holds its
+fetch ends at once. Servers move blocks over GPU Direct, which 'auto' picks here, or through host
+staging, and a block either path stores reads exactly on the other. Two instances of one service
+share system prompts and follow-up turns under concurrent load. A disaggregated context server,
+whose loop runs without the overlap scheduler, fetches, computes the rest and publishes. When the
+store fails, requests compute their prompts with the same tokens: slow gets still serve hits, stuck
+ones pause fetching, a stalled master pauses probing and publishing, a full store declines puts
+without a pause, and a restarted provider only empties the store. Where two servers provide all of
+the store's memory, one that stops normally while the other reads from it ends no reader. The store
+and its drivers are the module's (``conftest.py``), except where a test needs a store of its own.
 
 Runs only with ``TRTLLM_MOONCAKE_E2E=1`` (it skips otherwise), from ``tests/unittest``:
 ``TRTLLM_MOONCAKE_E2E=1 pytest _torch/executor/kv_sharing/test_mooncake_store_e2e.py``. Then it
@@ -111,6 +111,9 @@ T = {name: P[:FETCHED] + [_tokens.randrange(1000, 30000) for _ in range(200)] fo
 # The aggregated tests compare with a server without the store; the disaggregated one with its own.
 REFERENCED = SIBLINGS[:-1]
 T_BLOCKS = (FETCHED + 200) // TOKENS_PER_BLOCK  # 22
+# A sibling of P with 600 tokens of its own: past P's 16 blocks, three chunks of chunked prefill.
+LONG_SIBLING = P[:FETCHED] + [_tokens.randrange(1000, 30000) for _ in range(600)]
+LONG_SIBLING_NEW_BLOCKS = len(LONG_SIBLING) // TOKENS_PER_BLOCK - FETCHED_BLOCKS  # 18
 # The key prefix under which a writer published P for the readers.
 FETCH_PREFIX = "fetch"
 # Readers fetch prefixes of at least two blocks.
@@ -200,28 +203,47 @@ def test_publication_stores_whole_prompt_blocks_and_keeps_output(
     assert counters["publications_not_started"] == counters["publications_failed"] == 0
 
 
-def test_chunked_prefill_publishes_each_chunk_and_keeps_output(
+def test_chunked_prefill_publishes_each_chunk_and_a_fetch_computes_the_rest_in_chunks(
     store: Store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A writer under chunked prefill publishes each chunk's range once its commit lands, its pages
+    locked while later chunks compute, and serves the tokens of a server without the store. A
+    fresh reader of LONG_SIBLING fetches its first 16 blocks, P's, then computes the rest in three
+    chunks and publishes each once: the tokens of a server that reused the 16 blocks locally."""
     llm = server(monkeypatch, **CHUNKED_PREFILL)
     try:
         reference = generate(llm, P)
+        reused = complete(llm, LONG_SIBLING)
     finally:
         shut_down(llm)
-    # Each chunk's range is published once its commit lands, its pages locked while later chunks
-    # compute.
+    assert reused.cached_tokens == FETCHED
     llm = server(monkeypatch, kv_sharing=sharing(store, "chunked"), **CHUNKED_PREFILL)
-    executor = llm._executor.engine
+    writer = llm._executor.engine
     try:
         tokens = generate(llm, P)
         store.assert_readable("chunked", P_BLOCKS)
-        assert wait_until(lambda: settled(executor))
+        assert wait_until(lambda: settled(writer))
+    finally:
+        shut_down(llm)
+    llm = server(monkeypatch, kv_sharing=sharing(store, "chunked", **READER), **CHUNKED_PREFILL)
+    reader = llm._executor.engine
+    try:
+        fetched = complete(llm, LONG_SIBLING)
+        store.assert_readable("chunked", P_BLOCKS + LONG_SIBLING_NEW_BLOCKS)
+        assert wait_until(lambda: settled(reader))
     finally:
         shut_down(llm)
     assert tokens == reference
-    counters = executor.kv_sharing.counters
+    counters = writer.kv_sharing.counters
     assert counters["publications_started"] == 4  # [0, 256), [256, 512), [512, 768), [768, 992)
     assert counters["published_objects"] == P_BLOCKS
+    assert counters["publications_not_started"] == counters["publications_failed"] == 0
+    assert list(fetched.outputs[0].token_ids) == list(reused.outputs[0].token_ids)
+    assert fetched.cached_tokens == FETCHED
+    counters = reader.kv_sharing.counters
+    assert counters["fetches_resumed"] == 1
+    assert counters["publications_started"] == 3  # [512, 768), [768, 1024), [1024, 1088)
+    assert counters["published_objects"] == LONG_SIBLING_NEW_BLOCKS
     assert counters["publications_not_started"] == counters["publications_failed"] == 0
 
 
