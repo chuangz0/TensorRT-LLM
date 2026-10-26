@@ -98,8 +98,8 @@ reports is visible: an outcome or an access end through :meth:`Attempt.poll` or
 
 @runtime_checkable
 class SlotRegion(Protocol):
-    """A contiguous memory region divided into equal-sized slots; a row given by an address
-    occupies one slot.
+    """A contiguous memory region divided into equal-sized slots; a row lying in the region occupies
+    one of its slots.
 
     A backend registers only the regions whose :attr:`memory_kind` it can access, each once as
     ``(address, nbytes)``; rows in a region it has not registered are rows it does not recognize.
@@ -141,11 +141,11 @@ class SlotRegion(Protocol):
 class LayerGroupRows(Protocol):
     """One layer group's rows of a view, described by aligned arrays.
 
-    A row is one transfer unit. When slots are provided, a row concatenates one slot from each
-    named region, in region order. These members are all a backend reads of a group, apart from
-    those a capability it declares names. Ordinals and slots need not be consecutive. A backend
-    given rows it does not recognize rejects the submission with :class:`InvalidSubmission`;
-    it never skips them.
+    A row is one transfer unit. When slots are provided, row ``i`` occupies slot ``slots[i]`` in
+    every region :attr:`region_indices` lists. These members are all a backend reads of a group,
+    apart from those a capability it declares names. Slots need not be consecutive. A backend given
+    rows it does not recognize rejects the submission with :class:`InvalidSubmission`; it never
+    skips them.
     """
 
     @property
@@ -155,8 +155,9 @@ class LayerGroupRows(Protocol):
 
     @property
     def page_ordinals(self) -> np.ndarray:
-        """One logical page ordinal per row, ``int64`` of shape ``[rows]``, interpreted under the
-        lender's layout and identity rules."""
+        """One page ordinal per row, ``int64`` of shape ``[rows]``: the request's page the row
+        holds, as the lender's published page layout numbers pages. Ordinals need not be
+        consecutive."""
         ...
 
     @property
@@ -169,16 +170,15 @@ class LayerGroupRows(Protocol):
 
     @property
     def slots(self) -> np.ndarray | None:
-        """One non-negative slot per row, ``int64`` of shape ``[rows]``. Row ``i`` concatenates
-        ``slot_bytes`` bytes at ``address + slots[i] * slot_bytes`` from each named
-        :class:`SlotRegion`. Every slot is below every named region's ``slot_count``.
-        ``None`` exactly when :attr:`region_indices` is."""
+        """One slot per row, ``int64`` of shape ``[rows]``: row ``i`` occupies slot ``slots[i]`` in
+        every :class:`SlotRegion` :attr:`region_indices` lists, its bytes those slots back to back
+        in the listed order. ``None`` exactly when :attr:`region_indices` is."""
         ...
 
     @property
     def region_indices(self) -> tuple[int, ...] | None:
-        """Nonempty, distinct indices among the lender's regions, in row-byte order, or ``None``.
-        They name region positions, not pool or layer-group IDs."""
+        """The indices, among the lender's regions, of the :class:`SlotRegion` objects the rows lie
+        in, at least one and distinct, in the order a row's bytes run; or ``None``."""
         ...
 
     def __len__(self) -> int: ...
