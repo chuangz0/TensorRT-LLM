@@ -110,17 +110,17 @@ class MooncakeConfig:
 
     Attributes:
         master_server_address: The master's ``host:port``.
-        global_segment_size: Bytes of this process's memory that hold pool objects (its
-            segment). Required: the objects in it go when the process does; 0 leaves holding
-            objects to other processes.
+        global_segment_size: Bytes of this process's memory that ``setup`` mounts to hold pool
+            objects; the objects in it go when the process does. 0 by default: servers and
+            providers give the store memory through ``StoreSegment`` instead.
         protocol: ``"rdma"`` or ``"tcp"``.
         device_name: Comma-separated RDMA devices; empty picks every active InfiniBand device at
             the highest rate.
         local_hostname: The address peers reach this process at; empty takes the address the
             route to the master leaves from.
         metadata_server: Where segments are described; ``P2PHANDSHAKE`` needs no server.
-        local_buffer_size: Bytes for the SDK's copying calls, which the driver never makes; 0 is
-            allowed, and the default is the SDK's.
+        local_buffer_size: Bytes the SDK allocates, pins and registers for its copying calls,
+            which the drivers never make; 0 by default, allocating none.
         rpc_timeout_ms: How long one call to the master may take. It bounds the store calls
             that take no deadline of their own, an existence check say.
         driver: ``native``: store calls run on C++ threads that never hold the GIL, and the server
@@ -129,12 +129,12 @@ class MooncakeConfig:
     """
 
     master_server_address: str
-    global_segment_size: int
+    global_segment_size: int = 0
     protocol: str = "rdma"
     device_name: str = ""
     local_hostname: str = ""
     metadata_server: str = "P2PHANDSHAKE"
-    local_buffer_size: int = 16 << 20
+    local_buffer_size: int = 0
     rpc_timeout_ms: int = 10_000
     driver: str = "auto"
 
@@ -192,10 +192,10 @@ def load_store_config(config: str | os.PathLike | Mapping) -> tuple[BlobConfig, 
 
 def open_sdk(config: MooncakeConfig) -> Any:
     """Opens a set-up ``MooncakeDistributedStore``, on the builder thread: ``setup`` holds the GIL
-    while it mounts this process's segment. Sets the process's ``MC_RPC_TIMEOUT_MS`` from
-    ``config``, ``MC_RPC_CONNECT_TIMEOUT_MS`` and, unless set, ``MC_HANDSHAKE_MAX_LENGTH`` first:
-    every process may receive another's descriptor, one with a segment from each process that
-    reads it.
+    while it starts the transfer engine and connects to the master. Sets the process's
+    ``MC_RPC_TIMEOUT_MS`` from ``config``, ``MC_RPC_CONNECT_TIMEOUT_MS`` and, unless set,
+    ``MC_HANDSHAKE_MAX_LENGTH`` first: every process may receive another's descriptor, one with a
+    segment from each process that reads it.
 
     Raises:
         ValueError: TCP would use its legacy framing, the local hot cache is on, or the newer

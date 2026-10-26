@@ -118,8 +118,8 @@ def ib_device(root: pathlib.Path, name: str, link_layer: str, state: str, rate: 
 
 def test_store_config_refuses_missing_and_unknown_sections_and_keys() -> None:
     config = store_config()
-    del config["mooncake"]["global_segment_size"]
-    with pytest.raises(ValueError, match="'mooncake'.*global_segment_size"):
+    del config["mooncake"]["master_server_address"]
+    with pytest.raises(ValueError, match="'mooncake'.*master_server_address"):
         load_store_config(config)
     with pytest.raises(ValueError, match="unknown sections"):
         load_store_config({**store_config(), "mooncake_store": {}})
@@ -192,7 +192,7 @@ def test_open_passes_setup_arguments_in_order(
         ROUTED_ADDRESS,  # local_hostname: where the route to the master leaves from
         "P2PHANDSHAKE",  # metadata_server
         0,  # global_segment_size
-        16 << 20,  # local_buffer_size
+        0,  # local_buffer_size
         "rdma",  # protocol
         "mlx5_0,mlx5_1",  # device_name: the fastest active InfiniBand ports
         MASTER,  # master_server_address

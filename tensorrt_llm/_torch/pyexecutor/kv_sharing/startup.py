@@ -437,8 +437,8 @@ def _store_config(path: str) -> tuple[MooncakeConfig, BlobConfig]:
     blob, mooncake = load_store_config(path)
     if mooncake.global_segment_size != 0:
         raise ValueError(
-            f"kv_sharing: set mooncake.global_segment_size to 0 in {path}; a server provides the "
-            "store memory through its role 'provide' and segment_size, 'trtllm-serve "
+            f"leave mooncake.global_segment_size at 0 in {path}; a server provides the store "
+            "memory through its role 'provide' and segment_size, 'trtllm-serve "
             "mooncake_provider' through its --segment_size"
         )
     return mooncake, blob
