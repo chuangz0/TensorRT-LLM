@@ -880,21 +880,21 @@ class Lender(Protocol):
         prompt_tokens: Sequence[int],
         *,
         cache_salt: Optional[str],
-        layer_group_index: int,
         num_blocks: int,
-        shares: Sequence[int],
+        shares_per_group: Sequence[int],
     ) -> np.ndarray:
-        """``uint8 (len(shares) * num_blocks, 54)``, share-major: the object keys NAMED leases
-        give the first ``num_blocks`` whole blocks of a text prompt in each of ``shares`` of layer
-        group ``layer_group_index``, as the ranks holding those shares name them (the ranks of one
-        server name a group alike but for the share), for a request with this ``cache_salt`` and
-        no LoRA. Unlike the other methods it may run on any thread at any time after attach: it
-        reads only what attach fixed. Prompts with multimodal content or a LoRA adapter are named
-        by their leases alone.
+        """``uint8 (sum(shares_per_group) * num_blocks, 54)``: the object keys NAMED leases give
+        the first ``num_blocks`` whole blocks of a text prompt in shares ``0 .. n - 1`` of each
+        layer group ``lg`` (``n = shares_per_group[lg]``), as the ranks holding those shares name
+        them (the ranks of one server name a group alike but for the share), for a request with
+        this ``cache_salt`` and no LoRA. Rows run group by group, share by share within a group,
+        then block by block; the prompt is hashed once for them all. Unlike the other methods it
+        may run on any thread at any time after attach: it reads only what attach fixed. Prompts
+        with multimodal content or a LoRA adapter are named by their leases alone.
 
         Raises:
-            ValueError: The prompt has fewer whole blocks, the layer group is unknown, a share
-                lies outside the group's shard count, or this lender names no blocks.
+            ValueError: The prompt has fewer whole blocks, a layer group is unknown, a share lies
+                outside its group's shard count, or this lender names no blocks.
             RuntimeError: The lender's manager is gone."""
         ...
 

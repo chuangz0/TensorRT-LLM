@@ -1165,9 +1165,8 @@ class _ManagerLender:
         prompt_tokens: Sequence[int],
         *,
         cache_salt: str | None,
-        layer_group_index: int,
         num_blocks: int,
-        shares: Sequence[int],
+        shares_per_group: Sequence[int],
     ) -> np.ndarray:
         """See ``Lender.prompt_object_keys``."""
         manager = self._manager_ref()
@@ -1181,7 +1180,11 @@ class _ManagerLender:
         )
         reuse_keys = np.frombuffer(b"".join(keys), dtype=np.uint8)
         return np.concatenate(
-            [self._identity.object_keys(layer_group_index, reuse_keys, share) for share in shares]
+            [
+                self._identity.object_keys(group, reuse_keys, share)
+                for group, shares in enumerate(shares_per_group)
+                for share in range(shares)
+            ]
         )
 
     def usable_end(self, present: Sequence[np.ndarray], *, limit: int) -> int:

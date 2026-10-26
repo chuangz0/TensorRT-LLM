@@ -63,10 +63,15 @@ class Lender:
     def __init__(self) -> None:
         self.asked: list[tuple] = []  # (present, limit) of each usable_end
 
-    def prompt_object_keys(self, tokens, *, cache_salt, layer_group_index, num_blocks, shares):
+    def prompt_object_keys(self, tokens, *, cache_salt, num_blocks, shares_per_group):
         assert cache_salt == "tenant"
         return np.array(
-            [key(i, s, layer_group_index) for s in shares for i in range(num_blocks)],
+            [
+                key(i, s, group)
+                for group, shares in enumerate(shares_per_group)
+                for s in range(shares)
+                for i in range(num_blocks)
+            ],
             dtype=np.uint8,
         )
 

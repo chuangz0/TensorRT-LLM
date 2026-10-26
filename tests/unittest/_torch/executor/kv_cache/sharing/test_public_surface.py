@@ -424,9 +424,8 @@ def test_the_protocols_keep_their_members_and_stay_unrelated():
         "self",
         "prompt_tokens",
         "cache_salt",
-        "layer_group_index",
         "num_blocks",
-        "shares",
+        "shares_per_group",
     ]
     assert params(_lender._ManagerLender.prompt_object_keys) == params(Lender.prompt_object_keys)
     assert params(Lender.usable_end) == ["self", "present", "limit"]

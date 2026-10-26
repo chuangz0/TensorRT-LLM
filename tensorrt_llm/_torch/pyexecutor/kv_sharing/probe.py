@@ -401,12 +401,10 @@ class ProbeService:
                     self._lender.prompt_object_keys(
                         prompt.tokens,
                         cache_salt=prompt.cache_salt,
-                        layer_group_index=group,
                         num_blocks=prompt.num_blocks,
-                        shares=range(shares),
+                        shares_per_group=self._shares_per_group,
                     )
                     for prompt in batch
-                    for group, shares in enumerate(self._shares_per_group)
                 ]
             )
             hexed, width = names.tobytes().hex(), 2 * names.shape[1]  # one pass for the batch
