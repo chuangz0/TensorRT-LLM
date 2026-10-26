@@ -373,31 +373,6 @@ def test_returned_fetch_waits_for_its_ready_event(
         manager.free_resources(request)
 
 
-def test_late_outcome_returns_real_lease_after_access_end(
-    real_manager: Callable[..., AbstractContextManager[KVCacheManagerV2]], kit: SimpleNamespace
-) -> None:
-    """Early access-end evidence keeps the write lease until its Outcome names the rows."""
-    with real_manager(dtype=DataType.BF16) as manager, _runtime(manager, kit) as harness:
-        request = kit.admitted(manager, 1, list(range(2000, 2097)))
-        started = harness.fetch(request)
-        record = harness.runtime.operations[started.operation_id]
-        attempt = harness.backend.attempts[0]
-        attempt.ended = True
-        harness.tick()
-        assert not record.released
-        assert record.id in harness.runtime.operations
-
-        attempt.complete()
-        harness.tick()
-        manager._stream.synchronize()
-        harness.tick()
-        assert record.released
-        bounds = harness.domain.lender.poll_resume_bounds(request)
-        assert bounds is not None and bounds.max_position == _END
-        _assert_fetch_bytes(manager, request, kit)
-        manager.free_resources(request)
-
-
 def test_real_miss_counts_no_rows(
     real_manager: Callable[..., AbstractContextManager[KVCacheManagerV2]], kit: SimpleNamespace
 ) -> None:

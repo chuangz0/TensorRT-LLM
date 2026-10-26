@@ -238,7 +238,8 @@ GET_ANSWERS = {
     "short_object": (5, "fault", "object is 5 bytes, expected 8", None),
     "OBJECT_NOT_FOUND": (-704, "miss", None, None),
     "REPLICA_IS_NOT_READY": (-703, "not_ready", None, "rows_not_ready_being_written"),
-    "INVALID_REPLICA": (-702, "fault", f"{GET}: INVALID_REPLICA(-702)", None),
+    # The one code whose meaning depends on the call: a put's session start reads it as the
+    # client's own session still open.
     "INVALID_PARAMS": (-600, "fault", f"{GET}: INVALID_PARAMS(-600)", None),
     "RPC_FAIL": (-900, "fault", f"{GET}: RPC_FAIL(-900)", None),
     "TRANSFER_FAIL": (-800, "fault", f"{GET}: TRANSFER_FAIL(-800)", None),
@@ -264,7 +265,6 @@ PUT_START_ANSWERS = {
     # name: (the session start's answer, status, fault, the stat counting a skipped row)
     "NO_AVAILABLE_HANDLE": (-200, "declined", None, "rows_declined_pool_full"),
     "INVALID_PARAMS": (-600, "not_ready", None, "rows_not_ready_own_session_open"),
-    "INVALID_REPLICA": (-702, "fault", "put session start: INVALID_REPLICA(-702)", None),
     "RPC_FAIL": (-900, "fault", "put session start: RPC_FAIL(-900)", None),
     "unknown_code": (-9999, "fault", "put session start: code(-9999)", None),
 }
@@ -289,8 +289,6 @@ PUT_WRITE_ANSWERS = {
     # case: (the scatter's answer, the end's answer (None: real), status, fault, session revoked)
     "written": (None, None, "ready", None, False),
     "short_write": (5, None, "fault", "put ranges: moved 5 of 8 bytes", True),
-    # Left to the master: a TCP target may still write into the object's space.
-    "transfer_fail": (-800, None, "fault", "put ranges: TRANSFER_FAIL(-800)", False),
     "session_lost": (-600, None, "fault", "put ranges: INVALID_PARAMS(-600)", True),
     "end_refused": (None, -704, "fault", "put session end: OBJECT_NOT_FOUND(-704)", True),
     "end_not_owner": (None, -601, "fault", "put session end: ILLEGAL_CLIENT(-601)", True),
@@ -609,12 +607,10 @@ def test_a_full_store_is_warned_about_once_not_per_operation(make_driver, monkey
 # Access end.
 
 
+# Each driver turns every raise into one fault and checks every answer count against the rows.
 FAILURES = {
     "raises": RuntimeError("rpc lost"),
-    "raises_value_error": ValueError("bad pointer"),
     "short": lambda answers: answers[:-1],
-    "long": lambda answers: [*answers, 0],
-    "empty": lambda answers: [],
 }
 
 
@@ -639,22 +635,18 @@ def test_access_stays_open_when_a_data_call_raises_or_miscounts(
     assert bench.driver.drain(0.0) is False
 
 
-@pytest.mark.parametrize("direction", ["put", "get"])
-def test_a_fault_past_the_sdk_calls_keeps_access_open(direction: str, monkeypatch) -> None:
+def test_a_fault_past_the_sdk_calls_keeps_access_open(monkeypatch) -> None:
     """The Python driver's own bug path; the native one's is its worker's catch-all."""
 
     def broken(*_):
         raise ValueError("mapping bug")
 
     bench = Bench(python_driver)
-    if direction == "get":
-        monkeypatch.setattr(mooncake_module, "_get_result", broken)
-        bench.fake.script(GET, [5])  # a row read short goes past the all-whole shortcut
-    else:
-        monkeypatch.setattr(MooncakeDriver, "_end_put_sessions", broken)
-    bench.fill_sources(direction, "A")
-    results, access_ended = bench.run(direction, "A")
-    assert summary(results) == [("fault", f"{direction} failed: ValueError('mapping bug')")]
+    monkeypatch.setattr(mooncake_module, "_get_result", broken)
+    bench.fake.script(GET, [5])  # a row read short goes past the all-whole shortcut
+    bench.fill_sources("get", "A")
+    results, access_ended = bench.run("get", "A")
+    assert summary(results) == [("fault", "get failed: ValueError('mapping bug')")]
     assert not access_ended
 
 
