@@ -36,6 +36,7 @@
 
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <tuple>
 
 namespace nb = nanobind;
@@ -54,7 +55,7 @@ template <typename T>
 using Matrix = nb::ndarray<T const, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 using Cuts = nb::ndarray<int64_t const, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 
-//! The client a set-up MooncakeDistributedStore holds, checked slot by slot.
+//! The client a set-up MooncakeDistributedStore holds.
 std::shared_ptr<mirror::PyClient> clientOfStore(nb::handle store)
 {
     nb::object const capsule = store.attr("_get_pyclient_capsule")();
@@ -173,7 +174,6 @@ NB_MODULE(mooncake_store_worker, m)
     // NativeMooncakeDriver's weakref.finalize keeps each worker referenced until it runs, at the latest
     // at interpreter exit.
     nb::set_leak_warnings(false);
-    nb::exception<ClientLayoutError>(m, "ClientLayoutError", PyExc_RuntimeError);
 
     nb::class_<FinishedOpView>(m, "FinishedOp")
         .def_ro("op", &FinishedOpView::op)
@@ -212,7 +212,7 @@ NB_MODULE(mooncake_store_worker, m)
             },
             nb::arg("sdk"), nb::kw_only(), nb::arg("threads"), nb::arg("put_threads"), nb::arg("gets_per_put"),
             nb::arg("rows_per_call"), nb::arg("bytes_per_call"), nb::rv_policy::take_ownership,
-            "For tests: a worker whose store calls go to `sdk`'s methods of the same names, without the slot check.")
+            "For tests: a worker whose store calls go to `sdk`'s methods of the same names.")
         .def("get", submit(false), nb::arg("stem"), nb::arg("names"), nb::arg("hex_names"), nb::arg("starts"),
             nb::arg("lengths"), nb::arg("cuts"))
         .def("put", submit(true), nb::arg("stem"), nb::arg("names"), nb::arg("hex_names"), nb::arg("starts"),

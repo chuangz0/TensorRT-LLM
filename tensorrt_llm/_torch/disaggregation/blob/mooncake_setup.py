@@ -343,7 +343,7 @@ def _start_store_worker(store: Any, blob: BlobConfig) -> Any:
             f"the store worker module has API version {api_version}, this code needs "
             f"{STORE_WORKER_API_VERSION}: it was built from other sources"
         )
-    # Raises where the store has no client or a client the worker does not mirror (by slot).
+    # Raises where the store has no client.
     return store_worker.StoreWorker(
         store,
         threads=blob.workers,

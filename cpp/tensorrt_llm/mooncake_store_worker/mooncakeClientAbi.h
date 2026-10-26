@@ -33,11 +33,9 @@
 // RealClient's methods. A slot the worker calls must match the wheel in position, parameters and
 // return type; the slots it never calls are placeholders that only keep the count.
 //
-// sharedClientOfCapsule() refuses a client, before any call, unless the symbol each called slot points to
-// (dladdr) is RealClient's method of that name. Parameter types are not compared: the Python side
-// (open_sdk) admits only the pinned 0.3.13 builds first. ReplicateConfig (replica.h:104-125), passed by reference to
-// session start, is mirrored the same way and has no runtime check; the version pin and the
-// conformance suite's put round trips cover it.
+// The version pin is what admits a client: the Python side (open_sdk) opens only the pinned 0.3.13
+// builds, which all compile this pyclient.h, so a version bump must re-read it against this mirror.
+// ReplicateConfig (replica.h:104-125), passed by reference to session start, is mirrored the same way.
 //
 // The mirror's methods keep Mooncake's spelling, so each line can be compared with pyclient.h.
 //
@@ -48,7 +46,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -61,13 +58,6 @@
 
 namespace tensorrt_llm::mooncake_store_worker
 {
-
-//! A client whose method table the mirror below does not match.
-class ClientLayoutError : public std::runtime_error
-{
-public:
-    using std::runtime_error::runtime_error;
-};
 
 namespace mirror
 {
@@ -170,27 +160,16 @@ public:
 
 // clang-format on
 
-struct CalledSlot
-{
-    int index;
-    char const* method;
-};
-
-// The slots the worker calls; a client is refused unless each holds RealClient's method of this name.
-inline constexpr CalledSlot kCalledSlots[] = {
-    {13, "batch_get_into_multi_buffers"},
-    {21, "batch_put_session_start"},
-    {22, "batch_put_from_multi_buffer_ranges"},
-    {23, "batch_put_session_end"},
-    {24, "batch_put_session_revoke"},
-    {41, "batchIsExist"},
-};
-
 } // namespace mirror
 
 //! The client a Mooncake store capsule holds, shared with the Python store. `capsulePointer` is the
-//! pointer of a "mooncake.PyClient.shared_ptr" capsule. Throws ClientLayoutError naming the first called
-//! slot that does not hold RealClient's method, before any call.
-std::shared_ptr<mirror::PyClient> sharedClientOfCapsule(void const* capsulePointer);
+//! pointer of a "mooncake.PyClient.shared_ptr" capsule.
+inline std::shared_ptr<mirror::PyClient> sharedClientOfCapsule(void const* capsulePointer)
+{
+    // The capsule holds a std::shared_ptr<mooncake::PyClient>. Any std::shared_ptr is a pointer and a
+    // control block, so the copy shares ownership through Mooncake's control block: whoever drops the
+    // last reference runs Mooncake's deleter, never the mirror's destructor.
+    return *static_cast<std::shared_ptr<mirror::PyClient> const*>(capsulePointer);
+}
 
 } // namespace tensorrt_llm::mooncake_store_worker

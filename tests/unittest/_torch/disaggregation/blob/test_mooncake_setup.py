@@ -4,8 +4,8 @@
 
 The SDK is a fake module put into ``sys.modules`` and listed by a fake installed distribution,
 the master probe and the route probe are replaced, and the InfiniBand sysfs tree is a temporary
-directory, so nothing here needs a network or a GPU. The store worker tests need the built store
-worker, and the slot check the installed Mooncake wheel, without a server.
+directory, so nothing here needs a network or a GPU. The store worker test needs the built store
+worker.
 """
 
 from __future__ import annotations
@@ -282,35 +282,24 @@ def test_an_sdk_other_than_a_pinned_build_of_0_3_13_is_refused(
     assert sdk.stores == []
 
 
-def test_a_client_the_store_worker_does_not_mirror_is_refused_by_slot_and_auto_falls_back(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from mooncake.store import MooncakeDistributedStore
-
-    store = MooncakeDistributedStore()
-    # Without a server the setup fails, but the store keeps its DummyClient, whose method table
-    # holds DummyClient's methods where the worker calls RealClient's.
-    assert store.setup_dummy(0, 0, "127.0.0.1:1") != 0
-    refused = r"slot \d+ holds mooncake::DummyClient::batch_get_into_multi_buffers"
-    with pytest.raises(RuntimeError, match=refused):
-        make_store_driver(store, MooncakeConfig(MASTER, 0, driver="native"), BlobConfig())
-    warnings: list[str] = []
-    monkeypatch.setattr(mooncake_setup.logger, "warning", warnings.append)
-    driver = make_store_driver(store, MooncakeConfig(MASTER, 0), BlobConfig())
-    assert type(driver) is MooncakeDriver
-    (warning,) = warnings
-    assert "store calls run on Python threads" in warning and re.search(refused, warning)
-
-
 def test_a_store_worker_built_from_other_sources_is_refused_before_it_runs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The driver 'native' refuses the server; 'auto' falls back to the Python driver and says
+    why."""
     from tensorrt_llm import mooncake_store_worker
 
     needed = mooncake_setup.STORE_WORKER_API_VERSION
     monkeypatch.setattr(mooncake_store_worker, "API_VERSION", needed - 1)
-    with pytest.raises(RuntimeError, match=f"API version {needed - 1}, this code needs {needed}"):
+    refused = f"API version {needed - 1}, this code needs {needed}"
+    with pytest.raises(RuntimeError, match=refused):
         make_store_driver(object(), MooncakeConfig(MASTER, 0, driver="native"), BlobConfig())
+    warnings: list[str] = []
+    monkeypatch.setattr(mooncake_setup.logger, "warning", warnings.append)
+    driver = make_store_driver(object(), MooncakeConfig(MASTER, 0), BlobConfig())
+    assert type(driver) is MooncakeDriver
+    (warning,) = warnings
+    assert "store calls run on Python threads" in warning and refused in warning
 
 
 def test_setup_failure_closes_the_half_open_client(sdk: Sdk) -> None:

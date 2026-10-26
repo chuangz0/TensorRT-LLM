@@ -36,8 +36,8 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
   find_package(Threads REQUIRED)
 endif()
 
-set(MOONCAKE_STORE_WORKER_SOURCES bindings.cpp mooncakeClientAbi.cpp
-                                  sdkObjectClient.cpp storeWorker.cpp)
+set(MOONCAKE_STORE_WORKER_SOURCES bindings.cpp sdkObjectClient.cpp
+                                  storeWorker.cpp)
 # NB_DOMAIN: nanobind internals of its own, never shared with TRT-LLM's
 # bindings. NOSTRIP keeps the module BOLT compatible, as the bindings module
 # does.
@@ -48,5 +48,4 @@ else()
   nanobind_add_module(mooncake_store_worker NB_DOMAIN mooncake_store_worker
                       ${MOONCAKE_STORE_WORKER_SOURCES})
 endif()
-target_link_libraries(mooncake_store_worker PRIVATE ${CMAKE_DL_LIBS}
-                                                    Threads::Threads)
+target_link_libraries(mooncake_store_worker PRIVATE Threads::Threads)
