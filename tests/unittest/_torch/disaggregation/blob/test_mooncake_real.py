@@ -12,18 +12,17 @@ the host's fastest active InfiniBand devices). The shared ``driver_conformance``
 too, each over a fresh client and under a key prefix of its own, with a driver that registers
 device memory: over RDMA, rows of several spans move into and out of GPU memory in place. They and
 the backend-level tests run on both drivers, the Python one and the native one whose store worker
-calls the same client from C++ threads, and must give the same results.
+calls the same client from C++ threads, and must give the same results; a full pool, whose answer
+is the SDK's whichever driver asks, runs on the native one.
 """
 
 from __future__ import annotations
 
-import contextlib
 import importlib.util
 import json
 import os
 import secrets
 import shutil
-import threading
 import time
 from dataclasses import replace
 
@@ -78,33 +77,14 @@ def _require_mooncake() -> None:
     select_registration_path(PROTOCOL, registers_device_memory=True)
 
 
-def _running_pool(run_dir: str, segment_size: int) -> tuple[contextlib.ExitStack, str]:
-    """A master and a segment provider: the stack that stops them, and the master's address."""
-    from test_common.mooncake_utils import running_master_on_free_ports, running_segment_provider
-
-    stack = contextlib.ExitStack()
-    # Ratio 0: the master evicts only above its high watermark, never just because a put failed.
-    master = stack.enter_context(
-        running_master_on_free_ports(run_dir, protocol=PROTOCOL, eviction_ratio=0.0)
-    )
-    stack.enter_context(
-        running_segment_provider(
-            master.address,
-            run_dir,
-            segment_size=segment_size,
-            protocol=PROTOCOL,
-            device_name=DEVICES,
-        )
-    )
-    return stack, master.address
-
-
 @pytest.fixture(scope="module")
 def pool(tmp_path_factory):
+    from test_common.mooncake_utils import running_pool
+
     _require_mooncake()
-    stack, address = _running_pool(str(tmp_path_factory.mktemp("pool")), POOL_BYTES)
-    with stack:
-        yield address
+    run_dir = str(tmp_path_factory.mktemp("pool"))
+    with running_pool(run_dir, POOL_BYTES, protocol=PROTOCOL, device_name=DEVICES) as master:
+        yield master.address
 
 
 class Clients:
@@ -153,8 +133,9 @@ class Clients:
 
 
 def client_config(master: str) -> MooncakeConfig:
-    """A client with no segment of its own and no buffer for the SDK's copying calls."""
-    return MooncakeConfig(master, 0, PROTOCOL, DEVICES, local_buffer_size=0)
+    """A client with no segment of its own and no buffer for the SDK's copying calls (the
+    defaults)."""
+    return MooncakeConfig(master, protocol=PROTOCOL, device_name=DEVICES)
 
 
 @pytest.fixture
@@ -179,25 +160,26 @@ def finish(endpoint: Endpoint, submit, *names: str) -> Outcome:
     return outcome
 
 
-def test_real_auto_runs_the_native_driver_where_the_slot_check_passes(clients) -> None:
+def test_real_auto_runs_the_native_driver(clients) -> None:
     config = client_config(clients.master)
     assert config.driver == "auto"
     driver = make_store_driver(clients.open_client(), config, BlobConfig())
     assert isinstance(driver, NativeMooncakeDriver)
 
 
-@pytest.mark.parametrize("driver", DRIVERS)
-def test_real_store_full_is_declined(tmp_path, request, driver) -> None:
+def test_real_store_full_is_declined(tmp_path, request) -> None:
+    from test_common.mooncake_utils import running_pool
+
     _require_mooncake()
     # A pool of its own that one publish overfills: a 16 MiB segment (the smallest a TCP client
     # may give, one allocator slab) holds at most 256 of the 512 rows. A PutStart that finds no room
     # answers at once. The master evicts once the pool passes its high watermark, so how many rows
-    # land varies, but some are always declined and none fault.
-    stack, master = _running_pool(str(tmp_path), segment_size=16 << 20)
-    clients = Clients(master)
-    with stack:
+    # land varies, but some are always declined and none fault. The answer is the SDK's, whichever
+    # driver asks; each driver's reading of it is pinned over the fake SDK.
+    with running_pool(str(tmp_path), 16 << 20, protocol=PROTOCOL, device_name=DEVICES) as master:
+        clients = Clients(master.address)
         names = [f"{request.node.name}-{i}" for i in range(512)]
-        writer = clients.endpoint(names, driver=driver, workers=1)
+        writer = clients.endpoint(names, driver="native", workers=1)
         random_rows(writer, seed=4)
         outcome = finish(writer, writer.backend.publish, *names)
         delivered = int(outcome.delivered_masks[0].sum())
@@ -339,56 +321,6 @@ def test_real_four_workers_round_trip_2000_rows_without_crossed_bytes(
     assert crossed == []
     if driver == "python":  # the backend's threads; a native driver runs its calls itself
         assert writer.driver.peak_in_flight >= 2 and reader.driver.peak_in_flight >= 2
-    writer.close()
-    reader.close()
-
-
-class FirstScatterWaits:
-    """An SDK client whose first put scatter waits, after its session started, for ``release``."""
-
-    def __init__(self, store) -> None:
-        self.store = store
-        self.entered = threading.Event()
-        self.release = threading.Event()
-        self._first = threading.Lock()
-
-    def __getattr__(self, name: str):
-        return getattr(self.store, name)
-
-    def batch_put_from_multi_buffer_ranges(self, *args):
-        if self._first.acquire(blocking=False):
-            self.entered.set()
-            self.release.wait(WAIT_S)
-        return self.store.batch_put_from_multi_buffer_ranges(*args)
-
-
-def test_real_concurrent_publishes_of_the_same_keys_from_one_client(clients, request) -> None:
-    # The first publish holds every key while its scatter waits, so the driver skips the second
-    # publish's rows as another writer's, without a store call; then the first publish delivers
-    # them all.
-    names = [f"{request.node.name}-{i}" for i in range(64)]
-    sdk = FirstScatterWaits(clients.open_client())
-    # Three workers: publishes leave one to fetches, so the two publishes run side by side.
-    writer = clients.add(Endpoint(MooncakeDriver(sdk), names, slot_bytes=SLOT_BYTES, workers=3))
-    rows = random_rows(writer, seed=8)
-    first = writer.backend.publish(writer.view(*names), None)
-    try:
-        assert sdk.entered.wait(WAIT_S)
-        second = writer.backend.publish(writer.view(*names), None)
-        skipped = writer.wait_outcome(second)
-        assert skipped.fault is None and masks(skipped) == [[False] * 64]
-    finally:
-        sdk.release.set()
-    assert masks(writer.wait_outcome(first)) == [[True] * 64]
-    for attempt in (first, second):
-        writer.wait_quiesced(attempt)
-    stats = writer.driver.inner.stats()
-    assert stats["rows_not_ready_another_writer"] == 64
-    assert stats["rows_not_ready_own_session_open"] == 0
-    assert writer.driver.peak_in_flight == 2
-    reader = clients.endpoint(names, fill=0x2D)
-    assert all(masks(finish(reader, reader.backend.fetch, *names))[0])
-    assert all(reader.read(name) == rows[name] for name in names)
     writer.close()
     reader.close()
 

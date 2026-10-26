@@ -18,9 +18,9 @@ One manager publishes a request's KV blocks through its lender's staging slots; 
 them into a request of its own. A test lease holder drives the lender as the runtime does: lend,
 wait for the view, submit it to the backend as it stands, wait until the attempt quiesces, then
 release a read lease or return a write lease with what arrived. The store is the in-memory one, or
-with ``TRTLLM_MOONCAKE_REAL=1`` a real Mooncake pool (``TRTLLM_MOONCAKE_PROTOCOL``, default rdma).
-The caches: FP16 and NVFP4 multi-head attention, and DeepSeek sparse attention's MLA latent with
-its indexer keys. Allocates device pools.
+with ``TRTLLM_MOONCAKE_REAL=1`` a real Mooncake pool, one for the module
+(``TRTLLM_MOONCAKE_PROTOCOL``, default rdma). The caches: FP16 and NVFP4 multi-head attention, and
+DeepSeek sparse attention's MLA latent with its indexer keys. Allocates device pools.
 """
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ class Stores:
     def open_driver(self):
         if self._store is not None:
             return MemoryDriver(self._store)
-        sdk = open_sdk(MooncakeConfig(self._master, 0, PROTOCOL, DEVICES, local_buffer_size=0))
+        sdk = open_sdk(MooncakeConfig(self._master, protocol=PROTOCOL, device_name=DEVICES))
         self._clients.append(sdk)
         return MooncakeDriver(sdk)
 
@@ -117,26 +117,27 @@ class Stores:
                 client.close()
 
 
+@pytest.fixture(scope="module")
+def mooncake_master(tmp_path_factory):
+    """A real Mooncake pool for the module's tests; its master's address. The caches' keys never
+    collide: each cache's page layout names a namespace of its own."""
+    if os.environ.get("TRTLLM_MOONCAKE_REAL") != "1":
+        pytest.skip("needs a real Mooncake pool; set TRTLLM_MOONCAKE_REAL=1")
+    from test_common.mooncake_utils import running_pool
+
+    run_dir = str(tmp_path_factory.mktemp("pool"))
+    with running_pool(run_dir, 256 << 20, protocol=PROTOCOL, device_name=DEVICES) as master:
+        yield master.address
+
+
 @pytest.fixture(params=["memory", "mooncake"])
-def stores(request, tmp_path):
+def stores(request):
     if request.param == "memory":
         yield Stores()
         return
-    if os.environ.get("TRTLLM_MOONCAKE_REAL") != "1":
-        pytest.skip("needs a real Mooncake pool; set TRTLLM_MOONCAKE_REAL=1")
-    from test_common.mooncake_utils import running_master_on_free_ports, running_segment_provider
-
-    with running_master_on_free_ports(str(tmp_path), protocol=PROTOCOL) as master:
-        with running_segment_provider(
-            master.address,
-            str(tmp_path),
-            segment_size=256 << 20,
-            protocol=PROTOCOL,
-            device_name=DEVICES,
-        ):
-            opened = Stores(master=master.address)
-            yield opened
-            opened.close()
+    opened = Stores(master=request.getfixturevalue("mooncake_master"))
+    yield opened
+    opened.close()
 
 
 def dsa_manager():
