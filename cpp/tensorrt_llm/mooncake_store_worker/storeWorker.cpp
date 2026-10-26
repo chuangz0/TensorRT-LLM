@@ -690,7 +690,8 @@ struct StoreWorker::State
         else if (!gets.empty())
         {
             queue = &gets;
-            ++getsInARow;
+            // Capped, as putDue only compares it with getsPerPut: a fetch-only server pops gets for months.
+            getsInARow = std::min(getsInARow + 1, options.getsPerPut);
         }
         else
         {
