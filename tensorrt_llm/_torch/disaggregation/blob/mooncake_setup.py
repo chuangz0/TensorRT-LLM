@@ -277,11 +277,14 @@ class StoreSegment:
 
     def begin_unmount(self) -> None:
         """Stops new objects landing in the segment; the old ones stay readable for
-        UNMOUNT_GRACE_S. If the master refuses, the memory goes when the process exits."""
+        UNMOUNT_GRACE_S. If the master refuses, this still waits: a mount is several Mooncake
+        segments, each unmounted on its own, and the code is the first one's error, so others may
+        be unmounting."""
         code = self.store.unmount_and_free_segment(self.segment_ids, UNMOUNT_GRACE_S)
         if code != 0:
-            logger.error(f"mooncake: the master refused to unmount the segment (code {code})")
-            return
+            logger.error(
+                f"mooncake: the master refused to unmount the segment (code {code}); waiting anyway"
+            )
         self._freed_at = (
             time.monotonic() + UNMOUNT_GRACE_S + MOONCAKE_UNMOUNT_CLEANUP_S + _UNMOUNT_MARGIN_S
         )

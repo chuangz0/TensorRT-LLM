@@ -357,9 +357,11 @@ def test_a_store_segment_is_freed_13_s_after_its_unmount_began(
     assert store.calls_to("close") == []  # closing would free the memory at once
 
 
-def test_an_unmount_the_master_refuses_waits_for_nothing(
+def test_an_unmount_the_master_refuses_still_waits(
     sdk: Sdk, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Mooncake unmounts each segment of a mount on its own and answers the first one's error, so
+    others may be unmounting: their readers get the same 13 s."""
     clock = Clock()
     monkeypatch.setattr(mooncake_setup, "time", clock)
     store = open_sdk(MooncakeConfig(MASTER, 0, "tcp"))
@@ -369,8 +371,10 @@ def test_an_unmount_the_master_refuses_waits_for_nothing(
     monkeypatch.setattr(mooncake_setup.logger, "error", errors.append)
     segment.begin_unmount()
     segment.wait_until_freed()
-    assert clock.slept == []  # the memory goes when the process exits
-    assert errors == ["mooncake: the master refused to unmount the segment (code -900)"]
+    assert clock.slept == [13.0]
+    assert errors == [
+        "mooncake: the master refused to unmount the segment (code -900); waiting anyway"
+    ]
 
 
 # Layering.
