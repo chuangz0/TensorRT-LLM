@@ -194,6 +194,13 @@ class ProbeService:
         """Whether requests wait for their answer outside the request queue."""
         return bool(self._held)
 
+    def take_held(self) -> list[RequestQueueItem]:
+        """Removes and returns the requests waiting for their answer: at a fatal error the executor
+        answers them with the error, as it answers the request queue's. Runs on the executor
+        thread."""
+        held, self._held = self._held, []
+        return held
+
     def take_refreshed_hits(
         self, waiting: Iterable[RequestQueueItem]
     ) -> tuple[tuple[int, int], ...]:

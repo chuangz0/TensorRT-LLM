@@ -9044,8 +9044,12 @@ class PyExecutor:
             # here because is_shutdown is True and the queue's active
             # flag is about to be set False, so no new items arrive.
             raw_queue = self.executor_request_queue.get_request_queue()
+            # Requests rank 0's store probe holds are in neither queue.
+            queued = (self.kv_sharing.take_held_requests()
+                      if self.kv_sharing is not None else [])
             while not raw_queue.empty():
-                item = raw_queue.get_nowait()
+                queued.append(raw_queue.get_nowait())
+            for item in queued:
                 if item.is_shutdown_request:
                     continue
                 if ((self.gather_all_responses or self.dist.rank == 0)

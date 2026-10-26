@@ -4562,6 +4562,38 @@ def test_a_forward_error_while_a_fetch_is_parked_fails_the_request_at_once(disag
     assert sorted(request_id for request_id, _ in responses) == [1, 2]
 
 
+def test_a_fatal_error_answers_the_requests_rank_0s_store_probe_holds():
+    """kv_sharing: a fatal error answers every queued request with the error, so none is scheduled
+    after it. The requests rank 0's store probe holds for their answer are in no queue: the drain
+    takes them from the probe and answers them too."""
+    held = RequestQueueItem(7, request=Mock(client_id=70))
+    executor = object.__new__(PyExecutor)
+    executor._error_budget = Mock()
+    executor._error_budget.consume.return_value = True
+    executor._error_budget.budget = 0.0
+    executor._fatal_error = None
+    executor.enable_attention_dp = False
+    executor.dist = Mock(world_size=1, rank=0)
+    executor.waiting_queue = []
+    executor.executor_request_queue = Mock()
+    executor.executor_request_queue.get_request_queue.return_value.empty.return_value = True
+    executor.gather_all_responses = False
+    executor.active_requests = []
+    executor._pending_transfer_responses = []
+    executor._pending_response_terminations = []
+    executor._enqueue_responses = Mock()
+    executor.kv_sharing = Mock()
+    executor.kv_sharing.take_held_requests.return_value = [held]
+
+    executor._handle_errors("device lost")
+
+    (drained,) = executor._enqueue_responses.call_args_list[0].args
+    assert [(request_id, response.error_msg) for request_id, response in drained] == [
+        (7, "device lost")
+    ]
+    executor.executor_request_queue.enqueue_shutdown_request.assert_called_once_with()
+
+
 @pytest.mark.parametrize("sending", [True, False])
 def test_a_context_server_does_not_wait_for_requests_while_kv_sends_are_in_flight(sending):
     """After its last chunk a context-only request leaves the active requests while its KV cache

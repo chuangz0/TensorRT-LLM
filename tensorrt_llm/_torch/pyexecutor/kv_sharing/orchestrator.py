@@ -311,6 +311,11 @@ class SharedKvOrchestrator:
             STORE_UPDATE_REQUEST_ID, store_hits=hits, store_publishing=switch
         )
 
+    def take_held_requests(self) -> list[RequestQueueItem]:
+        """Rank 0: removes and returns the requests its probe holds, which are in no queue, for the
+        fatal error drain to answer."""
+        return [] if self._probe is None else self._probe.take_held()
+
     def request_queue_wait(
         self, timeout: Optional[datetime.timedelta]
     ) -> Optional[datetime.timedelta]:
