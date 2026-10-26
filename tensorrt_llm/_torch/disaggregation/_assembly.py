@@ -14,7 +14,7 @@
 # limitations under the License.
 """Private runtime assembly shared by transfer and Store integrations.
 
-The initial profile consumes NAMED leases of one memory kind, HOST (staged) or
+The profile consumes NAMED leases of one memory kind, HOST (staged) or
 DEVICE (in place), from the lender's complete mixed memory namespace. Model
 provenance and writer facts derive its canonical scope; public layout and region
 facts validate the serving profile. Neither a provider name nor a caller-supplied
@@ -30,16 +30,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
-import numpy as np
-
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import PageLayout
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
-    Lease,
     LeaseView,
     Lender,
     MemoryKind,
     MemoryRegion,
-    ResumeBounds,
     StagingOptions,
     attach_lender,
 )
@@ -53,38 +49,6 @@ from .base.backend import Backend, CacheKind, SlotRegion, WakeFn
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-
-WriteReturnFn = Callable[[Lease, tuple[np.ndarray, ...], bool], ResumeBounds | None]
-"""Owner-thread endpoint for one consuming write return to its originating lender.
-
-The holder supplies the fixed Outcome masks after coordinated return permission
-and ended backend access. Keep the endpoint rooted through return and cleanup.
-"""
-
-
-def bind_write_return(lender: Lender) -> WriteReturnFn:
-    """Bind only the lender association for a consuming write return.
-
-    Call the endpoint on the manager thread after every participating rank settles
-    its Outcome and ends backend access. The endpoint neither authorizes the
-    return nor waits for local copies. It forwards the exact masks and reuse
-    permission once and propagates errors; the caller must not retry a return.
-
-    Args:
-        lender: Originating lender, kept alive by the returned endpoint.
-
-    Returns:
-        A callable yielding the lender's single result, possibly pending bounds.
-    """
-
-    def return_write(
-        lease: Lease, arrived: tuple[np.ndarray, ...], reusable: bool
-    ) -> ResumeBounds | None:
-        (bounds,) = lender.return_writes([(lease, arrived, reusable)])
-        return bounds
-
-    return return_write
-
 
 OwnerCleanupFn = Callable[[Callable[[], None]], bool]
 """Thread-safe, nonblocking posting of bounded manager-thread finalizers.
@@ -127,12 +91,14 @@ class FactoryRejected(RuntimeError):
     """Construction certifies no remaining access, registration or region hold."""
 
 
+MHA_LAYOUT = "mha-trtllm-hnd"
+MLA_LAYOUT = "mla-trtllm-latent"
 # The supported caches: an attention writer layout with the dtype of its cache. MLA has no NVFP4
 # cache here: dense FP4 MLA has no block reuse upstream, and NVFP4 with DeepSeek sparse attention
 # is not qualified yet.
 SUPPORTED_CACHES = frozenset(
-    {("mha-trtllm-hnd", dtype) for dtype in ("bfloat16", "float16", "fp8", "nvfp4")}
-    | {("mla-trtllm-latent", dtype) for dtype in ("bfloat16", "fp8")}
+    {(MHA_LAYOUT, dtype) for dtype in ("bfloat16", "float16", "fp8", "nvfp4")}
+    | {(MLA_LAYOUT, dtype) for dtype in ("bfloat16", "fp8")}
 )
 # The public layout's dtype and quantization of each cache dtype.
 _LAYOUT_DTYPES = {
@@ -179,19 +145,19 @@ class ProfileSpec:
         sparse_attention: The model's effective sparse attention config as JSON values, or
             ``None`` for dense attention; its ``algorithm`` must be in ``SPARSE_ALGORITHMS``.
             The whole config enters the scope, so another setting names other blocks.
-        sink_token_length: Runtime sink length; this cell requires zero.
-        lora_enabled: Whether adapters are enabled; this cell excludes LoRA.
+        sink_token_length: Runtime sink length; must be 0.
+        lora_enabled: Whether adapters are enabled; must be False.
         pool_count: Number of physical pool groups in the selected layout.
         speculative_mode: Explicit speculative mode; only none is supported here.
-        model_role: Target or draft role; this cell accepts only the target.
-        draft_pool: Separate draft-pool provenance; this cell requires None.
+        model_role: Target or draft role; must be ``"target"``.
+        draft_pool: Separate draft-pool provenance; must be None.
         joint_reuse: Whether reuse requires another manager's draft state.
         staging: Canonical capacity options for the pinned lender baseline.
         backend_config: Opaque provider-owned factory configuration.
 
     Raises:
         TypeError: A fact has an invalid type.
-        ValueError: A required identity is empty or the cell is unsupported.
+        ValueError: A required identity is empty or a fact is unsupported.
     """
 
     id: str
@@ -242,9 +208,9 @@ class ProfileSpec:
         if not kinds or any(not isinstance(kind, CacheKind) for kind in kinds):
             raise TypeError("state kinds must contain canonical CacheKind values")
         if any(kind != CacheKind.PAGED for kind in kinds):
-            raise ValueError("initial profile supports paged attention state only")
+            raise ValueError("recurrent state is not supported")
         windows = tuple(sorted((int(layer), int(win)) for layer, win in self.attention_windows))
-        if windows and self.model_layout == "mla-trtllm-latent":
+        if windows and self.model_layout == MLA_LAYOUT:
             raise ValueError("MLA with sliding windows is not supported")
         if self.sparse_attention is not None:
             if not isinstance(self.sparse_attention, dict):
@@ -260,9 +226,9 @@ class ProfileSpec:
         ):
             raise TypeError("sink_token_length must be an integer")
         if self.sink_token_length != 0:
-            raise ValueError("initial profile excludes attention sinks")
+            raise ValueError("attention sink tokens are not supported")
         if self.lora_enabled is not False:
-            raise ValueError("initial profile excludes LoRA")
+            raise ValueError("LoRA is not supported")
         if isinstance(self.pool_count, bool) or not isinstance(self.pool_count, numbers.Integral):
             raise TypeError("pool_count must be an integer")
         if (
@@ -271,7 +237,7 @@ class ProfileSpec:
             or self.joint_reuse is not False
             or self.draft_pool is not None
         ):
-            raise ValueError("initial profile excludes speculative and joint draft reuse")
+            raise ValueError("speculative decoding and draft-model reuse are not supported")
         object.__setattr__(self, "topology", topology)
         object.__setattr__(self, "state_kinds", kinds)
         object.__setattr__(self, "attention_windows", windows)
@@ -292,7 +258,7 @@ def derive_kv_scope(profile: ProfileSpec) -> bytes:
     names, local paths and hints are not substitutes for checkpoint provenance.
 
     Args:
-        profile: Validated initial-profile facts from trusted model assembly.
+        profile: Validated profile facts from trusted model assembly.
 
     Returns:
         A versioned, deterministic byte scope, independent of local placement.
@@ -453,7 +419,7 @@ def _validate_layout(profile: ProfileSpec, layout: PageLayout, namespace: Region
         if any(windows.get(layer) != group.read_window for layer in group.layers):
             raise ValueError("lender windows do not match the selected profile")
     if any(group.num_sink_blocks != 0 for group in layout.layer_groups):
-        raise ValueError("initial profile excludes attention sinks")
+        raise ValueError("attention sink tokens are not supported")
     if len(layout.pool_slot_bytes) != profile.pool_count:
         raise ValueError("lender pool groups do not match the selected profile")
     if namespace.memory_kind is MemoryKind.HOST:

@@ -27,7 +27,6 @@ from tensorrt_llm._torch.disaggregation import _assembly
 from tensorrt_llm._torch.disaggregation._assembly import (
     ProfileSpec,
     attach_domain,
-    bind_write_return,
     check_view_compatibility,
 )
 from tensorrt_llm._torch.disaggregation.base.backend import CacheKind, Outcome, SlotRegion
@@ -111,8 +110,7 @@ def test_real_lender_projection_partial_delivery(
         outcome = Outcome.for_view(view, masks, fault="last block missing")
         outcome.check_mask_shapes(view)
         # The synchronous host writer ended; this one-rank test authorizes consumption.
-        return_write = bind_write_return(domain.lender)
-        return_write(lease, outcome.delivered_masks, True)
+        domain.lender.return_writes([(lease, outcome.delivered_masks, True)])
         bounds = kit.settled_bounds(domain.lender, manager, request)
         assert bounds is not None and bounds.max_position == 64
         device = kit.DevicePages(manager)

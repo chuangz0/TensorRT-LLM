@@ -28,7 +28,6 @@ from tensorrt_llm._torch.disaggregation._assembly import (
     ProfileSpec,
     RegionNamespace,
     attach_domain,
-    bind_write_return,
     check_view_compatibility,
 )
 from tensorrt_llm._torch.disaggregation.base.backend import CacheKind, Outcome, SlotRegion, View
@@ -44,7 +43,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     LentLayerGroupRows,
     MemoryKind,
     MemoryRegion,
-    ResumeBounds,
     StagingOptions,
 )
 from tensorrt_llm._torch.weight_sharing.artifact_identity import ArtifactIdentity
@@ -233,7 +231,7 @@ def test_attachment_uses_public_layout_and_complete_namespace(
         ),
         (
             replace(_layout(), layer_groups=(LayerGroupDesc("attention", None, 1, 0, (0,)),)),
-            "attention sinks",
+            "attention sink tokens",
         ),
         (replace(_layout(), pool_slot_bytes={0: (64,), 1: (64,)}), "pool groups"),
         (replace(_layout(), staging_region_index={}), "HOST/NAMED"),
@@ -646,56 +644,3 @@ def test_namespace_requires_explicit_known_memory_kind() -> None:
         MemoryRegion("device", 0x1000, 128, 64, 2, (3,), MemoryKind.DEVICE),
     )
     assert RegionNamespace(regions, MemoryKind.DEVICE).allowed_region_indices == frozenset({1})
-
-
-@pytest.mark.parametrize("reusable", [False, True])
-@pytest.mark.parametrize("bounds", [None, ResumeBounds(64, 0)])
-def test_bound_write_return_preserves_lender_masks_and_result(
-    reusable: bool, bounds: ResumeBounds | None
-) -> None:
-    """The bound endpoint forwards one exact entry without copying masks or deciding readiness."""
-    calls = []
-
-    class RecordingLender:
-        def return_writes(
-            self, entries: list[tuple[object, tuple[np.ndarray, ...], bool]]
-        ) -> list[ResumeBounds | None]:
-            calls.append(entries)
-            return [bounds]
-
-    lender = RecordingLender()
-    lender_ref = weakref.ref(lender)
-    return_write = bind_write_return(lender)
-    del lender
-    gc.collect()
-    assert lender_ref() is not None
-    lease = object()
-    masks = (np.array([False, True], dtype=bool), np.array([], dtype=bool))
-    assert return_write(lease, masks, reusable) is bounds
-    assert len(calls) == 1 and len(calls[0]) == 1
-    actual_lease, actual_masks, actual_reusable = calls[0][0]
-    assert actual_lease is lease
-    assert actual_masks is masks
-    assert actual_reusable is reusable
-    del return_write
-    gc.collect()
-    assert lender_ref() is None
-
-
-def test_bound_write_return_propagates_errors_without_retry() -> None:
-    """A return may have side effects before failing; its endpoint never retries it."""
-    calls = []
-    error = RuntimeError("copy submission failed")
-
-    class FailingLender:
-        def return_writes(
-            self, entries: list[tuple[object, tuple[np.ndarray, ...], bool]]
-        ) -> list[ResumeBounds | None]:
-            calls.append(entries)
-            raise error
-
-    return_write = bind_write_return(FailingLender())
-    with pytest.raises(RuntimeError) as raised:
-        return_write(object(), (), False)
-    assert raised.value is error
-    assert len(calls) == 1
