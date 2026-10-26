@@ -570,6 +570,7 @@ class Probe:
         ("resumed", [(False, "")]),
         ("evicted", []),  # rows missing without a fault: no store failure
         ("faulted", [(True, "a fetch failed in the store")]),
+        ("refused", []),  # the lender refused the lend at its first poll: no store failure
     ],
 )
 def test_each_round_tells_rank_0s_probe_whether_the_store_failed_a_fetch(
@@ -579,12 +580,15 @@ def test_each_round_tells_rank_0s_probe_whether_the_store_failed_a_fetch(
     server = Server(monkeypatch, MemoryKind.DEVICE, probe=probe)
     try:
         server.park(request(1))
-        server.iterate()  # the store starts reading
-        attempt = server.store.attempts[0]
-        delivered = attempt.view.row_masks(end == "resumed")
-        fault = "the store failed" if end == "faulted" else None
-        attempt.outcome, attempt.ended = Outcome.for_view(attempt.view, delivered, fault), True
-        server.lender.settled.add(1)  # in place: its rows are the cache's
+        if end == "refused":  # as the lender's slot limit refuses a lend at its first poll
+            server.lender.leases[0].failure = "no free slot"
+        else:
+            server.iterate()  # the store starts reading
+            attempt = server.store.attempts[0]
+            delivered = attempt.view.row_masks(end == "resumed")
+            fault = "the store failed" if end == "faulted" else None
+            attempt.outcome, attempt.ended = Outcome.for_view(attempt.view, delivered, fault), True
+            server.lender.settled.add(1)  # in place: its rows are the cache's
         server.iterate()
         assert probe.fetches == recorded
     finally:

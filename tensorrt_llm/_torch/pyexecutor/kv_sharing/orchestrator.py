@@ -620,9 +620,11 @@ class SharedKvOrchestrator:
             elif decision.action is Action.DROP and decision.reason == "late":
                 late = True
             elif decision.action is Action.DROP and decision.reason == "short":
-                started_here = op.operation_id is not None  # a refused lend is no store failure
-                if started_here and self._transfers.delivered_masks(op.operation_id) is None:
-                    faulted = True
+                # A store fault shows in the Outcome; a lend the lender refused, at the call or at
+                # its first poll, never reached the store.
+                if op.operation_id is not None:
+                    outcome = self._transfers.operations[op.operation_id].outcome
+                    faulted |= outcome is not None and outcome.fault is not None
         if resumed:
             self._last_resume_at = now
             self._probe.record_fetch(failed=False)
