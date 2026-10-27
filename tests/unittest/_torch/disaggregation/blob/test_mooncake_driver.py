@@ -6,11 +6,11 @@ Pins the mapping of SDK 0.3.13 answers to row results, the put session bookkeepi
 the driver starts is ended, revoked or left open; only rows written whole are ended), the access-end
 rules (a put scatter that returns ends access, whatever it answers; a ``batch_get_into`` ends it
 unless a row answers TRANSFER_FAIL; a call that raises or miscounts does not, and its access is
-unprovable), registration, drain and close, the parts and their scheduling (parts cut by rows
-and bytes, gets first with a waiting put after GETS_BEFORE_PUT_IS_DUE gets, puts leaving one
-worker to gets, a fixed pool of workers, cancel and drain ending the rows no worker took,
-``on_change`` once an operation is done), and a backend round trip over the fake SDK. The shared
-``driver_conformance`` checks run over the fake SDK too.
+unprovable), registration, drain and close, the probe's calls and answers, the parts and their
+scheduling (parts cut by rows and bytes, gets first with a waiting put after GETS_BEFORE_PUT_IS_DUE
+gets, puts leaving one worker to gets, a fixed pool of workers, cancel and drain ending the rows no
+worker took, ``on_change`` once an operation is done), and a backend round trip over the fake SDK.
+The shared ``driver_conformance`` checks run over the fake SDK too.
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.store import (
     DriverCapabilities,
     DriverRejected,
+    ProbeStatus,
     RegionLayout,
     RegistrationError,
     RowBatch,
@@ -77,6 +78,7 @@ PUT_RANGES = "batch_put_from_multi_buffer_ranges"
 PUT_END = "batch_put_session_end"
 PUT_REVOKE = "batch_put_session_revoke"
 GET = "batch_get_into"
+IS_EXIST = "batch_is_exist"
 DATA_CALL = {"put": PUT_RANGES, "get": GET}
 METADATA_CALL_FAILED = "existence check: METADATA_CALL_FAILED(-100000)"
 
@@ -177,7 +179,7 @@ def test_the_driver_is_a_store_driver_with_mooncake_capabilities() -> None:
         get=True,
         put=True,
         cancel=True,
-        probe=False,
+        probe=True,
         max_rows_per_op=None,
         hints=False,
         absent_is_miss=True,
@@ -193,9 +195,19 @@ class DriverLeavingOperationsUnstarted(MooncakeDriver):
         return None
 
 
+def stalled_master(answers: list[int]) -> list[int]:
+    """An existence check against a master that stopped answering: the client gives up after its
+    RPC timeout (``rpc_timeout_ms``, cut to 0.1 s here) and answers RPC_TIMEOUT for every key."""
+    time.sleep(0.1)
+    return [-901] * len(answers)
+
+
 class TestMooncakeDriverConformance(DriverConformance):
-    """The shared driver checks over the fake SDK, with every scenario it can stage. Probe is not
-    declared, so the blocked and failing presence queries are not staged."""
+    """The shared driver checks over the fake SDK, with every scenario it can stage. A probe is
+    bounded by the client's RPC timeout, not by its budget, so the blocked query is staged as the
+    SDK ends it: RPC_TIMEOUT once that timeout passed."""
+
+    probe_sees_unfinished_writes = False  # the master answers 0 for an open put
 
     def make_driver(self) -> StoreDriver:
         # A part per row, so every operation of more than one row runs in several parts.
@@ -234,6 +246,16 @@ class TestMooncakeDriverConformance(DriverConformance):
 
     def make_driver_leaving_operations_unstarted(self):
         return DriverLeavingOperationsUnstarted(FakeMooncakeStore())
+
+    def make_blocked_probe(self):
+        fake = FakeMooncakeStore()
+        fake.script(IS_EXIST, stalled_master)
+        return MooncakeDriver(fake), key("stalled"), lambda: None
+
+    def make_failing_presence(self):
+        fake = FakeMooncakeStore()
+        fake.script(IS_EXIST, [-900])  # the existence check fails with RPC_FAIL
+        return MooncakeDriver(fake), key("failing")
 
     def make_failing_get(self):
         fake = FakeMooncakeStore()
@@ -1116,6 +1138,28 @@ def test_an_object_being_written_is_not_ready_for_put_and_get(monkeypatch) -> No
             lambda: any(key("K") in line and f"not_ready ({reason})" in line for line in warnings),
             f"the {reason} warning",
         )
+
+
+def test_probe_asks_at_most_probe_keys_per_call_maps_each_answer_and_stops_at_a_timeout() -> None:
+    bench = Bench()
+    bench.store(A=b"aaaaaaaa")
+    fill = [key(f"K{i}") for i in range(mooncake_module.PROBE_KEYS_PER_CALL - 2)]
+    bench.fake.script(IS_EXIST, lambda answers: answers)  # as the pool holds them
+    bench.fake.script(IS_EXIST, [-901])  # the master did not answer C within the RPC timeout
+    statuses = bench.driver.probe([key("A"), key("B"), *fill, key("C")], 0.0)
+    calls = bench.fake.calls_to(IS_EXIST)
+    assert [len(call.args[0]) for call in calls] == [mooncake_module.PROBE_KEYS_PER_CALL, 1]
+    assert statuses[:2] == (ProbeStatus.HIT, ProbeStatus.MISS)
+    assert statuses[-1] is ProbeStatus.UNKNOWN
+    # Once a call timed out, the calls after it are not made: their keys are UNKNOWN too.
+    bench.fake.script(IS_EXIST, lambda answers: [-901, *answers[1:]])
+    statuses = bench.driver.probe([key("C"), key("A"), *fill, key("B")], 0.0)
+    assert len(bench.fake.calls_to(IS_EXIST)) == len(calls) + 1
+    assert statuses[:2] == (ProbeStatus.UNKNOWN, ProbeStatus.HIT)
+    assert statuses[-1] is ProbeStatus.UNKNOWN
+    bench.fake.script(IS_EXIST, [-900])
+    with pytest.raises(StoreError, match=r"batch_is_exist answered RPC_FAIL\(-900\)"):
+        bench.driver.probe([key("A")], 0.0)
 
 
 # Access end.

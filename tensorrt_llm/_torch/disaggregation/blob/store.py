@@ -83,8 +83,9 @@ class RowStatus(enum.Enum):
 
     NOT_READY = "not_ready"
     """The key is held by a write that has not finished: a get delivered nothing, a put published
-    nothing of its own. ``probe`` gives the same answer for such a key. Only for a hold the store
-    confirmed; a store that cannot tell an unfinished write from another refusal answers FAULT."""
+    nothing of its own. ``probe`` answers the same, or MISS where the store cannot tell such a key
+    from an absent one. Only for a hold the store confirmed; a store that cannot tell an unfinished
+    write from another refusal answers FAULT."""
 
     DECLINED = "declined"
     """For a put: the store would not take the row, for space or policy, and said so. Nothing was
@@ -553,13 +554,15 @@ class StoreDriver(Protocol):
         self, keys: Sequence[str], budget_s: float, hint: Hint = None
     ) -> tuple[ProbeStatus, ...]:
         """Advisory presence of ``keys``, at the source ``hint`` names when given, answered within
-        ``budget_s`` seconds.
+        ``budget_s`` seconds, or within the store's own request timeout where its client takes no
+        per-call deadline.
 
-        Keys the store did not answer in time are UNKNOWN, never MISS; the call returns within the
-        budget whatever the store does, and a driver with no capacity to ask answers UNKNOWN at
-        once. A key held by an unfinished write is NOT_READY, as a get would report. Called only
-        when ``capabilities.probe`` is set, and with a hint only when ``capabilities.hints`` is.
-        Raises on a store error rather than answering MISS.
+        Keys the store did not answer in time are UNKNOWN, never MISS; the call returns within that
+        bound whatever the store does, and a driver with no capacity to ask answers UNKNOWN at
+        once. A key held by an unfinished write is NOT_READY, as a get would report, or MISS where
+        the store cannot tell it from an absent key. Called only when ``capabilities.probe`` is
+        set, and with a hint only when ``capabilities.hints`` is. Raises on a store error rather
+        than answering MISS.
         """
         ...
 

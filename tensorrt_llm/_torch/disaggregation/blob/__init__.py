@@ -13,6 +13,8 @@ Read top down; a fetch or publish flows ``BlobBackend`` -> ``StoreDriver`` -> st
   public contract, and the store key encoding. How an object is laid out in a store is its
   driver's private format.
 - ``mooncake``: ``MooncakeDriver``, a ``StoreDriver`` over a set-up Mooncake SDK client.
+  ``BlobBackend`` has no probe: a caller asking which objects exist calls the driver's ``probe``
+  directly.
 - ``mooncake_setup``: reads a store config and opens the SDK client; ``open_mooncake_driver``
   reads the config's ``blob`` section with the caller's reader (``BlobConfig`` for the backend)
   before it opens the SDK, and returns the driver with what the reader returned.

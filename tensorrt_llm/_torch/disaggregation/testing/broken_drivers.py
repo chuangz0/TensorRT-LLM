@@ -214,6 +214,12 @@ class ProbeCallsAHeldKeyAMiss(MemoryDriver):
         return tuple(ProbeStatus.MISS if a is ProbeStatus.NOT_READY else a for a in answers)
 
 
+class ProbeCallsAHeldKeyAHit(MemoryDriver):
+    def probe(self, keys: Sequence[str], budget_s: float, hint: Hint = None):
+        answers = super().probe(keys, budget_s, hint)
+        return tuple(ProbeStatus.HIT if a is ProbeStatus.NOT_READY else a for a in answers)
+
+
 class ProbeCallsAMissAHit(MemoryDriver):
     def probe(self, keys: Sequence[str], budget_s: float, hint: Hint = None):
         answers = super().probe(keys, budget_s, hint)
@@ -726,6 +732,11 @@ BROKEN_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities, str]
     ),
     "a probe of a held key is not ready": (
         ProbeCallsAHeldKeyAMiss,
+        DEFAULT_CAPABILITIES,
+        "test_a_key_held_by_an_unfinished_write_is_not_ready_for_get_put_and_probe",
+    ),
+    "a probe never calls a held key a hit": (
+        ProbeCallsAHeldKeyAHit,
         DEFAULT_CAPABILITIES,
         "test_a_key_held_by_an_unfinished_write_is_not_ready_for_get_put_and_probe",
     ),

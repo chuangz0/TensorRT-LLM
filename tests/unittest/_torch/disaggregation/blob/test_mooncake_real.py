@@ -11,7 +11,7 @@ the host's fastest active InfiniBand devices). The master must be shipped by one
 distributions and report 0.3.13, and every installed pinned client build must be 0.3.13; both
 versions are printed and recorded as test-suite properties. The shared
 ``driver_conformance`` checks run here too, each over a fresh client and under a key prefix of its
-own.
+own; a probe meets a master that stopped answering (paused) and one that is gone.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess  # nosec B404
 import threading
 import time
@@ -45,6 +46,7 @@ from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
 )
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import SLOT as CHECK_SLOT
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import DriverConformance
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import LaunchedMaster
 
 # An exception that escapes a thread fails the test.
 pytestmark = [
@@ -59,6 +61,9 @@ PROTOCOL = os.environ.get("TRTLLM_MOONCAKE_PROTOCOL", "rdma")
 DEVICES = os.environ.get("TRTLLM_MOONCAKE_DEVICES", "")
 POOL_BYTES = 1 << 30
 SLOT_BYTES = 64 << 10
+# The RPC timeout of a client probing a paused master: well inside the half second the check allows
+# past the probe's budget.
+PAUSED_MASTER_RPC_TIMEOUT_MS = 200
 
 
 def _require_mooncake() -> str:
@@ -113,8 +118,8 @@ def _master_binary(run_dir: str, flags: Sequence[str]) -> str:
 
 def _running_pool(
     run_dir: str, segment_size: int, master_flags: Sequence[str] = ()
-) -> tuple[contextlib.ExitStack, str]:
-    """A master and a segment provider: the stack that stops them, and the master's address."""
+) -> tuple[contextlib.ExitStack, LaunchedMaster]:
+    """A master and a segment provider: the stack that stops them, and the master."""
     from test_common.mooncake_utils import running_master_on_free_ports, running_segment_provider
 
     stack = contextlib.ExitStack()
@@ -136,7 +141,7 @@ def _running_pool(
             device_name=DEVICES,
         )
     )
-    return stack, master.address
+    return stack, master
 
 
 @pytest.fixture(scope="module")
@@ -144,9 +149,9 @@ def pool(tmp_path_factory, record_testsuite_property):
     versions = _require_mooncake()
     print(versions)
     record_testsuite_property("mooncake", versions)
-    stack, address = _running_pool(str(tmp_path_factory.mktemp("pool")), POOL_BYTES)
+    stack, master = _running_pool(str(tmp_path_factory.mktemp("pool")), POOL_BYTES)
     with stack:
-        yield address
+        yield master
 
 
 class Clients:
@@ -183,14 +188,14 @@ class Clients:
                 store.close()
 
 
-def client_config(master: str) -> MooncakeConfig:
+def client_config(master: str, **options) -> MooncakeConfig:
     """A client with no segment of its own and no buffer for the SDK's copying calls."""
-    return MooncakeConfig(master, 0, PROTOCOL, DEVICES, local_buffer_size=0)
+    return MooncakeConfig(master, 0, PROTOCOL, DEVICES, local_buffer_size=0, **options)
 
 
 @pytest.fixture
 def clients(pool):
-    opened = Clients(pool)
+    opened = Clients(pool.address)
     yield opened
     opened.close()
 
@@ -217,7 +222,7 @@ def test_real_store_full_is_declined(tmp_path, request) -> None:
     # answers at once. The master evicts once the pool passes its high watermark, so how many rows
     # land varies, but some are always declined and none fault.
     stack, master = _running_pool(str(tmp_path), segment_size=16 << 20)
-    clients = Clients(master)
+    clients = Clients(master.address)
     with stack:
         names = [f"{request.node.name}-{i}" for i in range(512)]
         writer = clients.endpoint(names, workers=1)
@@ -257,14 +262,19 @@ def test_real_get_faults_a_shorter_object_it_landed_and_refuses_a_longer_one(
 
 class TestRealMooncakeConformance(DriverConformance):
     """The shared driver checks over the real pool, one fresh client per check, with the scenarios
-    a real master can stage: a key another client is writing, and a get or a put held inside the
-    SDK."""
+    a real master can stage: a key another client is writing, a get or a put held inside the SDK,
+    a master that stopped answering and one that is gone."""
 
     timeout = 30.0
+    probe_sees_unfinished_writes = False  # the master answers 0 for an open put
 
     @pytest.fixture(autouse=True)
-    def _master(self, pool):
-        self.master = pool
+    def _master(self, pool, tmp_path):
+        self.master = pool.address
+        self.master_process = pool.process
+        self.run_dir = str(tmp_path)
+        yield
+        self._resume_master()  # a probe check that failed before its unblock left it paused
 
     def make_driver(self) -> MooncakeDriver:
         return MooncakeDriver(open_sdk(client_config(self.master)))
@@ -293,6 +303,24 @@ class TestRealMooncakeConformance(DriverConformance):
             open_sdk(client_config(self.master)), "batch_put_from_multi_buffer_ranges", key
         )
         return MooncakeDriver(sdk), key, sdk.entered, sdk.release.set
+
+    def make_blocked_probe(self):
+        # The pool's master paused: the client's existence check ends at its RPC timeout.
+        timeout = PAUSED_MASTER_RPC_TIMEOUT_MS
+        driver = MooncakeDriver(open_sdk(client_config(self.master, rpc_timeout_ms=timeout)))
+        self.master_process.send_signal(signal.SIGSTOP)
+        return driver, f"paused{secrets.token_hex(4)}/v1/Q", self._resume_master
+
+    def make_failing_presence(self):
+        # A client whose master is gone: its existence check answers RPC_FAIL.
+        from test_common.mooncake_utils import running_master_on_free_ports
+
+        with running_master_on_free_ports(self.run_dir, protocol=PROTOCOL) as gone:
+            sdk = open_sdk(client_config(gone.address, rpc_timeout_ms=1000))
+        return MooncakeDriver(sdk), f"gone{secrets.token_hex(4)}/v1/F"
+
+    def _resume_master(self) -> None:
+        self.master_process.send_signal(signal.SIGCONT)
 
 
 class DataCallsInFlight:
@@ -420,7 +448,7 @@ def test_real_put_stuck_past_the_discard_timeout_keeps_its_keys(tmp_path, reques
     _require_mooncake()
     flags = [f"--put_start_discard_timeout_sec={DISCARD_S}"]
     stack, master = _running_pool(str(tmp_path), 64 << 20, master_flags=flags)
-    clients = Clients(master)
+    clients = Clients(master.address)
     with stack:
         names = [f"{request.node.name}-{i}" for i in range(8)]
         keys = [store_key(name) for name in names]

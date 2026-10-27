@@ -121,6 +121,9 @@ class _Code(IntEnum):
 
 
 OBJECT_EXISTS, OBJECT_ABSENT = 1, 0  # batch_is_exist answers
+# Keys in one batch_is_exist call of a probe: bounds the RPC's message and the master's lock time.
+# A 32k-token prompt of 32-token blocks is 1,024 keys.
+PROBE_KEYS_PER_CALL = 8192
 DEFAULT_WORKERS = 4
 DEFAULT_ROWS_PER_CALL = 256
 DEFAULT_BYTES_PER_CALL = 128 << 20
@@ -131,7 +134,7 @@ _CAPABILITIES = DriverCapabilities(
     get=True,
     put=True,
     cancel=True,  # ends the rows no worker took; the SDK cannot stop a running call
-    probe=False,
+    probe=True,
     max_rows_per_op=None,  # any number: the driver cuts an operation into parts itself
     # The master answers OBJECT_NOT_FOUND for a key it does not hold; failures keep their own
     # codes and stay FAULT.
@@ -476,9 +479,30 @@ class MooncakeDriver:
     def probe(
         self, keys: Sequence[str], budget_s: float, hint: Hint = None
     ) -> tuple[ProbeStatus, ...]:
-        """Never called: ``capabilities.probe`` is false."""
+        """Asks the master which keys hold a readable object, ``PROBE_KEYS_PER_CALL`` keys per
+        ``batch_is_exist`` call, on the caller's thread, which ends its probes before ``close``.
+        The master answers 0 both for an absent key and for one whose put is still open, so both
+        are MISS. The call takes no deadline: the client's RPC timeout (``rpc_timeout_ms`` of the
+        store config), not ``budget_s``, bounds each one, and a key it timed out on is UNKNOWN, as
+        are the keys of the calls after it, which are not made. Any other error raises
+        ``StoreError``.
+
+        The master also grants every existing key a read lease of its ``default_kv_lease_ttl``,
+        so a probed object outlives eviction that long.
+
+        TODO(mooncake): a per-call deadline for batch_is_exist, and an answer that tells an open
+        put from an absent key."""
+        if hint is not None:
+            raise DriverRejected("this driver reads no hints")
         self._require_open()
-        return tuple(ProbeStatus.UNKNOWN for _ in keys)
+        statuses: list[ProbeStatus] = []
+        for start in range(0, len(keys), PROBE_KEYS_PER_CALL):
+            chunk = list(keys[start : start + PROBE_KEYS_PER_CALL])
+            answers = _one_answer_per_key(self._store.batch_is_exist(chunk), len(chunk))
+            statuses += [_probe_status(answer) for answer in answers]
+            if _Code.RPC_TIMEOUT in answers:  # the master did not answer in time: ask no more
+                break
+        return tuple(statuses) + (ProbeStatus.UNKNOWN,) * (len(keys) - len(statuses))
 
     def drain(self, budget_s: float) -> bool:
         """Refuses new work for good, cancels the rows no worker took, ends the worker threads,
@@ -1011,6 +1035,16 @@ def _result_of_get(answer: int, size: int, is_reread: bool) -> RowResult:
     if answer == _Code.OBJECT_NOT_FOUND:
         return _MISS
     return faulted(f"batch_get_into: {_describe(answer)}")
+
+
+def _probe_status(answer: int) -> ProbeStatus:
+    if answer == OBJECT_EXISTS:
+        return ProbeStatus.HIT
+    if answer == OBJECT_ABSENT:
+        return ProbeStatus.MISS
+    if answer == _Code.RPC_TIMEOUT:  # the master did not answer within the client's RPC timeout
+        return ProbeStatus.UNKNOWN
+    raise StoreError(f"batch_is_exist answered {_describe(answer)}")
 
 
 def _session_gone(revoke_answer: int) -> bool:

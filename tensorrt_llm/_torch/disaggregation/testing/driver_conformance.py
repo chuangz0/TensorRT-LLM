@@ -438,6 +438,10 @@ class DriverConformance:
     # asks. A driver that answers inside put/get, as the in-memory driver's automatic mode does,
     # sets False to skip the checks that hold a put or a get inside the store.
     returns_before_the_store_answers = True
+    # True when a probe tells a key held by an unfinished write (NOT_READY) from an absent one. A
+    # driver whose store answers both alike, as Mooncake's existence check does, sets False: its
+    # probe may then call a held key MISS.
+    probe_sees_unfinished_writes = True
 
     def make_driver(self) -> StoreDriver:
         raise NotImplementedError
@@ -1101,7 +1105,10 @@ class DriverConformance:
                 (put,) = h.wait_for_results(h.put(write))
                 assert put.status is RowStatus.NOT_READY, put
                 if driver.capabilities.probe:
-                    assert driver.probe([key], h.timeout) == (ProbeStatus.NOT_READY,)
+                    answers = {(ProbeStatus.NOT_READY,)}
+                    if not self.probe_sees_unfinished_writes:
+                        answers.add((ProbeStatus.MISS,))
+                    assert driver.probe([key], h.timeout) in answers
             finally:
                 release()
             (put,) = h.wait_for_results(h.put(write))
