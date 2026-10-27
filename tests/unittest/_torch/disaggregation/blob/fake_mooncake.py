@@ -3,8 +3,9 @@
 """A fake ``mooncake.store.MooncakeDistributedStore`` that moves real bytes and can be scripted.
 
 It implements only the SDK methods the Mooncake driver may call (plus ``setup`` and ``close`` for
-the opening code), so a call to any other one, a copying API for instance, fails with
-``AttributeError``. Several fakes share one ``FakePool``, as clients of one master do.
+the opening code, and the two calls that mount and unmount a segment), so a call to any other one,
+a copying API for instance, fails with ``AttributeError``. Several fakes share one ``FakePool``, as
+clients of one master do.
 
 Unscripted calls follow SDK 0.3.13:
 
@@ -100,6 +101,8 @@ class FakeMooncakeStore:
         self.registered: dict[int, int] = {}
         self.put_sessions: set[str] = set()
         self.setup_answer = 0
+        self.mount_answer = 0  # allocate_and_mount_segment's "ret"
+        self.unmount_answer = 0  # unmount_and_free_segment's
         self.closed = False
         self._lock = threading.Lock()
         self._steps: dict[str, deque] = defaultdict(deque)
@@ -142,6 +145,19 @@ class FakeMooncakeStore:
         self._record("close", (), {})
         self.closed = True
         return 0
+
+    def allocate_and_mount_segment(self, size: int, protocol: str, location: str) -> dict:
+        self._record("allocate_and_mount_segment", (size, protocol, location), {})
+        mounted = self.mount_answer == 0
+        return {
+            "ret": self.mount_answer,
+            "segment_ids": ["00000000-0000-0000-0000-000000000001"] if mounted else [],
+            "allocated_size": size if mounted else 0,
+        }
+
+    def unmount_and_free_segment(self, segment_ids: list[str], grace_period_seconds: int) -> int:
+        self._record("unmount_and_free_segment", (segment_ids, grace_period_seconds), {})
+        return self.unmount_answer
 
     def register_buffer(self, buffer_ptr: int, size: int) -> int:
         args = (buffer_ptr, size)

@@ -26,10 +26,12 @@ memory from a separate process.
 """
 
 import contextlib
+import json
 import os
 import subprocess  # nosec B404
 import sys
 import time
+import urllib.request
 from typing import Iterator
 
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import local_address
@@ -40,7 +42,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
 )
 from tensorrt_llm._utils import get_free_ports
 
-__all__ = ["running_master_on_free_ports", "running_segment_provider"]
+__all__ = ["master_segments", "running_master_on_free_ports", "running_segment_provider"]
 
 PORT_ATTEMPTS = 5
 SEGMENT_PROVIDER_TIMEOUT = 60.0
@@ -151,3 +153,13 @@ def running_segment_provider(
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+
+
+def master_segments(metrics_url: str) -> list[dict]:
+    """The segments the master at `metrics_url` (`http://host:port`) lists.
+
+    One per mounted segment (`/get_segments_detail`): `segment_name` (the client's `host:port`),
+    `status` and `allocator_used_bytes` among others.
+    """
+    with urllib.request.urlopen(f"{metrics_url}/get_segments_detail", timeout=10) as reply:
+        return json.load(reply)["segments"]

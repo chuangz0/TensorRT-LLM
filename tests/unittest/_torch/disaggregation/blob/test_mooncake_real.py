@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The blob backend over a real Mooncake pool: a master, and a separate process holding objects.
+"""The blob backend over a real Mooncake pool: a master, and a separate process holding objects;
+and a segment a client mounts in the pool, then unmounts gracefully.
 
 The tested clients give the pool no segment (``global_segment_size`` 0), so every object sits in
 the other process's segment and every transfer goes through the transfer engine; their
@@ -19,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import importlib.metadata
 import importlib.util
+import json
 import os
 import pathlib
 import re
@@ -41,7 +43,9 @@ from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
     PINNED_SDK_DISTRIBUTIONS,
     PINNED_SDK_VERSION,
+    UNMOUNT_GRACE_S,
     MooncakeConfig,
+    StoreSegment,
     open_sdk,
 )
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import SLOT as CHECK_SLOT
@@ -476,4 +480,54 @@ def test_real_put_stuck_past_the_discard_timeout_keeps_its_keys(tmp_path, reques
         assert all(reader.read(name) == rows[name] for name in names)
         writer.close()
         reader.close()
+        clients.close()  # while the master still answers
+
+
+def test_real_store_segment_being_unmounted_serves_reads_for_the_grace_then_misses_cleanly(
+    tmp_path, request
+) -> None:
+    """A client mounts the pool's only memory and puts 8 objects there. Once it begins unmounting,
+    the objects read whole for the grace and a new put is declined; after it, gets miss and the end
+    of every get is proven; once Mooncake freed the memory, the master lists no segment."""
+    from test_common.mooncake_utils import master_segments, running_master_on_free_ports
+
+    _require_mooncake()
+    run_dir = str(tmp_path)
+    names = [f"{request.node.name}-{i}" for i in range(8)]
+    late = f"{request.node.name}-late"
+    with running_master_on_free_ports(run_dir, protocol=PROTOCOL, eviction_ratio=0.0) as master:
+        with open(os.path.join(run_dir, "pool.json")) as file:
+            metrics_port = json.load(file)["metrics_port"]
+        metrics_url = f"http://{master.address.rsplit(':', 1)[0]}:{metrics_port}"
+        segment = StoreSegment.mount(open_sdk(client_config(master.address)), 256 << 20, PROTOCOL)
+        clients = Clients(master.address)
+        writer = clients.endpoint(names + [late])
+        rows = write_random_rows(writer, seed=12)
+        # Every endpoint is open before the grace starts: a client takes about a second to open.
+        readers = [clients.endpoint(names, fill=0x2D) for _ in range(2)]
+        assert masks(finish(writer, writer.backend.publish, *names)) == [[True] * 8]
+        (listed,) = master_segments(metrics_url)
+        assert listed["allocator_used_bytes"] > 0
+
+        segment.begin_unmount()
+        grace_ends = time.monotonic() + UNMOUNT_GRACE_S
+        during = finish(readers[0], readers[0].backend.fetch, *names)
+        declined = finish(writer, writer.backend.publish, late)
+        assert time.monotonic() < grace_ends, "the reads took longer than the grace"
+        assert during.fault is None and masks(during) == [[True] * 8]
+        assert all(readers[0].read(name) == rows[name] for name in names)
+        assert declined.fault is None and masks(declined) == [[False]]
+        assert writer.driver.inner.stats()["rows_declined_pool_full"] == 1
+
+        time.sleep(grace_ends + 1 - time.monotonic())  # past the grace: the master dropped them
+        after = finish(readers[1], readers[1].backend.fetch, *names)
+        assert after.fault is None and masks(after) == [[False] * 8]
+        assert readers[1].driver.inner.stats()["ops_unprovable"] == 0
+        segment.wait_until_freed()
+        # The master drops the segment's record shortly after Mooncake freed the memory.
+        deadline = time.monotonic() + 10
+        while master_segments(metrics_url) and time.monotonic() < deadline:
+            time.sleep(0.5)
+        assert master_segments(metrics_url) == []
+        segment.store.close()  # it holds no segment any more
         clients.close()  # while the master still answers

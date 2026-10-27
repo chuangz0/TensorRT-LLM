@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Store config, opening the Mooncake SDK and driver, and the blob package's layering.
+"""Store config, opening the Mooncake SDK and driver, store segments, and the blob package's
+layering.
 
 The SDK is a fake module put into ``sys.modules``, the master probe and the route probe are
 replaced, and the InfiniBand sysfs tree is a temporary directory, so nothing here needs a network,
@@ -26,7 +27,9 @@ from tensorrt_llm._torch.disaggregation.blob import mooncake_setup
 from tensorrt_llm._torch.disaggregation.blob.backend import BlobConfig
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
+    UNMOUNT_GRACE_S,
     MooncakeConfig,
+    StoreSegment,
     load_store_config,
     open_mooncake_driver,
     open_sdk,
@@ -520,6 +523,62 @@ def test_a_driver_that_cannot_start_closes_the_client_it_was_given(
         open_mooncake_driver(store_config(), read_blob)
     (store,) = sdk.stores
     assert store.calls_to("setup") and len(store.calls_to("close")) == 1
+
+
+# Store segments.
+
+
+class Clock:
+    """``time`` as ``mooncake_setup`` sees it: ``sleep`` moves ``monotonic`` on."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.slept: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def test_a_store_segment_is_freed_13_s_after_its_unmount_began(
+    sdk: Sdk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = Clock()
+    monkeypatch.setattr(mooncake_setup, "time", clock)
+    store = open_sdk(MooncakeConfig(MASTER, protocol="rdma", device_name="mlx5_0"))
+    segment = StoreSegment.mount(store, 1 << 30, "rdma")
+    (mount,) = store.calls_to("allocate_and_mount_segment")
+    assert mount.args == (1 << 30, "rdma", "*")
+    segment.begin_unmount()
+    (unmount,) = store.calls_to("unmount_and_free_segment")
+    assert unmount.args == (segment.segment_ids, UNMOUNT_GRACE_S)
+    clock.now += 5.0  # the process's own shutdown
+    segment.wait_until_freed()
+    assert clock.slept == [8.0]  # 13 s after begin_unmount, 5 of them spent shutting down
+    assert store.calls_to("close") == []  # closing would free the memory at once
+
+
+def test_an_unmount_the_master_refuses_still_waits(
+    sdk: Sdk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mooncake unmounts each segment of a mount on its own and answers the first one's error, so
+    others may be unmounting: their readers get the same 13 s."""
+    clock = Clock()
+    monkeypatch.setattr(mooncake_setup, "time", clock)
+    store = open_sdk(MooncakeConfig(MASTER, protocol="tcp"))
+    store.unmount_answer = -900
+    segment = StoreSegment.mount(store, 1 << 30, "tcp")
+    errors: list[str] = []
+    monkeypatch.setattr(mooncake_setup.logger, "error", errors.append)
+    segment.begin_unmount()
+    segment.wait_until_freed()
+    assert clock.slept == [13.0]
+    assert errors == [
+        "mooncake: the master refused to unmount the segment (code -900); waiting anyway"
+    ]
 
 
 # Layering.

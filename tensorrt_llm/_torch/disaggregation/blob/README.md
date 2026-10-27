@@ -33,7 +33,7 @@ store SDK
 | `store.py` | the driver boundary: `StoreDriver`, the optional `RegistersRegionsTogether`, `RowBatch`, `RowIO`, `OnChange`, `RowStatus`, `DriverCapabilities`, `DriverRejected`, `RegistrationError` |
 | `keys.py` | the store key encoding |
 | `mooncake.py` | `MooncakeDriver`, a `StoreDriver` over a set-up Mooncake 0.3.13 SDK client |
-| `mooncake_setup.py` | `open_mooncake_driver`: reads a store config and opens the SDK client and the driver |
+| `mooncake_setup.py` | `open_mooncake_driver`: reads a store config and opens the SDK client and the driver; `StoreSegment`: host memory a process gives the pool and unmounts gracefully |
 | `../testing/` | what a driver's own CI imports from the wheel: the conformance suite, the in-memory store and drivers, the broken drivers that prove every check bites |
 
 ## Running the tests

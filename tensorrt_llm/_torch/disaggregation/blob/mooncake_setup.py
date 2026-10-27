@@ -13,6 +13,9 @@ TCP's legacy framing (``MC_TCP_PROTO=1``), the local hot cache (``MC_STORE_LOCAL
 the newer transfer engine (``MC_USE_TENT``, ``MC_USE_TEV1``) and any SDK build other than the
 pinned ones.
 
+``StoreSegment`` is host memory a process gives the pool: a segment that holds any process's
+objects, and that the process unmounts gracefully before it ends.
+
 Over RDMA, a process that used ibverbs before its first Mooncake client (importing
 ``tensorrt_llm`` does) logs ``RDMA context setup failed: fork compatibility: Invalid argument``
 once: ``ibv_fork_init`` only works before any other verbs call. It is harmless on Linux 5.13 and
@@ -29,7 +32,7 @@ import socket
 import sys
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, TypeVar
 
 import yaml
@@ -40,6 +43,7 @@ from .mooncake import DEFAULT_BYTES_PER_CALL, DEFAULT_ROWS_PER_CALL, DEFAULT_WOR
 
 __all__ = [
     "MooncakeConfig",
+    "StoreSegment",
     "load_store_config",
     "open_mooncake_driver",
     "open_sdk",
@@ -64,6 +68,17 @@ RPC_CONNECT_TIMEOUT_MS = 5_000
 # cache pieces. Mooncake drops a message longer than MC_HANDSHAKE_MAX_LENGTH (1 MiB unless set, at
 # most 128 MiB), which it reads once per process.
 HANDSHAKE_MAX_BYTES = 64 << 20
+# How long a segment being unmounted stays readable (StoreSegment.begin_unmount): a get that misses
+# after it costs a request its fetch, nothing more.
+UNMOUNT_GRACE_S = 2
+# Mooncake frees a segment unmounted gracefully this long after its grace ended, once the master
+# confirms (client_service.cpp, Client::StartGracefulUnmountTimer): a get that found the segment
+# before the grace ended has that long to finish.
+MOONCAKE_UNMOUNT_CLEANUP_S = 10
+# Slack after Mooncake's cleanup, for the master's confirmation and the free itself.
+_UNMOUNT_MARGIN_S = 1
+# A segment's location hint: Mooncake reads the NUMA node from the memory itself.
+_ANY_LOCATION = "*"
 SECTIONS = ("blob", "mooncake")
 # Logged before setup, as Mooncake will read them.
 _LOGGED_ENVIRONMENT = (
@@ -93,7 +108,8 @@ class MooncakeConfig:
         master_server_address: The master's ``host:port``.
         global_segment_size: Bytes of this process's memory that ``setup`` mounts to hold pool
             objects (its segment); the objects in it go when the process does. 0 by default:
-            other processes give the pool its memory.
+            a process gives the pool memory through ``StoreSegment`` instead, which it unmounts
+            gracefully.
         protocol: ``"rdma"`` or ``"tcp"``.
         device_name: Comma-separated RDMA devices; empty picks every active InfiniBand device at
             the highest rate.
@@ -236,6 +252,64 @@ def open_sdk(config: MooncakeConfig) -> Any:
             f"protocol {config.protocol})"
         )
     return store
+
+
+@dataclass
+class StoreSegment:
+    """Host memory this process gives the pool: a segment of fresh, pinned memory that the master
+    places objects in and other clients read and write directly.
+
+    Unmounting takes two calls. ``begin_unmount``: no new object lands here, and the objects here
+    stay readable for UNMOUNT_GRACE_S; after that the master drops them and gets miss. Mooncake
+    keeps the memory registered MOONCAKE_UNMOUNT_CLEANUP_S longer for gets already under way, then
+    frees it. ``wait_until_freed`` returns after that; then the process may exit.
+
+    Rules: never ``close()`` the client, nor end the process before ``wait_until_freed`` returns:
+    either frees the memory under a reader's get, that get fails without proof that its transfers
+    ended, and the reader's process ends. Mount at most once per client: a later segment would go
+    by the same name (the client's address), where a peer's retried read of an old object could
+    land.
+    """
+
+    store: Any  # the MooncakeDistributedStore that mounted the memory
+    segment_ids: list[str]
+    # When Mooncake will have freed the memory (time.monotonic()); None until an unmount began.
+    _freed_at: float | None = field(default=None, init=False)
+
+    @classmethod
+    def mount(cls, store: Any, nbytes: int, protocol: str) -> StoreSegment:
+        """Mounts ``nbytes`` of fresh host memory as a segment of ``store``, a client opened with
+        no segment of its own (``global_segment_size`` 0). Mooncake rounds the size up to whole
+        allocator slabs.
+
+        Raises:
+            RuntimeError: Mooncake did not mount it.
+        """
+        mounted = store.allocate_and_mount_segment(nbytes, protocol, _ANY_LOCATION)
+        if mounted["ret"] != 0:
+            raise RuntimeError(
+                f"mooncake: mounting {nbytes} bytes of host memory failed with {mounted['ret']}"
+            )
+        return cls(store, list(mounted["segment_ids"]))
+
+    def begin_unmount(self) -> None:
+        """Stops new objects landing in the segment; the old ones stay readable for
+        UNMOUNT_GRACE_S. If the master refuses, this still waits: a mount is several Mooncake
+        segments, each unmounted on its own, and the code is the first one's error, so others may
+        be unmounting."""
+        code = self.store.unmount_and_free_segment(self.segment_ids, UNMOUNT_GRACE_S)
+        if code != 0:
+            logger.error(
+                f"mooncake: the master refused to unmount the segment (code {code}); waiting anyway"
+            )
+        self._freed_at = (
+            time.monotonic() + UNMOUNT_GRACE_S + MOONCAKE_UNMOUNT_CLEANUP_S + _UNMOUNT_MARGIN_S
+        )
+
+    def wait_until_freed(self) -> None:
+        """Sleeps until Mooncake has freed the memory; returns at once if no unmount began."""
+        if self._freed_at is not None:
+            time.sleep(max(0.0, self._freed_at - time.monotonic()))
 
 
 def open_mooncake_driver(
