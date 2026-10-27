@@ -41,6 +41,7 @@ from tensorrt_llm._torch.disaggregation.base.backend import (
     CacheKind,
     Capabilities,
     Hint,
+    LayerGroupRows,
     MemoryKind,
     Outcome,
     SlotRegion,
@@ -104,6 +105,16 @@ class _Attempt:
         )
 
 
+def _slot_addresses(
+    regions: tuple[SlotRegion, ...], group: LayerGroupRows
+) -> tuple[list[int], int]:
+    """The address of each row's staging slot, and the slot size."""
+    (index,) = group.region_indices
+    region = regions[index]
+    slots = group.slots.tolist()
+    return [region.address + slot * region.slot_bytes for slot in slots], region.slot_bytes
+
+
 class _ByteBackend:
     """Deterministic provider reading and writing the actual protected host slots."""
 
@@ -133,8 +144,8 @@ class _ByteBackend:
         attempt = _Attempt(view)
         self.attempts.append(attempt)
         for group in view.groups:
-            length = self.regions[group.region_index].slot_bytes
-            for ordinal, address in enumerate(group.addresses.tolist()):
+            addresses, length = _slot_addresses(self.regions, group)
+            for ordinal, address in enumerate(addresses):
                 data = self.kit.staged_row(_FETCH_BYTE, group.layer_group_index, ordinal, length)
                 ctypes.memmove(address, data, length)
         return attempt
@@ -148,8 +159,8 @@ class _ByteBackend:
     def read_publication(self, attempt: _Attempt) -> None:
         """Read real host bytes while the operation still protects its staging slots."""
         for group in attempt.view.groups:
-            length = self.regions[group.region_index].slot_bytes
-            for ordinal, address in enumerate(group.addresses.tolist()):
+            addresses, length = _slot_addresses(self.regions, group)
+            for ordinal, address in enumerate(addresses):
                 self.published[group.layer_group_index, ordinal] = self.kit.host_bytes(
                     address, length
                 )
