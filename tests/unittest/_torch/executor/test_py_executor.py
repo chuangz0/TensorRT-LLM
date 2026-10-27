@@ -12,6 +12,7 @@ to PyExecutor, including:
 - Event-loop crash propagation to await_responses callers (nvbug 6038228)
 """
 
+import datetime
 import threading
 import time
 import types
@@ -55,6 +56,7 @@ from tensorrt_llm._torch.pyexecutor.py_executor import (
     PyExecutor,
     _ADPForwardIntent,
 )
+from tensorrt_llm._torch.pyexecutor.request_utils import RequestBroadcaster
 from tensorrt_llm._torch.pyexecutor.resource_manager import NoFreeSlotsError, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
@@ -4472,3 +4474,30 @@ def test_first_token_response_carries_the_prefill_logits(monkeypatch, overlap):
         assert py_result.generation_logits is None
         py_result.append_generation_logits(first_logits + 10)  # the next decode step lands
         assert torch.equal(response.result.generation_logits, first_logits.transpose(0, 1))
+
+
+@pytest.mark.parametrize("sending", [True, False])
+def test_a_context_server_does_not_wait_for_requests_while_kv_sends_are_in_flight(sending):
+    """After its last chunk a context-only request leaves the active requests while its KV cache
+    is still being sent. Only executor passes reap the send, free its pages and time it out, so
+    rank 0 does not wait on an empty request queue until the send ends."""
+    executor = object.__new__(PyExecutor)
+    executor.kv_connector_manager = None
+    executor.control_requests = []
+    executor.request_accumulated = []
+    executor.canceled_req_ids = []
+    executor.is_shutdown = False
+    executor._disable_mpi = False
+    executor.hang_detector = types.SimpleNamespace(pause=nullcontext)
+    executor.dist = types.SimpleNamespace(rank=0, world_size=1)
+    executor.request_broadcaster = RequestBroadcaster(executor.dist, executor.hang_detector)
+    executor.executor_request_queue = Mock()
+    executor.executor_request_queue.get_from_request_queue.return_value = []
+    executor.kv_cache_transceiver = Mock()
+    executor.async_transfer_manager = Mock()
+    executor.async_transfer_manager.has_any_inflight_requests.return_value = sending
+
+    executor._fetch_and_enqueue_requests(FCFSWaitingQueue(), total_num_live_requests=0)
+
+    expected = datetime.timedelta(0) if sending else None
+    executor.executor_request_queue.get_from_request_queue.assert_called_once_with(expected)
