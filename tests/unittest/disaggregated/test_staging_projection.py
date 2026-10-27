@@ -28,7 +28,6 @@ from tensorrt_llm._torch.disaggregation._assembly import (
     ProfileSpec,
     RegionNamespace,
     attach_domain,
-    bind_write_return,
     check_view_compatibility,
 )
 from tensorrt_llm._torch.disaggregation.base.backend import CacheKind, Outcome, SlotRegion, View
@@ -44,7 +43,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     LentLayerGroupRows,
     MemoryKind,
     MemoryRegion,
-    ResumeBounds,
     StagingOptions,
 )
 from tensorrt_llm._torch.weight_sharing.artifact_identity import ArtifactIdentity
@@ -76,8 +74,8 @@ def _profile() -> ProfileSpec:
         dtype="bfloat16",
         topology=(1, 1, 1, 1),
         state_kinds=(CacheKind.PAGED,),
-        full_attention=True,
-        sparse_attention=False,
+        attention_windows=(),
+        sparse_attention=None,
         sink_token_length=0,
         lora_enabled=False,
         pool_count=1,
@@ -218,8 +216,8 @@ def test_attachment_uses_public_layout_and_complete_namespace(
 @pytest.mark.parametrize(
     "layout, message",
     [
-        (replace(_layout(), dtype="HALF"), "BF16"),
-        (replace(_layout(), quant_mode="fp8"), "unquantized"),
+        (replace(_layout(), dtype="HALF"), "bfloat16 cache"),
+        (replace(_layout(), dtype="FP8", quant_mode="fp8"), "bfloat16 cache"),
         (replace(_layout(), topology=RankTopology(tp_size=2)), "topology"),
         (
             replace(_layout(), layer_groups=(LayerGroupDesc("state", None, 0, 0, (0,)),)),
@@ -227,11 +225,11 @@ def test_attachment_uses_public_layout_and_complete_namespace(
         ),
         (
             replace(_layout(), layer_groups=(LayerGroupDesc("attention", 32, 0, 0, (0,)),)),
-            "full-attention",
+            "windows do not match",
         ),
         (
             replace(_layout(), layer_groups=(LayerGroupDesc("attention", None, 1, 0, (0,)),)),
-            "attention sinks",
+            "attention sink tokens",
         ),
         (replace(_layout(), pool_slot_bytes={0: (64,), 1: (64,)}), "pool groups"),
         (replace(_layout(), staging_region_index={}), "HOST/NAMED"),
@@ -240,7 +238,7 @@ def test_attachment_uses_public_layout_and_complete_namespace(
     ],
     ids=[
         "dtype",
-        "quantized",
+        "fp8",
         "topology",
         "state",
         "window",
@@ -354,7 +352,7 @@ def test_view_rejects_region_outside_selected_namespace() -> None:
 
 
 def test_view_rejects_unsupported_row_placement() -> None:
-    """The initial HOST/NAMED path refuses views without keys or address placement."""
+    """The initial HOST/NAMED path refuses views without keys or slot placement."""
     view = LeaseView((LentLayerGroupRows(7, np.array([0])),), start=0, end=32)
     with pytest.raises(ValueError, match="requires keys"):
         check_view_compatibility(view, RegionNamespace((), MemoryKind.HOST))
@@ -368,8 +366,8 @@ def test_view_rejects_unsupported_row_placement() -> None:
         ("compatibility_id", "", ValueError),
         ("compatibility_id", "   ", ValueError),
         ("compatibility_id", 1, ValueError),
-        ("sparse_attention", True, ValueError),
-        ("sparse_attention", 0, ValueError),
+        ("sparse_attention", {"algorithm": "rocket"}, ValueError),
+        ("sparse_attention", True, TypeError),
         ("sink_token_length", 1, ValueError),
         ("sink_token_length", False, TypeError),
         ("lora_enabled", True, ValueError),
@@ -378,16 +376,14 @@ def test_view_rejects_unsupported_row_placement() -> None:
         ("staging", object(), TypeError),
         ("lifecycle_profile_id", "", ValueError),
         ("model_layout", "mha-token-major", ValueError),
-        ("topology", (2, 1, 1, 1), ValueError),
+        ("topology", (0, 1, 1, 1), ValueError),
         ("topology", (1, 2, 1, 1), ValueError),
         ("topology", (1, 1, 2, 1), ValueError),
         ("topology", (1, 1, 1, 2), ValueError),
         ("topology", (True, 1, 1, 1), TypeError),
         ("state_kinds", (CacheKind.PAGED, CacheKind.STATE), ValueError),
         ("state_kinds", ("attention",), TypeError),
-        ("dtype", "float16", ValueError),
-        ("full_attention", False, ValueError),
-        ("pool_count", 2, ValueError),
+        ("dtype", "int8", ValueError),
         ("pool_count", True, TypeError),
         ("speculative_mode", "eagle", ValueError),
         ("model_role", "draft", ValueError),
@@ -399,7 +395,7 @@ def test_view_rejects_unsupported_row_placement() -> None:
         "empty-compatibility",
         "blank-compatibility",
         "compatibility-type",
-        "sparse-attention",
+        "sparse-algorithm",
         "sparse-type",
         "attention-sinks",
         "sink-type",
@@ -417,8 +413,6 @@ def test_view_rejects_unsupported_row_placement() -> None:
         "hybrid-state",
         "noncanonical-kind",
         "dtype",
-        "window",
-        "multiple-pools",
         "boolean-pool-count",
         "speculative-mode",
         "draft-role",
@@ -431,6 +425,97 @@ def test_profile_rejects_unsupported_inputs(
     """No backend name can bypass the initial compatibility and containment gates."""
     with pytest.raises(error):
         replace(_profile(), **{field: value})
+
+
+def test_profile_accepts_the_supported_caches_and_parallel_layouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each supported cache is accepted and names blocks of its own; both parallel layouts too.
+
+    Multi-head attention in BF16, FP16, FP8 or NVFP4, each attaching to the layout its lender
+    reports; MLA in BF16 or FP8, also with DeepSeek sparse attention. MLA in NVFP4 is refused.
+    Tensor-parallel ranks lend shares of one cache, attention-DP ranks caches of their own.
+    """
+    # Each MHA cache dtype with the dtype and quantization its lender's public layout reports.
+    mha_layouts = {
+        "bfloat16": ("BF16", None),
+        "float16": ("HALF", None),
+        "fp8": ("FP8", "fp8"),
+        "nvfp4": ("NVFP4", "nvfp4"),
+    }
+    mha = {dtype: replace(_profile(), dtype=dtype) for dtype in mha_layouts}
+    mla = {
+        dtype: replace(_profile(), model_layout="mla-trtllm-latent", dtype=dtype)
+        for dtype in ("bfloat16", "fp8")
+    }
+    dsa = replace(mla["fp8"], sparse_attention={"algorithm": "dsa", "index_topk": 2048})
+    assert len({profile.scope for profile in [*mha.values(), *mla.values(), dsa]}) == 7
+    with pytest.raises(ValueError, match="is not supported"):
+        replace(mla["bfloat16"], dtype="nvfp4")
+    for dtype, (layout_dtype, quant_mode) in mha_layouts.items():
+        lender = _lender(replace(_layout(), dtype=layout_dtype, quant_mode=quant_mode))
+        monkeypatch.setattr(_assembly, "attach_lender", lambda *args, lender=lender, **kw: lender)
+        assert attach_domain(object(), mha[dtype]).lender is lender
+    for topology in ((4, 1, 1, 1), (2, 2, 1, 1)):
+        assert replace(_profile(), topology=topology).topology == topology
+
+
+def test_dense_attention_keeps_the_scope_its_stored_blocks_are_named_under() -> None:
+    """A dense server's scope stays fixed, with full attention or with windows.
+
+    Another scope would rename every block its deployment stored.
+    """
+    windowed = replace(_profile(), attention_windows=((0, 512), (1, 512)))
+    assert _profile().scope[-32:].hex() == (
+        "9833952ee10e44adc7c6e2e1e00bf018e4be22bc9ef8cf69882086649daa4926"
+    )
+    assert windowed.scope[-32:].hex() == (
+        "79f7866cc3b92ea216b45ff257e24bb56e787c5693c6998ae42e223ccc5e49f4"
+    )
+
+
+def test_a_windowed_layout_attaches_to_the_profile_naming_its_windows_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A windowed layout attaches to the profile naming its windows, and to no other.
+
+    A windowed layer group and a full one, each on a pool group of its own: gemma-3's shape.
+    """
+    windowed = LayerGroupDesc("attention", 512, 0, 0, (0, 1))
+    layout = replace(
+        _layout(),
+        pool_slot_bytes={0: (64,), 1: (64,)},
+        layer_groups=(windowed, LayerGroupDesc("attention", None, 0, 1, (2,))),
+        staging_region_index={0: 0, 1: 1},
+    )
+    lender = SimpleNamespace(
+        page_layout=layout,
+        regions=tuple(
+            MemoryRegion("host", 0x1000 * (g + 1), 256, 64, 4, (g,), MemoryKind.HOST)
+            for g in (0, 1)
+        ),
+    )
+    monkeypatch.setattr(_assembly, "attach_lender", lambda *args, **kwargs: lender)
+    profile = replace(
+        _profile(),
+        state_kinds=(CacheKind.PAGED,) * 2,
+        pool_count=2,
+        attention_windows=((1, 512), (0, 512)),
+    )
+    assert profile.attention_windows == ((0, 512), (1, 512))
+    assert attach_domain(object(), profile).lender is lender
+    for other in (((0, 512), (1, 256)), ((0, 512),)):
+        with pytest.raises(ValueError, match="windows do not match"):
+            attach_domain(object(), replace(profile, attention_windows=other))
+    reads_less = replace(windowed, read_window=256)
+    lender.page_layout = replace(layout, layer_groups=(reads_less, layout.layer_groups[1]))
+    with pytest.raises(ValueError, match="keeps a wider window"):
+        attach_domain(object(), replace(profile, attention_windows=((0, 256), (1, 256))))
+    # Another window, or none, names other blocks.
+    scopes = {replace(profile, attention_windows=w).scope for w in ((), ((0, 256), (1, 256)))}
+    assert profile.scope not in scopes and len(scopes) == 2
+    with pytest.raises(ValueError, match="MLA with sliding windows"):
+        replace(profile, model_layout="mla-trtllm-latent")
 
 
 def test_profile_preserves_scope_and_opaque_provider_config() -> None:
@@ -549,61 +634,11 @@ def test_profile_does_not_infer_containment_from_host_memory(profile_id: str) ->
 
 
 def test_namespace_requires_explicit_known_memory_kind() -> None:
-    """Operation selection uses the canonical enum and does not enable DEVICE access."""
+    """Operation selection uses the canonical enum: a DEVICE namespace allows its DEVICE regions."""
     with pytest.raises(TypeError, match="MemoryKind"):
         RegionNamespace((), "HOST")
-    with pytest.raises(ValueError, match="HOST operations"):
-        RegionNamespace((), MemoryKind.DEVICE)
-
-
-@pytest.mark.parametrize("reusable", [False, True])
-@pytest.mark.parametrize("bounds", [None, ResumeBounds(64, 0)])
-def test_bound_write_return_preserves_lender_masks_and_result(
-    reusable: bool, bounds: ResumeBounds | None
-) -> None:
-    """The bound endpoint forwards one exact entry without copying masks or deciding readiness."""
-    calls = []
-
-    class RecordingLender:
-        def return_writes(
-            self, entries: list[tuple[object, tuple[np.ndarray, ...], bool]]
-        ) -> list[ResumeBounds | None]:
-            calls.append(entries)
-            return [bounds]
-
-    lender = RecordingLender()
-    lender_ref = weakref.ref(lender)
-    return_write = bind_write_return(lender)
-    del lender
-    gc.collect()
-    assert lender_ref() is not None
-    lease = object()
-    masks = (np.array([False, True], dtype=bool), np.array([], dtype=bool))
-    assert return_write(lease, masks, reusable) is bounds
-    assert len(calls) == 1 and len(calls[0]) == 1
-    actual_lease, actual_masks, actual_reusable = calls[0][0]
-    assert actual_lease is lease
-    assert actual_masks is masks
-    assert actual_reusable is reusable
-    del return_write
-    gc.collect()
-    assert lender_ref() is None
-
-
-def test_bound_write_return_propagates_errors_without_retry() -> None:
-    """A return may have side effects before failing; its endpoint never retries it."""
-    calls = []
-    error = RuntimeError("copy submission failed")
-
-    class FailingLender:
-        def return_writes(
-            self, entries: list[tuple[object, tuple[np.ndarray, ...], bool]]
-        ) -> list[ResumeBounds | None]:
-            calls.append(entries)
-            raise error
-
-    return_write = bind_write_return(FailingLender())
-    with pytest.raises(RuntimeError) as raised:
-        return_write(object(), (), False)
-    assert raised.value is error
-    assert len(calls) == 1
+    regions = (
+        MemoryRegion("host", 0x1000, 128, 64, 2, (3,), MemoryKind.HOST),
+        MemoryRegion("device", 0x1000, 128, 64, 2, (3,), MemoryKind.DEVICE),
+    )
+    assert RegionNamespace(regions, MemoryKind.DEVICE).allowed_region_indices == frozenset({1})

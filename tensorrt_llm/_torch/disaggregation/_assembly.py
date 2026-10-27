@@ -14,10 +14,11 @@
 # limitations under the License.
 """Private runtime assembly shared by transfer and Store integrations.
 
-The initial profile consumes HOST/NAMED leases from the lender's complete mixed
-memory namespace. Model provenance and writer facts derive its canonical scope;
-public layout and region facts validate the serving profile. Neither
-a provider name nor a caller-supplied hint establishes compatibility or isolation.
+The profile consumes NAMED leases of one memory kind, HOST (staged) or
+DEVICE (in place), from the lender's complete mixed memory namespace. Model
+provenance and writer facts derive its canonical scope; public layout and region
+facts validate the serving profile. Neither a provider name nor a caller-supplied
+hint establishes compatibility or isolation.
 """
 
 from __future__ import annotations
@@ -126,9 +127,31 @@ class FactoryRejected(RuntimeError):
     """Construction certifies no remaining access, registration or region hold."""
 
 
+MHA_LAYOUT = "mha-trtllm-hnd"
+MLA_LAYOUT = "mla-trtllm-latent"
+# The supported caches: an attention writer layout with the dtype of its cache. MLA has no NVFP4
+# cache here: dense FP4 MLA has no block reuse upstream, and NVFP4 with DeepSeek sparse attention
+# is not qualified yet.
+SUPPORTED_CACHES = frozenset(
+    {(MHA_LAYOUT, dtype) for dtype in ("bfloat16", "float16", "fp8", "nvfp4")}
+    | {(MLA_LAYOUT, dtype) for dtype in ("bfloat16", "fp8")}
+)
+# The public layout's dtype and quantization of each cache dtype.
+_LAYOUT_DTYPES = {
+    "bfloat16": ("BF16", None),
+    "float16": ("HALF", None),
+    "fp8": ("FP8", "fp8"),
+    "nvfp4": ("NVFP4", "nvfp4"),
+}
+# The supported sparse attention algorithms: DeepSeek sparse attention keeps its indexer keys in
+# the pool group of the MLA cache, and a query's top-k depends only on its prefix, so a fetched
+# prefix serves as a locally reused one does.
+SPARSE_ALGORITHMS = frozenset({"dsa"})
+
+
 @dataclass(frozen=True)
 class ProfileSpec:
-    """Trusted immutable facts for the initial BF16 MHA compatibility cell.
+    """Trusted immutable facts for one of the supported caches.
 
     The model/executor assembly supplies facts for the actual writer and serving
     manager. Attachment checks the manager facts against its public page layout.
@@ -144,25 +167,33 @@ class ProfileSpec:
         source_identity: Immutable loaded-checkpoint and effective-config provenance.
         compatibility_id: Qualified KV semantics ABI, changed for incompatible releases.
         scope: Derived immutable byte identity; callers cannot supply a raw scope.
-        model_layout: Actual attention-writer layout identifier.
-        dtype: Actual cache dtype supplied by model assembly.
-        topology: Tensor, data, pipeline and context parallel sizes.
+        model_layout: Actual attention-writer layout identifier: ``mha-trtllm-hnd``
+            or ``mla-trtllm-latent``.
+        dtype: Actual cache dtype supplied by model assembly: ``bfloat16`` or ``fp8``, or
+            for the MHA layout also ``float16`` or ``nvfp4``.
+        topology: Tensor, data, pipeline and context parallel sizes; any tensor
+            parallel size, data parallelism 1 or equal to it (attention DP), no
+            pipeline or context parallelism.
         state_kinds: Canonical cache kinds from the layout's layer groups.
-        full_attention: Whether every group uses full attention.
-        sparse_attention: Whether runtime sparse attention is enabled; must be false.
-        sink_token_length: Runtime sink length; this cell requires zero.
-        lora_enabled: Whether adapters are enabled; this cell excludes LoRA.
+        attention_windows: ``(global layer id, tokens)`` of each layer whose attention reads a
+            sliding window, sorted; ``()`` when every layer reads its whole context. MLA with
+            sliding windows is not supported.
+        sparse_attention: The model's effective sparse attention config as JSON values, or
+            ``None`` for dense attention; its ``algorithm`` must be in ``SPARSE_ALGORITHMS``.
+            The whole config enters the scope, so another setting names other blocks.
+        sink_token_length: Runtime sink length; must be 0.
+        lora_enabled: Whether adapters are enabled; must be False.
         pool_count: Number of physical pool groups in the selected layout.
         speculative_mode: Explicit speculative mode; only none is supported here.
-        model_role: Target or draft role; this cell accepts only the target.
-        draft_pool: Separate draft-pool provenance; this cell requires None.
+        model_role: Target or draft role; must be ``"target"``.
+        draft_pool: Separate draft-pool provenance; must be None.
         joint_reuse: Whether reuse requires another manager's draft state.
         staging: Canonical capacity options for the pinned lender baseline.
         backend_config: Opaque provider-owned factory configuration.
 
     Raises:
         TypeError: A fact has an invalid type.
-        ValueError: A required identity is empty or the cell is unsupported.
+        ValueError: A required identity is empty or a fact is unsupported.
     """
 
     id: str
@@ -173,8 +204,8 @@ class ProfileSpec:
     dtype: str
     topology: tuple[int, int, int, int]
     state_kinds: tuple[CacheKind, ...]
-    full_attention: bool
-    sparse_attention: bool
+    attention_windows: tuple[tuple[int, int], ...]
+    sparse_attention: dict | None
     sink_token_length: int
     lora_enabled: bool
     pool_count: int
@@ -193,45 +224,59 @@ class ProfileSpec:
                 raise ValueError(f"{name} must be a nonempty string")
         if not isinstance(self.staging, StagingOptions):
             raise TypeError("profile staging must be StagingOptions")
-        if self.model_layout != "mha-trtllm-hnd" or self.dtype != "bfloat16":
-            raise ValueError("initial profile requires BF16 MHA with the HND writer layout")
+        if (self.model_layout, self.dtype) not in SUPPORTED_CACHES:
+            raise ValueError(
+                f"KV cache layout {self.model_layout} with dtype {self.dtype} is not supported; "
+                f"supported: {sorted(SUPPORTED_CACHES)}"
+            )
         topology = tuple(self.topology)
         if any(
             isinstance(size, bool) or not isinstance(size, numbers.Integral) for size in topology
         ):
             raise TypeError("topology sizes must be integers")
-        if topology != (1, 1, 1, 1):
-            raise ValueError("initial profile requires TP1/DP1/PP1/CP1")
+        tp, dp, pp, cp = topology
+        if tp < 1 or dp not in (1, tp) or (pp, cp) != (1, 1):
+            raise ValueError(
+                "tensor parallelism with or without attention DP is supported, not pipeline or "
+                "context parallelism"
+            )
         kinds = tuple(self.state_kinds)
         if not kinds or any(not isinstance(kind, CacheKind) for kind in kinds):
             raise TypeError("state kinds must contain canonical CacheKind values")
         if any(kind != CacheKind.PAGED for kind in kinds):
-            raise ValueError("initial profile supports paged attention state only")
-        if self.full_attention is not True:
-            raise ValueError("initial profile requires full attention")
-        if self.sparse_attention is not False:
-            raise ValueError("initial profile excludes sparse attention")
+            raise ValueError("recurrent state is not supported")
+        windows = tuple(sorted((int(layer), int(win)) for layer, win in self.attention_windows))
+        if windows and self.model_layout == MLA_LAYOUT:
+            raise ValueError("MLA with sliding windows is not supported")
+        if self.sparse_attention is not None:
+            if not isinstance(self.sparse_attention, dict):
+                raise TypeError("sparse_attention must be a config dict or None")
+            algorithm = self.sparse_attention.get("algorithm")
+            if algorithm not in SPARSE_ALGORITHMS:
+                raise ValueError(
+                    f"sparse attention {algorithm!r} is not supported; supported: "
+                    f"{sorted(SPARSE_ALGORITHMS)}"
+                )
         if isinstance(self.sink_token_length, bool) or not isinstance(
             self.sink_token_length, numbers.Integral
         ):
             raise TypeError("sink_token_length must be an integer")
         if self.sink_token_length != 0:
-            raise ValueError("initial profile excludes attention sinks")
+            raise ValueError("attention sink tokens are not supported")
         if self.lora_enabled is not False:
-            raise ValueError("initial profile excludes LoRA")
+            raise ValueError("LoRA is not supported")
         if isinstance(self.pool_count, bool) or not isinstance(self.pool_count, numbers.Integral):
             raise TypeError("pool_count must be an integer")
-        if self.pool_count != 1:
-            raise ValueError("initial profile requires one pool group")
         if (
             self.speculative_mode != "none"
             or self.model_role != "target"
             or self.joint_reuse is not False
             or self.draft_pool is not None
         ):
-            raise ValueError("initial profile excludes speculative and joint draft reuse")
+            raise ValueError("speculative decoding and draft-model reuse are not supported")
         object.__setattr__(self, "topology", topology)
         object.__setattr__(self, "state_kinds", kinds)
+        object.__setattr__(self, "attention_windows", windows)
         object.__setattr__(self, "scope", derive_kv_scope(self))
 
 
@@ -249,7 +294,7 @@ def derive_kv_scope(profile: ProfileSpec) -> bytes:
     names, local paths and hints are not substitutes for checkpoint provenance.
 
     Args:
-        profile: Validated initial-profile facts from trusted model assembly.
+        profile: Validated profile facts from trusted model assembly.
 
     Returns:
         A versioned, deterministic byte scope, independent of local placement.
@@ -293,11 +338,7 @@ def derive_kv_scope(profile: ProfileSpec) -> bytes:
         "compatibility_id": profile.compatibility_id,
         "writer_layout": profile.model_layout,
         "cache_dtype": profile.dtype,
-        "attention": {
-            "full": profile.full_attention,
-            "sparse": profile.sparse_attention,
-            "sink_tokens": int(profile.sink_token_length),
-        },
+        "attention": _attention_payload(profile.attention_windows, profile.sparse_attention),
         "lora_enabled": profile.lora_enabled,
         "speculative_mode": profile.speculative_mode,
         "model_role": profile.model_role,
@@ -307,14 +348,23 @@ def derive_kv_scope(profile: ProfileSpec) -> bytes:
     return b"trtllm-kv-scope-v1\0" + hashlib.sha256(encoded.encode("utf-8")).digest()
 
 
+def _attention_payload(windows: tuple[tuple[int, int], ...], sparse: dict | None) -> dict:
+    """The scope's attention facts: dense full attention keeps its payload; windows name each
+    windowed layer and its window, sparse attention its whole config, so another setting names
+    other blocks."""
+    payload = {"full": not windows, "sparse": False if sparse is None else sparse, "sink_tokens": 0}
+    if windows:
+        payload["windows"] = [[layer, window] for layer, window in windows]
+    return payload
+
+
 @dataclass(frozen=True)
 class RegionNamespace:
     """Validated whole namespace and the operation's selected memory kind.
 
     Preserve every HOST and DEVICE region and its original lender index. Factories
     register only supported regions; an operation may reference only its selected
-    kind. This profile supports HOST/NAMED operations, not DEVICE activation.
-    A provider owns any registration hold, not this immutable descriptor.
+    kind. A provider owns any registration hold, not this immutable descriptor.
 
     Attributes:
         regions: Complete namespace in the lender's original index order.
@@ -334,8 +384,6 @@ class RegionNamespace:
         """Check namespace overlap and selection; canonical regions validate their own geometry."""
         if not isinstance(self.memory_kind, MemoryKind):
             raise TypeError("selected memory kind must be MemoryKind")
-        if self.memory_kind is not MemoryKind.HOST:
-            raise ValueError("initial profile supports HOST operations only")
         regions = tuple(self.regions)
         intervals: dict[MemoryKind, list[tuple[int, int]]] = {}
         for region in regions:
@@ -367,12 +415,12 @@ class DomainBinding:
     The executor owns the manager; this binding does not retain it. Orchestration
     keeps the manager and this lender association alive through transfer cleanup.
     For normal shutdown, stop submissions and confirm ended backend access before
-    returning consuming writes or releasing reads and discarded writes. Consuming
-    returns also require coordinated permission. Progress lender copies and finish
-    deregistration, hold release and accepted owner-thread finalizers before manager
-    shutdown. Missing evidence requires retention under the selected containment policy.
-    The holder receives only ``namespace``, never this association. The lender
-    remains the only memory-access authority.
+    returning writes with their arrived rows or releasing reads and discarded writes.
+    Keep lender progress running for pending copies, then finish deregistration, hold
+    release and accepted owner-thread finalizers before manager shutdown. Missing
+    evidence requires retention under the selected containment policy.
+    The holder receives ``namespace`` and ``lender``, never this association. The
+    lender remains the only memory-access authority.
 
     Attributes:
         lender: Canonical access-granting interface.
@@ -386,26 +434,42 @@ class DomainBinding:
 
 
 def _validate_layout(profile: ProfileSpec, layout: PageLayout, namespace: RegionNamespace) -> None:
-    """Check the selected profile against public manager layout and HOST capability."""
+    """Check the selected profile against public manager layout and the selected kind's regions."""
     if not isinstance(layout, PageLayout):
         raise TypeError("lender page_layout must be PageLayout")
     topology = layout.topology
     if (topology.tp_size, topology.dp_size, topology.pp_size, topology.cp_size) != profile.topology:
         raise ValueError("lender topology does not match the selected profile")
-    if layout.dtype != "BF16" or layout.quant_mode is not None:
-        raise ValueError("initial profile requires public BF16 unquantized layout")
+    if (layout.dtype, layout.quant_mode) != _LAYOUT_DTYPES[profile.dtype]:
+        raise ValueError(
+            f"lender layout {layout.dtype} (quantization {layout.quant_mode}) does not match the "
+            f"profile's {profile.dtype} cache"
+        )
     kinds = {"attention": CacheKind.PAGED, "state": CacheKind.STATE}
     if tuple(kinds.get(group.kind) for group in layout.layer_groups) != profile.state_kinds:
         raise ValueError("lender layer kinds do not match the selected profile")
-    if any(
-        group.kept_window is not None or group.read_window is not None
-        for group in layout.layer_groups
-    ):
-        raise ValueError("initial profile requires full-attention layout")
+    windows = dict(profile.attention_windows)
+    for group in layout.layer_groups:
+        if group.kept_window != group.read_window:
+            raise ValueError("a layer group keeps a wider window than its attention reads")
+        if any(windows.get(layer) != group.read_window for layer in group.layers):
+            raise ValueError("lender windows do not match the selected profile")
     if any(group.num_sink_blocks != 0 for group in layout.layer_groups):
-        raise ValueError("initial profile excludes attention sinks")
+        raise ValueError("attention sink tokens are not supported")
     if len(layout.pool_slot_bytes) != profile.pool_count:
         raise ValueError("lender pool groups do not match the selected profile")
+    if namespace.memory_kind is MemoryKind.HOST:
+        _validate_staging_regions(layout, namespace)
+    else:
+        _validate_device_regions(layout, namespace)
+
+
+def _layer_groups_of(layout: PageLayout, pool_group: int) -> tuple[int, ...]:
+    return tuple(i for i, group in enumerate(layout.layer_groups) if group.pool_group == pool_group)
+
+
+def _validate_staging_regions(layout: PageLayout, namespace: RegionNamespace) -> None:
+    """A staging region per pool group, holding the pool group's slots back to back."""
     if not layout.staging_region_index or set(layout.staging_region_index) != set(
         layout.pool_slot_bytes
     ):
@@ -414,24 +478,41 @@ def _validate_layout(profile: ProfileSpec, layout: PageLayout, namespace: Region
         if not 0 <= index < len(namespace.regions):
             raise ValueError("staging region is outside the lender namespace")
         region = namespace.regions[index]
-        groups = tuple(
-            i for i, group in enumerate(layout.layer_groups) if group.pool_group == pool_group
-        )
         if (
-            region.memory_kind is not namespace.memory_kind
-            or region.layer_group_indices != groups
+            region.memory_kind is not MemoryKind.HOST
+            or region.layer_group_indices != _layer_groups_of(layout, pool_group)
             or region.slot_bytes != sum(layout.pool_slot_bytes[pool_group])
         ):
             raise ValueError("staging region does not match the public HOST layout")
 
 
-def attach_domain(manager: KVCacheManagerV2, profile: ProfileSpec) -> DomainBinding:
+def _validate_device_regions(layout: PageLayout, namespace: RegionNamespace) -> None:
+    """A device region per pool of every pool group, slots of the pool's width."""
+    for pool_group, widths in layout.pool_slot_bytes.items():
+        for pool, width in enumerate(widths):
+            index = layout.device_region_index.get((pool_group, pool))
+            if index is None or not 0 <= index < len(namespace.regions):
+                raise ValueError("the lender does not lend KV cache pages in place")
+            region = namespace.regions[index]
+            if (
+                region.memory_kind is not MemoryKind.DEVICE
+                or region.layer_group_indices != _layer_groups_of(layout, pool_group)
+                or region.slot_bytes != width
+            ):
+                raise ValueError("device region does not match the public DEVICE layout")
+
+
+def attach_domain(
+    manager: KVCacheManagerV2, profile: ProfileSpec, *, memory_kind: MemoryKind = MemoryKind.HOST
+) -> DomainBinding:
     """Attach the canonical lender without duplicating manager policy checks.
 
     The caller supplies facts derived from its actual writer/serving-manager
     assembly. The lender validates attachment and exposes available memory kinds;
-    this helper checks its public layout and HOST/NAMED capability. Backend-specific
-    pinning requirements belong to its factory.
+    this helper checks its public layout and the NAMED capability of ``memory_kind``:
+    staging regions for HOST, a region per device pool for DEVICE. The scope does
+    not depend on the kind. Backend-specific pinning requirements belong to its
+    factory.
     This helper neither activates a backend nor certifies provider qualification.
     Unexpected attach failures retain the canonical lender's safety meaning.
     The caller retains the manager through cleanup and shuts it down last.
@@ -441,9 +522,11 @@ def attach_domain(manager: KVCacheManagerV2, profile: ProfileSpec) -> DomainBind
     Args:
         manager: Serving manager, never a sizing probe.
         profile: Trusted compatibility facts and canonical byte scope.
+        memory_kind: The kind every operation of the domain lends.
 
     Returns:
-        An orchestration-owned association and full namespace for HOST operations.
+        An orchestration-owned association and full namespace for ``memory_kind``
+        operations.
 
     Raises:
         TypeError: Profile is not ProfileSpec.
@@ -453,7 +536,7 @@ def attach_domain(manager: KVCacheManagerV2, profile: ProfileSpec) -> DomainBind
     if not isinstance(profile, ProfileSpec):
         raise TypeError("profile must be ProfileSpec")
     lender = attach_lender(manager, scope=profile.scope, staging=profile.staging)
-    namespace = RegionNamespace(lender.regions, memory_kind=MemoryKind.HOST)
+    namespace = RegionNamespace(lender.regions, memory_kind=memory_kind)
     _validate_layout(profile, lender.page_layout, namespace)
     return DomainBinding(lender, profile, namespace)
 
@@ -474,8 +557,9 @@ def check_view_compatibility(lease_view: LeaseView, namespace: RegionNamespace) 
     Raises:
         ValueError: The view uses unsupported memory or row placement.
     """
+    kind = namespace.memory_kind
     for blocks in lease_view.groups:
         if blocks.object_keys is None or blocks.slots is None:
-            raise ValueError("initial profile requires keys and rows placed by slot")
+            raise ValueError(f"a {kind.name} profile requires keys and rows placed by slot")
         if not namespace.allowed_region_indices.issuperset(blocks.region_indices):
-            raise ValueError("row region is not permitted by the selected HOST profile")
+            raise ValueError(f"row region is not permitted by the selected {kind.name} profile")

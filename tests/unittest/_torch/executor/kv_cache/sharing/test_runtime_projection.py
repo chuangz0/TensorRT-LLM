@@ -27,7 +27,6 @@ from tensorrt_llm._torch.disaggregation import _assembly
 from tensorrt_llm._torch.disaggregation._assembly import (
     ProfileSpec,
     attach_domain,
-    bind_write_return,
     check_view_compatibility,
 )
 from tensorrt_llm._torch.disaggregation.base.backend import CacheKind, Outcome, SlotRegion
@@ -68,8 +67,8 @@ def _profile() -> ProfileSpec:
         dtype="bfloat16",
         topology=(1, 1, 1, 1),
         state_kinds=(CacheKind.PAGED,),
-        full_attention=True,
-        sparse_attention=False,
+        attention_windows=(),
+        sparse_attention=None,
         sink_token_length=0,
         lora_enabled=False,
         pool_count=1,
@@ -111,8 +110,7 @@ def test_real_lender_projection_partial_delivery(
         outcome = Outcome.for_view(view, masks, fault="last block missing")
         outcome.check_mask_shapes(view)
         # The synchronous host writer ended; this one-rank test authorizes consumption.
-        return_write = bind_write_return(domain.lender)
-        return_write(lease, outcome.delivered_masks, True)
+        domain.lender.return_writes([(lease, outcome.delivered_masks, True)])
         bounds = kit.settled_bounds(domain.lender, manager, request)
         assert bounds is not None and bounds.max_position == 64
         device = kit.DevicePages(manager)
@@ -129,6 +127,30 @@ def test_real_lender_projection_partial_delivery(
                 actual = device.read(group.layer_group_index, slots[int(ordinal)])
                 assert kit.digest(actual) == kit.digest(expected)
         manager.free_resources(request)
+
+
+def test_a_device_domain_takes_rows_lent_in_place_and_refuses_staged_rows(
+    real_manager: Callable[..., AbstractContextManager[KVCacheManagerV2]], kit: SimpleNamespace
+) -> None:
+    """GPU Direct operations take the device pools' rows placed by slot, never staged rows."""
+    with real_manager(dtype=DataType.BF16) as manager:
+        domain = attach_domain(manager, _profile(), memory_kind=MemoryKind.DEVICE)
+        assert domain.namespace.memory_kind is MemoryKind.DEVICE
+        fetched = kit.admitted(manager, 1, list(range(1000, 1097)))
+        lease = domain.lender.lend_write(
+            fetched, 0, 96, memory_kind=MemoryKind.DEVICE, rows=RowSelection.NAMED, ready_event=None
+        )
+        check_view_compatibility(kit.ready_view(lease, manager), domain.namespace)
+        lease.release()
+        computed = kit.published(manager, 2, list(range(2000, 2097)))
+        staged = domain.lender.lend_read(
+            computed, 0, 96, memory_kind=MemoryKind.HOST, rows=RowSelection.NAMED, ready_event=None
+        )
+        with pytest.raises(ValueError, match="selected DEVICE profile"):
+            check_view_compatibility(kit.ready_view(staged, manager), domain.namespace)
+        staged.release()
+        for request in (fetched, computed):
+            manager.free_resources(request)
 
 
 def test_real_lender_attachment_is_unique_and_scope_fixed(
