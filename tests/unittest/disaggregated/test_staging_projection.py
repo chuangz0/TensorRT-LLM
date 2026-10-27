@@ -89,24 +89,24 @@ def _profile() -> ProfileSpec:
     )
 
 
-def _blocks(group: int, region: int, addresses: list[int]) -> LentLayerGroupRows:
+def _blocks(group: int, region: int, slots: list[int]) -> LentLayerGroupRows:
     """Create real lender rows with distinct opaque keys and nonconsecutive ordinals.
 
     Args:
         group: Original layer-group identifier.
         region: Original region index.
-        addresses: Addresses in the requested row order.
+        slots: Slots of the region in the requested row order.
 
     Returns:
         Canonical immutable lender rows.
     """
-    count = len(addresses)
+    count = len(slots)
     return LentLayerGroupRows(
         layer_group_index=group,
         page_ordinals=np.arange(count, dtype=np.int64) * 3 + 2,
         object_keys=np.arange(count * 54, dtype=np.uint8).reshape(count, 54),
-        addresses=np.asarray(addresses, dtype=np.int64),
-        region_index=region,
+        slots=np.asarray(slots, dtype=np.int64),
+        region_indices=(region,),
     )
 
 
@@ -116,12 +116,10 @@ def test_compatibility_check_preserves_region_group_and_row_identity() -> None:
         MemoryRegion("layout-a", 0x1000, 256, 64, 4, (9,), MemoryKind.HOST),
         MemoryRegion("layout-b", 0x2000, 512, 128, 4, (3,), MemoryKind.HOST),
     )
-    lease_view = LeaseView(
-        (_blocks(3, 1, [0x2180, 0x2000]), _blocks(9, 0, [0x1080])), start=0, end=192
-    )
+    lease_view = LeaseView((_blocks(3, 1, [3, 0]), _blocks(9, 0, [2])), start=0, end=192)
     original_groups = lease_view.groups
     original_keys = tuple(group.object_keys for group in original_groups)
-    original_addresses = tuple(group.addresses for group in original_groups)
+    original_slots = tuple(group.slots for group in original_groups)
     check_view_compatibility(lease_view, RegionNamespace(regions, MemoryKind.HOST))
     view = lease_view
     assert view.groups is original_groups
@@ -129,12 +127,12 @@ def test_compatibility_check_preserves_region_group_and_row_identity() -> None:
     assert isinstance(view, View)
     assert all(isinstance(region, SlotRegion) for region in regions)
     assert [group.layer_group_index for group in view.groups] == [3, 9]
-    assert [group.region_index for group in view.groups] == [1, 0]
-    for group, keys, addresses in zip(view.groups, original_keys, original_addresses):
+    assert [group.region_indices for group in view.groups] == [(1,), (0,)]
+    for group, keys, slots in zip(view.groups, original_keys, original_slots):
         assert group.object_keys is keys
-        assert group.addresses is addresses
+        assert group.slots is slots
         assert not group.object_keys.flags.writeable
-        assert not group.addresses.flags.writeable
+        assert not group.slots.flags.writeable
     masks = view.row_masks(True)
     assert [mask.tolist() for mask in masks] == [[True, True], [True]]
     assert all(mask.flags.writeable and mask.dtype == np.bool_ for mask in masks)
@@ -151,12 +149,12 @@ def test_mixed_namespace_preserves_indices_and_selects_host_rows() -> None:
     )
     namespace = RegionNamespace(regions, MemoryKind.HOST)
     assert namespace.regions is regions
-    view = LeaseView((_blocks(9, 1, [0x2040]),), start=0, end=192)
+    view = LeaseView((_blocks(9, 1, [1]),), start=0, end=192)
     assert namespace.allowed_region_indices == frozenset({0, 1})
     assert check_view_compatibility(view, namespace) is None
-    assert view.groups[0].region_index == 1
+    assert view.groups[0].region_indices == (1,)
     with pytest.raises(ValueError, match="selected HOST profile"):
-        check_view_compatibility(LeaseView((_blocks(3, 2, [0x1000]),), start=0, end=192), namespace)
+        check_view_compatibility(LeaseView((_blocks(3, 2, [0]),), start=0, end=192), namespace)
     device_rows = LentLayerGroupRows(3, np.array([0]), slots=np.array([0]), region_indices=(2,))
     with pytest.raises(ValueError, match="requires keys"):
         check_view_compatibility(LeaseView((device_rows,), start=0, end=32), namespace)
@@ -266,7 +264,7 @@ def test_attachment_rejects_public_layout_mismatch(
 def test_outcome_masks_are_already_in_lender_row_order() -> None:
     """Canonical masks map directly, including partial delivery alongside a fault."""
     regions = (MemoryRegion("layout", 0x1000, 256, 64, 4, (7, 12), MemoryKind.HOST),)
-    lease_view = LeaseView((_blocks(12, 0, [0x1080, 0x1000]), _blocks(7, 0, [])), start=0, end=192)
+    lease_view = LeaseView((_blocks(12, 0, [2, 0]), _blocks(7, 0, [])), start=0, end=192)
     original_groups = lease_view.groups
     check_view_compatibility(lease_view, RegionNamespace(regions, MemoryKind.HOST))
     view = lease_view
@@ -292,7 +290,7 @@ def test_outcome_masks_are_already_in_lender_row_order() -> None:
 def test_canonical_outcome_rejects_invalid_mask_shapes(masks: tuple[np.ndarray, ...]) -> None:
     """The existing Outcome checker validates the exact submitted projection."""
     region = MemoryRegion("layout", 0x1000, 128, 64, 2, (7,), MemoryKind.HOST)
-    view = LeaseView((_blocks(7, 0, [0x1000, 0x1040]),), start=0, end=192)
+    view = LeaseView((_blocks(7, 0, [0, 1]),), start=0, end=192)
     check_view_compatibility(view, RegionNamespace((region,), MemoryKind.HOST))
     with pytest.raises(ValueError):
         Outcome(masks).check_mask_shapes(view)
@@ -350,7 +348,7 @@ def test_view_rejects_region_outside_selected_namespace() -> None:
     region = MemoryRegion("layout", 0x1000, 64, 64, 1, (7,), MemoryKind.HOST)
     with pytest.raises(ValueError, match="selected HOST profile"):
         check_view_compatibility(
-            LeaseView((_blocks(7, 1, [0x1000]),), start=0, end=192),
+            LeaseView((_blocks(7, 1, [0]),), start=0, end=192),
             RegionNamespace((region,), MemoryKind.HOST),
         )
 

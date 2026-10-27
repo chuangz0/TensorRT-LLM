@@ -119,10 +119,11 @@ def test_real_lender_projection_partial_delivery(
         cache = kit.kv(manager, request)
         for group, original in zip(view.groups, lender_view.groups):
             assert group.object_keys is original.object_keys
-            assert group.addresses is original.addresses
+            assert group.slots is original.slots
             slots = kit.pages(cache, group.layer_group_index)
-            nbytes = domain.namespace.regions[group.region_index].slot_bytes
-            assert domain.namespace.regions[group.region_index].memory_kind is MemoryKind.HOST
+            (region_index,) = group.region_indices
+            nbytes = domain.namespace.regions[region_index].slot_bytes
+            assert domain.namespace.regions[region_index].memory_kind is MemoryKind.HOST
             for ordinal in original.page_ordinals[:2]:
                 expected = kit.staged_row(0x2A, group.layer_group_index, int(ordinal), nbytes)
                 actual = device.read(group.layer_group_index, slots[int(ordinal)])

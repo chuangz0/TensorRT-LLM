@@ -462,7 +462,7 @@ def check_view_compatibility(lease_view: LeaseView, namespace: RegionNamespace) 
     """Check operation placement against the profile's permitted regions.
 
     Canonical LeaseView already implements View. The lender guarantees array
-    shape, immutability, group mapping and valid addresses. Check only placement
+    shape, immutability, group mapping and valid slots. Check only placement
     selection per group; do not inspect rows or create a replacement View.
     Orchestration must pair the lease with its lender's binding. Region indices
     alone do not prove lease origin, and this check grants no memory access.
@@ -475,7 +475,7 @@ def check_view_compatibility(lease_view: LeaseView, namespace: RegionNamespace) 
         ValueError: The view uses unsupported memory or row placement.
     """
     for blocks in lease_view.groups:
-        if blocks.object_keys is None or blocks.addresses is None or blocks.region_index is None:
-            raise ValueError("initial profile requires keys, addresses and a region")
-        if blocks.region_index not in namespace.allowed_region_indices:
+        if blocks.object_keys is None or blocks.slots is None:
+            raise ValueError("initial profile requires keys and rows placed by slot")
+        if not namespace.allowed_region_indices.issuperset(blocks.region_indices):
             raise ValueError("row region is not permitted by the selected HOST profile")
