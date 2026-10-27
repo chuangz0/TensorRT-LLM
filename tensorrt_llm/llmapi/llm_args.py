@@ -2760,6 +2760,145 @@ class KvCacheConnectorConfig(StrictBaseModel):
         return self
 
 
+class KvSharingBackendConfig(StrictBaseModel):
+    """A KV store that servers share prompt KV cache blocks through.
+
+    Servers may also give it host memory (the role 'provide').
+    """
+
+    type: Literal["mooncake"] = Field(
+        description="The kind of store. Only a Mooncake store is supported.")
+    config: str = Field(
+        description="Path to the store config, a YAML file every server and "
+        "provider of the store reads: a 'mooncake' section (master address, "
+        "protocol, RDMA devices, RPC timeout, store workers, rows and bytes per "
+        "store call; global_segment_size stays 0, its default: servers give the "
+        "store memory through the role 'provide', providers through "
+        "'trtllm-serve mooncake_provider --segment_size') and an optional "
+        "'blob' section (key prefix).")
+    roles: List[Literal["fetch", "publish", "provide"]] = Field(
+        default_factory=lambda: ["fetch", "publish"],
+        min_length=1,
+        description="'fetch' reads stored prompt prefixes instead of computing "
+        "them; 'publish' stores the prompt blocks this server computes; "
+        "'provide' gives the store segment_size bytes of each rank's host "
+        "memory, where the store keeps any server's blocks. Aggregated and "
+        "context servers fetch and publish. On a generation server use only "
+        "'provide' (or no kv_sharing): fetching or publishing there turns off "
+        "the reuse of generated blocks.")
+    segment_size: Union[int, str] = Field(
+        0,
+        description="Host memory each rank gives the store under the role "
+        "'provide', as a binary size ('32GiB') or a byte count; required with "
+        "'provide', 0 without it. Startup refuses a size the node cannot give: "
+        "this server's segments, plus up to 8 GiB of host staging per rank if "
+        "it also fetches or publishes, must fit in the node's available memory "
+        "less 32 GiB. A server that provides memory takes about 13 s longer to "
+        "stop, while reads of its memory finish: stop it with SIGTERM to "
+        "trtllm-serve or to rank 0's trtllm-llmapi-launch (under Slurm, "
+        "scancel the job), never with SIGKILL or a signal to mpirun or to all "
+        "of its processes.")
+
+    @field_validator("config")
+    @classmethod
+    def _config_is_a_file(cls, path: str) -> str:
+        if not os.path.isfile(path):
+            raise ValueError(f"the store config {path!r} is not a file")
+        return path
+
+    @field_validator("roles")
+    @classmethod
+    def _each_role_once(cls, roles: List[str]) -> List[str]:
+        if len(set(roles)) != len(roles):
+            raise ValueError(f"roles {roles} name a role twice")
+        return roles
+
+    @field_validator("segment_size", mode="after")
+    @classmethod
+    def _segment_size_in_bytes(cls, value: Union[int, str]) -> int:
+        from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import \
+            parse_size
+        nbytes = parse_size(value, strict_units=True)
+        if nbytes < 0:
+            raise ValueError(f"segment_size {value!r} is negative")
+        return nbytes
+
+    @model_validator(mode="after")
+    def _segment_size_goes_with_provide(self) -> "KvSharingBackendConfig":
+        provides = "provide" in self.roles
+        if provides and self.segment_size == 0:
+            raise ValueError(
+                "the role 'provide' needs segment_size: the host memory each "
+                "rank gives the store")
+        if not provides and self.segment_size > 0:
+            raise ValueError("segment_size is set but roles lack 'provide': "
+                             "add 'provide' or set segment_size to 0")
+        return self
+
+
+class KvSharingConfig(StrictBaseModel):
+    """Share prompt KV cache blocks through a KV store, or give it memory.
+
+    A server fetches the stored part of a prompt instead of computing it, and
+    stores the whole prompt blocks it computes. A server whose only role is
+    'provide' gives the store host memory and does nothing else with it.
+    """
+
+    backends: List[KvSharingBackendConfig] = Field(
+        min_length=1,
+        max_length=1,
+        description="The store to share through; exactly one.")
+    data_path: Literal["auto", "gpu_direct", "host_staging"] = Field(
+        default="auto",
+        description="How blocks move between the store and the KV cache: "
+        "'gpu_direct' reads and writes KV cache pages in place over GPUDirect "
+        "RDMA, 'host_staging' copies them through pinned host memory. 'auto' "
+        "picks GPU Direct when a startup check passes, else host staging. "
+        "Both store the same blocks.")
+    min_fetch_tokens: PositiveInt = Field(
+        default=2048,
+        description="Shortest stored prompt prefix worth fetching; a request "
+        "whose stored prefix extends its locally cached one by less computes "
+        "it instead.")
+    max_fetch_tokens: PositiveInt = Field(
+        default=32768,
+        description="Most prompt tokens one fetch reads past the prefix the "
+        "server reuses locally, in whole KV cache blocks; a longer stored "
+        "prefix is cut there or, with sliding windows, computed instead. Under "
+        "host staging each rank pins at most 8 GiB of host memory: one fetch of "
+        "max(max_fetch_tokens, max_num_tokens) tokens of KV cache, and up to "
+        "as much again for publications; the server refuses to start when one "
+        "fetch and one publication do not fit.")
+    probe_hold_ms: NonNegativeFloat = Field(
+        default=50.0,
+        description="Longest a new request waits for the store to say how "
+        "much of its prompt it holds before it is scheduled without fetching; "
+        "with 0 no request waits for the store, so a fresh request on an idle "
+        "server never fetches.")
+    fetch_timeout_s: float = Field(
+        default=5.0,
+        gt=0,
+        description="A fetch still running this long after the server admitted "
+        "it (parked its request to wait for the store) is abandoned and its "
+        "request computes its prompt.")
+
+    @property
+    def only_provides(self) -> bool:
+        """Whether the server only gives the store host memory.
+
+        Its only role is 'provide'; its KV cache is left alone.
+        """
+        return self.backends[0].roles == ["provide"]
+
+    @model_validator(mode="after")
+    def _fetch_limits_are_ordered(self) -> "KvSharingConfig":
+        if self.max_fetch_tokens < self.min_fetch_tokens:
+            raise ValueError(
+                f"max_fetch_tokens ({self.max_fetch_tokens}) is below "
+                f"min_fetch_tokens ({self.min_fetch_tokens})")
+        return self
+
+
 class LayerwiseBenchmarksConfig(StrictBaseModel):
     """Configuration for layer-wise benchmarks calibration."""
     calibration_mode: Literal["NONE", "MARK", "COLLECT"] = Field(
@@ -6955,6 +7094,15 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    kv_sharing: Optional[KvSharingConfig] = Field(
+        default=None,
+        description="Share prompt KV cache blocks with other servers through "
+        "a KV store, or give the store host memory. Aggregated and context "
+        "servers fetch and publish blocks; a generation server only provides "
+        "memory (roles: [provide]).",
+        status="prototype",
+    )
+
     mm_encoder_only: bool = Field(
         default=False,
         description=
@@ -7913,6 +8061,78 @@ class TorchLlmArgs(BaseLlmArgs):
                     f"Failed to load MoE load balancer config: {self.moe_config.load_balancer}"
                 ) from e
         return self
+
+    @model_validator(mode="after")
+    def validate_kv_sharing(self) -> 'TorchLlmArgs':
+        """Refuse setups kv_sharing cannot serve yet, naming every reason.
+
+        A server that only provides the store memory (roles: [provide])
+        leaves its KV cache alone: only a KV connector or an orchestrator
+        other than MPI refuses it.
+
+        Model facts (sliding windows, MLA, the KV cache dtype and sparse
+        attention a checkpoint resolves to) are checked when the executor
+        starts.
+        """
+        if self.kv_sharing is None:
+            return self
+        has_connector = self.kv_connector_config is not None
+        checks = [
+            ("kv_connector_config: one way per server to share KV cache "
+             "through a store", has_connector),
+            # Under 'rpc' the ranks other than 0 never shut their executor
+            # down, so the memory they provide would leave abruptly.
+            (f"orchestrator_type={self.orchestrator_type!r}: only the MPI "
+             "orchestrator", self.orchestrator_type is not None),
+        ]
+        if not self.kv_sharing.only_provides:
+            checks += self._kv_sharing_checks_for_fetch_and_publish()
+        reasons = [reason for reason, applies in checks if applies]
+        if reasons:
+            raise ValueError("kv_sharing does not support: " +
+                             "; ".join(reasons))
+        return self
+
+    def _kv_sharing_checks_for_fetch_and_publish(
+            self) -> List[Tuple[str, bool]]:
+        """Setups a server that fetches or publishes blocks cannot serve.
+
+        Returns ``(reason, applies)`` of each.
+        """
+        kv_cache = self.kv_cache_config
+        sparse = getattr(self.sparse_attention_config, "algorithm", None)
+        compression = getattr(self.kv_cache_compression_config, "algorithm",
+                              None)
+        return [
+            ("kv_cache_config.use_kv_cache_manager_v2=False",
+             kv_cache.use_kv_cache_manager_v2 is False),
+            ("block reuse off or a block_reuse_config.policy other than "
+             "'all_reusable': stored blocks are the committed ones",
+             not kv_cache.enable_block_reuse
+             or kv_cache.block_reuse_config.policy != "all_reusable"),
+            ("kv_cache_config.enable_swa_scratch_reuse",
+             kv_cache.enable_swa_scratch_reuse),
+            (f"kv_cache_config.dtype={kv_cache.dtype!r}: a packed sparse-MLA or "
+             "mixed-precision KV cache, which stored blocks do not carry",
+             kv_cache.dtype == "fp8_ds_mla"
+             or kv_cache.mixed_precision_kv is not None),
+            (f"kv_cache_compression_config ({compression}): stored blocks "
+             "would carry compressed or evicted KV", compression is not None),
+            ("pipeline or context parallelism", self.pipeline_parallel_size > 1
+             or self.context_parallel_size > 1),
+            ("speculative decoding", self.speculative_config is not None),
+            ("LoRA", self.enable_lora or self.lora_config is not None),
+            ("beam search", (self.max_beam_width or 1) > 1),
+            (f"{sparse} sparse attention: DeepSeek sparse attention ('dsa') "
+             "only", sparse not in (None, "dsa")),
+            ("sleep_config: sleep releases the KV cache memory",
+             self.sleep_config is not None),
+            (f"load_format={self.load_format}: stored blocks are named after "
+             "the checkpoint, not the weights in memory", self.load_format
+             != LoadFormat.AUTO),
+            (f"attn_backend={self.attn_backend!r}: stored blocks have the "
+             "TRTLLM backend's layout", self.attn_backend != "TRTLLM"),
+        ]
 
     @model_validator(mode='after')
     def sync_quant_config_with_kv_cache_config_dtype(self) -> 'TorchLlmArgs':

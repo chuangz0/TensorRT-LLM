@@ -138,7 +138,9 @@ if TYPE_CHECKING:
 
     from tensorrt_llm.bindings import MpiProgressThread
 
+    from ..disaggregation.blob.mooncake_setup import StoreSegment
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
+    from .kv_sharing.orchestrator import SharedKvOrchestrator
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
@@ -429,6 +431,13 @@ class PyExecutor:
     # If the number of micro batches is too large, the executor will spend too much host memory (No additional GPU memory is required).
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
+
+    # Set by kv_sharing startup. A class default keeps executors that tests
+    # build partially working.
+    kv_sharing: Optional["SharedKvOrchestrator"] = None
+    # The host memory this rank provides the KV store, also set by kv_sharing
+    # startup.
+    store_segment: Optional["StoreSegment"] = None
 
     def __init__(
         self,
@@ -2012,7 +2021,19 @@ class PyExecutor:
 
     def shutdown(self):
         """Shut down the terminal executor and all CUDA graphs it owns."""
-        self._shutdown(release_model_owned_graphs=True)
+        store_segment = self.store_segment
+        if store_segment is None:
+            self._shutdown(release_model_owned_graphs=True)
+            return
+        # First, so that its grace and Mooncake's cleanup run while the
+        # executor stops.
+        store_segment.begin_unmount()
+        try:
+            self._shutdown(release_model_owned_graphs=True)
+        finally:
+            # Other servers may read the memory until Mooncake frees it: the
+            # process must not end before.
+            store_segment.wait_until_freed()
 
     def shutdown_for_kv_cache_estimation(self):
         """Shut down a temporary profiling executor whose model is reused."""
@@ -3089,6 +3110,13 @@ class PyExecutor:
             except Exception as error:
                 # Waiters are already awake; retained resources still block manager teardown.
                 logger.error(f"Shared KV shutdown initiation failed: {error}")
+        kv_sharing = self.__dict__.get("kv_sharing")
+        if kv_sharing is not None:
+            try:
+                kv_sharing.shutdown()
+            except Exception as error:
+                # Cleanup also runs after a crash; teardown goes on.
+                logger.error(f"kv_sharing shutdown failed: {error}")
 
         # The loop may exit while the benchmark fill gate is still closed.
         keepalive = getattr(self, "_gpu_keepalive", None)
@@ -4399,6 +4427,10 @@ class PyExecutor:
         return all_ranks_fetched and any_rank_terminal_no_fit
 
     def _prepare_and_schedule_batch(self):
+        if self.kv_sharing is not None:
+            # Returns leases, resumes and drops parked fetches. Both loops call
+            # this method after the input-copy wait, so page tables may change.
+            self.kv_sharing.resolve_store_operations()
         self._release_unused_connector_reservations()
         self._poll_encoder_steps()
         new_requests = self._fetch_and_activate_new_requests()
@@ -4406,6 +4438,10 @@ class PyExecutor:
             return None, None
 
         self._handle_control_request()
+
+        if self.kv_sharing is not None:
+            self.kv_sharing.add_fetch_candidates(new_requests)
+            self._cancel_parked_requests()
 
         self.disagg.prepare_context_schedulable(new_requests)
         self.disagg.poll_gen_transfers()
@@ -5140,6 +5176,15 @@ class PyExecutor:
                                 sample_state = self._sample_async(
                                     scheduled_batch, batch_outputs)
 
+                    if (self.kv_sharing is not None
+                            and self.kv_sharing.has_store_transfers_to_start()):
+                        # A fetch admitted in this pass starts while the
+                        # forward runs. Starting may fail a lease, which
+                        # rewrites host page-index entries the input copy
+                        # reads: wait for the copy first.
+                        self._wait_for_model_engine_input_copy()
+                        self.kv_sharing.start_store_transfers()
+
                     if batch_outputs is not None:
                         if self.perf_manager.enabled:
                             self.perf_manager.save_timing_to_requests(
@@ -5180,6 +5225,9 @@ class PyExecutor:
                             self._update_v2_context_resources(scheduled_batch)
                             self._update_v2_generation_resources(
                                 scheduled_batch)
+                            if self.kv_sharing is not None:
+                                self.kv_sharing.publish_committed_blocks(
+                                    scheduled_batch.context_requests)
                         self._send_kv_async(scheduled_batch.all_requests())
 
                         self._handle_canceled_requests()
@@ -6174,6 +6222,10 @@ class PyExecutor:
                     # host page-index entries with BAD_PAGE_INDEX. Wait until
                     # the current input preparation has consumed those buffers.
                     self._wait_for_model_engine_input_copy()
+                    if self.kv_sharing is not None:
+                        # A fetch admitted in this pass starts while the
+                        # forward runs.
+                        self.kv_sharing.start_store_transfers()
                     self._update_request_states(scheduled_batch)
 
                     # Update context requests' KV cache so that sliding-window
@@ -6183,6 +6235,9 @@ class PyExecutor:
                     if (self._is_kv_manager_v2
                             and scheduled_batch.context_requests):
                         self._update_v2_context_resources(scheduled_batch)
+                        if self.kv_sharing is not None:
+                            self.kv_sharing.publish_committed_blocks(
+                                scheduled_batch.context_requests)
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._commit_kv_cache_stats(
@@ -6643,6 +6698,9 @@ class PyExecutor:
                 seconds=1200) if self._disable_mpi else None
         else:
             timeout = datetime.timedelta(0)
+        kv_sharing = self.kv_sharing
+        if kv_sharing is not None:
+            timeout = kv_sharing.request_queue_wait(timeout)
 
         # Fetch requests from rank 0
         new_requests = []
@@ -6654,8 +6712,16 @@ class PyExecutor:
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
             with self.hang_detector.pause():
-                new_requests.extend(
-                    self.executor_request_queue.get_from_request_queue(timeout))
+                fetched = self.executor_request_queue.get_from_request_queue(
+                    timeout)
+            if kv_sharing is not None:
+                fetched, store_update = kv_sharing.take_rank0_items(
+                    fetched, waiting_queue)
+                if store_update is not None:
+                    # First, so a shutdown or control item ending the envelope
+                    # does not cut it off.
+                    new_requests.insert(0, store_update)
+            new_requests.extend(fetched)
 
         if connector is not None and self.dist.rank == 0:
             completed = connector.take_finished_prefix_loads()
@@ -6681,8 +6747,18 @@ class PyExecutor:
         # The transport choice must be identical on every rank, so `idle` has
         # to be too: it follows the all-rank live-request count and the
         # replicated waiting queue.
+        # kv_sharing: rank 0's round size rides the request count (the other
+        # ranks' values are not sent); on every rank the next
+        # resolve_store_operations enters the round's collective exactly when
+        # it is not zero.
+        if kv_sharing is not None:
+            round_size = kv_sharing.round_to_announce()
+            self.request_broadcaster.store_round_size = round_size
         new_requests, py_request_objects = self.request_broadcaster.broadcast(
             new_requests, prefer_cpu=idle)
+        if kv_sharing is not None:
+            kv_sharing.round_announced(
+                self.request_broadcaster.rank0_store_round_size)
         if isinstance(waiting_queue, GenAdmissionWaitingQueue):
             if self._gen_admission.needs_clock:
                 waiting_queue.set_now(self.request_broadcaster.rank0_now,
@@ -6880,6 +6956,11 @@ class PyExecutor:
                     "totalKvBlocks"]
                 iter_stats_payload.kv_load_timestamp_ns = load_sample[
                     "timestampUnixNanos"]
+            # Work that keeps rank 0 from sleeping on an empty request queue
+            # while another rank still needs executor passes.
+            background_work = int(self._has_kv_transfers_in_flight()
+                                  or (self.kv_sharing is not None
+                                      and self.kv_sharing.has_store_work()))
             if getattr(self, "_enable_remote_tail_adp", False):
                 context_ids, generation_ids = self._snapshot_remote_tail_phase_work(
                     active_requests)
@@ -6887,14 +6968,16 @@ class PyExecutor:
                     active_requests,
                     iter_stats_payload=iter_stats_payload,
                     forward_work=(len(context_ids), len(generation_ids)),
-                    include_kv_cache_load=self._kv_load_tracker.enabled)
+                    include_kv_cache_load=self._kv_load_tracker.enabled,
+                    background_work=background_work)
                 self._select_remote_tail_phase(all_rank_states, context_ids,
                                                generation_ids)
             else:
                 all_rank_states = self.adp_router.gather_all_rank_states(
                     active_requests,
                     iter_stats_payload=iter_stats_payload,
-                    include_kv_cache_load=self._kv_load_tracker.enabled)
+                    include_kv_cache_load=self._kv_load_tracker.enabled,
+                    background_work=background_work)
             if self._kv_load_tracker.enabled and self.dist.rank == 0:
                 self._kv_load_tracker.record_rank_states(all_rank_states)
             if self.enable_iter_perf_stats:
@@ -6986,8 +7069,12 @@ class PyExecutor:
             if req_item.is_prefix_load_completion_request:
                 finished_prefix_load_ids.extend(
                     req_item.finished_prefix_load_ids)
+            elif req_item.is_store_update_request:
+                self.kv_sharing.apply_store_update(self.waiting_queue, req_item)
             elif req_item.is_shutdown_request:
                 self.is_shutdown = True
+                if self.kv_sharing is not None:
+                    self.kv_sharing.begin_shutdown()
                 self.disagg.begin_shared_shutdown()
                 break
             elif req_item.is_canceled_request:
@@ -7799,7 +7886,13 @@ class PyExecutor:
         if (not self._enable_scheduler_aware_adp_dummy
                 or self.kv_cache_transceiver is None):
             if self.kv_cache_transceiver is None:
-                return len(self.active_requests)
+                # Without a transceiver only a request parked for a kv_sharing
+                # store fetch is in transmission (KV connectors refuse attention
+                # DP in py_executor_creator); it waits, so the rank still needs a
+                # padding request.
+                return sum(
+                    1 for req in self.active_requests
+                    if not req.is_disagg_generation_transmission_in_progress)
 
             # PP intentionally preserves its established ADP padding behavior
             # until its dummy lifecycle is generalized. Keep this fallback on
@@ -8998,8 +9091,12 @@ class PyExecutor:
             # here because is_shutdown is True and the queue's active
             # flag is about to be set False, so no new items arrive.
             raw_queue = self.executor_request_queue.get_request_queue()
+            # Requests rank 0's store probe holds are in neither queue.
+            queued = (self.kv_sharing.take_held_requests()
+                      if self.kv_sharing is not None else [])
             while not raw_queue.empty():
-                item = raw_queue.get_nowait()
+                queued.append(raw_queue.get_nowait())
+            for item in queued:
                 if item.is_shutdown_request:
                     continue
                 if ((self.gather_all_responses or self.dist.rank == 0)
@@ -9025,6 +9122,13 @@ class PyExecutor:
 
         failed_requests = (list(self.active_requests)
                            if requests is None else requests)
+        if self.kv_sharing is not None:
+            # A request parked for a store fetch fails now, like any other: its
+            # fetch lets it go first, so it no longer reads as in transfer and
+            # the orchestrator forgets it (a GPU Direct lease's lock keeps the
+            # pages from reuse until a round returns the lease).
+            for request in failed_requests:
+                self.kv_sharing.cancel_fetch(request)
         if not is_fatal:
             # Async work enqueued before the failure -- the model engine's
             # input H2D copy in particular -- can still be reading the failed
@@ -9332,6 +9436,33 @@ class PyExecutor:
             return False
 
         return self.disagg.request_cancellation(request)
+
+    def _cancel_parked_requests(self) -> None:
+        """Cancels each request parked for a store fetch in the pass its
+        cancel arrives; any other cancelled request loses its candidacy, so it
+        never parks. Call it after the pass's candidates are added and before
+        scheduling. ``_handle_canceled_requests`` runs only in passes with a
+        forward, so on an otherwise idle server a parked request's cancel
+        would wait for its fetch. Responses and terminations ride this pass's
+        response flush, as transfer completions' do."""
+        if not self.canceled_req_ids:
+            return
+        cancelled = set(self.canceled_req_ids)
+        for request in [
+                r for r in self.active_requests if r.py_request_id in cancelled
+        ]:
+            if not self.kv_sharing.cancel_fetch(request):
+                continue  # not parked: the response pass cancels it
+            request.finish_by_reason(FinishReason.CANCELLED)
+            request.decoding_iter = request.py_decoding_iter
+            self.active_requests.remove(request)
+            self.canceled_req_ids.remove(request.py_request_id)
+            response = request.create_response()
+            if response:
+                response.result.cached_tokens = request.cached_tokens
+                self._pending_transfer_responses.append(
+                    (request.py_request_id, response))
+            self._pending_response_terminations.append(request)
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):

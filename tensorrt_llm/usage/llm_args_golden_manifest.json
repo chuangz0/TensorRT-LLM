@@ -895,6 +895,59 @@
       "path": "kv_connector_config.mooncake_store.segment_size"
     },
     {
+      "allowed_values": [
+        "fetch",
+        "publish",
+        "provide"
+      ],
+      "capture_policy": "list[list[literal]]",
+      "kind": "categorical",
+      "path": "kv_sharing.backends.roles"
+    },
+    {
+      "capture_policy": "list[int]",
+      "kind": "value",
+      "path": "kv_sharing.backends.segment_size"
+    },
+    {
+      "allowed_values": [
+        "mooncake"
+      ],
+      "capture_policy": "list[literal]",
+      "kind": "categorical",
+      "path": "kv_sharing.backends.type"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "gpu_direct",
+        "host_staging"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_sharing.data_path"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_sharing.fetch_timeout_s"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_sharing.max_fetch_tokens"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "kv_sharing.min_fetch_tokens"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_sharing.probe_hold_ms"
+    },
+    {
       "capture_policy": "list[int]|none",
       "kind": "value",
       "path": "layer_wise_benchmarks_config.calibration_layer_indices"

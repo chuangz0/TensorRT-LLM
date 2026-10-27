@@ -16,7 +16,7 @@
 import enum
 import os
 from collections import Counter
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
 from tensorrt_llm.logger import logger
@@ -38,6 +38,9 @@ from .scheduler import (
     _is_forced_context_chunk_boundary,
     drop_decoder_context_requests_waiting_for_encoder_output,
 )
+
+if TYPE_CHECKING:
+    from ..kv_sharing.orchestrator import SharedKvOrchestrator
 
 
 class ScheduleAction(enum.Enum):
@@ -155,6 +158,10 @@ class KVCacheV2Scheduler(RequestScheduler):
     Merges capacity checking (KV cache allocation via resize()) and token budget
     assignment into one unified loop.
     """
+
+    # Set by kv_sharing startup: parks requests whose prompt prefix a KV store
+    # holds while it is fetched.
+    store_fetches: Optional["SharedKvOrchestrator"] = None
 
     def __init__(
         self,
@@ -584,6 +591,15 @@ class KVCacheV2Scheduler(RequestScheduler):
 
             req_it += 1
 
+        # A request parked for a store fetch takes no batch slot and no token
+        # budget, so the store's admission walks its own candidates, past both
+        # requests_full breaks, once generation took its pages.
+        parked_for_fetch = (
+            self.store_fetches.start_fetches() if self.store_fetches is not None else set()
+        )
+        if parked_for_fetch:
+            pending_ctx = [req for req in pending_ctx if req.py_request_id not in parked_for_fetch]
+
         # Requests whose pages were given up during this pass. A victim that is
         # itself a started context request still sits in pending_ctx, so
         # re-admitting it would spend the pages its own preemption released.
@@ -744,6 +760,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             or evicted
             or recompute_paused
             or deferred_behind_contributor
+            or parked_for_fetch
         )
         if (
             self.remote_tail_phase is None

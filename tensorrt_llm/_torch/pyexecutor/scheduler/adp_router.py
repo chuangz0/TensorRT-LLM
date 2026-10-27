@@ -202,6 +202,7 @@ class ADPRouter(ABC):
         iter_stats_payload: RankIterStatsPayload | None = None,
         forward_work: tuple[int, int] | None = None,
         include_kv_cache_load: bool = False,
+        background_work: int = 0,
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
 
@@ -218,6 +219,9 @@ class ADPRouter(ABC):
                 piggyback on this allgather, if one is pending.
             forward_work: Context and generation work eligible before this
                 iteration polls transfers, used by conditional attention DP.
+            background_work: Work that needs executor passes but holds no
+                admission seat: open KV sharing store operations and KV
+                transfers in flight. Counted with the retiring requests.
         """
         if self.exclude_retiring_requests:
             active_requests_for_overlap = build_active_requests_for_overlap(active_requests)
@@ -226,7 +230,7 @@ class ADPRouter(ABC):
             active_requests_for_overlap = active_requests
             num_retiring_requests = 0
         local_state = self.create_rank_state(active_requests_for_overlap, new_requests or [])
-        local_state.num_retiring_requests = num_retiring_requests
+        local_state.num_retiring_requests = num_retiring_requests + background_work
         local_state.copy_iter_stats_from(iter_stats_payload)
         if forward_work is not None:
             local_state.num_context_requests, local_state.num_generation_requests = forward_work

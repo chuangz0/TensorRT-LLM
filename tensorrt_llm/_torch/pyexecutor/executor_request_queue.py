@@ -7,7 +7,7 @@ import enum
 import queue
 import threading
 import time
-from typing import Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
@@ -23,6 +23,9 @@ CONTROL_REQUEST_ID = -2
 PROFILE_START_REQUEST_ID = -3
 PROFILE_STOP_REQUEST_ID = -4
 PREFIX_LOAD_COMPLETION_REQUEST_ID = -5
+# Rank 0's store update (kv_sharing): new store hits of waiting requests and
+# a publishing switch; every rank applies it before it activates any request.
+STORE_UPDATE_REQUEST_ID = -6
 
 
 class RequestAdmissionState(enum.Enum):
@@ -58,6 +61,14 @@ class RequestQueueItem:
     # original arrival on the same clock.
     admit_arrival: Optional[float] = None
     admit_orig_arrival: Optional[float] = None
+    # Leading prompt tokens, in whole blocks, a KV store held when rank 0
+    # probed the request (kv_sharing); None when not probed.
+    store_hit_tokens: Optional[int] = None
+    # Only on the store-update item (kv_sharing): (request id, hit) of waiting
+    # requests whose store hit rank 0 measured again, and whether publications
+    # are appended from now on (None: unchanged).
+    store_hits: tuple[tuple[int, int], ...] = ()
+    store_publishing: Optional[bool] = None
 
     @property
     def is_shutdown_request(self):
@@ -68,11 +79,16 @@ class RequestQueueItem:
         return not (self.is_shutdown_request or self.is_canceled_request
                     or self.is_control_request or self.is_profile_start_request
                     or self.is_profile_stop_request
-                    or self.is_prefix_load_completion_request)
+                    or self.is_prefix_load_completion_request
+                    or self.is_store_update_request)
 
     @property
     def is_prefix_load_completion_request(self):
         return self.id == PREFIX_LOAD_COMPLETION_REQUEST_ID
+
+    @property
+    def is_store_update_request(self):
+        return self.id == STORE_UPDATE_REQUEST_ID
 
     @property
     def is_control_request(self):
@@ -89,6 +105,10 @@ class RequestQueueItem:
 
 class ExecutorRequestQueue:
     """Handles basic queue operations for executor requests."""
+
+    # Set by kv_sharing startup on rank 0: starts a store probe of each new
+    # request, on the enqueuing thread, before the request enters the queue.
+    probe_on_enqueue: Optional[Callable[[RequestQueueItem], None]] = None
 
     def __init__(
         self,
@@ -254,6 +274,8 @@ class ExecutorRequestQueue:
                                         child_req_ids=child_req_ids)
                 if self._stamp_admission_times is not None:
                     self._stamp_admission_times(item, time.monotonic())
+                if self.probe_on_enqueue is not None:
+                    self.probe_on_enqueue(item)
                 self.request_queue.put(item)
                 req_ids.append(req_id)
         return req_ids
