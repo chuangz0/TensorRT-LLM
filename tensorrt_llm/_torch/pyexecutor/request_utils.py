@@ -397,6 +397,15 @@ class RequestBroadcaster:
         self.rank0_now: Optional[float] = None
         self.aux: Optional[float] = None
         self.rank0_aux: Optional[float] = None
+        # carry_store_round: rank 0's ``store_round_size`` (how many store
+        # operations kv_sharing's next round covers) rides along too, read on
+        # every rank as ``rank0_store_round_size`` right after ``broadcast()``;
+        # a pass that skips the broadcast keeps the previous value. Set it on
+        # every rank before the executor loop starts (``start_worker``): it
+        # changes the length, which every rank's broadcast must agree on.
+        self.carry_store_round = False
+        self.store_round_size = 0
+        self.rank0_store_round_size = 0
 
     def broadcast(
         self, new_requests: List, prefer_cpu: bool = False
@@ -446,11 +455,13 @@ class RequestBroadcaster:
         rest is static topology / transport state shared by every rank. The
         PP route keeps its probe + send/recv chain, the idle path
         (``prefer_cpu``) keeps the CPU-transport probe as its wake mechanism,
-        and ``sync_clock`` keeps the probe that carries rank 0's clock.
+        and ``sync_clock`` and ``carry_store_round`` keep the probe that
+        carries rank 0's clock and store round.
         """
         return (
             not prefer_cpu
             and not self.sync_clock
+            and not self.carry_store_round
             and self.dist.world_size > 1
             and not self.dist.has_pp
             and bool(getattr(self.dist, "supports_single_round_broadcast", False))
@@ -481,16 +492,21 @@ class RequestBroadcaster:
         return received
 
     def _broadcast_request_count(self, request_count: int, prefer_cpu: bool = False) -> int:
-        """Broadcast rank 0's request count and, with ``sync_clock``, its clock and aux in us."""
+        """Broadcast rank 0's request count and, with ``sync_clock``, its clock and aux in us;
+        with ``carry_store_round``, its store round size last."""
+        is_root = self.dist.rank == 0
         header = [request_count]
         if self.sync_clock:
-            is_root = self.dist.rank == 0
             header.append(int(time.monotonic() * 1e6) if is_root else 0)
             header.append(int(self.aux * 1e6) if is_root and self.aux is not None else -1)
+        if self.carry_store_round:
+            header.append(self.store_round_size if is_root else 0)
         header = self._broadcast_header(header, prefer_cpu=prefer_cpu)
         if self.sync_clock:
             self.rank0_now = header[1] / 1e6
             self.rank0_aux = None if header[2] < 0 else header[2] / 1e6
+        if self.carry_store_round:
+            self.rank0_store_round_size = header[-1]
         return header[0]
 
     def _broadcast_header(self, header: List[int], prefer_cpu: bool = False) -> List[int]:

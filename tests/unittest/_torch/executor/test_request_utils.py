@@ -6,7 +6,7 @@
 This module tests:
 - Request merging functions (merge_requests, merge_helix_requests)
 - Waiting queue functions (get_from_waiting_queue, can_process_attention_dp_request)
-- Rank-0 clock piggyback in RequestBroadcaster
+- Rank-0 clock and store round piggyback in RequestBroadcaster
 
 """
 
@@ -1274,3 +1274,42 @@ class TestBroadcasterClock:
         (values,), _ = other.broadcast_int64.call_args
         assert list(values) == [0, 0, -1]
         assert b.rank0_aux == pytest.approx(0.17) and b.rank0_now == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("sync_clock", [False, True])
+def test_the_store_round_rides_the_request_count_to_every_rank(sync_clock: bool):
+    """kv_sharing: rank 0's count of store operations its next round covers reaches every rank
+    with the request count, also when no request is broadcast. It keeps the count probe where a
+    single-round broadcast, which has no room for it, would replace the probe. It goes last, so
+    with ``sync_clock`` the header is [count, now, aux, round]."""
+    wire = []
+
+    def broadcaster(rank):
+        def broadcast_int64(values, root, prefer_cpu):
+            if rank == root:
+                wire[:] = values
+            return list(wire)
+
+        dist = SimpleNamespace(
+            rank=rank,
+            world_size=2,
+            has_pp=False,
+            supports_single_round_broadcast=True,
+            broadcast_int64=broadcast_int64,
+        )
+        broadcaster = RequestBroadcaster(dist, MagicMock(), sync_clock=sync_clock)
+        broadcaster.carry_store_round = True
+        return broadcaster
+
+    root = broadcaster(0)
+    root.store_round_size = 3
+    root.aux = 0.25
+    assert root.broadcast([]) == ([], None)
+    assert len(wire) == (4 if sync_clock else 2)
+    assert wire[0] == 0 and wire[-1] == 3 and root.rank0_store_round_size == 3
+    other = broadcaster(1)
+    other.store_round_size = 5  # ignored off rank 0
+    assert other.broadcast([]) == ([], None)
+    assert other.rank0_store_round_size == 3
+    if sync_clock:
+        assert wire[2] == 250_000 and other.rank0_aux == pytest.approx(0.25)
