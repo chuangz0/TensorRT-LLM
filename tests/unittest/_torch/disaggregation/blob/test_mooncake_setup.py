@@ -10,6 +10,7 @@ a Mooncake install or a GPU.
 from __future__ import annotations
 
 import ast
+import os
 import pathlib
 import socket
 import sys
@@ -49,7 +50,6 @@ def store_config(protocol: str = "tcp", **mooncake) -> dict:
         "blob": {"key_prefix": "t"},
         "mooncake": {
             "master_server_address": MASTER,
-            "global_segment_size": 0,
             "protocol": protocol,
             **mooncake,
         },
@@ -97,6 +97,9 @@ def sdk(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> Sdk:
     monkeypatch.setattr(mooncake_setup, "IB_SYSFS_ROOT", str(tmp_path / "no-infiniband"))
     for name in ("MC_TCP_PROTO", "MC_STORE_LOCAL_HOT_CACHE_SIZE", "MC_USE_TENT", "MC_USE_TEV1"):
         monkeypatch.delenv(name, raising=False)
+    # Unset now and restored after the test, as open_sdk sets them.
+    for name in ("MC_RPC_TIMEOUT_MS", "MC_RPC_CONNECT_TIMEOUT_MS", "MC_HANDSHAKE_MAX_LENGTH"):
+        monkeypatch.delenv(name, raising=False)
     return sdk
 
 
@@ -113,8 +116,8 @@ def ib_device(root: pathlib.Path, name: str, link_layer: str, state: str, rate: 
 
 def test_store_config_refuses_missing_and_unknown_sections_and_keys() -> None:
     config = store_config()
-    del config["mooncake"]["global_segment_size"]
-    with pytest.raises(ValueError, match="'mooncake'.*global_segment_size"):
+    del config["mooncake"]["master_server_address"]
+    with pytest.raises(ValueError, match="'mooncake'.*master_server_address"):
         load_store_config(config)
     with pytest.raises(ValueError, match="unknown sections"):
         load_store_config({**store_config(), "mooncake_store": {}})
@@ -137,6 +140,7 @@ BAD_VALUES = {
     "mooncake.workers=0": ("mooncake", "workers", 0),
     "mooncake.global_segment_size=1.0": ("mooncake", "global_segment_size", 1.0),
     "mooncake.local_buffer_size=-1": ("mooncake", "local_buffer_size", -1),
+    "mooncake.rpc_timeout_ms=0": ("mooncake", "rpc_timeout_ms", 0),
     "mooncake.master_server_address=5": ("mooncake", "master_server_address", 5),
     "mooncake.device_name=None": ("mooncake", "device_name", None),
     # One master's host:port: an HA master list would leave nothing to wait for.
@@ -210,7 +214,7 @@ def test_open_passes_setup_arguments_by_name(
     assert setup.kwargs == {
         "local_hostname": ROUTED_ADDRESS,  # where the route to the master leaves from
         "metadata_server": "P2PHANDSHAKE",
-        "global_segment_size": 0,
+        "global_segment_size": 0,  # the default: other processes give the pool its memory
         "local_buffer_size": 16 << 20,
         "protocol": "rdma",
         "rdma_devices": "mlx5_0,mlx5_1",  # the fastest active InfiniBand ports
@@ -239,6 +243,19 @@ def test_open_passes_setup_arguments_by_name(
         "rdma_devices": "eth9",
         "master_server_addr": MASTER,
     }
+
+
+def test_open_sets_the_rpc_timeouts_per_client_and_the_handshake_limit_where_unset(
+    sdk: Sdk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    open_sdk(MooncakeConfig(MASTER, protocol="tcp"))
+    assert os.environ["MC_RPC_TIMEOUT_MS"] == "10000"
+    assert os.environ["MC_RPC_CONNECT_TIMEOUT_MS"] == "5000"
+    assert os.environ["MC_HANDSHAKE_MAX_LENGTH"] == str(64 << 20)
+    monkeypatch.setenv("MC_HANDSHAKE_MAX_LENGTH", str(128 << 20))  # an operator's own limit
+    open_sdk(MooncakeConfig(MASTER, protocol="tcp", rpc_timeout_ms=250))
+    assert os.environ["MC_RPC_TIMEOUT_MS"] == "250"  # Mooncake reads it as it creates the client
+    assert os.environ["MC_HANDSHAKE_MAX_LENGTH"] == str(128 << 20)
 
 
 def test_device_detection_picks_the_fastest_active_ib_ports(tmp_path: pathlib.Path) -> None:

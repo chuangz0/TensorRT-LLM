@@ -4,11 +4,14 @@
 
 A store config has two sections: ``blob``, read by the caller's reader, and ``mooncake``, read
 here; both are checked before the SDK is opened. Mooncake reads its own environment variables, some
-once per process (``MOONCAKE_STORE_CHECKSUM``), some per client (``MC_STORE_MEMCPY``,
-``MC_USE_TENT``) and ``MC_TCP_PROTO`` on every transfer; this module logs them before setup and
-never sets them. ``open_sdk`` refuses the settings the driver's rules do not cover: TCP's legacy
-framing (``MC_TCP_PROTO=1``), the local hot cache (``MC_STORE_LOCAL_HOT_CACHE_SIZE``), the newer
-transfer engine (``MC_USE_TENT``, ``MC_USE_TEV1``) and any SDK build other than the pinned ones.
+once per process (``MOONCAKE_STORE_CHECKSUM``, ``MC_HANDSHAKE_MAX_LENGTH``), some per client
+(``MC_STORE_MEMCPY``, ``MC_USE_TENT``, the two RPC timeouts) and ``MC_TCP_PROTO`` on every
+transfer; this module logs them before setup. It sets only the RPC timeouts (the call timeout from
+the config, the connect timeout to ``RPC_CONNECT_TIMEOUT_MS``) and, unless set,
+``MC_HANDSHAKE_MAX_LENGTH``. ``open_sdk`` refuses the settings the driver's rules do not cover:
+TCP's legacy framing (``MC_TCP_PROTO=1``), the local hot cache (``MC_STORE_LOCAL_HOT_CACHE_SIZE``),
+the newer transfer engine (``MC_USE_TENT``, ``MC_USE_TEV1``) and any SDK build other than the
+pinned ones.
 
 Over RDMA, a process that used ibverbs before its first Mooncake client (importing
 ``tensorrt_llm`` does) logs ``RDMA context setup failed: fork compatibility: Invalid argument``
@@ -53,9 +56,20 @@ PINNED_SDK_VERSION = "0.3.13"
 IB_SYSFS_ROOT = "/sys/class/infiniband"
 MASTER_WAIT_S = 60.0
 MASTER_RETRY_S = 0.5
+# How long one connection to the master may take; short, as ``open_sdk`` first waits
+# (MASTER_WAIT_S) until the master accepts connections. Unset, Mooncake waits 30 s.
+RPC_CONNECT_TIMEOUT_MS = 5_000
+# The longest handshake message a process accepts. A process's first transfer with another sends
+# its transfer descriptor, which lists every buffer it registered: under GPU Direct thousands of KV
+# cache pieces. Mooncake drops a message longer than MC_HANDSHAKE_MAX_LENGTH (1 MiB unless set, at
+# most 128 MiB), which it reads once per process.
+HANDSHAKE_MAX_BYTES = 64 << 20
 SECTIONS = ("blob", "mooncake")
 # Logged before setup, as Mooncake will read them.
 _LOGGED_ENVIRONMENT = (
+    "MC_RPC_TIMEOUT_MS",
+    "MC_RPC_CONNECT_TIMEOUT_MS",
+    "MC_HANDSHAKE_MAX_LENGTH",
     "MC_STORE_MEMCPY",
     "MOONCAKE_STORE_CHECKSUM",
     "WITH_NVIDIA_PEERMEM",
@@ -77,9 +91,9 @@ class MooncakeConfig:
 
     Attributes:
         master_server_address: The master's ``host:port``.
-        global_segment_size: Bytes of this process's memory that hold pool objects (its
-            segment). Required: the objects in it go when the process does; 0 leaves holding
-            objects to other processes.
+        global_segment_size: Bytes of this process's memory that ``setup`` mounts to hold pool
+            objects (its segment); the objects in it go when the process does. 0 by default:
+            other processes give the pool its memory.
         protocol: ``"rdma"`` or ``"tcp"``.
         device_name: Comma-separated RDMA devices; empty picks every active InfiniBand device at
             the highest rate.
@@ -88,6 +102,9 @@ class MooncakeConfig:
         metadata_server: Where segments are described; ``P2PHANDSHAKE`` needs no server.
         local_buffer_size: Bytes for the SDK's copying calls, which the driver never makes; 0 is
             allowed, and the default is the SDK's.
+        rpc_timeout_ms: How long one call to the master may take (``MC_RPC_TIMEOUT_MS``; 30 s
+            unless set). It bounds the calls that take no deadline of their own, such as the
+            existence check a probe makes.
         workers: The most threads the driver runs SDK calls on. One put call does not fill the
             links, and each running get busy-polls a core; with two workers or more, puts leave
             one to gets.
@@ -104,12 +121,13 @@ class MooncakeConfig:
     """
 
     master_server_address: str
-    global_segment_size: int
+    global_segment_size: int = 0
     protocol: Literal["rdma", "tcp"] = "rdma"
     device_name: str = ""
     local_hostname: str = ""
     metadata_server: str = "P2PHANDSHAKE"
     local_buffer_size: int = 16 << 20
+    rpc_timeout_ms: int = 10_000
     workers: int = DEFAULT_WORKERS
     rows_per_call: int = DEFAULT_ROWS_PER_CALL
     bytes_per_call: int = DEFAULT_BYTES_PER_CALL
@@ -128,6 +146,7 @@ class MooncakeConfig:
         for name, least in (
             ("global_segment_size", 0),
             ("local_buffer_size", 0),
+            ("rpc_timeout_ms", 1),
             ("workers", 1),
             ("rows_per_call", 1),
             ("bytes_per_call", 1),
@@ -174,7 +193,10 @@ def load_store_config(
 
 def open_sdk(config: MooncakeConfig) -> Any:
     """Opens a set-up ``MooncakeDistributedStore``, on the builder thread: ``setup`` holds the GIL
-    while it mounts this process's segment.
+    while it mounts the segment ``global_segment_size`` asks for, if any. Sets the process's
+    ``MC_RPC_TIMEOUT_MS`` from ``config``, ``MC_RPC_CONNECT_TIMEOUT_MS`` and, unless set,
+    ``MC_HANDSHAKE_MAX_LENGTH`` first: every process may receive another's descriptor, which lists
+    every buffer that process registered.
 
     Raises:
         ValueError: TCP would use its legacy framing, the local hot cache is on, or the newer
@@ -186,6 +208,10 @@ def open_sdk(config: MooncakeConfig) -> Any:
     _refuse_legacy_tcp_framing(config.protocol)
     _refuse_hot_cache()
     _refuse_tent()
+    # Mooncake reads both when it creates a client, so each client gets its own config's values.
+    os.environ["MC_RPC_TIMEOUT_MS"] = str(config.rpc_timeout_ms)
+    os.environ["MC_RPC_CONNECT_TIMEOUT_MS"] = str(RPC_CONNECT_TIMEOUT_MS)
+    os.environ.setdefault("MC_HANDSHAKE_MAX_LENGTH", str(HANDSHAKE_MAX_BYTES))
     _log_environment()
     try:
         import mooncake.store as sdk
@@ -217,7 +243,8 @@ def open_mooncake_driver(
     read_blob_section: Callable[[Mapping[str, object]], BlobSectionT],
 ) -> tuple[MooncakeDriver, BlobSectionT]:
     """Opens the Mooncake driver a store config describes, once both its sections are read: opening
-    waits for the master and mounts this process's segment, so a bad config fails before that.
+    waits for the master and mounts the segment ``global_segment_size`` asks for, if any, so a bad
+    config fails before that.
 
     The caller owns the driver and closes it last, with ``MooncakeDriver.close``, which also closes
     the SDK client.
