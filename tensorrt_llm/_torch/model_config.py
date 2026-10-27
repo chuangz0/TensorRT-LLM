@@ -782,7 +782,7 @@ class ModelConfig(Generic[TConfig]):
             # Merge HF config's modules_to_not_convert with default exclude_modules
             if hf_exclude_modules is not None:
                 quant_config.exclude_modules = list(
-                    set(hf_exclude_modules + default_exclude))
+                    dict.fromkeys(hf_exclude_modules + default_exclude))
             else:
                 quant_config.exclude_modules = default_exclude
         # MXFP4 checkpoints.
@@ -800,7 +800,7 @@ class ModelConfig(Generic[TConfig]):
             # Merge HF config's modules_to_not_convert with default exclude_modules
             if hf_exclude_modules is not None:
                 quant_config.exclude_modules = list(
-                    set(hf_exclude_modules + default_exclude))
+                    dict.fromkeys(hf_exclude_modules + default_exclude))
             else:
                 quant_config.exclude_modules = default_exclude
 
@@ -1065,7 +1065,8 @@ class ModelConfig(Generic[TConfig]):
         quant_config = QuantConfig()
         layer_quant_config = None
 
-        exclude_modules = set()
+        # Ordered as the file lists them, so every process derives the same quant config.
+        exclude_modules = {}
         has_mxfp4 = False
         is_dynamic_quant = False
         with open(dtypes_json_file) as f:
@@ -1074,7 +1075,7 @@ class ModelConfig(Generic[TConfig]):
                 if layer.endswith("weight"):
                     if dtype == "BF16" or dtype == "FP16":
                         names = layer.split(".")
-                        exclude_modules.add('.'.join(names[:-1]))
+                        exclude_modules['.'.join(names[:-1])] = None
                     elif dtype == "MXFP4":
                         # This is the path for the fp8 checkpoint which requires dynamic quantization.
                         is_dynamic_quant = True
