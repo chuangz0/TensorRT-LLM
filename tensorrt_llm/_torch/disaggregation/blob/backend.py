@@ -346,7 +346,8 @@ class RegionBinding:
 
 
 class DriverCallLimit(NamedTuple):
-    """The most rows of a region, and their bytes, that one driver ``put`` or ``get`` carries."""
+    """The most rows of a layer group, and their bytes, that one driver ``put`` or ``get``
+    carries."""
 
     rows: int
     nbytes: int
@@ -611,24 +612,27 @@ class BlobBackend:
         self._log_still_accessible(labels)
         return labels
 
-    def driver_call_limit(self, region_index: int) -> DriverCallLimit | None:
-        """The most rows of region ``region_index`` the driver takes in one ``put`` or ``get`` (its
-        ``max_rows_per_op``), and their bytes; None when the driver declares no limit on the rows
-        of one call. A group is still cut at a repeated object key, which no call carries twice.
+    def driver_call_limit(self, region_indices: Sequence[int]) -> DriverCallLimit | None:
+        """The most rows of a layer group lying in ``region_indices`` the driver takes in one
+        ``put`` or ``get`` (its ``max_rows_per_op``), and their bytes: a row is a slot of each of
+        those regions. None when the driver declares no limit on the rows of one call. A group is
+        still cut at a repeated object key, which no call carries twice.
 
         An attempt quiesces only once every call proved its access ended, so one call that never
         proves it keeps the slots of its whole submission; a holder bounds that by submitting at
-        most this many rows of the region at a time.
+        most this many rows of the group at a time.
 
         Raises:
-            ValueError: The backend did not register the region.
+            ValueError: The backend did not register one of the regions.
         """
-        if region_index not in self._binding.served_region_indices:
-            raise ValueError(f"region {region_index} is not registered")
+        for index in region_indices:
+            if index not in self._binding.served_region_indices:
+                raise ValueError(f"region {index} is not registered")
         rows = self._max_rows_per_op
         if rows is None:
             return None
-        return DriverCallLimit(rows=rows, nbytes=rows * self._regions[region_index].slot_bytes)
+        row_bytes = sum(self._regions[index].slot_bytes for index in region_indices)
+        return DriverCallLimit(rows=rows, nbytes=rows * row_bytes)
 
     def stats(self) -> dict[str, int]:
         """A snapshot of the work in flight, for logs and tests."""

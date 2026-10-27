@@ -221,12 +221,13 @@ retrying the drain and the revocation, and the hold stays with the manager until
   when it refuses more (`DriverRejected`, which fails that call) is the driver's; how much to
   submit at a time is the lease holder's admission policy. There is no backend-side cap on
   queued work.
-- **One call per group, cut twice**: `BlobBackend.driver_call_limit(region_index)` tells a
-  holder how many rows of a region one driver call carries (the driver's `max_rows_per_op`),
-  so it can bound what a single call that never proves its access ended would pin; `None`
-  means the driver declares no limit on the rows of one call. A group is also cut at a
-  repeated object key: a view may name one key in two slots, while a `RowBatch` carries no
-  key twice. The rows keep their order, and the outcome's masks their positions.
+- **One call per group, cut twice**: `BlobBackend.driver_call_limit(region_indices)` tells a
+  holder how many rows of a group one driver call carries (the driver's `max_rows_per_op`), and
+  their bytes over every region a row lies in, so it can bound what a single call that never
+  proves its access ended would pin; `None` means the driver declares no limit on the rows of
+  one call. A group is also cut at a repeated object key: a view may name one key in two slots,
+  while a `RowBatch` carries no key twice. The rows keep their order, and the outcome's masks
+  their positions.
 - **A driver out of its protocol** (a raise from `put`/`get` that is not `DriverRejected`, no
   handle returned, a raise from a query, a `poll` with the wrong row count) is fenced: the call
   is held as unprovable unless its access end was recorded already, the calls of the same

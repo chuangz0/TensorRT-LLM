@@ -171,7 +171,7 @@ def test_each_group_goes_in_one_call_split_only_by_the_driver_limit(
     expected = [10, 2] if max_rows_per_op is None else [4, 4, 2, 2]
     assert [len(call.rows) for call in writer.driver.calls_to("put")] == expected
     limit = None if max_rows_per_op is None else (4, 4 * SLOT_BYTES)
-    assert writer.backend.driver_call_limit(0) == limit
+    assert writer.backend.driver_call_limit((0,)) == limit
     writer.wait_quiesced(attempt)
     writer.close()
 
@@ -1583,7 +1583,7 @@ def test_rows_in_a_region_the_backend_did_not_register_are_rejected(store: Memor
     with pytest.raises(InvalidSubmission, match="region 1 is not registered"):
         reader.backend.fetch(view, None)
     with pytest.raises(ValueError, match="region 1 is not registered"):
-        reader.backend.driver_call_limit(1)
+        reader.backend.driver_call_limit((1,))
     assert store_calls(reader) == []
     reader.close()
 
@@ -1606,6 +1606,15 @@ def test_a_row_lying_in_two_regions_is_its_two_slots_back_to_back(store: MemoryS
     assert endpoint.region.read(1) == b"a" * SLOT_BYTES
     assert second.read(1) == b"x" * 2 * SLOT_BYTES
     endpoint.wait_quiesced(fetched)
+    endpoint.close()
+
+
+def test_a_call_limit_counts_the_slot_of_every_region_a_row_lies_in(store: MemoryStore) -> None:
+    capabilities = replace(DEFAULT_CAPABILITIES, max_rows_per_op=4)
+    second = CpuRegion(2 * SLOT_BYTES, 2)
+    endpoint = Endpoint(MemoryDriver(store, capabilities=capabilities), ["A", "B"], others=[second])
+    assert endpoint.backend.driver_call_limit((0,)) == (4, 4 * SLOT_BYTES)
+    assert endpoint.backend.driver_call_limit((0, 1)) == (4, 4 * 3 * SLOT_BYTES)
     endpoint.close()
 
 
@@ -1664,7 +1673,7 @@ def test_rows_naming_one_key_at_two_addresses_never_share_a_call(
     capabilities = replace(DEFAULT_CAPABILITIES, max_rows_per_op=max_rows_per_op)
     endpoint = Endpoint(MemoryDriver(store, capabilities=capabilities), slot_names)
     if max_rows_per_op is None:
-        assert endpoint.backend.driver_call_limit(0) is None  # no limit declared; still cut
+        assert endpoint.backend.driver_call_limit((0,)) is None  # no limit declared; still cut
     payload = {key: key.encode() * SLOT_BYTES for key in set(keys)}
     view = CpuView(
         [
