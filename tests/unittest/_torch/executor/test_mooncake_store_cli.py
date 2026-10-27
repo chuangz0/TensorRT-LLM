@@ -14,9 +14,10 @@
 # limitations under the License.
 """Unit tests for the pool lifecycle `trtllm-serve` owns.
 
-Two seams: the signal that ends `mooncake_master`, which has to release the
-master before the telemetry boundary reports it, and the provisioning a server
-is wrapped in, which has to leave an externally managed pool in charge.
+Three seams: the signal that ends `mooncake_master`, which has to release the
+master before the telemetry boundary reports it, the provisioning a server is
+wrapped in, which has to leave an externally managed pool in charge, and
+`mooncake_provider`'s graceful leave, which a second signal must not cut.
 
 Runs without a Mooncake installation and without a GPU. The master process the
 command holds is a context manager that records its own release, and the signal
@@ -236,6 +237,45 @@ def test_the_pool_report_accepts_the_same_opt_out(monkeypatch, tmp_path):
 
     command = CommandUnderTest(Resource(None), ["mooncake_pool_report", "--run_dir", str(tmp_path)])
     command.run("--no-telemetry")
+
+
+def test_a_second_signal_does_not_cut_the_providers_graceful_leave(monkeypatch, tmp_path):
+    """`mooncake_provider` unmounts its memory on SIGTERM or SIGINT and waits about 13 s while
+    readers' gets finish: ending sooner frees the memory under them. A second signal in that
+    time is ignored; SIGKILL still ends it."""
+    from tensorrt_llm._torch.disaggregation.blob import mooncake_setup
+
+    class Store:
+        """What the provider calls of a Mooncake client."""
+
+        def allocate_and_mount_segment(self, nbytes, protocol, location):
+            return {"ret": 0, "segment_ids": ["segment"]}
+
+        def unmount_and_free_segment(self, segment_ids, grace_s):
+            return 0
+
+    def signal_self(seconds):
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    waited = []
+
+    def signal_during_the_unmount_wait(seconds):
+        signal_self(seconds)
+        waited.append(seconds)
+
+    monkeypatch.setattr(mooncake_setup, "open_sdk", lambda config: Store())
+    clock = SimpleNamespace(monotonic=lambda: 0.0, sleep=signal_during_the_unmount_wait)
+    monkeypatch.setattr(mooncake_setup, "time", clock)
+    monkeypatch.setattr(mooncake_commands, "time", SimpleNamespace(sleep=signal_self))
+    config = tmp_path / "store.yaml"
+    config.write_text("mooncake:\n  master_server_address: 127.0.0.1:50051\n  protocol: tcp\n")
+
+    with pytest.raises(_telemetry.SignalExit):  # the first signal, at the idle wait
+        mooncake_commands.mooncake_provider.main(
+            args=["--config", str(config), "--segment_size", "1024"], standalone_mode=False
+        )
+
+    assert waited == [13.0]
 
 
 def test_an_inherited_config_is_left_in_charge(monkeypatch, tmp_path):

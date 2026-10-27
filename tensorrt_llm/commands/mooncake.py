@@ -19,11 +19,14 @@ servers share a pool and keeps the pool's own settings stated once. It
 publishes them as a manifest that each server's
 `kv_connector_config.mooncake_store.pool` names.
 
-Capacity needs no command: every rank that joins the pool lends the memory its
-own config asks for.
+Capacity needs no command for the connector: every rank that joins the pool
+gives it the memory its own config asks for. Clients that give the pool none, as
+those of a blob store config do by default (`global_segment_size` 0), need
+`mooncake_provider`: it gives the pool host memory.
 """
 
 import contextlib
+import pathlib
 import signal
 import tempfile
 import time
@@ -242,6 +245,72 @@ def mooncake_master(
                     f"mooncake-store: master at {master.address} alive after "
                     f"{(now - started) / 60:.0f}m"
                 )
+
+
+@click.command("mooncake_provider")
+@click.option(
+    "--config",
+    type=str,
+    required=True,
+    help="The store config the pool's servers read; its 'mooncake' section "
+    "names the master, the protocol and the RDMA devices.",
+)
+@click.option(
+    "--segment_size",
+    type=click.IntRange(min=1),
+    required=True,
+    help="Bytes of this process's host memory that hold the pool's objects.",
+)
+@click.option(
+    "--ready_file",
+    type=str,
+    default=None,
+    help="Created once the memory joined the pool, for job scripts that start servers after it.",
+)
+@_telemetry_option
+def mooncake_provider(config: str, segment_size: int, ready_file: Optional[str], telemetry: bool):
+    """Give a Mooncake pool host memory for as long as this command runs.
+
+    Start it after the master and before the servers that share KV cache
+    through the pool. On SIGTERM or SIGINT it unmounts its memory gracefully
+    and exits about 13 s later, ignoring a further SIGINT or SIGTERM: no new
+    object lands in it, and servers read the old ones for a short grace, then
+    miss them. So it may restart while servers read from it; a provider killed
+    outright can end a server that was reading from it, about two minutes
+    later.
+    """
+    _apply_cli_telemetry(telemetry)
+
+    from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
+        StoreSegment,
+        load_store_config,
+        open_sdk,
+    )
+
+    _, mooncake = load_store_config(config)
+    with _signal_handoff():
+        store = open_sdk(mooncake)
+        segment = StoreSegment.mount(store, segment_size, mooncake.protocol)
+        try:
+            logger.warning(
+                f"mooncake-store: providing {segment_size} bytes to the pool at "
+                f"{mooncake.master_server_address} until this command stops"
+            )
+            if ready_file:
+                pathlib.Path(ready_file).touch()
+            while True:
+                # The handler raises, so a signal ends this wait rather than resuming it.
+                time.sleep(1.0)
+        finally:
+            # Ending before the unmount ran its course would free the memory under readers' gets.
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            logger.warning(
+                "mooncake-store: unmounting; exits in about 13 s and ignores SIGINT and SIGTERM "
+                "meanwhile (SIGKILL ends it at once)"
+            )
+            segment.begin_unmount()
+            segment.wait_until_freed()
 
 
 @click.command("mooncake_pool_report")
