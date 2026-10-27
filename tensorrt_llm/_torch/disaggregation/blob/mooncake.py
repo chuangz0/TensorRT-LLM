@@ -168,7 +168,7 @@ _instance_ids = itertools.count()  # names each driver's worker threads
 
 # Why a row was skipped (nothing moved and nothing went wrong), and the result it gets; ``stats()``
 # counts skipped rows by both, and a part's warning names its first row that faulted or was
-# skipped, with the skip's reason.
+# skipped, with the skip's reason, unless the skip is quiet (``_QUIET_SKIPS``).
 #
 # NOT_READY here departs from the protocol's "only for a hold the store confirmed": 0.3.13 cannot
 # tell a write in progress from a complete replica it cannot read. -703 answers both, and so does
@@ -186,6 +186,18 @@ _SKIP_RESULTS = {
     "held_by_own_put": _NOT_READY,
     "uncommitted": _NOT_READY,  # put start -705, and the master shows the object uncommitted
     "pool_full": _DECLINED,  # put start -200: no space for the object
+}
+# The skips a busy store makes in normal traffic, each warned of once per process instead of per
+# part: two requests computing one prompt prefix at once put the same objects (the first writer
+# normally completes them; if its put fails, they stay missing until a server computes the prefix
+# again), and a full pool is a cache's normal state (its master evicts within milliseconds).
+_QUIET_SKIPS = {
+    "uncommitted": "skipped objects another writer is still putting",
+    "held_by_own_put": "skipped objects a put of this process is writing or left open",
+    "pool_full": (
+        "the store declined objects for lack of space: its master evicts to make room, unless no "
+        "segment is mounted"
+    ),
 }
 
 # Session-end answers after which the end may still reach the master, even if the retry is refused.
@@ -332,6 +344,7 @@ class _PartResults:
         result = faulted(reason)
         for key in keys:
             self.recorded[key] = result
+            self.skip_reasons.pop(key, None)  # a faulted row is not a skip
 
     def in_order(self, keys: list[str]) -> list[RowResult]:
         """The results of ``keys``, READY where none was recorded."""
@@ -1228,9 +1241,20 @@ def _describe(code: int) -> str:
 def _warn(
     direction: str, rows: _Rows, results: _PartResults, access_ended: bool, seconds: float
 ) -> None:
-    """One warning per part that failed or skipped a row, or left access open; a MISS is
-    neither."""
-    went_wrong = [(key, result) for key, result in results.recorded.items() if result is not _MISS]
+    """One warning per part that failed or skipped a row, or left access open; a MISS is neither,
+    and a quiet skip is warned of once per process, by reason."""
+    quiet = {key: reason for key, reason in results.skip_reasons.items() if reason in _QUIET_SKIPS}
+    for reason in set(quiet.values()):
+        stat = f"rows_{_SKIP_RESULTS[reason].status.value}_{reason}"
+        logger.warning_once(
+            f"mooncake {direction}: {_QUIET_SKIPS[reason]} (driver stats {stat}); warned once",
+            key=f"mooncake {direction} {reason}",
+        )
+    went_wrong = [
+        (key, result)
+        for key, result in results.recorded.items()
+        if result is not _MISS and key not in quiet
+    ]
     if access_ended and not went_wrong:
         return
     first = ""

@@ -1123,9 +1123,19 @@ def test_rows_whose_lease_expired_are_reread_once_and_both_reads_must_end_access
     assert bench.driver.drain(WAIT_S) is ended  # False at once when unprovable
 
 
-def test_an_object_being_written_is_not_ready_for_put_and_get(monkeypatch) -> None:
+def logged(monkeypatch: pytest.MonkeyPatch) -> tuple[list[str], dict[str, str]]:
+    """The driver's warnings, and its warnings once per process by key."""
     warnings: list[str] = []
+    once: dict[str, str] = {}
     monkeypatch.setattr(mooncake_module.logger, "warning", warnings.append)
+    monkeypatch.setattr(
+        mooncake_module.logger, "warning_once", lambda message, key: once.setdefault(key, message)
+    )
+    return warnings, once
+
+
+def test_an_object_being_written_is_not_ready_for_put_and_get(monkeypatch) -> None:
+    warnings, once = logged(monkeypatch)
     pool = FakePool()
     writer = FakeMooncakeStore(pool)
     assert writer.batch_put_session_start([key("K")], [SLOT]) == [0]  # another client is writing
@@ -1136,12 +1146,33 @@ def test_an_object_being_written_is_not_ready_for_put_and_get(monkeypatch) -> No
     assert summary(results) == [("not_ready", None)] and access_ended
     stats = bench.driver.stats()
     assert stats["rows_not_ready_no_complete_replica"] == stats["rows_not_ready_uncommitted"] == 1
-    # Each part logs once it ended, a moment after its operation settled.
-    for reason in ("no_complete_replica", "uncommitted"):
-        wait_until(
-            lambda: any(key("K") in line and f"not_ready ({reason})" in line for line in warnings),
-            f"the {reason} warning",
-        )
+    # The warning of the get names the key it skipped; the skip of the put, two writers of one
+    # object, is warned of once per process.
+    assert any(key("K") in line and "not_ready (no_complete_replica)" in line for line in warnings)
+    assert [line for line in warnings if "mooncake put" in line] == []
+    assert list(once.values()) == [
+        "mooncake put: skipped objects another writer is still putting (driver stats "
+        "rows_not_ready_uncommitted); warned once"
+    ]
+
+
+def test_skips_of_a_busy_store_are_warned_of_once_per_reason_and_faults_per_part(
+    monkeypatch,
+) -> None:
+    warnings, once = logged(monkeypatch)
+    pool = FakePool()
+    writer = FakeMooncakeStore(pool)
+    assert writer.batch_put_session_start([key("B")], [SLOT]) == [0]  # another client is writing
+    bench = Bench(pool=pool)
+    bench.fill_sources("put", "A", "B", "C")
+    for _ in range(2):
+        bench.fake.script(PUT_START, [-200, None, -900])  # A finds the pool full, C fails
+        results, _ = bench.run("put", "A", "B", "C")
+        fault = "put session start: RPC_FAIL(-900)"
+        assert summary(results) == [("declined", None), ("not_ready", None), ("fault", fault)]
+    assert len(warnings) == 2  # one per part, each naming only the fault
+    assert all("1 of 3 rows failed or skipped" in line and key("C") in line for line in warnings)
+    assert sorted(once) == ["mooncake put pool_full", "mooncake put uncommitted"]
 
 
 def test_probe_asks_at_most_probe_keys_per_call_maps_each_answer_and_stops_at_a_timeout() -> None:
