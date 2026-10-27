@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import shlex
+import signal
 import subprocess  # nosec B404
 import sys
 import tempfile
@@ -635,6 +636,44 @@ def test_llmapi_launch_aborts_when_no_workspace_is_available(
     assert (
         "Failed to create a temporary FlashInfer JIT workspace; aborting launch"
         in result.stderr)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT],
+                         ids=["sigterm", "sigint"])
+def test_llmapi_launch_passes_a_stop_signal_on_to_the_task_and_waits_for_it(
+        tmp_path: Path, signum: signal.Signals) -> None:
+    """The launcher passes SIGTERM or SIGINT on to the task and exits after it.
+
+    The task gets SIGTERM either way. Slurm (scancel, a time limit, srun's
+    double Ctrl-C) signals only the launcher, each task's own process, and
+    kills the rest of the step once it exits; the task stops in its own time.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    env = _launcher_env(tmp_path, str(home))
+    stopped = tmp_path / "stopped"
+    task = ("import pathlib, signal, sys, time\n"
+            "def stop(*_):\n"
+            "    time.sleep(1)  # a graceful stop takes a while\n"
+            "    pathlib.Path(sys.argv[1]).touch()\n"
+            "    sys.exit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            "print('serving', flush=True)\n"
+            "time.sleep(60)\n")
+    launcher = subprocess.Popen(  # nosec B603
+        ["bash",
+         str(_LAUNCHER), sys.executable, "-c", task,
+         str(stopped)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    assert launcher.stdout.readline() == "serving\n"
+    launcher.send_signal(signum)
+    assert launcher.wait(timeout=30) == 0
+    assert stopped.exists()
 
 
 # ---- wait_shutdown: shutdown blocks until worker processes actually exit ----

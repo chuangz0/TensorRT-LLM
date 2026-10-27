@@ -390,6 +390,7 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
             return 1
         fi
         started_guard_pid=$guard_pid
+        started_payload_pgid=$payload_pgid
     }
 
     # Guards stay direct children; each owns a separate workload process group.
@@ -399,6 +400,14 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
     server_pid=$started_guard_pid
     start_guarded_command task "${task_with_command[@]}" || exit $?
     task_pid=$started_guard_pid
+    # Slurm with proctrack/cgroup (scancel, a time limit) sends SIGTERM to this
+    # script alone and kills the rest of the step once it exits. So SIGTERM goes
+    # on to the task, which stops every rank in order (a server giving a KV store
+    # host memory unmounts it gracefully), while this script and the other ranks
+    # wait. SIGINT too: the task's own process group receives no Ctrl-C. Slurm's
+    # SIGKILL after KillWait still ends whatever hangs.
+    task_pgid=$started_payload_pgid
+    trap 'kill -TERM -- "-$task_pgid" 2>/dev/null' INT TERM
 
     while command_running "$task_pid"; do
         if ! command_running "$server_pid"; then
@@ -430,6 +439,9 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
     done
     wait "$task_pid"
     task_exit_code=$?
+    # The task's process group is gone and its ID free for reuse: a later
+    # signal reaches no process, and this script keeps waiting for the stop.
+    trap ':' INT TERM
     log_stderr "Rank${mpi_rank} Task exit code: $task_exit_code"
 
     # The wait covers the stop helper's imports, connection, send and queue
@@ -486,6 +498,9 @@ if [ -z "$mpi_rank" ] || [ "$mpi_rank" -eq 0 ]; then
 else
     # Turn off "exit on error" so the following lines always run
     set +e
+    # On SIGTERM keep waiting: the worker node ends when rank 0's task stops.
+    # (bash runs a trap only after the foreground child ended.)
+    trap ':' TERM
 
     log_stderr "Rank${mpi_rank} run mgmn worker node with mpi_world_size: $(mpi_world_size) ..."
     run_child_command python3 -m tensorrt_llm.llmapi.mgmn_worker_node
