@@ -2,16 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """A store driver over Mooncake's distributed store, pinned to SDK 0.3.13.
 
-Each row is one object holding exactly the row's payload, written from and read into the lender's
-registered host slots without a copy. ``put`` and ``get`` run on the executor loop's thread: they
-check a batch with a few comparisons, whatever its size, and record and queue the operation.
-``workers`` threads, started with the driver and running until it drains, take the queued rows a
-part at a time, at most ``rows_per_call`` rows and ``bytes_per_call`` payload bytes, and make each
-part's SDK calls, which block their thread until the store answers. Gets go first, as they sit on
-the time-to-first-token path, but once ``GETS_BEFORE_PUT_IS_DUE`` gets have gone ahead of a
-waiting put, that put goes next once a put may run. Puts occupy at most ``workers - 1`` threads (at
-least one), so with two workers or more a get never waits behind puts alone. Every SDK return code
-is translated here and nowhere else.
+Each row is one object holding exactly the row's payload, its spans back to back, written from and
+read into registered memory without a copy: the lender's host staging slots, or, for a driver given
+``allocation_range``, the KV cache's device pages too. ``put`` and ``get`` run on the executor
+loop's thread: they check a batch with a few comparisons, whatever its size, and record and queue
+the operation. ``workers`` threads, started with the driver and running until it drains, take the
+queued rows a part at a time, at most ``rows_per_call`` rows and ``bytes_per_call`` payload bytes,
+and make each part's SDK calls, which block their thread until the store answers. Gets go first, as
+they sit on the time-to-first-token path, but once ``GETS_BEFORE_PUT_IS_DUE`` gets have gone ahead
+of a waiting put, that put goes next once a put may run. Puts occupy at most ``workers - 1`` threads
+(at least one), so with two workers or more a get never waits behind puts alone. Every SDK return
+code is translated here and nowhere else.
 
 A part's rows are READY unless an SDK answer says otherwise: a worker compares a call's answers
 with what an all-OK call answers, and looks at rows one by one only when they differ.
@@ -23,8 +24,13 @@ rest. Put uses sessions because this scatter has no timeout, so a failed row is 
 nothing writes into its space; ``batch_put_from`` revokes a timed-out transfer at once, while its
 RDMA writes may still land in space the master has given to another object.
 
-Get, per part: one ``batch_get_into``. A get session would add two SDK calls, and every call waits
-for the GIL on return, which a busy executor thread makes cost milliseconds.
+Get, per part: one ``batch_get_into``, or ``batch_get_into_multi_buffers`` when a row is several
+buffers. A get session would add two SDK calls, and every call waits for the GIL on return, which a
+busy executor thread makes cost milliseconds.
+
+Device memory is registered one piece per CUDA allocation (Mooncake refuses a GPUDirect
+registration that crosses two), and a span crossing pieces goes to the SDK as one buffer per piece:
+the transfer engine places each of its slices inside one registration.
 
 When access ends. The rules below were read in the Mooncake sources at tag v0.3.13 (paths are in
 that tree), for a wheel built without ``USE_TENT``, as the release wheels are
@@ -50,7 +56,7 @@ write before it lands and is also used toward a process of the pool that runs an
   (``mooncake-store/src/master_service.cpp:4776, 4869``), so such a row's session is never revoked
   by the driver; the master frees a put left unfinished only after
   ``put_start_release_timeout_sec`` (600 s by default; ``master_service.cpp:4441-4450``).
-- ``batch_get_into`` waits on one transfer future per key, and a future can give up with
+- A get waits on one transfer future per key, and a future can give up with
   TRANSFER_FAIL (after 60 s, on a status error, after a partly posted RDMA batch;
   ``mooncake-store/src/transfer_task.cpp:746-905, 1239-1258``) while its transfer still runs;
   every other answer comes after all futures finished or from a step that posted nothing. So a get
@@ -66,15 +72,18 @@ or drain ends only the rows no worker took yet.
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import itertools
 import threading
 import time
 from collections import Counter, deque
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, NamedTuple
+
+import numpy as np
 
 from tensorrt_llm.logger import logger
 
@@ -95,7 +104,12 @@ from .store import (
     faulted,
 )
 
-__all__ = ["MooncakeDriver"]
+__all__ = ["AllocationRange", "MooncakeDriver"]
+
+AllocationRange = Callable[[int], tuple[int, int] | None]
+"""The ``(base, size)`` of the CUDA allocation holding an address, or None where none is known:
+``pyexecutor.connectors.mooncake_store.gpudirect.allocation_range``, which this package may not
+import."""
 
 
 class _Code(IntEnum):
@@ -139,10 +153,8 @@ _CAPABILITIES = DriverCapabilities(
     # The master answers OBJECT_NOT_FOUND for a key it does not hold; failures keep their own
     # codes and stay FAULT.
     absent_is_miss=True,
-    device_memory=False,  # registers host memory only: the lender stages rows there
-    # One span per row: batch_get_into reads each object into one buffer; a get of several
-    # spans would need batch_get_into_multi_buffers.
-    multi_span=False,
+    device_memory=False,  # set per driver: one given ``allocation_range`` registers device memory
+    multi_span=True,
 )
 # The results that carry no fault text, one shared object each.
 _PENDING = RowResult(RowStatus.PENDING)
@@ -195,8 +207,19 @@ class _LeftOpen(enum.Enum):
 @dataclass(eq=False)
 class _Registration:
     span: Span
-    live: bool = True
+    # What the SDK holds registered, in address order: the whole span for host memory, one piece
+    # per CUDA allocation for device memory.
+    pieces: list[Span] = field(default_factory=list)
+    # From the registration of its last piece until its unregistration begins. Its pieces do not
+    # change meanwhile; ``piece_ends`` holds their ends.
+    admits_rows: bool = False
+    piece_ends: np.ndarray | None = None
     ops_accessing: int = 0  # operations whose access may touch it; unregister refuses it until 0
+
+    @property
+    def registered(self) -> bool:
+        """Some piece may still be registered with the SDK."""
+        return bool(self.pieces)
 
 
 @dataclass(eq=False)
@@ -206,7 +229,7 @@ class _Op:
     owner: MooncakeDriver
     is_put: bool
     rows: RowBatch
-    region: _Registration  # the registration every row lies in
+    regions: tuple[_Registration, ...]  # the registration each span of every row lies in
     rows_per_part: int
     results: list[RowResult]  # per row; each part writes its slice when it ends
     # Called once every row concluded (its access ends then too, unless unprovable) and once
@@ -238,22 +261,55 @@ class _Part:
     stop: int
 
 
+@dataclass
 class _Rows:
-    """Rows of one part as SDK calls take them: keys, addresses, and the size every row has."""
+    """Rows of one part as SDK calls take them: keys, each row's buffers with their lengths and
+    their offsets in its object (its spans back to back, cut where a registration's pieces meet),
+    and the size every row has."""
 
-    def __init__(self, keys: list[str], addresses: list[int], row_bytes: int) -> None:
-        self.keys = keys
-        self.addresses = addresses
-        self.row_bytes = row_bytes
-        # Also what a call answers when it moved every row whole.
-        self.sizes = [row_bytes] * len(keys)
+    keys: list[str]
+    buffers: list[list[int]]
+    lengths: list[list[int]]
+    offsets: list[list[int]]
+    row_bytes: int
+    one_buffer_each: bool
+    # Every row's size; also what a call answers when it moved every row whole.
+    sizes: list[int] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.sizes = [self.row_bytes] * len(self.keys)
+
+    @classmethod
+    def of(cls, rows: RowBatch, regions: tuple[_Registration, ...]) -> _Rows:
+        """``rows``, their spans lying in ``regions``. Lists are built per row at C speed; only a
+        row with a span across pieces is cut in Python. Rows not cut share one lengths list and
+        one offsets list, which the SDK only reads."""
+        buffers = rows.addresses.tolist()
+        lengths = list(rows.span_bytes)
+        count = len(buffers)
+        all_lengths = [lengths] * count
+        all_offsets = [list(itertools.accumulate(lengths[:-1], initial=0))] * count
+        cut = _rows_across_pieces(rows, regions)
+        for row in cut:
+            buffers[row], all_lengths[row] = _cut_at_pieces(buffers[row], lengths, regions)
+            all_offsets[row] = list(itertools.accumulate(all_lengths[row][:-1], initial=0))
+        one_buffer_each = rows.spans_per_row == 1 and not cut
+        return cls(rows.keys(), buffers, all_lengths, all_offsets, rows.row_bytes, one_buffer_each)
 
     def only(self, keys: list[str]) -> _Rows:
         """The rows of ``keys``, a subset of these in their order."""
         if len(keys) == len(self.keys):
             return self
-        address_of = dict(zip(self.keys, self.addresses))
-        return _Rows(keys, [address_of[key] for key in keys], self.row_bytes)
+        index_of = {key: i for i, key in enumerate(self.keys)}
+        picked = [index_of[key] for key in keys]
+        return _Rows(
+            keys,
+            [self.buffers[i] for i in picked],
+            [self.lengths[i] for i in picked],
+            [self.offsets[i] for i in picked],
+            self.row_bytes,
+            self.one_buffer_each,
+        )
 
 
 class _PartResults:
@@ -322,6 +378,8 @@ class MooncakeDriver:
     Args:
         store: An SDK store whose ``setup`` returned 0. The driver takes it over: ``close``
             closes it.
+        allocation_range: Where given, the driver registers device regions too, one piece per
+            CUDA allocation they cover.
         workers: The most threads running SDK calls; each blocks while its call waits on the
             store.
         rows_per_call: The most rows of one part, so of each SDK call.
@@ -333,6 +391,7 @@ class MooncakeDriver:
         self,
         store: Any,
         *,
+        allocation_range: AllocationRange | None = None,
         workers: int = DEFAULT_WORKERS,
         rows_per_call: int = DEFAULT_ROWS_PER_CALL,
         bytes_per_call: int = DEFAULT_BYTES_PER_CALL,
@@ -345,6 +404,10 @@ class MooncakeDriver:
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive int, got {value!r}")
         self._store = store
+        self._allocation_range = allocation_range
+        self._capabilities = dataclasses.replace(
+            _CAPABILITIES, device_memory=allocation_range is not None
+        )
         self._rows_per_call = rows_per_call
         self._bytes_per_call = bytes_per_call
         # Puts occupy at most this many threads, so with two workers or more a get never waits
@@ -395,7 +458,7 @@ class MooncakeDriver:
 
     @property
     def capabilities(self) -> DriverCapabilities:
-        return _CAPABILITIES
+        return self._capabilities
 
     def register(self, address: int, nbytes: int, layout: RegionLayout) -> _Registration:
         try:
@@ -404,50 +467,58 @@ class MooncakeDriver:
             raise DriverRejected(str(error)) from None
         if layout.nbytes > nbytes:
             raise DriverRejected(f"layout needs {layout.nbytes} bytes, region has {nbytes}")
-        if layout.memory_kind is not MemoryKind.HOST:
-            raise DriverRejected("this driver registers host memory only")
+        pieces = self._pieces(span, layout.memory_kind)
         with self._lock:
             self._require_open(DriverRejected)
-            overlapping = [r.span for r in self._registrations if r.live and r.span.overlaps(span)]
+            overlapping = [
+                r.span for r in self._registrations if r.registered and r.span.overlaps(span)
+            ]
         if overlapping:
-            raise DriverRejected(f"region {span} overlaps a live registration {overlapping[0]}")
+            raise DriverRejected(f"region {span} overlaps a registered region {overlapping[0]}")
+        started_s = time.monotonic()
         registration = _Registration(span)
-        try:
-            code = self._store.register_buffer(address, nbytes)
-        except Exception as error:
-            self._add(registration)
-            raise RegistrationError(f"register_buffer raised {error!r}", registration) from error
-        # The SDK undoes a partial registration before it answers (RdmaTransport::
-        # registerLocalMemoryInternal), so a non-OK answer leaves nothing registered; a rollback
-        # that itself fails is only logged by the SDK and cannot be seen here. Handing back the
-        # handle instead would keep the lender's hold for good: unregistering what the SDK never
-        # kept fails.
-        if code != _Code.OK:
-            raise RegistrationError(f"register_buffer returned {_describe(code)}")
+        for piece in pieces:
+            try:
+                code = self._store.register_buffer(piece.address, piece.nbytes)
+            except Exception as error:
+                registration.pieces.append(piece)  # the SDK may have registered it
+                self._add(registration)
+                raise RegistrationError(
+                    f"register_buffer raised {error!r}", registration
+                ) from error
+            # The SDK undoes a partial registration before it answers (RdmaTransport::
+            # registerLocalMemoryInternal), so a non-OK answer leaves this piece unregistered; a
+            # rollback that itself fails is only logged by the SDK and cannot be seen here. Handing
+            # back a handle for it would keep the lender's hold for good: unregistering what the
+            # SDK never kept fails.
+            if code != _Code.OK:
+                raise self._rolled_back(registration, f"register_buffer returned {_describe(code)}")
+            registration.pieces.append(piece)
+        registration.piece_ends = np.array([piece.end for piece in pieces], dtype=np.int64)
+        registration.admits_rows = True
         self._add(registration)
+        if layout.memory_kind is MemoryKind.DEVICE:
+            logger.info(
+                f"mooncake: registered device region {layout.label} of {nbytes / (1 << 30):.2f} "
+                f"GiB in {len(pieces)} pieces in {time.monotonic() - started_s:.1f} s"
+            )
         return registration
 
     def unregister(self, handle: _Registration) -> None:
         with self._lock:
             registration = self._checked_registration(handle)
-            if not registration.live:
+            if not registration.registered:
                 return
             if registration.ops_accessing:
                 raise DriverRejected(
                     f"{registration.ops_accessing} operation(s) may still access the region"
                 )
-            registration.live = False  # admits no new rows while the SDK unregisters it
-        try:
-            code = self._store.unregister_buffer(registration.span.address)
-        except Exception as error:
-            failure = StoreError(f"unregister_buffer raised {error!r}")
-        else:
-            if code == _Code.OK:
-                return
-            failure = StoreError(f"unregister_buffer returned {_describe(code)}")
-        with self._lock:
-            registration.live = True  # still registered: the call may be retried
-        raise failure
+            # No rows from now on, also if this fails: some pieces may be gone, and the backend
+            # unregisters only after a drain, which refuses new rows anyway.
+            registration.admits_rows = False
+        failure = self._unregister_pieces(registration)
+        if failure is not None:  # the pieces left stay registered and refuse overlaps; retryable
+            raise StoreError(failure)
 
     def put(self, rows: RowBatch, *, on_change: OnChange | None = None) -> _Op:
         return self._admit(rows, is_put=True, on_change=on_change)
@@ -542,7 +613,7 @@ class MooncakeDriver:
                 return
             if not self._drained:
                 raise DriverRejected("close needs a drain that returned True")
-            if any(r.live for r in self._registrations):
+            if any(r.registered for r in self._registrations):
                 raise DriverRejected("close needs every registration unregistered")
             self._closed = True
             left = self._sessions_left_open.items()
@@ -576,12 +647,10 @@ class MooncakeDriver:
     def _admit(self, rows: RowBatch, is_put: bool, on_change: OnChange | None) -> _Op:
         """Checks ``rows`` and queues the operation, or raises ``DriverRejected`` having done
         neither. The checks look at the batch once, whatever its size: its rows are laid out alike,
-        in the registration that holds their extent. The only work per row is the operation's list
-        of pending results, built at C speed."""
+        span ``j`` of every row in the registration that holds extent ``j``. The only work per row
+        is the operation's list of pending results, built at C speed."""
         if not len(rows):
             raise DriverRejected("an operation needs at least one row")
-        if rows.spans_per_row != 1:
-            raise DriverRejected("this driver takes rows of one span")
         if rows.row_bytes > MAX_ROW_BYTES:
             raise DriverRejected(f"a row holds at most {MAX_ROW_BYTES} bytes")
         per_part = max(1, min(self._rows_per_call, self._bytes_per_call // rows.row_bytes))
@@ -591,13 +660,8 @@ class MooncakeDriver:
                 raise DriverRejected("the driver is draining")
             if not self._workers_alive:  # every worker was stopped by an exception
                 raise DriverRejected("no worker thread is left to run the operation")
-            (extent,) = rows.extents
-            region = next(
-                (r for r in self._registrations if r.live and extent.within(r.span)), None
-            )
-            if region is None:
-                raise DriverRejected(f"{extent} is outside every live registration")
-            op = _Op(self, is_put, rows, region, per_part, [_PENDING] * len(rows), on_change)
+            regions = tuple(self._live_registration_holding(extent) for extent in rows.extents)
+            op = _Op(self, is_put, rows, regions, per_part, [_PENDING] * len(rows), on_change)
             parts = -(-len(rows) // per_part)
             if is_put:
                 if not self._queued_puts:  # the wait GETS_BEFORE_PUT_IS_DUE measures starts now
@@ -609,7 +673,8 @@ class MooncakeDriver:
                 self._queued_gets.append(op)
                 self._work_due.notify(parts)
             self._in_flight_op_count += 1
-            region.ops_accessing += 1
+            for region in set(regions):
+                region.ops_accessing += 1
         return op
 
     # The workers.
@@ -694,7 +759,7 @@ class MooncakeDriver:
         direction = "put" if part.op.is_put else "get"
         batch = part.op.rows[part.start : part.stop]
         try:
-            rows = _Rows(batch.keys(), batch.addresses[:, 0].tolist(), batch.row_bytes)
+            rows = _Rows.of(batch, part.op.regions)
         except Exception as error:  # no SDK call was made, so nothing touches the slots
             failed = [faulted(f"{direction} failed before any SDK call: {error!r}")] * len(batch)
             logger.warning(f"mooncake {direction}: {failed[0].fault}")
@@ -766,7 +831,8 @@ class MooncakeDriver:
             return False
         self._in_flight_op_count -= 1
         if not op.unprovable:
-            op.region.ops_accessing -= 1
+            for region in set(op.regions):
+                region.ops_accessing -= 1
         return True
 
     def _call_on_change(self, op: _Op) -> None:
@@ -881,13 +947,10 @@ class MooncakeDriver:
         Returns whether access ended."""
         count = len(rows.keys)
         try:
-            # One range per row: the whole payload, written at offset 0 of its object.
+            # Each row's buffers fill its object back to back from offset 0.
             answers = _one_answer_per_key(
                 self._store.batch_put_from_multi_buffer_ranges(
-                    rows.keys,
-                    [[a] for a in rows.addresses],
-                    [[rows.row_bytes]] * count,
-                    [[0]] * count,
+                    rows.keys, rows.buffers, rows.lengths, rows.offsets
                 ),
                 count,
             )
@@ -960,13 +1023,25 @@ class MooncakeDriver:
         return results, self._get_into(rows, results, is_reread=False)
 
     def _get_into(self, rows: _Rows, results: _PartResults, is_reread: bool) -> bool:
-        """Reads ``rows`` and records each one not read whole; returns whether access ended."""
+        """Reads ``rows`` and records each one not read whole; returns whether access ended.
+
+        Rows of one buffer each go to ``batch_get_into``, which reads an object shorter than its
+        row into the buffer's head and answers its size. Other rows go to
+        ``batch_get_into_multi_buffers``, whose transfer submission refuses such an object with
+        TRANSFER_FAIL, posting nothing; access then stays unproven.
+        TODO(mooncake): answer INVALID_PARAMS there, as for a longer object, so access ends."""
+        call = "batch_get_into" if rows.one_buffer_each else "batch_get_into_multi_buffers"
         try:
-            answers = _one_answer_per_key(
-                self._store.batch_get_into(rows.keys, rows.addresses, rows.sizes), len(rows.keys)
-            )
+            if rows.one_buffer_each:
+                buffers = [buffer for (buffer,) in rows.buffers]
+                answers = self._store.batch_get_into(rows.keys, buffers, rows.sizes)
+            else:
+                answers = self._store.batch_get_into_multi_buffers(
+                    rows.keys, rows.buffers, rows.lengths
+                )
+            answers = _one_answer_per_key(answers, len(rows.keys))
         except Exception as error:  # the transfers may still be writing the slots
-            results.fault(rows.keys, f"batch_get_into raised {error!r}")
+            results.fault(rows.keys, f"{call} raised {error!r}")
             return False
         if answers == rows.sizes:  # usually every row was read whole
             return True
@@ -979,7 +1054,7 @@ class MooncakeDriver:
             elif answer == _Code.REPLICA_IS_NOT_READY and not is_reread:
                 results.skip(key, "no_complete_replica")
             else:
-                results.recorded[key] = _result_of_get(answer, rows.row_bytes, is_reread)
+                results.recorded[key] = _result_of_get(call, answer, rows.row_bytes, is_reread)
         # A TRANSFER_FAIL future may give up while its RDMA still runs (module docstring).
         access_ended = _Code.TRANSFER_FAIL not in answers
         if expired:
@@ -1006,6 +1081,56 @@ class MooncakeDriver:
         with self._lock:
             self._registrations.append(registration)
 
+    def _live_registration_holding(self, extent: Span) -> _Registration:
+        """Under the lock: the live registration ``extent`` lies in; raises ``DriverRejected``
+        when none holds it."""
+        for registration in self._registrations:
+            if registration.admits_rows and extent.within(registration.span):
+                return registration
+        raise DriverRejected(f"{extent} is outside every live registration")
+
+    def _pieces(self, span: Span, memory_kind: MemoryKind) -> list[Span]:
+        """What a region is registered as: host memory whole, device memory one piece per CUDA
+        allocation it covers."""
+        if memory_kind is MemoryKind.HOST:
+            return [span]
+        if self._allocation_range is None:
+            raise DriverRejected("this driver registers host memory only")
+        pieces, address = [], span.address
+        while address < span.end:
+            allocation = self._allocation_range(address)
+            if allocation is None:
+                raise DriverRejected(f"no CUDA allocation is known at {address:#x}")
+            base, size = allocation
+            if not base <= address < base + size:
+                raise DriverRejected(f"the CUDA allocation at {address:#x} does not hold it")
+            stop = min(base + size, span.end)
+            pieces.append(Span(address, stop - address))
+            address = stop
+        return pieces
+
+    def _rolled_back(self, registration: _Registration, reason: str) -> RegistrationError:
+        """Unregisters the pieces a failed registration made; its RegistrationError, without a
+        handle when nothing stays registered."""
+        failure = self._unregister_pieces(registration)
+        if failure is None:
+            return RegistrationError(reason)
+        self._add(registration)
+        return RegistrationError(f"{reason}; then rolling back: {failure}", registration)
+
+    def _unregister_pieces(self, registration: _Registration) -> str | None:
+        """Unregisters the registration's pieces, the latest first, up to the first failure: its
+        reason, or None when none is left."""
+        while registration.pieces:
+            try:
+                code = self._store.unregister_buffer(registration.pieces[-1].address)
+            except Exception as error:
+                return f"unregister_buffer raised {error!r}"
+            if code != _Code.OK:
+                return f"unregister_buffer returned {_describe(code)}"
+            registration.pieces.pop()
+        return None
+
     def _checked_registration(self, handle: _Registration) -> _Registration:
         self._require_open()
         if not isinstance(handle, _Registration) or handle not in self._registrations:
@@ -1024,8 +1149,38 @@ class MooncakeDriver:
             raise error("the driver is closed")
 
 
-def _result_of_get(answer: int, size: int, is_reread: bool) -> RowResult:
-    """The result of a row ``batch_get_into`` did not read whole."""
+def _rows_across_pieces(rows: RowBatch, regions: tuple[_Registration, ...]) -> list[int]:
+    """The rows with a span across two pieces of its registration, which only device regions of
+    several CUDA allocations have."""
+    across = np.zeros(len(rows), dtype=bool)
+    for column, (region, nbytes) in enumerate(zip(regions, rows.span_bytes)):
+        if len(region.piece_ends) > 1:
+            starts = rows.addresses[:, column]
+            ends = region.piece_ends
+            holding = np.searchsorted(ends, starts, side="right")  # the piece a span starts in
+            across |= starts + nbytes > ends[holding]
+    return np.flatnonzero(across).tolist()
+
+
+def _cut_at_pieces(
+    starts: list[int], lengths: list[int], regions: tuple[_Registration, ...]
+) -> tuple[list[int], list[int]]:
+    """One row's buffers and their lengths: its spans, starting at ``starts``, each cut where the
+    pieces of its registration meet."""
+    buffers, cut_lengths = [], []
+    for address, nbytes, region in zip(starts, lengths, regions):
+        end = address + nbytes
+        piece = int(np.searchsorted(region.piece_ends, address, side="right"))
+        while address < end:
+            stop = min(int(region.piece_ends[piece]), end)
+            buffers.append(address)
+            cut_lengths.append(stop - address)
+            address, piece = stop, piece + 1
+    return buffers, cut_lengths
+
+
+def _result_of_get(call: str, answer: int, size: int, is_reread: bool) -> RowResult:
+    """The result of a row ``call``, a get, did not read whole."""
     if answer >= 0:  # a read answers the object's size, which must be the row's
         return faulted(f"object is {answer} bytes, expected {size}")
     if is_reread and answer in (_Code.OBJECT_NOT_FOUND, _Code.REPLICA_IS_NOT_READY):
@@ -1034,7 +1189,7 @@ def _result_of_get(answer: int, size: int, is_reread: bool) -> RowResult:
         return faulted(f"reread after LEASE_EXPIRED: {_describe(answer)}")
     if answer == _Code.OBJECT_NOT_FOUND:
         return _MISS
-    return faulted(f"batch_get_into: {_describe(answer)}")
+    return faulted(f"{call}: {_describe(answer)}")
 
 
 def _probe_status(answer: int) -> ProbeStatus:

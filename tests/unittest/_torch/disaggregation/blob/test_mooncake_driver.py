@@ -41,6 +41,7 @@ from cpu_fixtures import (
 from fake_mooncake import FakeMooncakeStore, FakePool, KeyGatedClient
 
 from tensorrt_llm._torch.disaggregation.base.backend import Attempt, Backend, Capabilities
+from tensorrt_llm._torch.disaggregation.base.memory import MemoryKind
 from tensorrt_llm._torch.disaggregation.blob import mooncake as mooncake_module
 from tensorrt_llm._torch.disaggregation.blob import store as store_module
 from tensorrt_llm._torch.disaggregation.blob.backend import BlobBackend, BlobConfig, RegionBinding
@@ -78,6 +79,7 @@ PUT_RANGES = "batch_put_from_multi_buffer_ranges"
 PUT_END = "batch_put_session_end"
 PUT_REVOKE = "batch_put_session_revoke"
 GET = "batch_get_into"
+GET_INTO_BUFFERS = "batch_get_into_multi_buffers"
 IS_EXIST = "batch_is_exist"
 DATA_CALL = {"put": PUT_RANGES, "get": GET}
 METADATA_CALL_FAILED = "existence check: METADATA_CALL_FAILED(-100000)"
@@ -184,8 +186,10 @@ def test_the_driver_is_a_store_driver_with_mooncake_capabilities() -> None:
         hints=False,
         absent_is_miss=True,
         device_memory=False,
-        multi_span=False,
+        multi_span=True,
     )
+    device = MooncakeDriver(FakeMooncakeStore(), allocation_range=lambda address: None)
+    assert device.capabilities.device_memory
 
 
 class DriverLeavingOperationsUnstarted(MooncakeDriver):
@@ -1219,9 +1223,6 @@ def test_bad_rows_are_rejected_before_the_sdk() -> None:
     bench = Bench()
     with pytest.raises(DriverRejected, match="at most"):
         bench.driver.put(RowBatch.of([RowIO(key("A"), (Span(bench.buffer.address, 1 << 31),))]))
-    two_spans = (bench.buffer.span(0, SLOT), bench.buffer.span(2 * SLOT, SLOT))
-    with pytest.raises(DriverRejected, match="one span"):
-        bench.driver.put(RowBatch.of([RowIO(key("A"), two_spans)]))
     assert [c for c in bench.fake.calls if c.method.startswith("batch_")] == []
 
 
@@ -1301,6 +1302,113 @@ def test_register_and_unregister_follow_the_protocol() -> None:
     assert revocations() == 2
     driver.unregister(handle)  # and is idempotent once it succeeded
     assert revocations() == 2
+
+
+class Allocations:
+    """A CUDA allocation lookup over host memory: allocations of ``SLOT`` bytes back to back over
+    ``buffer``, and none elsewhere."""
+
+    def __init__(self, buffer: HostBuffer) -> None:
+        self.buffer = buffer
+
+    def __call__(self, address: int) -> tuple[int, int] | None:
+        offset = address - self.buffer.address
+        if not 0 <= offset < self.buffer.nbytes:
+            return None
+        return self.buffer.address + offset // SLOT * SLOT, SLOT
+
+
+def test_a_device_region_registers_one_piece_per_allocation_and_rolls_back_a_failed_piece():
+    fake = FakeMooncakeStore()
+    region = HostBuffer(3 * SLOT)  # stands in for device memory of three allocations
+    driver = MooncakeDriver(fake, allocation_range=Allocations(region))
+    layout = RegionLayout(SLOT, 3, "kv", MemoryKind.DEVICE)
+    pieces = [(region.address + i * SLOT, SLOT) for i in range(3)]
+    for answer in (None, None, -1):  # the third piece fails
+        fake.script("register_buffer", [answer])
+    with pytest.raises(RegistrationError, match="INTERNAL_ERROR") as failed:
+        driver.register(region.address, region.nbytes, layout)
+    assert [call.args for call in fake.calls_to("register_buffer")] == pieces
+    assert failed.value.handle is None and fake.registered == {}  # the first two rolled back
+    handle = driver.register(region.address, region.nbytes, layout)
+    assert sorted(fake.registered.items()) == pieces
+    driver.unregister(handle)
+    assert fake.registered == {}
+
+
+def test_a_span_across_allocations_reaches_the_sdk_as_one_buffer_per_allocation() -> None:
+    region = HostBuffer(3 * SLOT, fill=0x2D)
+    bench = Bench(allocation_range=Allocations(region))
+    layout = RegionLayout(SLOT, 3, "kv", MemoryKind.DEVICE)
+    bench.driver.register(region.address, region.nbytes, layout)
+    region.write(b"0123456789abcdef", SLOT // 2)  # bytes 4 to 20: across both inner boundaries
+    row = RowIO(key("A"), (region.span(SLOT // 2, 2 * SLOT), region.span(0, SLOT // 2)))
+    results, _ = bench.settle(bench.driver.put(RowBatch.of([row])))
+    assert summary(results) == [("ready", None)]
+    (scatter,) = bench.fake.calls_to(PUT_RANGES)
+    _, buffers, lengths, offsets = scatter.args
+    assert lengths == [[4, 8, 4, 4]] and offsets == [[0, 4, 12, 16]]
+    a = region.address
+    assert buffers == [[a + 4, a + 8, a + 16, a]]
+    assert bench.fake.pool.objects[key("A")] == b"0123456789abcdef----"
+
+    region.write(b"-" * 3 * SLOT)
+    results, access_ended = bench.settle(bench.driver.get(RowBatch.of([row])))
+    assert summary(results) == [("ready", None)] and access_ended
+    (get,) = bench.fake.calls_to(GET_INTO_BUFFERS)
+    assert get.args[2] == [[4, 8, 4, 4]]
+    assert region.read() == b"----0123456789abcdef----"
+
+
+def test_only_a_row_across_a_piece_boundary_is_cut_in_a_batch_over_three_pieces() -> None:
+    """Rows of one batch over three allocations: one inside a piece, one across a boundary, one
+    ending on a boundary and one starting on it. Only the crossing row is cut, in the put and in
+    the get, and every row comes back where it was."""
+    region = HostBuffer(3 * SLOT, fill=0x2D)
+    bench = Bench(allocation_range=Allocations(region))
+    layout = RegionLayout(SLOT, 3, "kv", MemoryKind.DEVICE)
+    bench.driver.register(region.address, region.nbytes, layout)
+    starts = {"inside": 1, "across": 6, "ends_on": 12, "starts_on": 16}  # boundaries at 8 and 16
+    rows = RowBatch.of([RowIO(key(name), (region.span(at, 4),)) for name, at in starts.items()])
+    region.write(bytes(range(ord("A"), ord("A") + 3 * SLOT)))
+    written = region.read()
+    results, _ = bench.settle(bench.driver.put(rows))
+    assert summary(results) == [("ready", None)] * 4
+    a = region.address
+    buffers = [[a + 1], [a + 6, a + 8], [a + 12], [a + 16]]
+    lengths = [[4], [2, 2], [4], [4]]
+    (scatter,) = bench.fake.calls_to(PUT_RANGES)
+    assert scatter.args[1:] == (buffers, lengths, [[0], [0, 2], [0], [0]])
+
+    region.write(b"-" * 3 * SLOT)
+    results, access_ended = bench.settle(bench.driver.get(rows))
+    assert summary(results) == [("ready", None)] * 4 and access_ended
+    (get,) = bench.fake.calls_to(GET_INTO_BUFFERS)
+    assert get.args[1:] == (buffers, lengths)
+    expected = bytearray(b"-" * 3 * SLOT)
+    for at in starts.values():
+        expected[at : at + 4] = written[at : at + 4]
+    assert region.read() == bytes(expected)
+
+
+def test_an_operation_over_two_registrations_keeps_both_until_its_access_ended() -> None:
+    bench = Bench()
+    other = HostBuffer(SLOT, fill=0x6F)  # a second registration, apart from the first
+    other_handle = bench.driver.register(other.address, SLOT, RegionLayout(SLOT, 1))
+    bench.write(0, b"aaaaaaaa")
+    scatter = bench.fake.block(PUT_RANGES)
+    row = RowIO(key("A"), (bench.buffer.span(0, SLOT), other.span()))
+    op = bench.driver.put(RowBatch.of([row]))
+    assert scatter.entered.wait(WAIT_S)
+    for handle in (bench.handle, other_handle):
+        with pytest.raises(DriverRejected, match="may still access"):
+            bench.driver.unregister(handle)
+    scatter.release.set()
+    results, access_ended = bench.settle(op)
+    assert summary(results) == [("ready", None)] and access_ended
+    assert bench.fake.pool.objects[key("A")] == b"aaaaaaaa" + b"o" * SLOT
+    bench.driver.unregister(bench.handle)
+    bench.driver.unregister(other_handle)
 
 
 def wait_until_draining(driver: MooncakeDriver) -> None:

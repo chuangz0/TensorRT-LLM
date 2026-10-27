@@ -12,7 +12,8 @@ the host's fastest active InfiniBand devices). The master must be shipped by one
 distributions and report 0.3.13, and every installed pinned client build must be 0.3.13; both
 versions are printed and recorded as test-suite properties. The shared
 ``driver_conformance`` checks run here too, each over a fresh client and under a key prefix of its
-own; a probe meets a master that stopped answering (paused) and one that is gone.
+own, with a driver that registers device memory: over RDMA, rows of several spans move into and out
+of GPU memory in place. A probe meets a master that stopped answering (paused) and one that is gone.
 """
 
 from __future__ import annotations
@@ -35,10 +36,12 @@ from collections.abc import Sequence
 
 import numpy as np
 import pytest
+import torch
 from cpu_fixtures import WAIT_S, Endpoint, masks, store_key
 from fake_mooncake import KeyGatedClient
 
 from tensorrt_llm._torch.disaggregation.base.backend import Outcome
+from tensorrt_llm._torch.disaggregation.base.memory import MemoryKind
 from tensorrt_llm._torch.disaggregation.blob.mooncake import MooncakeDriver
 from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
     PINNED_SDK_DISTRIBUTIONS,
@@ -50,6 +53,11 @@ from tensorrt_llm._torch.disaggregation.blob.mooncake_setup import (
 )
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import SLOT as CHECK_SLOT
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import DriverConformance
+from tensorrt_llm._torch.disaggregation.testing.host_memory import CANARY, GUARD, HostBuffer
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.gpudirect import (
+    allocation_range,
+    select_registration_path,
+)
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import LaunchedMaster
 
 # An exception that escapes a thread fails the test.
@@ -106,6 +114,8 @@ def _require_mooncake() -> str:
         and reported[1] == PINNED_SDK_VERSION
     )
     assert owners and pinned, f"not the pinned Mooncake {PINNED_SDK_VERSION}: {versions}"
+    # Before the process's first client, which fixes how every client registers device memory.
+    select_registration_path(PROTOCOL, registers_device_memory=True)
     return versions
 
 
@@ -264,10 +274,37 @@ def test_real_get_faults_a_shorter_object_it_landed_and_refuses_a_longer_one(
         each.close()
 
 
+class DeviceBuffer:
+    """GPU memory with canaries on both sides: a ``Memory`` for the checks' device rows."""
+
+    def __init__(self, nbytes: int, fill: int) -> None:
+        canary = torch.frombuffer(bytearray(CANARY), dtype=torch.uint8)
+        self._tensor = torch.full((nbytes + 2 * GUARD,), fill, dtype=torch.uint8, device="cuda")
+        self._tensor[:GUARD] = canary
+        self._tensor[-GUARD:] = canary
+        torch.cuda.synchronize()  # written before the NIC touches it
+        self.address = self._tensor.data_ptr() + GUARD
+        self.nbytes = nbytes
+
+    def read(self, offset: int = 0, nbytes: int | None = None) -> bytes:
+        nbytes = self.nbytes - offset if nbytes is None else nbytes
+        return self._tensor[GUARD + offset : GUARD + offset + nbytes].cpu().numpy().tobytes()
+
+    def write(self, data: bytes, offset: int = 0) -> None:
+        part = torch.frombuffer(bytearray(data), dtype=torch.uint8)
+        self._tensor[GUARD + offset : GUARD + offset + len(data)] = part.cuda()
+        torch.cuda.synchronize()
+
+    def canaries_intact(self) -> bool:
+        whole = self._tensor.cpu().numpy().tobytes()
+        return whole[:GUARD] == CANARY and whole[-GUARD:] == CANARY
+
+
 class TestRealMooncakeConformance(DriverConformance):
     """The shared driver checks over the real pool, one fresh client per check, with the scenarios
     a real master can stage: a key another client is writing, a get or a put held inside the SDK,
-    a master that stopped answering and one that is gone."""
+    a master that stopped answering and one that is gone. The driver registers device memory, and
+    the checks' device rows lie in GPU memory."""
 
     timeout = 30.0
     probe_sees_unfinished_writes = False  # the master answers 0 for an open put
@@ -281,7 +318,13 @@ class TestRealMooncakeConformance(DriverConformance):
         self._resume_master()  # a probe check that failed before its unblock left it paused
 
     def make_driver(self) -> MooncakeDriver:
-        return MooncakeDriver(open_sdk(client_config(self.master)))
+        sdk = open_sdk(client_config(self.master))
+        return MooncakeDriver(sdk, allocation_range=allocation_range)
+
+    def allocate(self, nbytes: int, fill: int, memory_kind: MemoryKind):
+        if memory_kind is MemoryKind.DEVICE:
+            return DeviceBuffer(nbytes, fill), None
+        return HostBuffer(nbytes, fill), None
 
     def make_held_key(self):
         key = f"held{secrets.token_hex(4)}/v1/H"  # the pool outlives each check
