@@ -21,8 +21,8 @@ binding it and letting go, so another process can still take it before the
 master binds, and the master then exits before it accepts connections. Each
 attempt picks a fresh pair.
 
-The master stores nothing itself: `running_segment_provider` gives a pool its
-memory from a separate process.
+The master stores nothing itself: providers, separate `trtllm-serve
+mooncake_provider` processes, give a pool its memory.
 """
 
 import contextlib
@@ -32,34 +32,33 @@ import subprocess  # nosec B404
 import sys
 import time
 import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterator
 
-from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import local_address
+import yaml
+
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import (
     LaunchedMaster,
-    resolve_device_name,
     running_master,
 )
 from tensorrt_llm._utils import get_free_ports
 
-__all__ = ["master_segments", "running_master_on_free_ports", "running_segment_provider"]
+__all__ = [
+    "infiniband_by_socket",
+    "master_segments",
+    "running_master_on_free_ports",
+    "running_pool",
+    "running_providers_per_socket",
+    "running_segment_provider",
+]
 
 PORT_ATTEMPTS = 5
-SEGMENT_PROVIDER_TIMEOUT = 60.0
-
-# Runs in the provider process: join the pool, mount the segment, and hold it until stdin closes.
-_SEGMENT_PROVIDER = """
-import pathlib, sys
-from mooncake.store import MooncakeDistributedStore
-master, segment_size, protocol, devices, hostname, ready = sys.argv[1:]
-store = MooncakeDistributedStore()
-code = store.setup(hostname, "P2PHANDSHAKE", int(segment_size), 16 << 20, protocol, devices, master)
-if code != 0:
-    sys.exit(f"segment provider: setup failed with {code}")
-pathlib.Path(ready).touch()
-sys.stdin.read()
-store.close()
-"""
+# The provider imports tensorrt_llm before it joins the pool, which takes long on a cold network
+# file system.
+SEGMENT_PROVIDER_TIMEOUT = 300.0
+# A provider leaves the pool about 13 s after its SIGTERM, once Mooncake freed its memory.
+SEGMENT_PROVIDER_STOP_TIMEOUT = 30.0
 
 
 def _start_master(
@@ -103,6 +102,93 @@ def running_master_on_free_ports(
         yield _start_master(stack, run_dir, attempts, kwargs)
 
 
+@dataclass(frozen=True)
+class _Provider:
+    """One `trtllm-serve mooncake_provider` process.
+
+    Attributes:
+        run_dir: Where its store config, log and readiness marker go.
+        segment_size: Bytes of its segment.
+        device_name: RDMA devices; empty picks the host's fastest InfiniBand ones.
+        launcher: A command it runs under, e.g. `numactl` binding it to a socket.
+    """
+
+    run_dir: str
+    segment_size: int
+    device_name: str = ""
+    launcher: tuple[str, ...] = ()
+
+    @property
+    def ready_file(self) -> str:
+        return os.path.join(self.run_dir, "segment_provider.ready")
+
+    @property
+    def log_path(self) -> str:
+        return os.path.join(self.run_dir, "segment_provider.log")
+
+    def launch(self, master_address: str, protocol: str) -> subprocess.Popen:
+        os.makedirs(self.run_dir, exist_ok=True)
+        config = os.path.join(self.run_dir, "segment_provider.yaml")
+        mooncake = {
+            "master_server_address": master_address,
+            "protocol": protocol,
+            "device_name": self.device_name,
+        }
+        with open(config, "w") as file:
+            yaml.safe_dump({"mooncake": mooncake}, file)
+        command = [*self.launcher, sys.executable, "-m", "tensorrt_llm.commands.serve"]
+        command += ["mooncake_provider", "--no-telemetry", "--config", config]
+        command += ["--segment_size", str(self.segment_size), "--ready_file", self.ready_file]
+        with open(self.log_path, "wb") as log:
+            return subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)  # nosec B603
+
+    def wait_until_joined(
+        self, process: subprocess.Popen, master_address: str, deadline: float
+    ) -> None:
+        while not os.path.exists(self.ready_file):
+            if process.poll() is not None or time.monotonic() > deadline:
+                with open(self.log_path, errors="replace") as log:
+                    tail = log.read()[-4000:]
+                raise RuntimeError(
+                    f"the segment provider in {self.run_dir} did not join {master_address}:\n{tail}"
+                )
+            time.sleep(0.1)
+
+
+@contextlib.contextmanager
+def _running_providers(
+    master_address: str, providers: list[_Provider], protocol: str
+) -> Iterator[list[subprocess.Popen]]:
+    """Every provider in `providers`, for the body's duration.
+
+    They join the pool side by side and leave it side by side: each gets one
+    SIGTERM, then a deadline shared by all to exit.
+    """
+    processes = []
+    try:
+        for provider in providers:
+            processes.append(provider.launch(master_address, protocol))
+        deadline = time.monotonic() + SEGMENT_PROVIDER_TIMEOUT
+        for provider, process in zip(providers, processes):
+            provider.wait_until_joined(process, master_address, deadline)
+        yield processes
+    finally:
+        for process in processes:
+            process.terminate()  # the provider unmounts its memory gracefully
+        deadline = time.monotonic() + SEGMENT_PROVIDER_STOP_TIMEOUT
+        for provider, process in zip(providers, processes):
+            try:
+                process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                print(
+                    f"mooncake-store: the segment provider in {provider.run_dir} did not leave the "
+                    f"pool within {SEGMENT_PROVIDER_STOP_TIMEOUT:.0f} s of its SIGTERM; killing it "
+                    "before it unmounted its segment."
+                )
+                process.kill()
+                process.wait()
+
+
 @contextlib.contextmanager
 def running_segment_provider(
     master_address: str,
@@ -111,48 +197,90 @@ def running_segment_provider(
     segment_size: int,
     protocol: str = "tcp",
     device_name: str = "",
-    timeout: float = SEGMENT_PROVIDER_TIMEOUT,
 ) -> Iterator[subprocess.Popen]:
-    """Give the pool a `segment_size`-byte segment from a separate process, for the body's duration.
+    """Give the pool a `segment_size`-byte segment for the body's duration.
 
+    The segment comes from `trtllm-serve mooncake_provider`, a separate process.
     A client with no segment of its own then finds every object in another
     process's memory, so each transfer goes through the transfer engine as it
     would across hosts, never through a copy inside one process.
 
     Args:
         master_address: The pool's master, `host:port`.
-        run_dir: Where the provider's log and readiness marker go.
+        run_dir: Where the provider's store config, log and readiness marker go.
         segment_size: Bytes of the provider's segment.
         protocol: `rdma` or `tcp`.
         device_name: RDMA devices; empty picks the host's fastest InfiniBand ones.
-        timeout: Seconds to wait for the provider to join the pool.
     """
-    os.makedirs(run_dir, exist_ok=True)
-    ready = os.path.join(run_dir, "segment_provider.ready")
-    log_path = os.path.join(run_dir, "segment_provider.log")
-    devices = resolve_device_name(protocol, device_name)
-    command = [sys.executable, "-c", _SEGMENT_PROVIDER, master_address, str(segment_size)]
-    command += [protocol, devices, local_address(master_address), ready]
-    with open(log_path, "wb") as log:
-        process = subprocess.Popen(  # nosec B603
-            command, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT
-        )
-    try:
-        deadline = time.monotonic() + timeout
-        while not os.path.exists(ready):
-            if process.poll() is not None or time.monotonic() > deadline:
-                with open(log_path, errors="replace") as log:
-                    tail = log.read()[-4000:]
-                raise RuntimeError(f"the segment provider did not join {master_address}:\n{tail}")
-            time.sleep(0.1)
+    provider = _Provider(run_dir, segment_size, device_name)
+    with _running_providers(master_address, [provider], protocol) as (process,):
         yield process
-    finally:
-        process.stdin.close()
-        try:
-            process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+
+
+@contextlib.contextmanager
+def running_pool(
+    run_dir: str,
+    segment_size: int,
+    *,
+    protocol: str = "tcp",
+    device_name: str = "",
+    eviction_ratio: float = 0.0,
+) -> Iterator[LaunchedMaster]:
+    """A master on free ports and a provider of `segment_size` bytes, for the body's duration.
+
+    No provider for `segment_size` 0. With `eviction_ratio` 0 the master evicts
+    only above its high watermark, never just because a put failed.
+    """
+    with contextlib.ExitStack() as stack:
+        master = stack.enter_context(
+            running_master_on_free_ports(run_dir, protocol=protocol, eviction_ratio=eviction_ratio)
+        )
+        if segment_size:
+            stack.enter_context(
+                running_segment_provider(
+                    master.address,
+                    run_dir,
+                    segment_size=segment_size,
+                    protocol=protocol,
+                    device_name=device_name,
+                )
+            )
+        yield master
+
+
+def infiniband_by_socket() -> dict[int, list[str]]:
+    """The active InfiniBand devices of each NUMA node (Grace socket) of this host."""
+    found: dict[int, list[str]] = {}
+    for device in sorted(Path("/sys/class/infiniband").iterdir()):
+        port = device / "ports" / "1"
+        if (port / "link_layer").read_text().strip() != "InfiniBand":
+            continue
+        if "ACTIVE" in (port / "state").read_text():
+            socket = int((device / "device" / "numa_node").read_text())
+            found.setdefault(socket, []).append(device.name)
+    return found
+
+
+def running_providers_per_socket(
+    master_address: str, run_dir: str, *, total_bytes: int, protocol: str = "rdma"
+) -> contextlib.AbstractContextManager[list[subprocess.Popen]]:
+    """A provider on each socket of this host with active InfiniBand devices.
+
+    As deployments run them: under `numactl` on the socket's CPUs and memory,
+    over its devices, `total_bytes` split between them, each in
+    `run_dir/provider-<socket>`.
+    """
+    sockets = infiniband_by_socket()
+    providers = [
+        _Provider(
+            os.path.join(run_dir, f"provider-{socket}"),
+            total_bytes // len(sockets),
+            ",".join(devices),
+            ("numactl", f"--cpunodebind={socket}", f"--membind={socket}"),
+        )
+        for socket, devices in sockets.items()
+    ]
+    return _running_providers(master_address, providers, protocol)
 
 
 def master_segments(metrics_url: str) -> list[dict]:
