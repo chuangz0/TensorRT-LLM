@@ -905,6 +905,70 @@ def test_public_windowed_fetch_bounds_match_a_native_formula_oracle(floor_follow
         assert kv.history_length == known and manager.kv_cache_map[7] is kv
 
 
+def _named_window_case(monkeypatch, windows, prompt, **kwargs):
+    """``_window_case`` lending by name, its windows read by the formula the stand-in follows."""
+    case = _window_case(windows, prompt, **kwargs)
+    _owner, lender, _kv, req = case
+    _names_in_place(lender, monkeypatch)
+    lender._layout.stale_ranges_by_formula = True
+    req.try_get_encoder_output_len = lambda: None
+    req.py_return_context_logits, req.py_additional_outputs = False, None
+    return case
+
+
+def _fetch_by_name(monkeypatch, case, end):
+    """A named fetch [0, end) of ``case`` into a fresh cache: the fresh case (whose manager the
+    lender holds weakly), the lease, and per lent row whether the store holds it."""
+    tpb, windows, sinks, prompt, held = case
+    fresh = _named_window_case(monkeypatch, windows, prompt, tpb=tpb, sinks=sinks)
+    _owner, lender, _kv, req = fresh
+    lease = lender.lend_write(req, 0, end, memory_kind=DEVICE, rows=NAMED, ready_event=READY)
+    view = lease.poll()
+    assert view is not None, (end, lease.failure)
+    return fresh, lease, [np.array(held[g.layer_group_index])[g.page_ordinals] for g in view.groups]
+
+
+@pytest.mark.cpu_only
+def test_usable_end_is_the_largest_end_a_fetch_of_the_held_rows_resumes_at(
+    floor_follows_history, monkeypatch
+):
+    """Given the blocks the store holds of each layer group, the largest end at which a named
+    fetch of a prompt's start resumes once every row it lends arrived; every later end lends a row
+    the store does not hold. Small exhaustive masks and seeded layouts, windows with sinks too."""
+    cases = []
+    tpb = 4
+    for window, sink in itertools.product((None, 3, 4, 5, 8), (0, 1)):
+        for held in itertools.product((False, True), repeat=4):
+            cases.append((tpb, (window,), (sink,), 4 * tpb + 1, (held,)))
+    rng = random.Random(20261024)
+    for _ in range(200):
+        tpb = rng.choice((4, 8, 16))
+        windows = tuple(
+            rng.choice((None, 1, tpb - 1, tpb + 1, 2 * tpb - 1, 3 * tpb + 3))
+            for _ in range(rng.randint(1, 3))
+        )
+        sinks = tuple(rng.randrange(3) for _ in windows)
+        prompt = rng.randint(2 * tpb + 1, 8 * tpb + 1)
+        held = tuple(tuple(rng.random() < 0.8 for _ in range(prompt // tpb)) for _ in windows)
+        cases.append((tpb, windows, sinks, prompt, held))
+
+    for case in cases:
+        tpb, windows, sinks, prompt, held = case
+        limit = (prompt - 1) // tpb * tpb
+        lender = _named_window_case(monkeypatch, windows, prompt, tpb=tpb, sinks=sinks)[1]
+        usable = lender.usable_end([np.array(h) for h in held], limit=limit)
+        assert 0 <= usable <= limit and usable % tpb == 0, (case, usable)
+        if usable > 0:
+            (_owner, lender, _kv, req), lease, masks = _fetch_by_name(monkeypatch, case, usable)
+            assert all(mask.all() for mask in masks), (case, usable)
+            bounds = return_write(lender, req, lease, masks)
+            assert bounds.min_position <= usable <= bounds.max_position, (case, usable, bounds)
+        for later in range(usable + tpb, limit + 1, tpb):
+            _fresh, lease, masks = _fetch_by_name(monkeypatch, case, later)
+            assert not all(mask.all() for mask in masks), (case, usable, later)
+            lease.release()
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("window", [None, 72])
 def test_a_complete_refetch_replaces_an_earlier_partial_page(floor_follows_history, window):

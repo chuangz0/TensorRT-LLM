@@ -397,6 +397,9 @@ def test_the_protocols_keep_their_members_and_stay_unrelated():
         "return_writes",
         "progress",
         "poll_resume_bounds",
+        "prompt_object_keys",
+        "usable_end",
+        "stopped",
     }
     assert members(RegionHold) == {"release"}
     assert Lease not in RegionHold.__mro__ and RegionHold not in Lease.__mro__
@@ -406,7 +409,7 @@ def test_the_protocols_keep_their_members_and_stay_unrelated():
     assert isinstance(Lease.failure, property) and isinstance(Lender.regions, property)
     assert isinstance(Lease.return_resumes_at_end, property)
     assert isinstance(Lease.writable, property)
-    assert isinstance(Lender.page_layout, property)
+    assert isinstance(Lender.page_layout, property) and isinstance(Lender.stopped, property)
     # The checks are structural: a lease passes as a hold.
     lease = object.__new__(_lender._StagingLease)
     assert isinstance(lease, RegionHold)
@@ -419,6 +422,16 @@ def test_the_protocols_keep_their_members_and_stay_unrelated():
     assert params(RegionHold.release) == ["self"]
     assert params(Lender.hold_regions) == ["self"]
     assert params(Lender.held_page_counts) == ["self"]
+    assert params(Lender.prompt_object_keys) == [
+        "self",
+        "prompt_tokens",
+        "cache_salt",
+        "num_blocks",
+        "shares_per_group",
+    ]
+    assert params(_lender._ManagerLender.prompt_object_keys) == params(Lender.prompt_object_keys)
+    assert params(Lender.usable_end) == ["self", "present", "limit"]
+    assert params(_lender._ManagerLender.usable_end) == params(Lender.usable_end)
 
     def shape(func):
         """The signature, annotated on its keyword-only parameters alone."""
@@ -471,6 +484,9 @@ LENDER_MEMBERS = {
     "return_writes",
     "progress",
     "poll_resume_bounds",
+    "prompt_object_keys",
+    "usable_end",
+    "stopped",
 }
 
 

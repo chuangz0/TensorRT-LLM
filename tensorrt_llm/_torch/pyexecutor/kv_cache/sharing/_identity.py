@@ -70,21 +70,34 @@ class Identity:
         self.layout_id = bytes(layout_id)
         self.namespace = namespace(bytes(scope), self.layout_id)
         self.canonical = canonical_order(layers)
-        self._groups = []
+        # Per local layer group: its canonical index, shard count and this rank's share.
+        self._groups: list[tuple[int, int, int]] = []
         for index, (count, share) in zip(self.canonical, shards):
             ShardDesc(count, share)  # ValueError for a share outside the count
-            suffix = _u16(index) + _u16(count) + _u16(share)
-            self._groups.append(suffix)
+            self._groups.append((index, count, share))
 
-    def object_keys(self, layer_group_index: int, reuse_keys: np.ndarray) -> np.ndarray:
+    def object_keys(
+        self, layer_group_index: int, reuse_keys: np.ndarray, share: int | None = None
+    ) -> np.ndarray:
         """``uint8 (n, OBJECT_KEY_BYTES)``: the namespace, each row's 32-byte reuse key, then
-        the group's canonical index, shard count and shard index as big-endian ``u16``."""
+        the group's canonical index, shard count and shard index as big-endian ``u16``.
+        ``share`` names that share of the group, as the rank holding it does; this rank's by
+        default. ``ValueError`` for a share outside the group's shard count."""
         if not 0 <= layer_group_index < len(self._groups):
             raise ValueError(f"unknown layer group {layer_group_index}")
         reuse_keys = np.ascontiguousarray(reuse_keys, dtype=np.uint8).reshape(-1, REUSE_KEY_BYTES)
-        suffix = self._groups[layer_group_index]
-        payload = b"".join(piece for key in reuse_keys for piece in (self.namespace, key, suffix))
-        return np.frombuffer(payload, dtype=np.uint8).reshape(-1, OBJECT_KEY_BYTES)
+        index, count, own_share = self._groups[layer_group_index]
+        if share is None:
+            share = own_share
+        else:
+            ShardDesc(count, share)  # ValueError for a share outside the count
+        suffix = _u16(index) + _u16(count) + _u16(share)
+        keys = np.empty((len(reuse_keys), OBJECT_KEY_BYTES), dtype=np.uint8)
+        keys[:, :_NAMESPACE_BYTES] = np.frombuffer(self.namespace, dtype=np.uint8)
+        keys[:, _NAMESPACE_BYTES : _NAMESPACE_BYTES + REUSE_KEY_BYTES] = reuse_keys
+        keys[:, _NAMESPACE_BYTES + REUSE_KEY_BYTES :] = np.frombuffer(suffix, dtype=np.uint8)
+        # On immutable bytes, which lease views keep without a copy.
+        return np.frombuffer(keys.tobytes(), dtype=np.uint8).reshape(keys.shape)
 
     def region_label(self, layer_group_indices: Iterable[int]) -> str:
         """The layout-derived label for a staging region serving ``layer_group_indices``:

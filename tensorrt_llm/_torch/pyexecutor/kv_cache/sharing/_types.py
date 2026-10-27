@@ -631,6 +631,12 @@ class Lender(Protocol):
         type and quantization, and the position in ``regions`` of each pool's region."""
         ...
 
+    @property
+    def stopped(self) -> bool:
+        """Whether the lender lends no more: it stopped for good after an error it logged, or its
+        manager shut down. Its leases still go back."""
+        ...
+
     def held_page_counts(self) -> HeldPages:
         """Pages lending holds on this rank and pipeline stage, per local pool group (``HeldPages``).
         Compare them across ranks and stages to find holds that differ. These diagnostics alone do
@@ -648,7 +654,7 @@ class Lender(Protocol):
     def lend_read(
         self,
         request: LlmRequest,
-        start: int,
+        start: Union[int, Sequence[int]],
         end: int,
         *,
         memory_kind: MemoryKind,
@@ -684,8 +690,11 @@ class Lender(Protocol):
 
         Args:
             request: Request to read; the lease binds to the cache it holds now.
-            start: Nonnegative whole-block boundary.
-            end: Exclusive end, at least ``start``; a whole-block boundary for NAMED.
+            start: Nonnegative whole-block boundary, or one per layer group in ``page_layout``'s
+                ``layer_groups`` order: each group lends its rows from its own start (a windowed
+                group from 0 lends its sinks and the window rows needed at ``end``); the view's
+                ``start`` is the smallest.
+            end: Exclusive end, at least every start; a whole-block boundary for NAMED.
             memory_kind: Required ``MemoryKind``.
             rows: Required ``RowSelection``.
             ready_event: Required: an event with ``query()``, and ``wait()`` where rows are not the
@@ -855,4 +864,44 @@ class Lender(Protocol):
 
         Raises:
             ValueError: No request cache, including after manager shutdown."""
+        ...
+
+    def prompt_object_keys(
+        self,
+        prompt_tokens: Sequence[int],
+        *,
+        cache_salt: Optional[str],
+        num_blocks: int,
+        shares_per_group: Sequence[int],
+    ) -> np.ndarray:
+        """``uint8 (sum(shares_per_group) * num_blocks, 54)``: the object keys NAMED leases give
+        the first ``num_blocks`` whole blocks of a text prompt in shares ``0 .. n - 1`` of each
+        layer group ``lg`` (``n = shares_per_group[lg]``), as the ranks holding those shares name
+        them (the ranks of one server name a group alike but for the share), for a request with
+        this ``cache_salt`` and no LoRA. Rows run group by group, share by share within a group,
+        then block by block; the prompt is hashed once for them all. Unlike the other methods it
+        may run on any thread at any time after attach: it reads only what attach fixed. Prompts
+        with multimodal content or a LoRA adapter are named by their leases alone.
+
+        Raises:
+            ValueError: The prompt has fewer whole blocks, a layer group is unknown, a share lies
+                outside its group's shard count, or this lender names no blocks.
+            RuntimeError: The lender's manager is gone."""
+        ...
+
+    def usable_end(self, present: Sequence[np.ndarray], *, limit: int) -> int:
+        """The largest whole-block end ``E <= limit`` at which a NAMED fetch ``[0, E)`` resumes
+        once its every lent row arrived, given the rows the store holds: ``present[lg][b]`` says
+        block ``b`` of layer group ``lg`` is held (``page_layout``'s ``layer_groups`` order; blocks
+        past an array's end are not). Every row ``lend_write`` lends for ``[0, E)`` must be held:
+        full attention needs every block before ``E``, a window its sinks and the blocks it keeps
+        at ``E``. 0 where no such end exists. Without a window every end below a usable one is
+        usable too; with one, in general only the ends a publication reached are.
+
+        Like ``prompt_object_keys`` it may run on any thread after attach.
+
+        Raises:
+            ValueError: A mask per layer group is missing, the lender names no blocks, or its
+                windows do not follow the window formula (V2 without Helix does; attach checks
+                it)."""
         ...

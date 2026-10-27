@@ -412,6 +412,11 @@ def _fenced(
     return fence if ready_event is None else _BothDone(ready_event, fence)
 
 
+def _key_rows(keys: Sequence[bytes]) -> np.ndarray:
+    """32-byte reuse keys as the rows of one ``uint8 (n, 32)`` array."""
+    return np.frombuffer(b"".join(keys), dtype=np.uint8).reshape(-1, 32)
+
+
 def _frozen_array(values: np.ndarray) -> np.ndarray:
     """``values`` as contiguous ``int64`` on immutable bytes of their own."""
     return np.frombuffer(np.ascontiguousarray(values, dtype=np.int64).tobytes(), dtype=np.int64)
@@ -571,6 +576,7 @@ class _ManagerLender:
         "_parked_made",
         "_bad_row",
         "_writes_at_end",
+        "_prompt_keys",
         "_margin_groups",
         "__dict__",
         "__weakref__",
@@ -710,6 +716,11 @@ class _ManagerLender:
         # Open fast write leases whose return would resume at their end, by ``id`` of their cache,
         # at most one per cache; the hooks that can move a cache's history take them out.
         self._writes_at_end: dict[int, _InPlaceLease] = {}
+        # By request id: its cache and the reuse keys of its prompt's whole blocks, uint8 (n, 32),
+        # hashed at its first NAMED lease and kept while the cache lives. A key depends only on the
+        # cache's reuse scope and the tokens up to its block, and prompt tokens never change, so
+        # later leases of a long prompt do not hash it again from block 0.
+        self._prompt_keys: dict[int, tuple[_KVCache, np.ndarray]] = {}
         # Layer groups that keep a window wider than the one they read, whose margin rows a fetch
         # need not deliver.
         self._margin_groups = frozenset(
@@ -740,6 +751,11 @@ class _ManagerLender:
             )
         return self._page_layout
 
+    @property
+    def stopped(self) -> bool:
+        """See ``Lender.stopped``."""
+        return self._stop_reason is not None or self._shut_down
+
     def held_page_counts(self) -> HeldPages:
         """See ``Lender.held_page_counts``."""
         return self._locks.held_page_counts()
@@ -756,7 +772,7 @@ class _ManagerLender:
     def lend_read(
         self,
         request: LlmRequest,
-        start: int,
+        start: int | Sequence[int],
         end: int,
         *,
         memory_kind: MemoryKind,
@@ -790,11 +806,11 @@ class _ManagerLender:
         if ready_event is not None and type(ready_event) is not _CUDA_EVENT:
             _check_ready_event(ready_event, memory_kind is MemoryKind.HOST)
         named = rows is RowSelection.NAMED
-        start, end = self._whole_blocks(start, end, named)
+        start, end = self._whole_blocks(start, end, named, per_group=True)
         request_id = int(request.py_request_id)
         manager = self._lending_manager()
         self._check_not_stopped()
-        if fast:
+        if fast and isinstance(start, int):
             lease = self._read_every_row_fast(manager, request, request_id, start, end, ready_event)
             if lease is not None:
                 return lease
@@ -837,6 +853,7 @@ class _ManagerLender:
         reuse_keys = (
             self._reuse_keys_for(manager, request, kv, entries.block_ordinals) if named else None
         )
+        view_start = start if isinstance(start, int) else min(start)  # per group: the smallest
         if memory_kind is MemoryKind.DEVICE:
             refusal = self._ledger._unsettled_fetch_refusal(request_id, kv, entries)
             if refusal is None:
@@ -850,13 +867,13 @@ class _ManagerLender:
                 "read",
                 entries,
                 reuse_keys,
-                start=start,
+                start=view_start,
                 end=end,
                 ready_event=ready_event,
             )
         lease = _StagingLease(self, "read", request_id, kv, entries, reuse_keys)
         lease._ready_event = ready_event
-        lease._range = (start, end)
+        lease._range = (view_start, end)
         self._admit(lease, counts)
         return lease
 
@@ -1148,6 +1165,74 @@ class _ManagerLender:
             state,
         )
 
+    def prompt_object_keys(
+        self,
+        prompt_tokens: Sequence[int],
+        *,
+        cache_salt: str | None,
+        num_blocks: int,
+        shares_per_group: Sequence[int],
+    ) -> np.ndarray:
+        """See ``Lender.prompt_object_keys``."""
+        manager = self._manager_ref()
+        if manager is None:
+            raise RuntimeError("the lender's manager is gone")
+        if self._no_names is not None:
+            raise ValueError(f"this lender names no blocks: {self._no_names}")
+        scope = _manager.prompt_reuse_scope(manager, cache_salt)
+        keys = _manager.reuse_keys_of_tokens(
+            self._tokens_per_block, scope, prompt_tokens, num_blocks
+        )
+        reuse_keys = np.frombuffer(b"".join(keys), dtype=np.uint8)
+        return np.concatenate(
+            [
+                self._identity.object_keys(group, reuse_keys, share)
+                for group, shares in enumerate(shares_per_group)
+                for share in range(shares)
+            ]
+        )
+
+    def usable_end(self, present: Sequence[np.ndarray], *, limit: int) -> int:
+        """See ``Lender.usable_end``."""
+        if self._no_names is not None:
+            raise ValueError(f"this lender names no blocks: {self._no_names}")
+        layout = self._layout
+        if self._any_window and not getattr(layout, "stale_ranges_by_formula", False):
+            raise ValueError("this lender's windows do not follow the window formula")
+        if len(present) != layout.num_layer_groups:
+            raise ValueError(
+                f"{len(present)} masks of held blocks for {layout.num_layer_groups} layer groups"
+            )
+        tpb = self._tokens_per_block
+        last = int(limit) // tpb
+        if last <= 0:
+            return 0
+        # Candidate ends ``ends[i] * tpb``, every whole block in (0, limit].
+        ends = np.arange(1, last + 1, dtype=np.int64)
+        usable = np.ones(len(ends), dtype=bool)
+        for lg in range(layout.num_layer_groups):
+            if lg in self._recurrent_groups or not self._named_groups[lg]:
+                continue  # a named fetch lends such a group nothing
+            have = np.zeros(last, dtype=bool)
+            mask = np.asarray(present[lg], dtype=bool)[:last]
+            have[: len(mask)] = mask
+            # missing[b]: the blocks below b the store does not hold.
+            missing = np.concatenate(([0], np.cumsum(~have)))
+            window = layout.windows[lg]
+            if window is None:  # every block before the end
+                usable &= missing[ends] == 0
+                continue
+            # lend_write lends the sinks [0, sinks_end) and the window [window_start, end) at each
+            # end: the blocks around the stale range.
+            sinks_end, window_start = _ranges._formula_stale_ranges(
+                int(window), int(layout.sink_blocks[lg]), tpb, ends * tpb
+            )
+            usable &= missing[np.minimum(sinks_end, ends)] == 0  # the sinks are held
+            usable &= missing[ends] == missing[np.clip(window_start, 0, ends)]  # the window too
+        if not usable.any():
+            return 0
+        return int(ends[np.flatnonzero(usable)[-1]]) * tpb
+
     def return_writes(
         self,
         entries: Sequence[tuple[_StagingLease | _InPlaceLease, object, bool]],
@@ -1431,6 +1516,7 @@ class _ManagerLender:
                 self._fail_waiting(request_id, "the request was freed")
             self._ledger._drop_records(request_id)
             self._ordinal_ranges.pop(request_id, None)
+            self._prompt_keys.pop(request_id, None)
             self._shrink_epochs.pop(request_id, None)
             self._state_unverified.discard(request_id)
             parked = self._parked.pop(request_id, None)
@@ -1577,6 +1663,7 @@ class _ManagerLender:
         frees removed waiting leases and fetches; granted publishes finish. Never raises."""
         self._reuse_was_reset = True
         self._ordinal_ranges.clear()
+        self._prompt_keys.clear()
         if self._writes_at_end:
             self._lose_end_resumes()
 
@@ -1599,6 +1686,7 @@ class _ManagerLender:
         if self._shut_down:
             return
         self._ordinal_ranges.clear()
+        self._prompt_keys.clear()
         if self._writes_at_end:
             self._lose_end_resumes()
         if self._device_regions_of_pool_group and self._open_holds:
@@ -2120,9 +2208,24 @@ class _ManagerLender:
                 f"{memory_kind} is not lent: this lender stages nothing, as {self._no_staging}"
             )
 
-    def _whole_blocks(self, start: int, end: int, whole_end: bool = True) -> tuple[int, int]:
+    def _whole_blocks(
+        self,
+        start: int | Sequence[int],
+        end: int,
+        whole_end: bool = True,
+        *,
+        per_group: bool = False,
+    ) -> tuple[int | list[int], int]:
         """Validate integer ``[start, end)``; require an ordered, non-negative range starting,
-        and with ``whole_end`` also ending, at a whole block."""
+        and with ``whole_end`` also ending, at a whole block. With ``per_group`` (a read's),
+        ``start`` may also be one start per layer group, each checked so and returned as a list."""
+        if per_group and isinstance(start, (list, tuple)):
+            starts = list(start)
+            if len(starts) != self._layout.num_layer_groups:
+                raise ValueError(
+                    f"{len(starts)} starts for {self._layout.num_layer_groups} layer groups"
+                )
+            return [self._whole_blocks(s, end, whole_end)[0] for s in starts], int(end)
         for name, value in (("start", start), ("end", end)):
             if isinstance(value, bool) or not isinstance(value, numbers.Integral):
                 raise TypeError(f"{name} must be an integer, got {type(value).__name__}")
@@ -2496,14 +2599,25 @@ class _ManagerLender:
         block_ordinals: Sequence[np.ndarray],
     ) -> list[np.ndarray]:
         """Per layer group, its block entries' reuse keys, ``uint8 (n, 32)``."""
-        # TODO: every lease hashes the request's whole prefix again from block 0, so a lease late in
-        # a long prompt costs time in proportion to the prompt.
         top = max((int(o.max()) + 1 for o in block_ordinals if len(o)), default=0)
-        reuse_keys = _manager.block_keys(manager, request, kv, top)
-        columns = [
-            b"".join(reuse_keys[int(o)] for o in lg_ordinals) for lg_ordinals in block_ordinals
-        ]
-        return [np.frombuffer(column, dtype=np.uint8).reshape(-1, 32) for column in columns]
+        keys = self._block_key_chain(manager, request, kv, top)
+        return [keys[np.asarray(lg_ordinals, dtype=np.int64)] for lg_ordinals in block_ordinals]
+
+    def _block_key_chain(
+        self, manager: KVCacheManagerV2, request: LlmRequest, kv: _KVCache, count: int
+    ) -> np.ndarray:
+        """``uint8 (n, 32)``, ``n >= count``: the reuse keys of the request's whole blocks from
+        block 0; those of its prompt from ``_prompt_keys``."""
+        request_id = int(request.py_request_id)
+        owner, keys = self._prompt_keys.get(request_id, (None, None))
+        if owner is kv and count <= len(keys):  # a cache re-created for the request hashes afresh
+            return keys
+        prompt_blocks = _manager.prompt_length(request, manager) // int(manager.tokens_per_block)
+        if count > prompt_blocks:  # past the prompt, beam search may still change tokens
+            return _key_rows(_manager.block_keys(manager, request, kv, count))
+        keys = _key_rows(_manager.block_keys(manager, request, kv, prompt_blocks))
+        self._prompt_keys[request_id] = (kv, keys)
+        return keys
 
     def _assign_staging_slots(self, entries: _LentBlockEntries, runs: SlotRuns | None) -> None:
         """Each pool group's run goes to its layer groups in order, so the entries of one pool group

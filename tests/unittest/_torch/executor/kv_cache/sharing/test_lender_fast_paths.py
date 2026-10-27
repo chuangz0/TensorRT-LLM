@@ -89,6 +89,7 @@ def _sources(immutable_mutant=None):
     ns = dict(__name__=__name__, np=np, struct=struct, numbers=numbers, traceback=traceback)
     ns.update(dataclass=dataclass, field=field, _manager=manager, REUSE_KEY_BYTES=32)
     ns.update(_OBJECT_KEY_BYTES=54, OBJECT_KEY_BYTES=54, logger=SimpleNamespace(error=pytest.fail))
+    ns.update(_NAMESPACE_BYTES=16)
     for name in ("_immutable", "_frozen_int64", "_integer", "_entry_integers", "_region_indices"):
         _load("_types.py", name, ns)
     if immutable_mutant == "identity":
@@ -107,6 +108,7 @@ def _sources(immutable_mutant=None):
     for name in ("_stale_range", "_needed_ranges", "_last_history_keeping"):
         setattr(ranges, name, _load("_ranges.py", name, ns))
     ns["_ranges"] = ranges
+    _load("_identity.py", "_u16", ns)
     _load("_identity.py", "Identity.object_keys", ns)
     result = SimpleNamespace(
         object_keys=ns["object_keys"],
@@ -715,9 +717,10 @@ def test_metadata_mutants_expose_writable_or_changing_old_views(mutant):
             _assert_frozen_view(view)
 
 
-def test_ordinal_cache_is_cleared_on_free_reset_and_shutdown(sources):
+def test_ordinal_and_key_caches_are_cleared_on_free_reset_and_shutdown(sources):
     lender = SimpleNamespace(
         _ordinal_ranges={7: {}, 8: {}},
+        _prompt_keys={7: (object(), None), 8: (object(), None)},
         _shrink_epochs={7: 2, 8: 1},
         _writes_at_end={},
         _state_unverified={7, 8},
@@ -733,10 +736,11 @@ def test_ordinal_cache_is_cleared_on_free_reset_and_shutdown(sources):
     )
     sources._on_free(lender, 7, object())
     assert lender._ordinal_ranges == {8: {}} and lender._shrink_epochs == {8: 1}
-    assert lender._state_unverified == {8}
+    assert lender._state_unverified == {8} and list(lender._prompt_keys) == [8]
     sources._on_reset(lender)
-    assert lender._ordinal_ranges == {} and lender._reuse_was_reset
+    assert lender._ordinal_ranges == lender._prompt_keys == {} and lender._reuse_was_reset
     lender._ordinal_ranges[7] = {}
+    lender._prompt_keys[7] = (object(), None)
     lender._shut_down = False
     lender._device_regions_of_pool_group = {}
     lender._leases_holding_slots = lender._waiting_for_slots = lender._open_leases = ()
@@ -744,7 +748,34 @@ def test_ordinal_cache_is_cleared_on_free_reset_and_shutdown(sources):
     lender._recycle = lambda: None
     lender._memory_ref = lambda: None
     sources._on_shutdown(lender)
-    assert lender._ordinal_ranges == {} and lender._shut_down
+    assert lender._ordinal_ranges == lender._prompt_keys == {} and lender._shut_down
+
+
+def test_a_requests_prompt_keys_are_hashed_once_for_its_cache_and_not_kept_past_the_prompt():
+    """A request's later leases reuse the keys its first one hashed over the prompt's whole
+    blocks; a cache re-created for the request hashes afresh, and a lease past the prompt hashes
+    its blocks without keeping them (beam search may still change generated tokens)."""
+    methods = _sources()
+    _load("_lender.py", "_key_rows", methods.ns)
+    block_key_chain = _load("_lender.py", "_ManagerLender._block_key_chain", methods.ns)
+    hashed = []
+
+    def block_keys(manager, request, kv, count):
+        hashed.append(count)
+        return [bytes([len(hashed), block]) * 16 for block in range(count)]
+
+    methods.manager.prompt_length = lambda request, manager: request.prompt
+    methods.manager.block_keys = block_keys
+    lender, manager = SimpleNamespace(_prompt_keys={}), SimpleNamespace(tokens_per_block=TPB)
+    request = SimpleNamespace(py_request_id=RID, prompt=3 * TPB + 1)  # three whole blocks
+    kv, recreated = object(), object()
+    first = block_key_chain(lender, manager, request, kv, 2)
+    assert block_key_chain(lender, manager, request, kv, 3) is first and hashed == [3]
+    again = block_key_chain(lender, manager, request, recreated, 3)
+    assert hashed == [3, 3] and again.tobytes() != first.tobytes()
+    assert lender._prompt_keys[RID][0] is recreated
+    past = block_key_chain(lender, manager, request, recreated, 4)
+    assert hashed == [3, 3, 4] and len(past) == 4 and lender._prompt_keys[RID][1] is again
 
 
 def _slow_object_keys(identity, group, keys):
@@ -754,7 +785,7 @@ def _slow_object_keys(identity, group, keys):
     out = np.empty((len(keys), 54), dtype=np.uint8)
     out[:, :16] = np.frombuffer(identity.namespace, dtype=np.uint8)
     out[:, 16:48] = keys
-    out[:, 48:] = identity._groups[group]
+    out[:, 48:] = np.frombuffer(struct.pack(">HHH", *identity._groups[group]), dtype=np.uint8)
     return out
 
 
@@ -764,9 +795,8 @@ def test_object_key_bytes_and_snapshots_match_eager_layout(sources):
         count = rng.choice((0, 0, 1, 4, 15))
         raw = np.frombuffer(rng.randbytes(count * 64), dtype=np.uint8).copy().reshape(count, 64)
         keys = raw[:, ::2]
-        suffix = struct.pack(">HHH", rng.randrange(65536), 4, 2)
         identity = SimpleNamespace(
-            namespace=bytes(range(16)), _groups=[np.frombuffer(suffix, dtype=np.uint8).copy()]
+            namespace=bytes(range(16)), _groups=[(rng.randrange(65536), 4, 2)]
         )
         expected = _slow_object_keys(identity, 0, keys)
         result = sources.object_keys(identity, 0, keys)
@@ -777,10 +807,11 @@ def test_object_key_bytes_and_snapshots_match_eager_layout(sources):
             result.flags.writeable = True
         assert all(row[:16].tobytes() == identity.namespace for row in result)
         assert np.array_equal(result[:, 16:48], keys)
-        assert np.array_equal(result[:, 48:], np.broadcast_to(identity._groups[0], (count, 6)))
+        suffix = np.frombuffer(struct.pack(">HHH", *identity._groups[0]), dtype=np.uint8)
+        assert np.array_equal(result[:, 48:], np.broadcast_to(suffix, (count, 6)))
         snapshot = result.tobytes()
         raw[:] = 0
-        identity._groups[0][:] = 0
+        identity._groups[0] = (0, 4, 2)
         identity.namespace = b"!" * 16
         assert result.tobytes() == snapshot
     for invalid in (-1, 1):
@@ -994,7 +1025,7 @@ def test_named_pipeline_reuses_frozen_metadata_and_preserves_old_views(
     lender = _metadata_lender(sources, layout([False, False], tpb=4), manager)
     identity = SimpleNamespace(
         namespace=bytes(range(16)),
-        _groups=[np.frombuffer(struct.pack(">HHH", lg, 4, 2), dtype=np.uint8) for lg in range(2)],
+        _groups=[(lg, 4, 2) for lg in range(2)],
     )
     emitted = {}
 
@@ -1041,7 +1072,7 @@ def test_named_pipeline_reuses_frozen_metadata_and_preserves_old_views(
             assert np.shares_memory(rows.page_ordinals, entries.block_ordinals[lg])
             assert np.shares_memory(rows.object_keys, emitted[lg])
             expected_keys = b"".join(
-                identity.namespace + row.tobytes() + identity._groups[lg].tobytes()
+                identity.namespace + row.tobytes() + struct.pack(">HHH", *identity._groups[lg])
                 for row in keys[lg]
             )
             assert rows.object_keys.tobytes() == expected_keys
