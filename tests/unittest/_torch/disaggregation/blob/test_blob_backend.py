@@ -37,6 +37,7 @@ from cpu_fixtures import (
     commit_object,
     masks,
     object_key,
+    slots,
     store_key,
     wait_until,
 )
@@ -1055,8 +1056,8 @@ def _view_with(endpoint: Endpoint, **changes) -> CpuView:
     fields = {
         "layer_group_index": 0,
         "object_keys": rows.object_keys,
-        "addresses": rows.addresses,
-        "region_index": 0,
+        "slots": rows.slots,
+        "region_indices": (0,),
     }
     fields.update(changes)
     return CpuView([Rows(**fields)])
@@ -1064,18 +1065,19 @@ def _view_with(endpoint: Endpoint, **changes) -> CpuView:
 
 INVALID_SUBMISSIONS: dict[str, Callable[[Endpoint], tuple[CpuView, object]]] = {
     "hint": lambda e: (e.view("A"), "peer-0"),
-    "no_keys": lambda e: (_view_with(e, object_keys=None, addresses=None, region_index=None), None),
+    "no_keys": lambda e: (_view_with(e, object_keys=None, slots=None, region_indices=None), None),
     "key_dtype": lambda e: (_view_with(e, object_keys=np.zeros((1, 4), dtype=np.int32)), None),
     "key_width": lambda e: (_view_with(e, object_keys=np.zeros((1, 0), dtype=np.uint8)), None),
-    "address_dtype": lambda e: (_view_with(e, addresses=e.region.slots(0).astype(np.uint64)), None),
+    "slot_dtype": lambda e: (_view_with(e, slots=slots(0).astype(np.uint64)), None),
     "len_disagrees_with_arrays": lambda e: (_view_with(e, rows=2), None),
-    "past_the_region": lambda e: (_view_with(e, addresses=e.region.slots(2)), None),
-    "before_the_region": lambda e: (_view_with(e, addresses=e.region.slots(-1)), None),
-    "misaligned": lambda e: (_view_with(e, addresses=e.region.slots(0) + 1), None),
-    "unknown_region_index": lambda e: (_view_with(e, region_index=1), None),
-    "negative_region_index": lambda e: (_view_with(e, region_index=-1), None),
+    "past_the_region": lambda e: (_view_with(e, slots=slots(2)), None),
+    "before_the_region": lambda e: (_view_with(e, slots=slots(-1)), None),
+    "no_region": lambda e: (_view_with(e, region_indices=()), None),
+    "one_region_twice": lambda e: (_view_with(e, region_indices=(0, 0)), None),
+    "unknown_region_index": lambda e: (_view_with(e, region_indices=(1,)), None),
+    "negative_region_index": lambda e: (_view_with(e, region_indices=(-1,)), None),
     "same_slot_in_a_group": lambda e: (
-        CpuView([Rows(0, np.stack([object_key("A"), object_key("B")]), e.region.slots(0, 0), 0)]),
+        CpuView([Rows(0, np.stack([object_key("A"), object_key("B")]), slots(0, 0), (0,))]),
         None,
     ),
     "same_slot_across_groups": lambda e: (CpuView([e.rows(["A"], 0), e.rows(["A"], 1)]), None),
@@ -1086,7 +1088,7 @@ def test_object_keys_in_any_memory_order_are_taken(store: MemoryStore) -> None:
     commit_objects(store, {"A": b"aaaaaaaa", "B": b"bbbbbbbb"})
     reader = Endpoint(MemoryDriver(store), ["A", "B"])
     rows = reader.rows(["A", "B"])
-    view = CpuView([Rows(0, np.asfortranarray(rows.object_keys), rows.addresses, 0)])
+    view = CpuView([Rows(0, np.asfortranarray(rows.object_keys), rows.slots, (0,))])
     attempt = reader.backend.fetch(view, None)
     assert masks(reader.wait_outcome(attempt)) == [[True, True]]
     reader.wait_quiesced(attempt)
@@ -1128,7 +1130,7 @@ def test_a_publish_may_read_one_slot_twice(store: MemoryStore) -> None:
     writer = Endpoint(MemoryDriver(store), ["A", "B"])
     writer.write("A", b"aaaaaaaa")
     keys = np.stack([object_key("A"), object_key("B")])
-    view = CpuView([Rows(0, keys, writer.region.slots(0, 0), 0)])
+    view = CpuView([Rows(0, keys, slots(0, 0), (0,))])
     attempt = writer.backend.publish(view, None)
     assert masks(writer.wait_outcome(attempt)) == [[True, True]]
     assert store.committed_payload(store_key("B")) == b"aaaaaaaa"
@@ -1577,13 +1579,65 @@ def test_rows_in_a_region_the_backend_did_not_register_are_rejected(store: Memor
     device = CpuRegion(SLOT_BYTES, 1, memory_kind=MemoryKind.DEVICE)
     reader = Endpoint(MemoryDriver(store, capabilities=HOST_ONLY), ["A"], others=[device])
     assert reader.binding.live_labels() == frozenset({"region:0"})
-    view = CpuView([Rows(0, object_key("A")[None, :], device.slots(0), 1)])
+    view = CpuView([Rows(0, object_key("A")[None, :], slots(0), (1,))])
     with pytest.raises(InvalidSubmission, match="region 1 is not registered"):
         reader.backend.fetch(view, None)
     with pytest.raises(ValueError, match="region 1 is not registered"):
         reader.backend.driver_call_limit(1)
     assert store_calls(reader) == []
     reader.close()
+
+
+# Rows lying in several regions.
+
+
+def test_a_row_lying_in_two_regions_is_its_two_slots_back_to_back(store: MemoryStore) -> None:
+    second = CpuRegion(2 * SLOT_BYTES, 2)
+    endpoint = Endpoint(MemoryDriver(store), ["A", "B"], others=[second])
+    endpoint.write("A", b"a" * SLOT_BYTES)
+    second.write(0, b"x" * 2 * SLOT_BYTES)
+    keys = object_key("A")[None, :]
+    published = endpoint.backend.publish(CpuView([Rows(0, keys, slots(0), (0, 1))]), None)
+    assert masks(endpoint.wait_outcome(published)) == [[True]]
+    assert store.committed_payload(store_key("A")) == b"a" * SLOT_BYTES + b"x" * 2 * SLOT_BYTES
+    endpoint.wait_quiesced(published)
+    fetched = endpoint.backend.fetch(CpuView([Rows(0, keys, slots(1), (0, 1))]), None)
+    assert masks(endpoint.wait_outcome(fetched)) == [[True]]
+    assert endpoint.region.read(1) == b"a" * SLOT_BYTES
+    assert second.read(1) == b"x" * 2 * SLOT_BYTES
+    endpoint.wait_quiesced(fetched)
+    endpoint.close()
+
+
+def test_a_row_in_two_regions_is_refused_by_a_driver_taking_rows_of_one_region(
+    store: MemoryStore,
+) -> None:
+    one_region = replace(DEFAULT_CAPABILITIES, multi_span=False)
+    endpoint = Endpoint(
+        MemoryDriver(store, capabilities=one_region), ["A"], others=[CpuRegion(SLOT_BYTES, 1)]
+    )
+    view = CpuView([Rows(0, object_key("A")[None, :], slots(0), (0, 1))])
+    with pytest.raises(InvalidSubmission, match="rows of one region only"):
+        endpoint.backend.publish(view, None)
+    assert store_calls(endpoint) == []
+    endpoint.close()
+
+
+def test_rows_in_two_regions_stay_inside_the_smaller_and_never_share_a_slot(
+    store: MemoryStore,
+) -> None:
+    """A row's slot lies in every region it names, here a two-slot and a one-slot region; and two
+    rows of a fetch share no slot in any region, here only in the second."""
+    endpoint = Endpoint(MemoryDriver(store), ["A", "B"], others=[CpuRegion(SLOT_BYTES, 1)])
+    key = object_key("A")[None, :]
+    past_the_smaller = CpuView([Rows(0, key, slots(1), (0, 1))])
+    with pytest.raises(InvalidSubmission, match="outside its regions"):
+        endpoint.backend.fetch(past_the_smaller, None)
+    shared_in_the_second = CpuView([Rows(0, key, slots(0), (0, 1)), Rows(1, key, slots(0), (1,))])
+    with pytest.raises(InvalidSubmission, match="write the same slot"):
+        endpoint.backend.fetch(shared_in_the_second, None)
+    assert store_calls(endpoint) == []
+    endpoint.close()
 
 
 # Repeated object keys.
@@ -1606,9 +1660,9 @@ def test_rows_naming_one_key_at_two_addresses_never_share_a_call(
     """A view may name one key at two addresses; a RowBatch carries no key twice, so the group is
     cut there as well as at the driver's row limit, the rows keeping their order."""
     max_rows_per_op, keys, expected = REPEATED_KEYS[case]
-    slots = [f"S{i}" for i in range(len(keys))]  # one slot per row, named apart from the keys
+    slot_names = [f"S{i}" for i in range(len(keys))]  # one slot per row, named apart from the keys
     capabilities = replace(DEFAULT_CAPABILITIES, max_rows_per_op=max_rows_per_op)
-    endpoint = Endpoint(MemoryDriver(store, capabilities=capabilities), slots)
+    endpoint = Endpoint(MemoryDriver(store, capabilities=capabilities), slot_names)
     if max_rows_per_op is None:
         assert endpoint.backend.driver_call_limit(0) is None  # no limit declared; still cut
     payload = {key: key.encode() * SLOT_BYTES for key in set(keys)}
@@ -1617,13 +1671,13 @@ def test_rows_naming_one_key_at_two_addresses_never_share_a_call(
             Rows(
                 0,
                 np.stack([object_key(key) for key in keys]),
-                endpoint.region.slots(*range(len(keys))),
-                0,
+                slots(*range(len(keys))),
+                (0,),
             )
         ]
     )
     if direction == "publish":
-        for slot, key in zip(slots, keys):
+        for slot, key in zip(slot_names, keys):
             endpoint.write(slot, payload[key])
         attempt = endpoint.backend.publish(view, None)
     else:
@@ -1636,7 +1690,7 @@ def test_rows_naming_one_key_at_two_addresses_never_share_a_call(
     if direction == "publish":
         assert {key: store.committed_payload(store_key(key)) for key in set(keys)} == payload
     else:
-        assert [endpoint.read(slot) for slot in slots] == [payload[key] for key in keys]
+        assert [endpoint.read(slot) for slot in slot_names] == [payload[key] for key in keys]
     endpoint.wait_quiesced(attempt)
     endpoint.close()
 

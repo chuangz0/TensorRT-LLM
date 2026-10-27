@@ -116,13 +116,13 @@ def test_a_row_is_a_key_and_disjoint_spans_in_the_order_given() -> None:
 
 def test_a_batch_of_slots_builds_nothing_until_read() -> None:
     names = np.array([[0xAB, 0x01], [0xCD, 0x02], [0xEF, 0x03]], dtype=np.uint8)
-    slots = np.array([4096, 8192, 12288], dtype=np.int64)
+    starts = np.array([4096, 8192, 12288], dtype=np.int64)
     region = Span(4096, 3 * 4096)
-    batch = RowBatch.of_slots(key_stem("p"), names, slots, 4096, region)
+    batch = RowBatch.of_slots(key_stem("p"), names, starts[:, None], (4096,), (region,))
     assert len(batch) == 3 and batch.spans_per_row == 1 and batch.row_bytes == 4096
     # Both columns are the caller's arrays: a change to them shows, as nothing was copied or built.
     names[0] = [0x12, 0x34]
-    assert np.shares_memory(batch.addresses, slots)
+    assert np.shares_memory(batch.addresses, starts)
     assert not batch.addresses.flags.writeable  # a driver cannot write through it
     assert batch.addresses[:, 0].tolist() == [4096, 8192, 12288]
     assert batch.span_bytes == (4096,)
@@ -134,7 +134,8 @@ def test_a_batch_of_slots_builds_nothing_until_read() -> None:
 
 def test_a_slice_of_a_batch_is_the_batch_of_those_rows() -> None:
     names = np.arange(8, dtype=np.uint8).reshape(4, 2)
-    batch = RowBatch.of_slots("s/", names, np.arange(4, dtype=np.int64) * 8, 8, Span(0, 32))
+    starts = np.arange(4, dtype=np.int64)[:, None] * 8
+    batch = RowBatch.of_slots("s/", names, starts, (8,), (Span(0, 32),))
     part = batch[1:3]
     assert isinstance(part, RowBatch) and len(part) == 2
     assert part.keys() == batch.keys()[1:3]

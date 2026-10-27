@@ -34,6 +34,7 @@ from cpu_fixtures import (
     Rows,
     WakeCounter,
     object_key,
+    slots,
     store_key,
     wait_until,
 )
@@ -1195,7 +1196,11 @@ def test_a_batch_whose_extent_leaves_its_registration_is_rejected_before_the_sdk
 def test_an_empty_batch_is_rejected_before_the_sdk() -> None:
     bench = Bench()
     empty = RowBatch.of_slots(
-        "k/", np.zeros((0, 2), np.uint8), np.zeros(0, np.int64), SLOT, bench.buffer.span()
+        "k/",
+        np.zeros((0, 2), np.uint8),
+        np.zeros((0, 1), np.int64),
+        (SLOT,),
+        (bench.buffer.span(),),
     )
     with pytest.raises(DriverRejected, match="at least one row"):
         bench.driver.get(empty)
@@ -1400,15 +1405,13 @@ def test_a_view_naming_one_key_twice_goes_in_two_calls_and_never_faults(directio
     one worker the second put finds the object the first one committed; running alongside it, it
     would find the key held by this driver's put and be NOT_READY, never a fault."""
     fake = FakeMooncakeStore()
-    slots = ["S0", "S1", "S2"]
-    endpoint = Endpoint(MooncakeDriver(fake, workers=1), slots)
+    slot_names = ["S0", "S1", "S2"]
+    endpoint = Endpoint(MooncakeDriver(fake, workers=1), slot_names)
     keys = "ABA"
     payload = {name: name.encode() * SLOT for name in set(keys)}
-    view = CpuView(
-        [Rows(0, np.stack([object_key(name) for name in keys]), endpoint.region.slots(0, 1, 2), 0)]
-    )
+    view = CpuView([Rows(0, np.stack([object_key(name) for name in keys]), slots(0, 1, 2), (0,))])
     if direction == "publish":
-        for slot, name in zip(slots, keys):
+        for slot, name in zip(slot_names, keys):
             endpoint.write(slot, payload[name])
         attempt = endpoint.backend.publish(view, None)
     else:
@@ -1426,7 +1429,7 @@ def test_a_view_naming_one_key_twice_goes_in_two_calls_and_never_faults(directio
     if direction == "publish":
         assert {name: fake.pool.objects[store_key(name)] for name in "AB"} == payload
     else:
-        assert [endpoint.read(slot) for slot in slots] == [payload[name] for name in keys]
+        assert [endpoint.read(slot) for slot in slot_names] == [payload[name] for name in keys]
     endpoint.wait_quiesced(attempt)
     endpoint.close()
 
@@ -1482,8 +1485,8 @@ def test_fetch_and_publish_build_no_key_or_row_and_start_no_thread_on_the_callin
     keys = np.stack([object_key(f"R{i}") for i in range(rows)])
     for i in range(rows):
         region.write(i, f"R{i}".encode().ljust(SLOT, b"."))
-    offered = CpuView([Rows(0, keys, region.slots(*range(rows)), 0)])
-    wanted = CpuView([Rows(0, keys.copy(), region.slots(*range(rows, 2 * rows)), 0)])
+    offered = CpuView([Rows(0, keys, slots(*range(rows)), (0,))])
+    wanted = CpuView([Rows(0, keys.copy(), slots(*range(rows, 2 * rows)), (0,))])
     caller = threading.get_ident()
     for submit, view in ((backend.publish, offered), (backend.fetch, wanted)):
         work_per_row_or_thread.clear()

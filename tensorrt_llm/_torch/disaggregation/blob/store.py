@@ -249,24 +249,26 @@ class RowBatch(Sequence[RowIO]):
         cls,
         key_stem: str,
         object_keys: np.ndarray,
-        addresses: np.ndarray,
-        slot_bytes: int,
-        extent: Span,
+        starts: np.ndarray,
+        slot_bytes: tuple[int, ...],
+        extents: tuple[Span, ...],
     ) -> RowBatch:
-        """Rows that are each one whole slot: row ``i`` is keyed ``key_stem`` followed by
-        ``object_keys[i]`` in hex, and its payload is the ``slot_bytes`` at ``addresses[i]``.
-        Checks nothing and copies nothing.
+        """Rows that are each one whole slot of every region they lie in: row ``i`` is keyed
+        ``key_stem`` followed by ``object_keys[i]`` in hex, and its payload is, for each region
+        ``j`` in order, the ``slot_bytes[j]`` at ``starts[i, j]``. Checks nothing and copies
+        nothing.
 
         Args:
             key_stem: How every key starts (``keys.key_stem``).
             object_keys: ``uint8 [rows, width > 0]``, no row twice.
-            addresses: ``int64 [rows]``, each the start of a slot inside ``extent``.
-            slot_bytes: Every row's size.
-            extent: The registered region holding every slot, or a span inside it.
+            starts: ``int64 [rows, regions]``; ``starts[i, j]`` is the start of a slot inside
+                ``extents[j]``.
+            slot_bytes: The slot size of each region.
+            extents: Each region, registered, or a span inside it.
         """
-        column = addresses[:, None]  # a view of the caller's array, which stays writable
-        column.flags.writeable = False
-        return cls(_HexKeys(key_stem, object_keys), column, (slot_bytes,), (extent,))
+        starts = starts.view()  # the caller's array stays writable
+        starts.flags.writeable = False
+        return cls(_HexKeys(key_stem, object_keys), starts, slot_bytes, extents)
 
     @classmethod
     def of(cls, rows: Sequence[RowIO]) -> RowBatch:

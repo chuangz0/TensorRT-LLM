@@ -130,12 +130,15 @@ class Endpoint:
 
     def rows(self) -> RowBatch:
         """Every label's row, one whole slot each, laid out as the blob backend hands rows over:
-        keys built only when read, and addresses as a column of the caller's array."""
+        keys built only when read, and each row's start address in each of its regions (here
+        one)."""
         names = np.frombuffer(b"".join(name_of(label) for label in self.labels), dtype=np.uint8)
-        slots = self.memory.address + self.slot * np.arange(len(self.labels), dtype=np.int64)
+        starts = self.memory.address + self.slot * np.arange(len(self.labels), dtype=np.int64)
         region = Span(self.memory.address, self.memory.nbytes)
         object_keys = names.reshape(len(self.labels), NAME_BYTES)
-        return RowBatch.of_slots(key_stem(self.prefix), object_keys, slots, self.slot, region)
+        return RowBatch.of_slots(
+            key_stem(self.prefix), object_keys, starts[:, None], (self.slot,), (region,)
+        )
 
     def span_at(self, offset: int, nbytes: int) -> Span:
         """Any range of the region, slot boundaries or not."""
