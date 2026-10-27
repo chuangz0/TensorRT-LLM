@@ -31,12 +31,7 @@ import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.disaggregation._assembly import (
-    OwnerCleanupFn,
-    ProfileSpec,
-    attach_domain,
-    bind_write_return,
-)
+from tensorrt_llm._torch.disaggregation._assembly import OwnerCleanupFn, ProfileSpec, attach_domain
 from tensorrt_llm._torch.disaggregation.base.backend import (
     CacheKind,
     Capabilities,
@@ -53,8 +48,6 @@ from tensorrt_llm._torch.disaggregation.transfer_manager import (
     Accepted,
     Direction,
     LifecycleBinding,
-    ReturnDecision,
-    ReturnStatus,
     TransferIntent,
     TransferManager,
 )
@@ -216,8 +209,8 @@ class _Harness:
             dtype="bfloat16",
             topology=(1, 1, 1, 1),
             state_kinds=(CacheKind.PAGED,),
-            full_attention=True,
-            sparse_attention=False,
+            attention_windows=(),
+            sparse_attention=None,
             sink_token_length=0,
             lora_enabled=False,
             pool_count=1,
@@ -249,19 +242,19 @@ class _Harness:
             self.profile.id,
             factory,
             domain_id="runtime-test-lender",
+            lender=self.domain.lender,
             lifecycle=LifecycleBinding(self.watchdog, timeout_s=5),
             provider_cleanup_complete=lambda: self.backend.finalizer_posted,
         )
 
-    def tick(self) -> tuple:
-        """Advance manager work before the holder observes already acquired leases."""
-        self.domain.lender.progress()
-        return self.runtime.advance(_NOW)
+    def tick(self) -> None:
+        """Run one owner-loop iteration: lender progress, then the holder."""
+        self.runtime.advance(_NOW)
 
     def fetch(
         self, request: LlmRequest, *, ready_event: torch.cuda.Event | None = None
     ) -> Accepted:
-        """Fence page use in orchestration and bind return to the originating lender."""
+        """Fence page use in orchestration, then hand the write lease to the holder."""
         if ready_event is None:
             ready_event = torch.cuda.Event()
             ready_event.record(self.manager._stream)
@@ -274,9 +267,7 @@ class _Harness:
             ready_event=ready_event,
         )
         result = self.runtime.submit(
-            lease,
-            TransferIntent("store", self.profile.id, Direction.FETCH, MemoryKind.HOST),
-            write_return=bind_write_return(self.domain.lender),
+            lease, TransferIntent("store", self.profile.id, Direction.FETCH, MemoryKind.HOST)
         )
         assert isinstance(result, Accepted)
         self.tick()
@@ -300,10 +291,6 @@ class _Harness:
         assert isinstance(result, Accepted)
         self.tick()
         return result
-
-    def authorize(self, operation: int, *, reusable: bool = True) -> None:
-        """Authorize this single-rank fixture after its fixed result and access end."""
-        self.runtime.authorize_return(operation, ReturnDecision(reusable, True))
 
     def close(self) -> None:
         """End provider access and drain the holder before the manager fixture shuts down."""
@@ -343,39 +330,25 @@ def _assert_fetch_bytes(
             assert kit.digest(device.read(group, slots[ordinal])) == kit.digest(expected)
 
 
-@pytest.mark.parametrize("outcome_first", [False, True])
-def test_real_fetch_waits_for_evidence_and_authorization_before_consumption(
-    real_manager: Callable[..., AbstractContextManager[KVCacheManagerV2]],
-    kit: SimpleNamespace,
-    outcome_first: bool,
+def test_outcome_waits_for_quiescence_to_count_real_bytes(
+    real_manager: Callable[..., AbstractContextManager[KVCacheManagerV2]], kit: SimpleNamespace
 ) -> None:
-    """Delivery and ended access retain a fetch until coordinated consuming return."""
+    """A write lease goes back with its delivered rows only once backend access ended."""
     with real_manager(dtype=DataType.BF16) as manager, _runtime(manager, kit) as harness:
         request = kit.admitted(manager, 1, list(range(1000, 1097)))
         started = harness.fetch(request)
         record = harness.runtime.operations[started.operation_id]
         attempt = harness.backend.attempts[0]
-        if outcome_first:
-            attempt.complete()
-            harness.tick()
-            assert record.outcome is attempt.outcome and not record.access_ended
-            attempt.ended = True
-        else:
-            attempt.ended = True
-            harness.tick()
-            assert record.access_ended and record.outcome is None
-            attempt.complete()
+        attempt.complete()
+        harness.tick()
         assert not record.released
-        harness.tick()
-        manager._stream.synchronize()
-        harness.tick()
-        assert not record.released and record.return_status is ReturnStatus.PENDING
         assert harness.domain.lender.poll_resume_bounds(request) is None
 
-        harness.authorize(started.operation_id)
-        assert record.released and record.return_status is ReturnStatus.RETURNED
+        attempt.ended = True
+        harness.tick()
         manager._stream.synchronize()
         harness.tick()
+        assert record.released
         bounds = harness.domain.lender.poll_resume_bounds(request)
         assert bounds is not None and bounds.max_position == _END
         _assert_fetch_bytes(manager, request, kit)
@@ -383,10 +356,10 @@ def test_real_fetch_waits_for_evidence_and_authorization_before_consumption(
         manager.free_resources(request)
 
 
-def test_consuming_return_keeps_copy_pending_until_ready_event(
+def test_returned_fetch_waits_for_its_ready_event(
     real_manager: Callable[..., AbstractContextManager[KVCacheManagerV2]], kit: SimpleNamespace
 ) -> None:
-    """A consumed HOST lease does not make device bytes ready before the page-use fence."""
+    """A returned HOST lease does not make device bytes ready before the page-use fence."""
     with real_manager(dtype=DataType.BF16) as manager, _runtime(manager, kit) as harness:
         request = kit.admitted(manager, 1, list(range(2000, 2097)))
         elsewhere = torch.cuda.Stream()
@@ -399,8 +372,7 @@ def test_consuming_return_keeps_copy_pending_until_ready_event(
             attempt.complete()
             attempt.ended = True
             harness.tick()
-            harness.authorize(started.operation_id)
-            assert record.released and record.return_status is ReturnStatus.RETURNED
+            assert record.released
             for _ in range(3):
                 harness.tick()
                 assert harness.domain.lender.poll_resume_bounds(request) is None
@@ -412,19 +384,17 @@ def test_consuming_return_keeps_copy_pending_until_ready_event(
         manager.free_resources(request)
 
 
-def test_real_miss_settles_only_after_authorized_return(
+def test_real_miss_counts_no_rows(
     real_manager: Callable[..., AbstractContextManager[KVCacheManagerV2]], kit: SimpleNamespace
 ) -> None:
     """All-false delivery counts no KV while settling the real lender's pending fetch."""
     with real_manager(dtype=DataType.BF16) as manager, _runtime(manager, kit) as harness:
         request = kit.admitted(manager, 1, list(range(2500, 2597)))
-        started = harness.fetch(request)
+        harness.fetch(request)
         attempt = harness.backend.attempts[0]
         attempt.complete(delivered=False)
         attempt.ended = True
         harness.tick()
-        assert harness.domain.lender.poll_resume_bounds(request) is None
-        harness.authorize(started.operation_id, reusable=False)
         manager._stream.synchronize()
         harness.tick()
         bounds = harness.domain.lender.poll_resume_bounds(request)

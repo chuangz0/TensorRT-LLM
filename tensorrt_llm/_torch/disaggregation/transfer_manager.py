@@ -9,18 +9,18 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import TYPE_CHECKING
 
 from tensorrt_llm.logger import logger
 
+from ..pyexecutor.kv_cache.sharing import ALL_ARRIVED
 from ._assembly import (
     BackendFactory,
     FactoryRejected,
     ProviderCleanupCompleteFn,
     RegionNamespace,
-    WriteReturnFn,
     check_view_compatibility,
 )
 from .base.backend import (
@@ -36,7 +36,9 @@ from .base.backend import (
 from .lifecycle.retirement import RetirementDeadline, RetirementWatchdog
 
 if TYPE_CHECKING:
-    from ..pyexecutor.kv_cache.sharing import Lease, LeaseView, ResumeBounds
+    import numpy as np
+
+    from ..pyexecutor.kv_cache.sharing import Lease, LeaseView, Lender
 
 
 class Direction(Enum):
@@ -51,7 +53,10 @@ class TransferIntent:
     """Immutable operation input; the caller must also freeze its opaque hint.
 
     Direction comes from the lending call, not introspection of the Lease. Memory
-    kind must match independently verified assembly metadata.
+    kind must match independently verified assembly metadata. A publication with
+    ``put_stripe=(position, size)`` puts only the rows whose page ordinal modulo
+    ``size`` is ``position``; the others stay lent, unread. Ranks holding the same
+    bytes each put one stripe, so every object is put once.
     """
 
     binding_id: str
@@ -59,6 +64,7 @@ class TransferIntent:
     direction: Direction
     memory_kind: MemoryKind
     hint: Hint = None
+    put_stripe: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -83,54 +89,6 @@ class Rejected:
 
 
 SubmitResult = Accepted | Deferred | Rejected
-
-
-class ConsumptionDecision(Enum):
-    """Consumption intent, separate from the result of returning the lease."""
-
-    UNDECIDED = "undecided"
-    CONSUME = "consume"
-    DISCARD = "discard"
-
-
-class ReturnStatus(Enum):
-    """Whether ownership ended through a consuming return or discard release."""
-
-    PENDING = "pending"
-    RETURNED = "returned"
-    FAILED = "failed"
-
-
-@dataclass(frozen=True)
-class ReturnDecision:
-    """Caller assurance that the complete transfer group permits write return.
-
-    Orchestration settles Outcomes and backend access across all required managers
-    and participating ranks before granting this permission. The holder verifies
-    local evidence; this flag alone does not establish distributed completion.
-    """
-
-    reusable: bool
-    all_ranks_returnable: bool
-
-    def __post_init__(self) -> None:
-        """Require explicit Boolean consumption and coordination decisions."""
-        if type(self.reusable) is not bool or type(self.all_ranks_returnable) is not bool:
-            raise TypeError("return decisions require Boolean permissions")
-
-
-@dataclass(frozen=True)
-class OperationObservation:
-    """Operation facts only; orchestration owns readiness and request recovery."""
-
-    operation_id: int
-    outcome: Outcome | None
-    fault: str | None
-    decision: ConsumptionDecision
-    access_ended: bool
-    return_status: ReturnStatus
-    resume_bounds: ResumeBounds | None
-    retired: bool
 
 
 @dataclass(frozen=True)
@@ -242,7 +200,7 @@ class _OwnerCleanup:
 
 @dataclass
 class BackendBinding:
-    """A provider root with descriptors and cleanup, never a manager/lender service."""
+    """A provider root with descriptors, cleanup and the lender its leases come from."""
 
     namespace: RegionNamespace
     profile_id: str
@@ -251,6 +209,7 @@ class BackendBinding:
     cleanup: _OwnerCleanup
     provider_cleanup_complete: ProviderCleanupCompleteFn
     domain_id: str
+    lender: Lender
     backend: Backend | None = None
     capabilities: Capabilities | None = None
     accepting: bool = True
@@ -277,18 +236,15 @@ class OperationRecord:
     intent: TransferIntent
     lease: Lease
     accepted_at: float
+    # The rows the backend reads or writes: the lease's whole view, or a publication's stripe.
     lease_view: LeaseView | None = None
     attempt: Attempt | None = None
     submission: Submission = Submission.NOT_CALLED
     outcome: Outcome | None = None
-    write_return: WriteReturnFn | None = None
-    decision: ConsumptionDecision = ConsumptionDecision.UNDECIDED
-    return_decision: ReturnDecision | None = None
-    return_status: ReturnStatus = ReturnStatus.PENDING
-    resume_bounds: ResumeBounds | None = None
-    return_attempted: bool = False
     released: bool = False
     release_attempted: bool = False
+    # Access ended and the Lifecycle settled; the lease waits for ``return_now``.
+    held: bool = False
     cancel_sent: bool = False
     abandoned: bool = False
     access_ended: bool = False
@@ -297,7 +253,6 @@ class OperationRecord:
     lifecycle: RetirementDeadline | None = None
     timeout: threading.Event = field(default_factory=threading.Event)
     fault: str | None = None
-    observed: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -340,25 +295,46 @@ class _ShutdownAttempt:
     fault: str | None = None
 
 
+def _backend_rows(view: LeaseView, stripe: tuple[int, int] | None) -> LeaseView:
+    """The rows of ``view`` an operation with ``stripe`` (``TransferIntent.put_stripe``) hands its
+    backend: every row without one."""
+    if stripe is None:
+        return view
+    position, size = stripe
+    return replace(
+        view,
+        groups=tuple(rows.select(rows.page_ordinals % size == position) for rows in view.groups),
+    )
+
+
 class TransferManager:
     """Hold operations on one manager thread while backend I/O progresses independently.
 
-    There is no production activation here: request admission, loop-head lending,
-    readiness and fallback belong to orchestration. Scoped Lifecycle qualification
-    and general lender memory/row capabilities remain activation prerequisites.
+    Orchestration (``pyexecutor.kv_sharing``) owns admission, readiness and fallback;
+    this class owns leases and backend Attempts.
     """
 
-    def __init__(self, *, wake: WakeFn, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        *,
+        wake: WakeFn,
+        clock: Callable[[], float] = time.monotonic,
+        hold_returns: bool = False,
+    ) -> None:
         """Create an empty operation holder.
 
         Args:
             wake: Thread-safe, nonblocking notification; it must never raise.
             clock: Monotonic observation clock, shared with bound Lifecycle clocks.
+            hold_returns: Keep each lease, once its access ended and its Lifecycle
+                settled, until ``return_now`` returns it, so that every rank returns
+                leases at the same point; ``stop_holding`` lifts this.
         """
         self.bindings: dict[str, BackendBinding] = {}
         self.operations: dict[int, OperationRecord] = {}
         self._wake = wake
         self._clock = clock
+        self._holding = hold_returns
         self._owner_thread: int | None = None
         self._builder_thread = threading.get_ident()
         self._operation_id = 0
@@ -377,11 +353,13 @@ class TransferManager:
         self._progress_wake.set()
         self._wake()
 
-    def wait_for_progress(self, timeout: float = 0.01) -> None:
+    def wait_for_progress(self, timeout: float = 0.001) -> None:
         """Wait for a backend wake or bounded heartbeat without gating collectives.
 
         Args:
-            timeout: Maximum idle delay in seconds.
+            timeout: Maximum idle delay in seconds. A backend may end a call without a
+                wake (the native store worker does), so the heartbeat bounds how late an
+                idle server sees an operation end.
         """
         self._progress_wake.wait(timeout)
         self._progress_wake.clear()
@@ -407,6 +385,7 @@ class TransferManager:
         factory: BackendFactory,
         *,
         domain_id: str,
+        lender: Lender,
         lifecycle: LifecycleBinding,
         provider_cleanup_complete: ProviderCleanupCompleteFn,
         config: object = None,
@@ -418,6 +397,8 @@ class TransferManager:
             namespace: Verified complete regions and assembly-known memory kind.
             domain_id: Opaque lender identity shared by every binding using that lender.
                 It identifies failure scope, not a lender service or a memory region.
+            lender: The lender of every lease submitted to this binding. ``advance``
+                runs its progress, and fetches return their write leases through it.
             profile_id: Exact compatible assembly profile.
             factory: Private construction owner retaining partial resources on failure.
             lifecycle: Implemented policy selected explicitly for this profile.
@@ -442,7 +423,14 @@ class TransferManager:
             raise RuntimeError("backend assembly is unavailable for a failed lender domain")
         cleanup = _OwnerCleanup(self.notify)
         binding = BackendBinding(
-            namespace, profile_id, lifecycle, factory, cleanup, provider_cleanup_complete, domain_id
+            namespace,
+            profile_id,
+            lifecycle,
+            factory,
+            cleanup,
+            provider_cleanup_complete,
+            domain_id,
+            lender,
         )
         # Reserve the teardown owner before construction or watchdog admission can
         # close. No claim or active clock is needed while the binding is healthy.
@@ -470,16 +458,12 @@ class TransferManager:
             self._stop_binding(binding_id, f"backend construction failed: {error}")
             raise
 
-    def submit(
-        self, lease: Lease, intent: TransferIntent, *, write_return: WriteReturnFn | None = None
-    ) -> SubmitResult:
+    def submit(self, lease: Lease, intent: TransferIntent) -> SubmitResult:
         """Accept ownership before polling or exposing an acquired lease.
 
         Args:
             lease: Caller-owned read or write lease, possibly still pending.
             intent: Frozen fixed-binding intent consistent with its lending call.
-            write_return: Endpoint bound to the originating lender for FETCH;
-                PUBLISH does not use one. The caller proves lease provenance.
 
         Returns:
             Accepted transfers ownership permanently. Deferred/Rejected leave the
@@ -496,10 +480,8 @@ class TransferManager:
             return Rejected("intent does not match verified assembly metadata")
         if intent.direction not in (Direction.FETCH, Direction.PUBLISH):
             return Rejected("unsupported transfer direction")
-        if intent.direction is Direction.FETCH and not callable(write_return):
-            return Rejected("fetch requires its originating lender's write-return endpoint")
-        if intent.direction is Direction.PUBLISH and write_return is not None:
-            return Rejected("publish cannot have a write-return endpoint")
+        if intent.direction is Direction.FETCH and intent.put_stripe is not None:
+            return Rejected("only a publication puts a stripe of its rows")
         if any(record.lease is lease for record in self.operations.values()):
             return Rejected("lease ownership already transferred")
         watchdog = binding.lifecycle_binding.watchdog
@@ -515,11 +497,11 @@ class TransferManager:
         if not (caps.fetch if intent.direction is Direction.FETCH else caps.publish):
             return Rejected("backend does not support the requested direction")
         self._operation_id += 1
-        record = OperationRecord(
-            self._operation_id, intent, lease, self._clock(), write_return=write_return
-        )
+        record = OperationRecord(self._operation_id, intent, lease, self._clock())
         self.operations[record.id] = record
         self._count("accepted")
+        # The next idle wait returns at once: the operation starts at the next ``advance``.
+        self._progress_wake.set()
         return Accepted(record.id)
 
     def take_domain_failures(self) -> tuple[DomainFailure, ...]:
@@ -575,8 +557,6 @@ class TransferManager:
             record.fault = reason
         if record.lifecycle is not None:
             record.lifecycle.request_drain(reason)
-        if not record.return_attempted:
-            record.decision = ConsumptionDecision.DISCARD
         binding = self.bindings[record.intent.binding_id]
         if (
             record.attempt is not None
@@ -594,120 +574,52 @@ class TransferManager:
             except Exception as error:
                 self._stop_binding(record.intent.binding_id, f"backend cancel failed: {error}")
 
-    def authorize_return(self, operation_id: int, decision: ReturnDecision) -> None:
-        """Return one consuming write after orchestration's collective return gate.
+    def advance(self, now: float) -> None:
+        """Run lender progress, progress operations and perform bounded cleanup.
 
-        Args:
-            operation_id: Current operation from the coordinated transfer group.
-            decision: Reuse permission and assurance that every manager/rank has a
-                settled result and ended access. Orchestration prevalidates all
-                group inputs and invokes their returns in the same owner iteration.
-
-        Raises:
-            KeyError: The operation is unknown or already retired.
-            TypeError: The decision has the wrong type.
-            ValueError: The decision conflicts or required local/collective evidence
-                is absent. These checks perform no lender call.
-        """
-        self._owner()
-        record = self.operations[operation_id]
-        if not isinstance(decision, ReturnDecision):
-            raise TypeError("write return requires a ReturnDecision")
-        if not decision.all_ranks_returnable:
-            raise ValueError("write return requires all-rank return assurance")
-        if record.intent.direction is not Direction.FETCH:
-            raise ValueError("only fetch operations consume write returns")
-        if record.return_decision is not None:
-            if record.return_decision != decision:
-                raise ValueError("conflicting write-return authorization")
-            return
-        # Consumption cannot resume after discard, even if evidence arrives later.
-        if record.abandoned:
-            return
-        binding = self.bindings[record.intent.binding_id]
-        if (
-            record.outcome is None
-            or not record.access_ended
-            or record.write_return is None
-            or binding.domain_id in self._domain_faults
-        ):
-            raise ValueError("write return requires a settled Outcome and ended access")
-        policy = binding.lifecycle_binding
-        with policy.watchdog.lock:
-            if record.lifecycle is not None:
-                record.lifecycle.check()
-            if record.timeout.is_set():
-                self._abandon(record, "Lifecycle exposure timeout")
-            if record.abandoned or policy.watchdog.fatal is not None:
-                return
-            if record.lifecycle is not None and not record.lifecycle.settle(record):
-                return
-            record.return_decision = decision
-            record.decision = ConsumptionDecision.CONSUME
-            record.return_attempted = True
-            try:
-                record.resume_bounds = record.write_return(
-                    record.lease, record.outcome.delivered_masks, decision.reusable
-                )
-            except Exception as error:
-                # Return can partly consume a lease. Retain it and never retry or
-                # substitute release after the operational call has failed.
-                record.return_status = ReturnStatus.FAILED
-                record.fault = record.fault or f"write return failed: {error}"
-                if record.lifecycle is not None:
-                    record.lifecycle.retain_unproven(record, record.fault)
-                self.stop_lender_domain(binding.domain_id, record.fault)
-                return
-            record.released = True
-            record.return_status = ReturnStatus.RETURNED
-            self._count("returned")
-
-    def advance(self, now: float) -> tuple[OperationObservation, ...]:
-        """Observe operation facts and perform bounded manager-thread cleanup.
-
-        Orchestration calls each active lender's progress once per executor
-        iteration before this method. Keep that progress running through idle and
-        shutdown rounds, including pending copies after a consuming lease return.
-        This holder polls ready facts and never advances lender or backend I/O.
+        Call it once each executor iteration on the manager thread: the lenders'
+        staging grants and copy completions advance only through it.
 
         Args:
             now: Monotonic observation timestamp; safety timing belongs to Lifecycle.
-
-        Returns:
-            Changed operation observations, including the final retirement update.
         """
         self._owner()
         for watchdog in {item.lifecycle_binding.watchdog for item in self.bindings.values()}:
             watchdog.progress()
         self._observe_shutdowns()
-        updates: list[OperationObservation] = []
+        self._progress_lenders()
         for record in tuple(self.operations.values()):
             self._progress_operation(record)
-            retired = self._retire(record)
-            state = (
-                id(record.outcome),
-                record.fault,
-                record.decision,
-                record.access_ended,
-                record.return_status,
-                record.resume_bounds,
-                retired,
-            )
-            if state != record.observed:
-                record.observed = state
-                updates.append(
-                    OperationObservation(
-                        record.id,
-                        record.outcome,
-                        record.fault,
-                        record.decision,
-                        record.access_ended,
-                        record.return_status,
-                        record.resume_bounds,
-                        retired,
-                    )
-                )
-        return tuple(updates)
+            self._retire(record)
+
+    def start_submitted(self) -> None:
+        """Hands the backend each accepted operation whose lease view is ready, and does nothing
+        else: no lender progress, outcome polls, returns or releases. Lets an operation accepted
+        after this iteration's ``advance`` start while the forward runs; call it on the manager
+        thread where a failed lease poll may change page tables."""
+        self._owner()
+        for record in tuple(self.operations.values()):
+            binding = self.bindings[record.intent.binding_id]
+            if (
+                record.submission is Submission.NOT_CALLED
+                and not record.abandoned
+                and binding.accepting
+                and binding.domain_id not in self._domain_faults
+            ):
+                self._submit_when_ready(record)
+
+    def _progress_lenders(self) -> None:
+        """Run one round of progress of each lender whose domain has not stopped."""
+        lenders = {
+            binding.domain_id: binding.lender
+            for binding in self.bindings.values()
+            if binding.domain_id not in self._domain_faults
+        }
+        for domain_id, lender in lenders.items():
+            try:
+                lender.progress()
+            except Exception as error:
+                self.stop_lender_domain(domain_id, f"lender progress failed: {error}")
 
     def _progress_operation(self, record: OperationRecord) -> None:
         """Observe delivery and access independently without driving provider I/O."""
@@ -718,9 +630,7 @@ class TransferManager:
             if not binding.accepting:
                 self._abandon(record, "binding admission closed before exposure")
             if not record.abandoned:
-                self._poll_lease(record)
-                if record.lease_view is not None and not record.abandoned:
-                    self._submit_backend(record)
+                self._submit_when_ready(record)
         if record.attempt is not None and not binding.shutdown_started:
             if record.outcome is None:
                 try:
@@ -731,7 +641,7 @@ class TransferManager:
                 else:
                     if outcome is not None:
                         self._observe_outcome(record, outcome)
-            # A failed poll can hand off this binding while
+            # A failed poll or an invalid outcome can hand off this binding while
             # processing the outcome. Do not resume provider calls afterward.
             if not record.access_ended and not binding.shutdown_started:
                 try:
@@ -745,13 +655,17 @@ class TransferManager:
             record.access_ended = True
         if binding.retained_labels == frozenset():
             record.access_ended = True
-        if record.access_ended and (
-            record.intent.direction is Direction.PUBLISH or record.abandoned
-        ):
-            self._release(record)
+        if record.access_ended:
+            self._return_lease(record)
+
+    def _submit_when_ready(self, record: OperationRecord) -> None:
+        """Polls the lease and makes the backend call once its view is ready."""
+        self._poll_lease(record)
+        if record.lease_view is not None and not record.abandoned:
+            self._submit_backend(record)
 
     def _poll_lease(self, record: OperationRecord) -> None:
-        """Poll only until a view is ready; lender progress belongs to orchestration."""
+        """Poll an unreleased lease on its owner thread until its view is ready."""
         if record.lease_view is not None or record.released:
             return
         binding = self.bindings[record.intent.binding_id]
@@ -763,8 +677,8 @@ class TransferManager:
         except Exception as error:
             self.stop_lender_domain(binding.domain_id, f"lease poll failed: {error}")
             return
-        if view is not None and record.lease_view is None:
-            record.lease_view = view
+        if view is not None:
+            record.lease_view = _backend_rows(view, record.intent.put_stripe)
         if failure is not None:
             self._abandon(record, failure)
 
@@ -809,7 +723,7 @@ class TransferManager:
             record.submission = Submission.RETURNED
 
     def _observe_outcome(self, record: OperationRecord, outcome: Outcome) -> None:
-        """Retain the fixed result without granting consumption or release."""
+        """Retain a fixed validated result; a timeout it commits abandons the operation."""
         try:
             if not isinstance(outcome, Outcome) or record.lease_view is None:
                 raise ValueError("Attempt returned a noncanonical Outcome")
@@ -830,44 +744,132 @@ class TransferManager:
         if record.timeout.is_set():
             self._abandon(record, "Lifecycle exposure timeout")
 
-    def _release(self, record: OperationRecord) -> None:
-        """Return protection only after ended access wins Lifecycle arbitration."""
-        policy = self.bindings[record.intent.binding_id].lifecycle_binding
+    def _counts_arrivals(self, record: OperationRecord) -> bool:
+        """Whether the lease goes back through ``return_writes`` with its delivered rows.
+
+        That is a fetch's write lease whose view was polled, not abandoned, through
+        a lender domain this manager has not stopped. Any other lease is released,
+        which counts no rows of a write lease whose view was polled.
+        """
+        return (
+            record.intent.direction is Direction.FETCH
+            and record.lease_view is not None
+            and not record.abandoned
+            and self.bindings[record.intent.binding_id].domain_id not in self._domain_faults
+        )
+
+    def _return_lease(self, record: OperationRecord) -> None:
+        """Return the lease once ended access wins Lifecycle arbitration, or, while returns
+        are held, keep it there for ``return_now``.
+
+        A write lease that counts arrivals waits for its Outcome as well: the lender
+        counts the arrived rows and returns the lease in one call.
+        """
+        binding = self.bindings[record.intent.binding_id]
         if (
-            record.return_attempted
+            record.held
             or record.release_attempted
-            or record.released
-            or policy.watchdog.fatal is not None
+            or binding.lifecycle_binding.watchdog.fatal is not None
         ):
+            return
+        if self._counts_arrivals(record) and record.outcome is None:
             return
         if record.lifecycle is not None and not record.lifecycle.settle(record):
             return
+        # A deadline that passed before access ended counts no rows; settle commits it.
+        if record.timeout.is_set():
+            self._abandon(record, "Lifecycle exposure timeout")
+        if self._holding:
+            record.held = True
+            return
+        self._give_back(record, deliver=self._counts_arrivals(record))
+
+    def ended(self, operation_id: int) -> bool:
+        """Whether the operation's backend access ended and its lease is held for
+        ``return_now``."""
+        return self.operations[operation_id].held
+
+    def ready(self, operation_id: int) -> bool:
+        """Whether the operation's Outcome delivered every row of its view without a fault,
+        and neither it, its lender domain nor its lender stopped."""
+        masks = self.delivered_masks(operation_id)
+        return masks is not None and all(bool(mask.all()) for mask in masks)
+
+    def delivered_masks(self, operation_id: int) -> tuple[np.ndarray, ...] | None:
+        """The rows of its view the operation's Outcome delivered, one mask per group; None where
+        it failed: no Outcome yet, a fault, or it, its lender domain or its lender stopped. A row
+        not delivered without a failure is one the backend left alone, such as a store's put of
+        an object another writer is still putting."""
+        record = self.operations[operation_id]
+        binding = self.bindings[record.intent.binding_id]
+        outcome = record.outcome
+        failed = (
+            outcome is None
+            or outcome.fault is not None
+            or record.fault is not None
+            or record.abandoned
+            or binding.domain_id in self._domain_faults
+            or binding.lender.stopped
+        )
+        return None if failed else outcome.delivered_masks
+
+    def return_now(self, operation_id: int, deliver: bool) -> None:
+        """Return a held lease: a fetch's with the rows its Outcome delivered when ``deliver``
+        (where its lender still counts arrivals), otherwise with none.
+
+        Raises:
+            RuntimeError: Called on another thread, or the operation holds no lease.
+        """
+        self._owner()
+        record = self.operations.get(operation_id)
+        if record is None or not record.held:
+            raise RuntimeError(f"operation {operation_id} holds no lease to return")
+        record.held = False
+        self._give_back(record, deliver=deliver and self._counts_arrivals(record))
+
+    def stop_holding(self) -> None:
+        """Return held leases, and later ones, as if returns were never held: at the next
+        ``advance``, with the rows their Outcomes delivered."""
+        self._owner()
+        self._holding = False
+        for record in self.operations.values():
+            record.held = False
+
+    def _give_back(self, record: OperationRecord, deliver: bool) -> None:
+        """Return the lease through ``return_writes`` with the rows its Outcome delivered
+        (``ALL_ARRIVED`` when that is every row, which the lender returns without checking masks),
+        or release it with none."""
+        binding = self.bindings[record.intent.binding_id]
         record.release_attempted = True
         try:
-            record.lease.release()
+            if deliver:
+                masks = record.outcome.delivered_masks
+                arrived = ALL_ARRIVED if all(mask.all() for mask in masks) else masks
+                binding.lender.return_writes([(record.lease, arrived, True)])
+            else:
+                record.lease.release()
         except Exception as error:
             record.release_failed = True
-            record.return_status = ReturnStatus.FAILED
-            record.fault = record.fault or f"lease release failed: {error}"
+            record.fault = record.fault or f"lease return failed: {error}"
             if record.lifecycle is not None:
                 record.lifecycle.retain_unproven(record, record.fault)
-            self.stop_lender_domain(self.bindings[record.intent.binding_id].domain_id, record.fault)
+            self.stop_lender_domain(binding.domain_id, record.fault)
             return
         record.released = True
-        record.return_status = ReturnStatus.RETURNED
         self._count("released")
 
-    def _retire(self, record: OperationRecord) -> bool:
-        """Keep final result observation even after abandonment and early release."""
-        if not record.released or record.return_status is ReturnStatus.FAILED:
-            return False
+    def _retire(self, record: OperationRecord) -> None:
+        """Forgets the record once its lease went back (a failed release keeps it), a returned
+        Attempt's Outcome arrived and its Lifecycle closed; until then a late Outcome still lands
+        on it, also after an abandonment or an early release."""
+        if not record.released or record.release_failed:
+            return
         if record.submission is Submission.RETURNED and record.outcome is None:
-            return False
+            return
         if record.lifecycle is not None and not record.lifecycle.close():
-            return False
+            return
         del self.operations[record.id]
         self._count("retired")
-        return True
 
     def _binding_deadline(self, binding: BackendBinding, reason: str) -> None:
         """Retain uncertain construction and teardown through the bound Lifecycle."""
@@ -899,7 +901,9 @@ class TransferManager:
             deadline if self._shutdown_deadline is None else min(self._shutdown_deadline, deadline)
         )
         for record in tuple(self.operations.values()):
-            self._abandon(record, "holder shutdown")
+            # A held lease's access ended: its Outcome is final and nothing is left to cancel.
+            if not record.held:
+                self._abandon(record, "holder shutdown")
         for binding in self.bindings.values():
             binding.accepting = False
             self._binding_deadline(binding, "backend shutdown")

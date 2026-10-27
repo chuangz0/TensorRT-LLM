@@ -2278,21 +2278,13 @@ class PyExecutor:
             len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers()
 
     def _has_pending_connector_transfers(self) -> bool:
-        """Return whether connector or shared work needs another owner-loop round.
-
-        Returns:
-            Whether retained transfers prevent an indefinite idle wait or teardown.
-        """
         connector = getattr(self, "kv_connector_manager", None)
-        if connector is not None:
-            transfers = getattr(self, "async_transfer_manager", None)
-            if (connector.has_pending_loads()
-                    or (transfers is not None
-                        and transfers.has_any_inflight_requests())):
-                return True
-        coordinator = self.__dict__.get("_disagg_coordinator")
-        return (coordinator is not None
-                and coordinator.has_pending_shared_transfers())
+        if connector is None:
+            return False
+        transfers = getattr(self, "async_transfer_manager", None)
+        return (connector.has_pending_loads()
+                or (transfers is not None
+                    and transfers.has_any_inflight_requests()))
 
     @contextmanager
     def _profiler(self):

@@ -30,16 +30,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
-import numpy as np
-
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import PageLayout
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
-    Lease,
     LeaseView,
     Lender,
     MemoryKind,
     MemoryRegion,
-    ResumeBounds,
     StagingOptions,
     attach_lender,
 )
@@ -53,38 +49,6 @@ from .base.backend import Backend, CacheKind, SlotRegion, WakeFn
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-
-WriteReturnFn = Callable[[Lease, tuple[np.ndarray, ...], bool], ResumeBounds | None]
-"""Owner-thread endpoint for one consuming write return to its originating lender.
-
-The holder supplies the fixed Outcome masks after coordinated return permission
-and ended backend access. Keep the endpoint rooted through return and cleanup.
-"""
-
-
-def bind_write_return(lender: Lender) -> WriteReturnFn:
-    """Bind only the lender association for a consuming write return.
-
-    Call the endpoint on the manager thread after every participating rank settles
-    its Outcome and ends backend access. The endpoint neither authorizes the
-    return nor waits for local copies. It forwards the exact masks and reuse
-    permission once and propagates errors; the caller must not retry a return.
-
-    Args:
-        lender: Originating lender, kept alive by the returned endpoint.
-
-    Returns:
-        A callable yielding the lender's single result, possibly pending bounds.
-    """
-
-    def return_write(
-        lease: Lease, arrived: tuple[np.ndarray, ...], reusable: bool
-    ) -> ResumeBounds | None:
-        (bounds,) = lender.return_writes([(lease, arrived, reusable)])
-        return bounds
-
-    return return_write
-
 
 OwnerCleanupFn = Callable[[Callable[[], None]], bool]
 """Thread-safe, nonblocking posting of bounded manager-thread finalizers.

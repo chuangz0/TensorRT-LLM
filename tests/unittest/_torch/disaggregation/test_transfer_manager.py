@@ -22,23 +22,20 @@ from tensorrt_llm._torch.disaggregation.base.backend import (
 from tensorrt_llm._torch.disaggregation.lifecycle.retirement import RetirementWatchdog
 from tensorrt_llm._torch.disaggregation.transfer_manager import (
     Accepted,
-    ConsumptionDecision,
     Deferred,
     Direction,
     LifecycleBinding,
     Rejected,
-    ReturnDecision,
-    ReturnStatus,
     Submission,
     TransferIntent,
     TransferManager,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
+    ALL_ARRIVED,
     LeaseView,
     LentLayerGroupRows,
     MemoryKind,
     MemoryRegion,
-    ResumeBounds,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -53,11 +50,9 @@ class _Lease:
     failure: str | None = None
     released: bool = False
     polls: int = 0
-    returns: list[tuple[tuple[np.ndarray, ...], bool]] = field(default_factory=list)
-    bounds: ResumeBounds | None = ResumeBounds(4, 0)
+    marks: list[object] = field(default_factory=list)  # each return's ALL_ARRIVED or masks
     actions: list[str] = field(default_factory=list)
     poll_error: Exception | None = None
-    return_error: Exception | None = None
     release_error: Exception | None = None
 
     def poll(self) -> LeaseView | None:
@@ -69,25 +64,40 @@ class _Lease:
         return self.view if self.ready and self.failure is None else None
 
     def release(self) -> None:
-        """Record protection return without claiming local copies have completed."""
+        """Record protection return without claiming local copies have completed.
+
+        Like the lender's lease, a call after one that raised does nothing.
+        """
         assert not self.released
+        if "release" in self.actions:
+            return
         self.actions.append("release")
         if self.release_error is not None:
             raise self.release_error
         self.released = True
 
 
-def _return_write(
-    lease: _Lease, masks: tuple[np.ndarray, ...], reusable: bool
-) -> ResumeBounds | None:
-    """Model one consuming call at the lender endpoint, separate from discard release."""
-    assert not lease.released and not lease.returns
-    lease.returns.append((tuple(mask.copy() for mask in masks), reusable))
-    lease.actions.append("return")
-    if lease.return_error is not None:
-        raise lease.return_error
-    lease.released = True
-    return lease.bounds
+@dataclass
+class _Lender:
+    """Lender boundary: progress rounds and write returns that count rows, then release."""
+
+    progress_rounds: int = 0
+    stopped: bool = False
+
+    def progress(self) -> None:
+        """Count one round of lender progress."""
+        self.progress_rounds += 1
+
+    def return_writes(self, entries: list[tuple[_Lease, object, bool]]) -> list:
+        """Record each lease's arrived rows once, then release it as the lender does."""
+        for lease, arrived, reusable in entries:
+            assert reusable and not lease.marks
+            if arrived is not ALL_ARRIVED:
+                arrived = tuple(mask.copy() for mask in arrived)
+            lease.marks.append(arrived)
+            lease.actions.append("mark")
+            lease.release()
+        return [None] * len(entries)
 
 
 @dataclass
@@ -194,13 +204,15 @@ class _Backend:
 class _Harness:
     """Real holder and Lifecycle with canonical lender metadata."""
 
-    def __init__(self, *, cancel: bool = True) -> None:
+    def __init__(self, *, cancel: bool = True, hold_returns: bool = False) -> None:
         """Construct the explicitly known HOST fixture without claiming activation."""
         self.now = 10.0
         self.fatals: list[object] = []
         self.watchdog = RetirementWatchdog(self.fatals.append, clock=lambda: self.now)
         self.wake = threading.Event()
-        self.manager = TransferManager(wake=self.wake.set, clock=lambda: self.now)
+        self.manager = TransferManager(
+            wake=self.wake.set, clock=lambda: self.now, hold_returns=hold_returns
+        )
         self.namespace = RegionNamespace(
             (MemoryRegion("layout", 4096, 64, 16, 4, (7,), MemoryKind.HOST),),
             MemoryKind.HOST,
@@ -219,6 +231,7 @@ class _Harness:
             4,
         )
         self.backend = _Backend(cancel=cancel)
+        self.lender = _Lender()
         self.policy = LifecycleBinding(self.watchdog, 5)
         self.bind("store", self.backend)
         self.intent = TransferIntent("store", "m1", Direction.FETCH, MemoryKind.HOST)
@@ -238,6 +251,7 @@ class _Harness:
             "m1",
             factory,
             domain_id=domain_id,
+            lender=self.lender,
             lifecycle=self.policy,
             provider_cleanup_complete=lambda: backend.posted,
         )
@@ -245,19 +259,15 @@ class _Harness:
     def submit(
         self, *, direction: Direction = Direction.FETCH, ready: bool = True
     ) -> tuple[_Lease, int]:
-        """Acquire externally and hand off without any Request/lender dependency."""
+        """Acquire externally and hand the lease off with the harness intent."""
         lease = _Lease(self.view, ready=ready)
-        result = self.manager.submit(
-            lease,
-            replace(self.intent, direction=direction),
-            write_return=_return_write if direction is Direction.FETCH else None,
-        )
+        result = self.manager.submit(lease, replace(self.intent, direction=direction))
         assert isinstance(result, Accepted)
         return lease, result.operation_id
 
-    def tick(self) -> tuple:
+    def tick(self) -> None:
         """Run the actual owner-loop holder progress method."""
-        return self.manager.advance(self.now)
+        self.manager.advance(self.now)
 
     def complete(self, *, delivered: bool = True, fault: str | None = None) -> None:
         """Publish one fixed provider Outcome independently from access end."""
@@ -273,8 +283,18 @@ class _Harness:
         """Finish or contain test operations before the thread-leak check runs."""
         self.close()
 
+    def tick_until(self, condition: Callable[[], bool]) -> None:
+        """Run holder progress until ``condition`` holds, the shutdown worker included."""
+        stop = time.monotonic() + 1
+        while not condition() and time.monotonic() < stop:
+            self.tick()
+            self.wake.wait(0.001)
+            self.wake.clear()
+        assert condition()
+
     def close(self) -> None:
         """End fake I/O, finish real cleanup, or contain intentionally violated contracts."""
+        self.manager.stop_holding()
         for binding in self.manager.bindings.values():
             if isinstance(binding.backend, _Backend):
                 binding.backend.labels = frozenset()
@@ -338,198 +358,62 @@ def test_rejected_intent_leaves_lease_untouched(h: _Harness, field: str, value: 
     """Metadata mismatch never acquires lease ownership or substitutes a source."""
     with h:
         lease = _Lease(h.view)
-        result = h.manager.submit(
-            lease, replace(h.intent, **{field: value}), write_return=_return_write
-        )
+        result = h.manager.submit(lease, replace(h.intent, **{field: value}))
         assert isinstance(result, Rejected)
         assert not h.manager.operations and lease.polls == 0 and not lease.released
 
 
 def test_deferred_binding_leaves_caller_ownership(h: _Harness) -> None:
-    """Admission refusal must not poll, consume or return the caller's lease."""
+    """Admission refusal must not poll or return the caller's lease."""
     with h:
         h.manager.bindings["store"].accepting = False
         lease = _Lease(h.view)
-        assert isinstance(h.manager.submit(lease, h.intent, write_return=_return_write), Deferred)
+        assert isinstance(h.manager.submit(lease, h.intent), Deferred)
         assert lease.polls == 0 and not lease.actions and not h.manager.operations
 
 
+def test_an_accepted_operation_ends_the_idle_wait_at_once(h: _Harness) -> None:
+    """An idle executor pass waits for progress after it submitted: the operation starts at the
+    next ``advance``, not a heartbeat later."""
+    with h:
+        h.manager.wait_for_progress(0)  # the binding's assembly woke it
+        h.submit()
+        started = time.monotonic()
+        h.manager.wait_for_progress(5)
+        assert time.monotonic() - started < 1
+
+
 def test_same_lease_cannot_have_two_accepted_operations(h: _Harness) -> None:
-    """M1 protects one Lease/Attempt owner and rejects accidental active reuse."""
+    """A lease has one owner: a second submit of a lease already accepted is rejected."""
     with h:
         lease, _ = h.submit()
-        assert isinstance(h.manager.submit(lease, h.intent, write_return=_return_write), Rejected)
+        assert isinstance(h.manager.submit(lease, h.intent), Rejected)
         assert len(h.manager.operations) == 1
 
 
 @pytest.mark.parametrize("outcome_first", [False, True])
 def test_delivery_and_access_end_are_independent(h: _Harness, outcome_first: bool) -> None:
-    """Neither evidence order consumes or releases a fetch before coordinated return."""
+    """Either evidence order returns the write lease once, with its rows, after both."""
     with h:
         lease, operation = h.submit()
         h.tick()
+        record = h.manager.operations[operation]
         attempt = h.backend.attempts[0]
         if outcome_first:
             h.complete()
-            (update,) = h.tick()
-            assert update.outcome is attempt.outcome and not update.access_ended
+            h.tick()
+            assert record.outcome is attempt.outcome and not record.access_ended
             attempt.ended = True
         else:
             attempt.ended = True
-            (update,) = h.tick()
-            assert update.access_ended and update.outcome is None
+            h.tick()
+            assert record.access_ended and record.outcome is None
+            assert operation in h.manager.operations
             h.complete()
-        assert not lease.released and not lease.returns
-        assert operation in h.manager.operations
+        assert not lease.released and not lease.marks
         h.tick()
-        assert not lease.released and not lease.returns
-        h.manager.authorize_return(
-            operation, ReturnDecision(reusable=True, all_ranks_returnable=True)
-        )
-        (update,) = h.tick()
-        assert update.retired and update.outcome is attempt.outcome
-        assert update.decision is ConsumptionDecision.CONSUME
-        assert update.return_status is ReturnStatus.RETURNED
-        assert update.resume_bounds == lease.bounds
-        assert lease.released and lease.returns[0][0][0].all() and lease.returns[0][1]
-        assert lease.actions == ["return"]
-        assert lease.polls == 1
-        assert h.tick() == () and not h.manager.operations
-
-
-@pytest.mark.parametrize("direction", list(Direction))
-def test_direction_requires_matching_return_endpoint(h: _Harness, direction: Direction) -> None:
-    """Invalid handoff provenance leaves the lease and its pending work with the caller."""
-    with h:
-        lease = _Lease(h.view)
-        result = h.manager.submit(
-            lease,
-            replace(h.intent, direction=direction),
-            write_return=None if direction is Direction.FETCH else _return_write,
-        )
-        assert isinstance(result, Rejected)
-        assert not h.manager.operations and not lease.actions and lease.polls == 0
-
-
-@pytest.mark.parametrize("evidence", ["neither", "outcome", "access"])
-def test_return_rejects_incomplete_local_evidence(h: _Harness, evidence: str) -> None:
-    """Caller assurance cannot replace the holder's fixed result and ended-access checks."""
-    with h:
-        lease, operation = h.submit()
-        h.tick()
-        if evidence == "outcome":
-            h.complete()
-        elif evidence == "access":
-            h.backend.attempts[0].ended = True
-        h.tick()
-        with pytest.raises(ValueError):
-            h.manager.authorize_return(operation, ReturnDecision(True, True))
-        assert not lease.released and not lease.returns
-
-
-@pytest.mark.parametrize("reusable", [False, True])
-def test_return_requires_collective_assurance_and_is_one_shot(h: _Harness, reusable: bool) -> None:
-    """Fixed local evidence permits one authorized call with the caller's reuse permission."""
-    with h:
-        lease, operation = h.submit()
-        h.tick()
-        h.complete()
-        h.backend.attempts[0].ended = True
-        h.tick()
-        with pytest.raises(ValueError):
-            h.manager.authorize_return(operation, ReturnDecision(reusable, False))
-        assert not lease.returns
-        decision = ReturnDecision(reusable, True)
-        h.manager.authorize_return(operation, decision)
-        h.manager.authorize_return(operation, decision)
-        with pytest.raises(ValueError):
-            h.manager.authorize_return(operation, ReturnDecision(not reusable, True))
-        assert len(lease.returns) == 1 and lease.returns[0][1] is reusable
-        assert lease.actions == ["return"]
-        h.tick()
-        with pytest.raises(KeyError):
-            h.manager.authorize_return(operation, decision)
-
-
-def test_settled_miss_uses_authorized_return_instead_of_discard(h: _Harness) -> None:
-    """A final miss still returns canonical all-false masks to settle the lender fetch."""
-    with h:
-        lease, operation = h.submit()
-        h.tick()
-        h.complete(delivered=False)
-        h.backend.attempts[0].ended = True
-        h.tick()
-        assert not lease.released and not lease.returns
-        h.manager.authorize_return(operation, ReturnDecision(False, True))
-        (update,) = h.tick()
-        assert update.return_status is ReturnStatus.RETURNED and update.retired
-        assert len(lease.returns) == 1 and not lease.returns[0][0][0].any()
-        assert not lease.returns[0][1] and lease.actions == ["return"]
-
-
-def test_abandonment_prevents_late_authorization_from_consuming(h: _Harness) -> None:
-    """A completed result cannot restore consumption after orchestration abandons it."""
-    with h:
-        lease, operation = h.submit()
-        h.tick()
-        h.complete()
-        h.backend.attempts[0].ended = True
-        h.tick()
-        h.manager.abandon(operation, "request cancelled")
-        h.manager.authorize_return(operation, ReturnDecision(True, True))
-        (update,) = h.tick()
-        assert update.retired and update.decision is ConsumptionDecision.DISCARD
-        assert lease.released and not lease.returns and lease.actions == ["release"]
-
-
-def test_abandonment_after_return_keeps_consumption_record_and_avoids_second_return(
-    h: _Harness,
-) -> None:
-    """Late loss of request interest cannot undo consumed rows or return ownership twice."""
-    with h:
-        lease, operation = h.submit()
-        h.tick()
-        h.complete()
-        h.backend.attempts[0].ended = True
-        h.tick()
-        decision = ReturnDecision(True, True)
-        h.manager.authorize_return(operation, decision)
-        h.manager.abandon(operation, "request exited after return")
-        h.manager.authorize_return(operation, decision)
-        (update,) = h.tick()
-        assert update.retired and update.decision is ConsumptionDecision.CONSUME
-        assert update.return_status is ReturnStatus.RETURNED
-        assert len(lease.returns) == 1 and lease.actions == ["return"]
-
-
-def test_ready_lease_is_never_polled_again(h: _Harness) -> None:
-    """Once the view exists, provider progress uses the retained view and Attempt only."""
-    with h:
-        lease, operation = h.submit()
-        h.tick()
-        lease.poll_error = AssertionError("ready lease must not be polled twice")
-        h.tick()
-        h.complete()
-        h.backend.attempts[0].ended = True
-        h.tick()
-        h.manager.authorize_return(operation, ReturnDecision(True, True))
-        h.tick()
-        assert lease.polls == 1 and lease.released
-        assert h.manager.take_domain_failures() == ()
-
-
-def test_timeout_between_observation_and_authorization_prevents_return(h: _Harness) -> None:
-    """Return arbitration rechecks the safety deadline after orchestration observes results."""
-    with h:
-        lease, operation = h.submit()
-        h.tick()
-        h.complete()
-        h.backend.attempts[0].ended = True
-        h.tick()
-        h.now = 15.0
-        h.manager.authorize_return(operation, ReturnDecision(True, True))
-        h.tick()
-        assert not lease.returns
+        assert not h.manager.operations and record.outcome is attempt.outcome
+        assert lease.released and lease.marks == [ALL_ARRIVED]
 
 
 @pytest.mark.parametrize(
@@ -543,32 +427,34 @@ def test_late_result_survives_early_release_even_after_abandonment(
     with h:
         lease, operation = h.submit(direction=direction)
         h.tick()
+        record = h.manager.operations[operation]
         if abandoned:
             h.manager.abandon(operation, "caller no longer needs acquisition")
         h.backend.attempts[0].ended = True
         h.tick()
         assert lease.released and operation in h.manager.operations
         h.complete(fault="late provider fault")
-        (update,) = h.tick()
-        assert update.retired and update.outcome.fault == "late provider fault"
-        assert update.fault != "late provider fault"
-        assert not lease.returns and lease.actions == ["release"]
+        h.tick()
+        assert operation not in h.manager.operations
+        assert record.outcome.fault == "late provider fault"
+        assert record.fault != "late provider fault"
+        assert not lease.marks
 
 
-def test_unseen_abandonment_needs_no_consumption_or_submission(h: _Harness) -> None:
+def test_unseen_abandonment_needs_no_view_or_submission(h: _Harness) -> None:
     """An unpolled accepted lease can be abandoned without inventing a view."""
     with h:
         lease, operation = h.submit(ready=False)
         h.manager.abandon(operation, "request cancelled")
-        (update,) = h.tick()
-        assert update.retired and update.decision is ConsumptionDecision.DISCARD
-        assert lease.released and lease.polls == 0 and not lease.returns
+        h.tick()
+        assert operation not in h.manager.operations
+        assert lease.released and lease.polls == 0 and not lease.marks
         assert not h.backend.submissions
 
 
 @pytest.mark.parametrize("supported", [False, True])
 def test_cancellation_is_advisory_and_one_shot(supported: bool) -> None:
-    """Cancel neither proves access end nor changes a fixed consumption decision."""
+    """Cancel neither proves access end nor returns the lease."""
     with _Harness(cancel=supported) as h:
         lease, operation = h.submit()
         h.tick()
@@ -576,7 +462,7 @@ def test_cancellation_is_advisory_and_one_shot(supported: bool) -> None:
         h.manager.abandon(operation, "duplicate")
         h.tick()
         assert h.backend.attempts[0].cancels == int(supported)
-        assert not lease.released and not lease.returns
+        assert not lease.released and not lease.marks
 
 
 @pytest.mark.parametrize(
@@ -590,9 +476,9 @@ def test_submission_rejection_differs_from_uncertainty(
     with h:
         h.backend.error = error
         lease, operation = h.submit()
-        (update,) = h.tick()
-        assert update.retired is safe and lease.released is safe
-        assert not lease.returns
+        h.tick()
+        assert (operation not in h.manager.operations) is safe and lease.released is safe
+        assert not lease.marks
         if not safe:
             assert h.manager.operations[operation].submission is Submission.UNCERTAIN
             assert not h.manager.bindings["store"].accepting
@@ -605,21 +491,23 @@ def test_malformed_outcome_never_consumes_rows(h: _Harness) -> None:
         h.tick()
         h.backend.attempts[0].outcome = Outcome((np.ones(3, dtype=bool),))
         h.tick()
-        assert not lease.returns
+        assert not lease.marks
         assert h.manager.operations[operation].outcome is None
 
 
-def test_timeout_committed_inside_poll_prevents_consumption(h: _Harness) -> None:
+def test_timeout_committed_inside_poll_wins_before_rows_are_counted(h: _Harness) -> None:
     """A poll crossing the exact exposure deadline cannot consume late rows."""
     with h:
         lease, operation = h.submit()
         h.tick()
+        record = h.manager.operations[operation]
         h.complete()
+        h.backend.attempts[0].ended = True
         h.backend.attempts[0].before_poll = lambda: setattr(h, "now", 15.0)
-        (update,) = h.tick()
-        assert update.decision is ConsumptionDecision.DISCARD
-        assert not lease.returns
-        assert h.manager.operations[operation].abandoned
+        h.tick()
+        assert operation not in h.manager.operations
+        assert record.fault == "Lifecycle exposure timeout"
+        assert lease.released and not lease.marks
 
 
 def test_fatal_expiry_cannot_be_undone_by_late_evidence(h: _Harness) -> None:
@@ -633,36 +521,27 @@ def test_fatal_expiry_cannot_be_undone_by_late_evidence(h: _Harness) -> None:
         h.backend.attempts[0].ended = True
         h.tick()
         assert h.fatals and not lease.released and operation in h.manager.operations
-        assert not lease.returns
+        assert not lease.marks
 
 
-@pytest.mark.parametrize("method", ["poll", "return"])
-def test_lender_failure_stops_calls_but_releases_after_access_ends(
-    h: _Harness, method: str
-) -> None:
-    """A failed poll permits safe discard; a failed consuming return is not retried."""
+def test_lender_failure_stops_calls_but_releases_after_access_ends(h: _Harness) -> None:
+    """A lender stop forbids polls and progress, but does not forbid confirmed resource return."""
     with h:
         lease, operation = h.submit()
-        setattr(lease, method + "_error", RuntimeError("manager failed"))
+        lease.poll_error = RuntimeError("manager failed")
         h.tick()
-        if method == "return":
-            h.complete()
-            h.backend.attempts[0].ended = True
+        stop = time.monotonic() + 1
+        while not lease.released and time.monotonic() < stop:
             h.tick()
-            decision = ReturnDecision(reusable=True, all_ranks_returnable=True)
-            h.manager.authorize_return(operation, decision)
-            h.manager.authorize_return(operation, decision)
-            h.tick()
-            assert not lease.released and operation in h.manager.operations
-            assert h.manager.operations[operation].return_status is ReturnStatus.FAILED
-            assert lease.actions == ["return"]
-        else:
-            assert lease.released and operation not in h.manager.operations
-            assert lease.polls == 1 and lease.actions == ["release"]
+            h.wake.wait(0.001)
+            h.wake.clear()
+        assert lease.released and operation not in h.manager.operations
         assert not h.manager.bindings["store"].accepting
         (failure,) = h.manager.take_domain_failures()
         assert failure.domain_id == "lender" and "manager failed" in failure.fault
         assert h.manager.take_domain_failures() == ()
+        h.tick()
+        assert lease.polls == 1 and h.lender.progress_rounds == 1
 
 
 def test_release_failure_retains_owner_and_closes_lender_domain(h: _Harness) -> None:
@@ -671,7 +550,6 @@ def test_release_failure_retains_owner_and_closes_lender_domain(h: _Harness) -> 
         lease, operation = h.submit()
         lease.release_error = RuntimeError("manager failed")
         h.tick()
-        h.manager.abandon(operation, "discard failed acquisition")
         h.complete()
         h.backend.attempts[0].ended = True
         h.tick()
@@ -683,13 +561,28 @@ def test_release_failure_retains_owner_and_closes_lender_domain(h: _Harness) -> 
 
 
 def test_documented_lease_failure_before_view_can_retire(h: _Harness) -> None:
-    """A canonical failed lease has no backend exposure and needs no consuming return."""
+    """A canonical failed lease has no backend exposure and goes back by release alone."""
+    with h:
+        lease, operation = h.submit()
+        record = h.manager.operations[operation]
+        lease.failure = "staging capacity unavailable"
+        h.tick()
+        assert operation not in h.manager.operations and record.fault == lease.failure
+        assert lease.released and not lease.marks
+
+
+def test_ready_lease_is_never_polled_again(h: _Harness) -> None:
+    """Once the view exists, provider progress uses the retained view and Attempt only."""
     with h:
         lease, _ = h.submit()
-        lease.failure = "staging capacity unavailable"
-        (update,) = h.tick()
-        assert update.retired and update.fault == lease.failure
-        assert lease.released and not lease.returns
+        h.tick()
+        lease.poll_error = AssertionError("ready lease must not be polled twice")
+        h.tick()
+        h.complete()
+        h.backend.attempts[0].ended = True
+        h.tick()
+        assert lease.polls == 1 and lease.released
+        assert h.manager.take_domain_failures() == ()
 
 
 def test_constructor_uncertainty_retains_factory_and_accepted_cleanup(h: _Harness) -> None:
@@ -709,6 +602,7 @@ def test_constructor_uncertainty_retains_factory_and_accepted_cleanup(h: _Harnes
                 "m1",
                 factory,
                 domain_id="lender",
+                lender=h.lender,
                 lifecycle=h.policy,
                 provider_cleanup_complete=lambda: True,
             )
@@ -735,6 +629,7 @@ def test_certified_constructor_rejection_does_not_leave_binding(h: _Harness) -> 
                 "m1",
                 factory,
                 domain_id="lender",
+                lender=h.lender,
                 lifecycle=LifecycleBinding(watchdog, 5),
                 provider_cleanup_complete=lambda: True,
             )
@@ -848,9 +743,7 @@ def test_shutdown_handoff_keeps_independent_binding_and_deadlines_progressing(h:
         h.manager.stop_lender_domain("lender", "lender failed")
         assert h.backend.shutdown_started.wait(1)
         independent = _Lease(h.view)
-        result = h.manager.submit(
-            independent, replace(h.intent, binding_id="other"), write_return=_return_write
-        )
+        result = h.manager.submit(independent, replace(h.intent, binding_id="other"))
         assert isinstance(result, Accepted)
         h.tick()
         other.attempts[0].outcome = Outcome.for_view(h.view, h.view.row_masks(True))
@@ -858,9 +751,6 @@ def test_shutdown_handoff_keeps_independent_binding_and_deadlines_progressing(h:
         start = time.monotonic()
         h.tick()
         assert time.monotonic() - start < 0.1
-        assert not independent.released and not lease.released
-        h.manager.authorize_return(result.operation_id, ReturnDecision(True, True))
-        h.tick()
         assert independent.released and not lease.released
         assert not h.backend.call_violations
         h.now = 15
@@ -873,22 +763,15 @@ def test_shutdown_observes_final_outcome_after_early_lease_release(h: _Harness) 
     with h:
         lease, operation = h.submit(direction=Direction.PUBLISH)
         h.tick()
+        record = h.manager.operations[operation]
         h.backend.attempts[0].ended = True
         h.tick()
         assert lease.released and operation in h.manager.operations
         h.backend.labels = frozenset()
         h.manager.begin_shutdown(h.now + 5)
-        updates = []
-        stop = time.monotonic() + 1
-        while operation in h.manager.operations and time.monotonic() < stop:
-            updates.extend(h.tick())
-            h.wake.wait(0.001)
-            h.wake.clear()
-        final = next(
-            update for update in updates if update.operation_id == operation and update.retired
-        )
-        assert final.outcome is h.backend.attempts[0].outcome
-        assert final.outcome.fault == "shutdown"
+        h.tick_until(lambda: operation not in h.manager.operations)
+        assert record.outcome is h.backend.attempts[0].outcome
+        assert record.outcome.fault == "shutdown"
         assert {tid for name, tid in h.backend.calls if name == "poll"} == {
             threading.get_ident(),
             h.backend.shutdown_owner,
@@ -896,7 +779,7 @@ def test_shutdown_observes_final_outcome_after_early_lease_release(h: _Harness) 
 
 
 def test_lender_failure_stops_sibling_bindings_without_stopping_release(h: _Harness) -> None:
-    """The domain stop precedes any sibling poll/return and preserves pending releases."""
+    """The domain stop precedes any sibling poll or return and preserves pending releases."""
     with h:
         sibling = _Backend()
         h.bind("sibling", sibling)
@@ -905,32 +788,19 @@ def test_lender_failure_stops_sibling_bindings_without_stopping_release(h: _Harn
         failed, _ = h.submit()
         failed.poll_error = RuntimeError("lender state failed")
         pending = _Lease(h.view, ready=False)
-        accepted = h.manager.submit(
-            pending, replace(h.intent, binding_id="sibling"), write_return=_return_write
-        )
+        accepted = h.manager.submit(pending, replace(h.intent, binding_id="sibling"))
         assert isinstance(accepted, Accepted)
         h.tick()
         polls = exposed.polls
         assert pending.polls == 0 and pending.released and failed.released
-        assert not exposed.released and not exposed.returns
+        assert not exposed.released and not exposed.marks
         assert all(not item.accepting for item in h.manager.bindings.values())
         untouched = _Lease(h.view)
-        assert isinstance(
-            h.manager.submit(untouched, h.intent, write_return=_return_write), Deferred
-        )
+        assert isinstance(h.manager.submit(untouched, h.intent), Deferred)
         assert untouched.polls == 0 and not untouched.released
         h.backend.attempts[0].ended = True
-        stop = time.monotonic() + 1
-        updates = []
-        while exposed_id in h.manager.operations and time.monotonic() < stop:
-            updates.extend(h.tick())
-            h.wake.wait(0.001)
-            h.wake.clear()
-        assert exposed.released and exposed.polls == polls and not exposed.returns
-        final = next(
-            update for update in updates if update.operation_id == exposed_id and update.retired
-        )
-        assert final.decision is ConsumptionDecision.DISCARD
+        h.tick_until(lambda: exposed_id not in h.manager.operations)
+        assert exposed.released and exposed.polls == polls and not exposed.marks
         h.manager.stop_lender_domain("lender", "duplicate")
         assert len(h.manager.take_domain_failures()) == 1
 
@@ -956,9 +826,10 @@ def test_cumulative_shutdown_snapshot_preserves_proof_before_later_error(h: _Har
         while len(h.backend.shutdown_threads) < 3 and time.monotonic() < stop:
             time.sleep(0.001)
         assert len(h.backend.shutdown_threads) >= 3
-        updates = h.tick()
+        record = h.manager.operations[operation]
+        h.tick()
         assert lease.released and operation not in h.manager.operations
-        assert updates[0].outcome is h.backend.attempts[0].outcome
+        assert record.outcome is h.backend.attempts[0].outcome
         binding = h.manager.bindings["store"]
         assert binding.retained_labels == frozenset()
         assert "late shutdown failure" in binding.fault
@@ -998,9 +869,7 @@ def test_binding_fault_does_not_block_unrelated_binding_before_fatal(h: _Harness
         h.backend.error = RuntimeError("uncertain")
         h.submit()
         h.tick()
-        result = h.manager.submit(
-            _Lease(h.view), replace(h.intent, binding_id="second"), write_return=_return_write
-        )
+        result = h.manager.submit(_Lease(h.view), replace(h.intent, binding_id="second"))
         assert isinstance(result, Accepted)
         h.tick()
         assert len(second.attempts) == 1
@@ -1088,6 +957,7 @@ def test_constructor_without_backend_is_uncertain_even_when_cleanup_is_complete(
                 "m1",
                 factory,
                 domain_id="lender",
+                lender=h.lender,
                 lifecycle=h.policy,
                 provider_cleanup_complete=lambda: True,
             )
@@ -1116,7 +986,7 @@ def test_preexposure_lender_error_releases_failed_lease_and_drains_provider(h: _
         assert not binding.shutdown_thread.is_alive()
         assert binding.finalized and lease.released
         assert operation not in h.manager.operations
-        assert lease.polls == 1 and not lease.returns
+        assert lease.polls == 1 and not lease.marks
         h.now = 15.0
         h.watchdog.progress()
         h.tick()
@@ -1141,3 +1011,125 @@ def test_shutdown_keeps_binding_owner_before_pending_lease_release_can_fail(h: _
         h.now = 15.0
         h.watchdog.progress()
         assert h.fatals and operation in h.manager.operations and not lease.released
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "delivered",
+        "short",
+        "abandoned",
+        "domain stopped",
+        "lender stopped",
+        "timed out",
+        "shut down",
+    ],
+)
+def test_a_held_lease_goes_back_only_by_return_now(path: str) -> None:
+    """With returns held, the end of access settles the Lifecycle and returns nothing, whatever
+    ended the operation; the caller returns the lease with every row or with none."""
+    with _Harness(hold_returns=True) as h:
+        lease, operation = h.submit()
+        h.tick()
+        attempt = h.backend.attempts[0]
+        if path == "abandoned":
+            h.manager.abandon(operation, "the fetch is late")
+        elif path == "domain stopped":
+            h.manager.stop_lender_domain("lender", "a lend failed")
+        elif path == "lender stopped":
+            h.lender.stopped = True
+        elif path == "timed out":
+            attempt.before_poll = lambda: setattr(h, "now", 15.0)
+        elif path == "shut down":
+            h.manager.begin_shutdown(h.now + 5)
+        h.complete(delivered=path != "short")
+        attempt.ended = True
+        h.tick_until(lambda: h.manager.ended(operation))
+        for _ in range(3):
+            h.tick()
+        assert not lease.released and not lease.marks and not h.fatals
+        ready = h.manager.ready(operation)
+        assert ready is (path == "delivered")
+        # A short delivery failed nothing; every other path but "delivered" did.
+        failed = h.manager.delivered_masks(operation) is None
+        assert failed is (path not in ("delivered", "short"))
+        h.manager.return_now(operation, deliver=ready)
+        assert lease.released and bool(lease.marks) is ready
+        h.tick_until(lambda: operation not in h.manager.operations)
+        with pytest.raises(RuntimeError, match="holds no lease"):
+            h.manager.return_now(operation, deliver=False)
+
+
+def test_stop_holding_returns_held_leases_with_the_rows_their_outcomes_delivered() -> None:
+    with _Harness(hold_returns=True) as h:
+        lease, operation = h.submit()
+        h.tick()
+        h.backend.attempts[0].outcome = Outcome.for_view(h.view, (np.array([True, False]),), None)
+        h.backend.attempts[0].ended = True
+        h.tick()
+        assert h.manager.ended(operation) and not h.manager.ready(operation)
+        assert not lease.released
+        h.manager.stop_holding()
+        h.tick()
+        assert operation not in h.manager.operations
+        assert lease.released and lease.marks[0][0].tolist() == [True, False]
+
+
+def test_shutdown_leaves_a_held_lease_ready_for_its_return() -> None:
+    """A lease held when shutdown begins ended its access already: nothing is left to abandon."""
+    with _Harness(hold_returns=True) as h:
+        lease, operation = h.submit()
+        h.tick()
+        h.complete()
+        h.backend.attempts[0].ended = True
+        h.tick()
+        h.manager.begin_shutdown(h.now + 5)
+        assert h.manager.ready(operation) and "abandoned" not in h.manager.counters
+        h.manager.return_now(operation, deliver=True)
+        assert lease.released and lease.marks == [ALL_ARRIVED]
+
+
+def test_a_publication_puts_only_its_stripe_and_a_striped_fetch_is_refused() -> None:
+    """Ranks holding the same bytes each put a stripe of a publication's rows: the backend sees
+    the rows whose page ordinal modulo the stripe's size is its position, and the outcome answers
+    for those rows alone."""
+    with _Harness(hold_returns=True) as h:
+        striped_fetch = replace(h.intent, put_stripe=(1, 2))
+        assert isinstance(h.manager.submit(_Lease(h.view), striped_fetch), Rejected)
+        lease = _Lease(h.view)
+        publication = replace(h.intent, direction=Direction.PUBLISH, put_stripe=(1, 2))
+        result = h.manager.submit(lease, publication)
+        assert isinstance(result, Accepted)
+        h.tick()
+        ((view, _, direction),) = h.backend.submissions
+        # h.view lends ordinals 2 and 3; stripe (1, 2) keeps 3.
+        assert direction == "publish" and view.groups[0].page_ordinals.tolist() == [3]
+        h.backend.attempts[0].outcome = Outcome.for_view(view, view.row_masks(True))
+        h.backend.attempts[0].ended = True
+        h.tick_until(lambda: h.manager.ended(result.operation_id))
+        assert h.manager.ready(result.operation_id)
+        h.manager.return_now(result.operation_id, deliver=False)
+        assert lease.released
+
+
+def test_start_submitted_starts_a_ready_operation_and_makes_no_other_progress() -> None:
+    """Between two ``advance`` calls, ``start_submitted`` hands the backend an accepted operation
+    whose view is ready, leaves one whose view is not, and runs no lender progress, outcome poll
+    or return."""
+    with _Harness(hold_returns=True) as h:
+        waiting, _ = h.submit(ready=False)
+        h.tick()
+        rounds = h.lender.progress_rounds
+        ready, operation = h.submit()
+        h.manager.start_submitted()
+        ((view, _, _),) = h.backend.submissions
+        assert view is h.view and ready.polls == 1 and waiting.polls == 2
+        h.complete()
+        h.backend.attempts[0].ended = True
+        h.manager.start_submitted()
+        assert len(h.backend.submissions) == 1 and h.lender.progress_rounds == rounds
+        assert not h.manager.ended(operation) and not ready.released
+        h.tick()
+        assert h.manager.ended(operation) and h.manager.ready(operation)
+        h.manager.return_now(operation, deliver=True)
+        assert ready.released

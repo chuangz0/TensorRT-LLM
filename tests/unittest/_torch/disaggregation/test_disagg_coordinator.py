@@ -28,8 +28,6 @@ _LOOP_ENTRY_POINTS_EXCLUDED = {"release_transfer"}
 _SHARED_HOLDER_METHODS = {
     "attach_shared_transfer_manager",
     "has_pending_shared_transfers",
-    "take_shared_updates",
-    "take_shared_domain_failures",
     "begin_shared_shutdown",
     "shared_shutdown_complete",
 }
